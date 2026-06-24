@@ -13,8 +13,11 @@ intended (API) state against the actual data plane (OVN / OVS).
 > authentication, the YAML scenario schema, the deterministic plan generator,
 > the `generate` command, and `apply` (both `--dry-run` and the live executor,
 > which builds the full tagged topology in dependency order and collects timing
-> metrics) now exist. Run records, reporting, tag-based cleanup, and the quota
-> pre-check described below are still being built.
+> metrics) now exist. `apply` also pre-checks quotas before creating anything
+> and persists a `run-<id>.json` record; `status` re-queries live state,
+> `report` renders the metrics as table/JSON/CSV, and `cleanup` deletes a run's
+> tagged resources idempotently. The optional Prometheus textfile export and
+> the built-in scenario profiles are still being built.
 
 ---
 
@@ -230,12 +233,15 @@ Reported per resource type and overall:
 - total wall-clock for the run,
 - error breakdown (timeouts, 409 conflicts, quota, 5xx, …).
 
-Output formats:
+`report` renders a run record's metrics in three formats:
 
-- human-readable **table** on stdout,
-- **JSON** run record (canonical, machine-readable),
-- optional **CSV** of raw per-call samples,
-- optional **Prometheus textfile** export to fit the testbed's monitoring.
+- human-readable **table** on stdout (the default),
+- **JSON** metrics (machine-readable),
+- **CSV** with one row per resource type plus an overall row.
+
+The canonical run record itself is the `run-<id>.json` written by `apply`. An
+optional **Prometheus textfile** export to fit the testbed's monitoring is
+planned but not yet implemented.
 
 ---
 
@@ -260,14 +266,15 @@ Output formats:
 Large scenarios will exceed Neutron's **default per-project quotas** (typically
 10 networks, 10 subnets, 10 routers, 10 security groups, 100 SG rules, 50 ports).
 A 100-network / 200-subnet / 20-router scenario therefore requires quotas to be
-raised first. Options to be decided (see open questions):
+raised first.
 
-- document the required quota changes and let the operator apply them, or
-- have the tool (with an admin cloud) raise the target project's quotas as a
-  pre-step.
-
-Either way the tool will **pre-check quotas** against the expanded plan and
-abort early with a clear message if they are insufficient.
+This is resolved as **document-and-require** (see open questions): `apply`
+**pre-checks quotas** against the expanded plan and aborts early with an itemized
+message before creating anything if they are insufficient, leaving the operator
+to raise the quotas. The tool does **not** auto-raise quotas through an admin
+cloud — that would require admin credentials it otherwise never needs. The
+pre-check fails open (it logs a warning and proceeds) when the project cannot
+read its own quota, with the executor's quota fast-fail as the backstop.
 
 ---
 
@@ -324,8 +331,9 @@ contrib/openstack-tester/
          interfaces, security groups + rules, ports) with tagging.
    - [x] Dependency-ordered, concurrent executor with retry/backoff.
    - [x] Metrics collection and state polling.
-   - [ ] Run records, reporting, and CSV/Prometheus export.
-   - [ ] Tag-based `cleanup`; quota pre-check.
+   - [x] Run records, `status` re-query, and `report` (table/JSON/CSV).
+         (Prometheus textfile export still pending.)
+   - [x] Tag-based `cleanup`; quota pre-check.
    - [ ] Built-in profiles (incl. the 20/100/200 example).
 2. **Phase 2 — data-plane verification**
    - [ ] Compare API/plan against OVN NB/SB and OVS flows.
@@ -334,7 +342,10 @@ contrib/openstack-tester/
 
 ## 16. Open questions / decisions to confirm
 
-- **Quotas**: document-and-require, or auto-raise via an admin cloud?
+- **Quotas**: **resolved** — document-and-require. `apply` pre-checks the
+  expanded plan against the project quota and aborts early with an itemized
+  message; raising the quota is the operator's step. Auto-raise via an admin
+  cloud is deliberately not implemented (see §11).
 - **Network types**: **resolved** — geneve/vxlan tenant networks only; the
   generator emits plain tenant networks with no provider attributes (VLAN/flat
   deferred to Phase 3).
