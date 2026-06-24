@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/B42Labs/openstack-tester/internal/plan"
@@ -26,14 +28,18 @@ func smallScenario() Scenario {
 			Networks:       3,
 			Routers:        2,
 			SecurityGroups: 2,
+			RouterLinks:    1,
+			FloatingIPs:    2,
 		},
 		Distribution: Distribution{
-			SubnetsPerNetwork:            Range{Min: 1, Max: 3},
-			PortsPerNetwork:              Range{Min: 1, Max: 2},
-			RulesPerSecurityGroup:        Range{Min: 1, Max: 3},
-			SubnetFromPoolRatio:          0.5,
-			IPv6Ratio:                    0.3,
-			SubnetsAttachedToRouterRatio: 0.7,
+			SubnetsPerNetwork:               Range{Min: 1, Max: 3},
+			PortsPerNetwork:                 Range{Min: 1, Max: 2},
+			RulesPerSecurityGroup:           Range{Min: 1, Max: 3},
+			SubnetFromPoolRatio:             0.5,
+			IPv6Ratio:                       0.3,
+			SubnetsAttachedToRouterRatio:    0.7,
+			RoutersWithExternalGatewayRatio: 0.5,
+			FloatingIPAssociatedRatio:       0.5,
 		},
 		Topology: Topology{
 			RouterAttachStrategy:   "random",
@@ -119,6 +125,153 @@ func TestGenerateGolden(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Errorf("generated plan differs from golden file %s; run with -update if the change is intended", path)
+	}
+}
+
+// TestGenerateExternalConnectivityAndLinks exercises the external-gateway
+// intent, router-to-router links, and floating IPs together: it checks the link
+// topology is well-formed (one subnet-side and one port-side interface per
+// link over a /30 transit subnet), that gateway intent is recorded, and that
+// floating IPs associate only with distinct, non-interface ports.
+func TestGenerateExternalConnectivityAndLinks(t *testing.T) {
+	s := Scenario{
+		Name: "ext",
+		Seed: 99,
+		Resources: Resources{
+			Networks:       6,
+			Routers:        4,
+			SecurityGroups: 1,
+			RouterLinks:    2,
+			FloatingIPs:    5,
+		},
+		Distribution: Distribution{
+			SubnetsPerNetwork:               Range{Min: 1, Max: 2},
+			PortsPerNetwork:                 Range{Min: 1, Max: 3},
+			RulesPerSecurityGroup:           Range{Min: 1, Max: 2},
+			IPv6Ratio:                       0.4, // mix in IPv6 subnets the FIP eligibility must skip
+			SubnetsAttachedToRouterRatio:    1.0,
+			RoutersWithExternalGatewayRatio: 1.0,
+			FloatingIPAssociatedRatio:       1.0,
+		},
+		Topology: Topology{PortSecurityGroupCount: Range{Min: 0, Max: 1}},
+	}
+
+	p, err := s.Generate()
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+
+	// Every router intends an external gateway at ratio 1.0.
+	if got := p.RoutersWithExternalGateway(); got != 4 {
+		t.Errorf("routers with external gateway = %d, want 4", got)
+	}
+
+	// Each link adds exactly one subnet-side and one port-side interface.
+	var linkNets, linkSubnets, linkPorts, subnetSide, portSide int
+	for _, n := range p.Networks {
+		if strings.HasPrefix(n.Name, "link-net-") {
+			linkNets++
+		}
+	}
+	transitCIDR := map[string]string{}
+	for _, sub := range p.Subnets {
+		if strings.HasPrefix(sub.Name, "link-subnet-") {
+			linkSubnets++
+			if pfx, err := netip.ParsePrefix(sub.CIDR); err != nil || pfx.Bits() != 30 || !pfx.Addr().IsPrivate() {
+				t.Errorf("transit subnet %q has CIDR %q, want a private /30", sub.Name, sub.CIDR)
+			}
+			if !sub.DisableDHCP {
+				t.Errorf("transit subnet %q must disable DHCP so its single host address is free for the link port", sub.Name)
+			}
+			transitCIDR[sub.Name] = sub.CIDR
+		}
+	}
+	for _, pt := range p.Ports {
+		if strings.HasPrefix(pt.Name, "link-port-") {
+			linkPorts++
+			if len(pt.FixedIPs) != 1 || pt.FixedIPs[0].IPAddress == "" {
+				t.Errorf("transit port %q must pin exactly one explicit IP, got %+v", pt.Name, pt.FixedIPs)
+			}
+		}
+	}
+	for _, ri := range p.RouterInterfaces {
+		switch {
+		case strings.HasPrefix(ri.Name, "link-rif-a-"):
+			subnetSide++
+			if ri.Subnet == "" || ri.Port != "" {
+				t.Errorf("link interface %q must be subnet-side, got subnet=%q port=%q", ri.Name, ri.Subnet, ri.Port)
+			}
+		case strings.HasPrefix(ri.Name, "link-rif-b-"):
+			portSide++
+			if ri.Port == "" || ri.Subnet != "" {
+				t.Errorf("link interface %q must be port-side, got subnet=%q port=%q", ri.Name, ri.Subnet, ri.Port)
+			}
+		}
+	}
+	if linkNets != 2 || linkSubnets != 2 || linkPorts != 2 || subnetSide != 2 || portSide != 2 {
+		t.Errorf("link topology = nets %d, subnets %d, ports %d, subnet-side %d, port-side %d; want 2 of each",
+			linkNets, linkSubnets, linkPorts, subnetSide, portSide)
+	}
+
+	// Floating IPs: all requested are present; associations target distinct,
+	// real, non-interface ports.
+	if got := len(p.FloatingIPs); got != 5 {
+		t.Fatalf("floating IPs = %d, want 5", got)
+	}
+	interfacePort := map[string]bool{}
+	for _, ri := range p.RouterInterfaces {
+		if ri.Port != "" {
+			interfacePort[ri.Port] = true
+		}
+	}
+	ipv4Subnet := map[string]bool{}
+	for _, sub := range p.Subnets {
+		if sub.IPVersion == 4 {
+			ipv4Subnet[sub.Name] = true
+		}
+	}
+	portByName := map[string]plan.Port{}
+	for _, pt := range p.Ports {
+		portByName[pt.Name] = pt
+	}
+	seen := map[string]bool{}
+	var associated int
+	for _, fip := range p.FloatingIPs {
+		if fip.Port == "" {
+			continue
+		}
+		associated++
+		pt, ok := portByName[fip.Port]
+		if !ok {
+			t.Errorf("floating ip %q targets unknown port %q", fip.Name, fip.Port)
+			continue
+		}
+		if interfacePort[fip.Port] {
+			t.Errorf("floating ip %q targets a router-interface port %q", fip.Name, fip.Port)
+		}
+		hasIPv4 := false
+		for _, f := range pt.FixedIPs {
+			if ipv4Subnet[f.Subnet] {
+				hasIPv4 = true
+			}
+		}
+		if !hasIPv4 {
+			t.Errorf("floating ip %q targets port %q with no IPv4 fixed IP; Neutron would reject the association", fip.Name, fip.Port)
+		}
+		if seen[fip.Port] {
+			t.Errorf("port %q targeted by more than one floating ip", fip.Port)
+		}
+		seen[fip.Port] = true
+	}
+	if associated == 0 {
+		t.Error("no floating IPs were associated despite ratio 1.0 and eligible ports")
+	}
+
+	// The feature-enabled path stays deterministic.
+	if p2, err := s.Generate(); err != nil {
+		t.Fatalf("second Generate(): %v", err)
+	} else if !bytes.Equal(marshal(t, p), marshal(t, p2)) {
+		t.Error("two generations of the same external scenario differ")
 	}
 }
 

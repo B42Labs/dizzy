@@ -17,14 +17,18 @@ func mediumScenario() Scenario {
 			Networks:       100,
 			Routers:        20,
 			SecurityGroups: 15,
+			RouterLinks:    5,
+			FloatingIPs:    10,
 		},
 		Distribution: Distribution{
-			SubnetsPerNetwork:            Range{Min: 1, Max: 3},
-			PortsPerNetwork:              Range{Min: 0, Max: 5},
-			RulesPerSecurityGroup:        Range{Min: 2, Max: 12},
-			SubnetFromPoolRatio:          0.4,
-			IPv6Ratio:                    0.2,
-			SubnetsAttachedToRouterRatio: 0.6,
+			SubnetsPerNetwork:               Range{Min: 1, Max: 3},
+			PortsPerNetwork:                 Range{Min: 0, Max: 5},
+			RulesPerSecurityGroup:           Range{Min: 2, Max: 12},
+			SubnetFromPoolRatio:             0.4,
+			IPv6Ratio:                       0.2,
+			SubnetsAttachedToRouterRatio:    0.6,
+			RoutersWithExternalGatewayRatio: 0.3,
+			FloatingIPAssociatedRatio:       0.5,
 		},
 		Topology: Topology{
 			RouterAttachStrategy:   "random",
@@ -58,6 +62,8 @@ resources:
   networks:       100
   routers:        20
   security_groups: 15
+  router_links:    5
+  floating_ips:    10
 distribution:
   subnets_per_network:   { min: 1, max: 3 }
   ports_per_network:     { min: 0, max: 5 }
@@ -65,6 +71,8 @@ distribution:
   subnet_from_pool_ratio: 0.4
   ipv6_ratio:            0.2
   subnets_attached_to_router_ratio: 0.6
+  routers_with_external_gateway_ratio: 0.3
+  floating_ip_associated_ratio:        0.5
 topology:
   router_attach_strategy: random
   port_security_group_count: { min: 1, max: 3 }

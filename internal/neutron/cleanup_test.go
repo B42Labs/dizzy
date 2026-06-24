@@ -48,6 +48,53 @@ func TestListByTagRejectsUntaggableKind(t *testing.T) {
 	}
 }
 
+// TestDeleteNetworkPorts confirms the sweep deletes only the plain (empty
+// device_owner) ports on a network — the untagged orphans a cancelled run can
+// leave — while leaving router-interface and service ports for detach/cascade,
+// and tolerates a port already gone (404).
+func TestDeleteNetworkPorts(t *testing.T) {
+	var deletedPorts []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/ports":
+			if got := r.URL.Query().Get("network_id"); got != "net-1" {
+				t.Errorf("network_id query = %q, want net-1", got)
+			}
+			_, _ = io.WriteString(w, `{"ports":[
+				{"id":"orphan-1","device_owner":""},
+				{"id":"rif-1","device_owner":"network:router_interface"},
+				{"id":"dhcp-1","device_owner":"network:dhcp"},
+				{"id":"orphan-2","device_owner":""}
+			]}`)
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/ports/"):
+			id := strings.TrimPrefix(r.URL.Path, "/ports/")
+			deletedPorts = append(deletedPorts, id)
+			if id == "orphan-2" {
+				w.WriteHeader(http.StatusNotFound) // already gone: must be tolerated
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	c := testServiceClient(ts)
+	deleted, err := c.DeleteNetworkPorts(context.Background(), "net-1")
+	if err != nil {
+		t.Fatalf("DeleteNetworkPorts: %v", err)
+	}
+	if deleted != 1 {
+		t.Errorf("deleted = %d, want 1 (orphan-1 removed, orphan-2 already gone, others skipped)", deleted)
+	}
+	if strings.Join(deletedPorts, ",") != "orphan-1,orphan-2" {
+		t.Errorf("deleted ports = %v, want only the empty-device-owner ports attempted", deletedPorts)
+	}
+}
+
 // TestDetachRouterInterfaces confirms every port on the router is removed with a
 // port-scoped RemoveInterface call, and a 404 on one removal is tolerated.
 func TestDetachRouterInterfaces(t *testing.T) {

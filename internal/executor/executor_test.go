@@ -32,12 +32,13 @@ type fakeNeutron struct {
 	inFlight    int
 	maxInFlight int
 
-	failuresLeft    map[string]int   // logical name -> remaining transient failures
-	permanentFail   map[string]error // logical name -> error returned on every attempt
-	quotaKind       neutron.Kind     // kind to reject with a quota error ("" = none)
-	workDelay       time.Duration    // sleep inside each create to expose concurrency
-	holdUntilCancel bool             // block each create until ctx is cancelled
-	waitErr         error            // error WaitForReady returns ("" = ready)
+	gateways        map[string]string // router logical -> external network id a gateway was set to
+	failuresLeft    map[string]int    // logical name -> remaining transient failures
+	permanentFail   map[string]error  // logical name -> error returned on every attempt
+	quotaKind       neutron.Kind      // kind to reject with a quota error ("" = none)
+	workDelay       time.Duration     // sleep inside each create to expose concurrency
+	holdUntilCancel bool              // block each create until ctx is cancelled
+	waitErr         error             // error WaitForReady returns ("" = ready)
 
 	started     chan struct{} // closed when the first create begins
 	startedOnce sync.Once
@@ -52,6 +53,7 @@ func newFake() *fakeNeutron {
 	return &fakeNeutron{
 		exists:        make(map[string]bool),
 		attempts:      make(map[string]int),
+		gateways:      make(map[string]string),
 		failuresLeft:  make(map[string]int),
 		permanentFail: make(map[string]error),
 	}
@@ -147,12 +149,32 @@ func (f *fakeNeutron) CreateSubnet(ctx context.Context, s plan.Subnet, networkID
 	return f.do(ctx, neutron.KindSubnet, s.Name, refs...)
 }
 
-func (f *fakeNeutron) CreateRouter(ctx context.Context, r plan.Router) (neutron.Resource, error) {
-	return f.do(ctx, neutron.KindRouter, r.Name)
+func (f *fakeNeutron) CreateRouter(ctx context.Context, r plan.Router, externalNetworkID string) (neutron.Resource, error) {
+	res, err := f.do(ctx, neutron.KindRouter, r.Name)
+	if err == nil && r.ExternalGateway && externalNetworkID != "" {
+		f.mu.Lock()
+		f.gateways[r.Name] = externalNetworkID
+		f.mu.Unlock()
+	}
+	return res, err
 }
 
-func (f *fakeNeutron) CreateRouterInterface(ctx context.Context, ri plan.RouterInterface, routerID, subnetID string) (neutron.Resource, error) {
-	return f.do(ctx, neutron.KindRouterInterface, ri.Name, routerID, subnetID)
+func (f *fakeNeutron) CreateRouterInterface(ctx context.Context, ri plan.RouterInterface, routerID, subnetID, portID string) (neutron.Resource, error) {
+	// Exactly one of subnetID/portID is set; the non-empty one must already
+	// exist, which exercises the dependency ordering (ports before interfaces).
+	target := subnetID
+	if target == "" {
+		target = portID
+	}
+	return f.do(ctx, neutron.KindRouterInterface, ri.Name, routerID, target)
+}
+
+func (f *fakeNeutron) CreateFloatingIP(ctx context.Context, fip plan.FloatingIP, externalNetworkID, portID string) (neutron.Resource, error) {
+	var refs []string
+	if portID != "" {
+		refs = append(refs, portID)
+	}
+	return f.do(ctx, neutron.KindFloatingIP, fip.Name, refs...)
 }
 
 func (f *fakeNeutron) CreateSecurityGroup(ctx context.Context, sg plan.SecurityGroup) (neutron.Resource, error) {
@@ -208,7 +230,7 @@ func fullPlan() *plan.Plan {
 // that each created resource is waited on for readiness.
 func TestApplyDependencyOrder(t *testing.T) {
 	f := newFake()
-	res, err := Apply(context.Background(), "run0", f, fullPlan(), 4, time.Minute)
+	res, err := Apply(context.Background(), "run0", f, fullPlan(), 4, time.Minute, "")
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -234,7 +256,7 @@ func TestApplyConcurrencyBound(t *testing.T) {
 	f := newFake()
 	f.workDelay = 10 * time.Millisecond
 
-	if _, err := Apply(context.Background(), "run0", f, &plan.Plan{Networks: nets}, concurrency, time.Minute); err != nil {
+	if _, err := Apply(context.Background(), "run0", f, &plan.Plan{Networks: nets}, concurrency, time.Minute, ""); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	if f.maxInFlight > concurrency {
@@ -251,7 +273,7 @@ func TestApplyRetriesTransient(t *testing.T) {
 	f := newFake()
 	f.failuresLeft["net-1"] = 2 // fail twice, succeed on the third attempt
 
-	res, err := Apply(context.Background(), "run0", f, &plan.Plan{Networks: []plan.Network{{Name: "net-1"}}}, 1, time.Minute)
+	res, err := Apply(context.Background(), "run0", f, &plan.Plan{Networks: []plan.Network{{Name: "net-1"}}}, 1, time.Minute, "")
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -269,7 +291,7 @@ func TestApplyFailFastQuota(t *testing.T) {
 	f := newFake()
 	f.quotaKind = neutron.KindNetwork
 
-	_, err := Apply(context.Background(), "run0", f, fullPlan(), 4, time.Minute)
+	_, err := Apply(context.Background(), "run0", f, fullPlan(), 4, time.Minute, "")
 	if err == nil {
 		t.Fatal("expected a quota error, got nil")
 	}
@@ -301,7 +323,7 @@ func TestApplyCancellation(t *testing.T) {
 	type result struct{ err error }
 	done := make(chan result, 1)
 	go func() {
-		_, err := Apply(ctx, "run0", f, &plan.Plan{Networks: []plan.Network{{Name: "net-1"}}}, 1, time.Minute)
+		_, err := Apply(ctx, "run0", f, &plan.Plan{Networks: []plan.Network{{Name: "net-1"}}}, 1, time.Minute, "")
 		done <- result{err}
 	}()
 
@@ -328,7 +350,7 @@ func TestApplyPartialStageRecordsCreated(t *testing.T) {
 	f.permanentFail["net-1"] = gophercloud.ErrUnexpectedResponseCode{Actual: 400}
 
 	p := &plan.Plan{Networks: []plan.Network{{Name: "net-0"}, {Name: "net-1"}}}
-	res, err := Apply(context.Background(), "run0", f, p, 1, time.Minute)
+	res, err := Apply(context.Background(), "run0", f, p, 1, time.Minute, "")
 	if err == nil {
 		t.Fatal("expected an error from the failing create")
 	}
@@ -349,7 +371,7 @@ func TestApplyReadinessTimeoutWarns(t *testing.T) {
 	f := newFake()
 	f.waitErr = errors.New("still BUILD") // a readiness failure, not a context error
 
-	res, err := Apply(context.Background(), "run0", f, &plan.Plan{Networks: []plan.Network{{Name: "net-1"}}}, 1, time.Minute)
+	res, err := Apply(context.Background(), "run0", f, &plan.Plan{Networks: []plan.Network{{Name: "net-1"}}}, 1, time.Minute, "")
 	if err != nil {
 		t.Fatalf("Apply: %v (a readiness deadline must not fail the run)", err)
 	}
@@ -367,11 +389,100 @@ func TestApplyConflictRetriesCapped(t *testing.T) {
 	f := newFake()
 	f.permanentFail["net-1"] = gophercloud.ErrUnexpectedResponseCode{Actual: 409, Body: []byte("overlapping cidr")}
 
-	_, err := Apply(context.Background(), "run0", f, &plan.Plan{Networks: []plan.Network{{Name: "net-1"}}}, 1, time.Minute)
+	_, err := Apply(context.Background(), "run0", f, &plan.Plan{Networks: []plan.Network{{Name: "net-1"}}}, 1, time.Minute, "")
 	if err == nil {
 		t.Fatal("expected the conflict to fail the run")
 	}
 	if got := f.attempts["net-1"]; got != conflictMaxAttempts {
 		t.Errorf("net-1 attempted %d times, want %d (a permanent 409 must fail fast)", got, conflictMaxAttempts)
+	}
+}
+
+// externalPlan is a small plan that exercises external connectivity and a
+// router-to-router link: one router wants a gateway, two routers are linked
+// over a transit subnet (one subnet-side, one port-side interface), and two
+// floating IPs are allocated (one associated with an internal port).
+func externalPlan() *plan.Plan {
+	return &plan.Plan{
+		Networks: []plan.Network{{Name: "net-1"}, {Name: "link-net-1"}},
+		Subnets: []plan.Subnet{
+			{Name: "subnet-1", Network: "net-1", IPVersion: 4, CIDR: "10.0.0.0/24"},
+			{Name: "link-subnet-1", Network: "link-net-1", IPVersion: 4, CIDR: "192.168.0.0/30"},
+		},
+		Routers: []plan.Router{{Name: "router-1", ExternalGateway: true}, {Name: "router-2"}},
+		Ports: []plan.Port{
+			{Name: "port-1", Network: "net-1", FixedIPs: []plan.FixedIP{{Subnet: "subnet-1"}}},
+			{Name: "link-port-1", Network: "link-net-1", FixedIPs: []plan.FixedIP{{Subnet: "link-subnet-1", IPAddress: "192.168.0.2"}}},
+		},
+		RouterInterfaces: []plan.RouterInterface{
+			{Name: "rif-1", Router: "router-1", Subnet: "subnet-1"},
+			{Name: "link-rif-b-1", Router: "router-2", Port: "link-port-1"},
+		},
+		FloatingIPs: []plan.FloatingIP{
+			{Name: "fip-1", Port: "port-1"},
+			{Name: "fip-2"},
+		},
+	}
+}
+
+// countKind returns how many resources of kind were created.
+func (f *fakeNeutron) countKind(kind neutron.Kind) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var n int
+	for _, c := range f.creates {
+		if c.kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// TestApplyExternalConnectivity confirms that when an external network is
+// available, only the routers that want a gateway get one, the floating IPs are
+// created, and a port-based (router-link) interface resolves its port — which
+// requires ports to be created before router interfaces.
+func TestApplyExternalConnectivity(t *testing.T) {
+	f := newFake()
+	res, err := Apply(context.Background(), "run0", f, externalPlan(), 4, time.Minute, "extnet")
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if len(f.badRefs) != 0 {
+		t.Errorf("dependency-order violations (a port-based interface must resolve its already-created port): %v", f.badRefs)
+	}
+	if got := f.gateways["router-1"]; got != "extnet" {
+		t.Errorf("router-1 gateway = %q, want %q", got, "extnet")
+	}
+	if got, ok := f.gateways["router-2"]; ok {
+		t.Errorf("router-2 unexpectedly got a gateway %q (it did not request one)", got)
+	}
+	if got := f.countKind(neutron.KindFloatingIP); got != 2 {
+		t.Errorf("created %d floating IPs, want 2", got)
+	}
+	// 2 networks + 2 subnets + 2 routers + 2 ports + 2 interfaces + 2 floating IPs.
+	if len(res.Created) != 12 {
+		t.Errorf("created %d resources, want 12", len(res.Created))
+	}
+}
+
+// TestApplyWithoutExternalSkipsGatewaysAndFloatingIPs confirms that with no
+// external network the gateways are not set and the floating IPs are skipped,
+// while the rest of the topology — including the router link — is still built.
+func TestApplyWithoutExternalSkipsGatewaysAndFloatingIPs(t *testing.T) {
+	f := newFake()
+	res, err := Apply(context.Background(), "run0", f, externalPlan(), 4, time.Minute, "")
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if len(f.gateways) != 0 {
+		t.Errorf("gateways set without an external network: %v", f.gateways)
+	}
+	if got := f.countKind(neutron.KindFloatingIP); got != 0 {
+		t.Errorf("created %d floating IPs without an external network, want 0", got)
+	}
+	// Everything except the two floating IPs is still created.
+	if len(res.Created) != 10 {
+		t.Errorf("created %d resources, want 10 (no floating IPs)", len(res.Created))
 	}
 }

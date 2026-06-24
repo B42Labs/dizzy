@@ -14,6 +14,7 @@ import (
 type Cleaner interface {
 	ListByTag(ctx context.Context, kind neutron.Kind, runID string) ([]neutron.Resource, error)
 	DetachRouterInterfaces(ctx context.Context, routerID string) (int, error)
+	DeleteNetworkPorts(ctx context.Context, networkID string) (int, error)
 	Delete(ctx context.Context, r neutron.Resource) error
 }
 
@@ -24,24 +25,30 @@ type Cleaner interface {
 // filter by tag), are reclaimed instead from recorded — the run record's created
 // list — by id. recorded is nil when cleanup runs from a bare run id (--run-id),
 // in which case address scopes cannot be reclaimed. It treats an already-gone
-// resource as success — so running it twice is a no-op. Router interfaces are
-// detached (not deleted) before the routers and subnets they attach can be
-// removed; security-group rules are not handled because they cascade with their
-// group. The first non-404 error stops the run and is returned with the count
-// deleted so far.
+// resource as success — so running it twice is a no-op. Floating IPs are removed
+// first (an associated one pins its port and router); router interfaces are
+// detached (not deleted) before the ports they attach are removed; a network is
+// deleted before its subnets so its delete cascades the auto-created DHCP/service
+// ports that would otherwise block an explicit subnet delete (SubnetInUse);
+// security-group rules are not handled because they cascade with their group.
+// The first non-404 error stops the run and is returned with the count deleted
+// so far.
 func Cleanup(ctx context.Context, c Cleaner, runID string, recorded []neutron.Resource) (int, error) {
 	var deleted int
 
-	// Ports first: they pin subnet IPs and belong to networks.
-	n, err := deleteKind(ctx, c, neutron.KindPort, runID)
+	// Floating IPs first: an associated floating IP pins its internal port and
+	// is routed through a router's gateway, blocking both from deletion.
+	n, err := deleteKind(ctx, c, neutron.KindFloatingIP, runID)
 	deleted += n
 	if err != nil {
 		return deleted, err
 	}
 
-	// Detach every tagged router's interfaces before its subnets or the router
-	// itself can be deleted. The router list is reused to delete the routers
-	// below, avoiding a second tag query.
+	// Detach every tagged router's interfaces before its ports, subnets, or the
+	// router itself can be deleted. Detaching a port-based interface removes (or
+	// frees) the transit port, so it must precede the port deletion below. The
+	// router list is reused to delete the routers further down, avoiding a second
+	// tag query.
 	routers, err := c.ListByTag(ctx, neutron.KindRouter, runID)
 	if err != nil {
 		return deleted, err
@@ -52,7 +59,42 @@ func Cleanup(ctx context.Context, c Cleaner, runID string, recorded []neutron.Re
 		}
 	}
 
-	// Subnets (now interface-free) before their networks and subnet pools.
+	// Ports: they pin subnet IPs and belong to networks. Any transit port a
+	// port-based interface used is already detached above (a re-delete 404s and
+	// is treated as success), so this removes the remaining standalone ports.
+	n, err = deleteKind(ctx, c, neutron.KindPort, runID)
+	deleted += n
+	if err != nil {
+		return deleted, err
+	}
+
+	// Networks before subnets: deleting a network cascades its subnets and the
+	// service ports Neutron auto-created on them — notably the DHCP port, which
+	// holds an IP allocation and so makes an explicit subnet delete fail with
+	// SubnetInUse. Before each network delete, sweep any plain ports left on it
+	// (untagged orphans a cancelled run can leave behind) so the delete is not
+	// blocked by NetworkInUse; the cascade then takes the subnets with it.
+	nets, err := c.ListByTag(ctx, neutron.KindNetwork, runID)
+	if err != nil {
+		return deleted, err
+	}
+	for _, nw := range nets {
+		swept, err := c.DeleteNetworkPorts(ctx, nw.ID)
+		deleted += swept
+		if err != nil {
+			return deleted, err
+		}
+	}
+	n, err = deleteResources(ctx, c, nets)
+	deleted += n
+	if err != nil {
+		return deleted, err
+	}
+
+	// Subnets: the network cascade above already removed any whose network we
+	// own, so this is normally an idempotent 404 sweep. It still covers a subnet
+	// whose network delete was somehow skipped, and keeps cleanup correct for
+	// callers (and tests) where networks do not cascade.
 	n, err = deleteKind(ctx, c, neutron.KindSubnet, runID)
 	deleted += n
 	if err != nil {
@@ -66,21 +108,16 @@ func Cleanup(ctx context.Context, c Cleaner, runID string, recorded []neutron.Re
 		return deleted, err
 	}
 
-	// Routers (now interface-free).
+	// Routers (now interface-free; any external-gateway port is removed with the
+	// router, and floating IPs routed through it are already gone).
 	n, err = deleteResources(ctx, c, routers)
 	deleted += n
 	if err != nil {
 		return deleted, err
 	}
 
-	// Networks after their subnets and ports.
-	n, err = deleteKind(ctx, c, neutron.KindNetwork, runID)
-	deleted += n
-	if err != nil {
-		return deleted, err
-	}
-
-	// Subnet pools: subnets allocate their CIDRs from them.
+	// Subnet pools: subnets allocate their CIDRs from them and are gone (via the
+	// network cascade) by now, so the pools are free to delete.
 	n, err = deleteKind(ctx, c, neutron.KindSubnetPool, runID)
 	deleted += n
 	if err != nil {

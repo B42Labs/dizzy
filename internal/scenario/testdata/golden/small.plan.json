@@ -26,6 +26,9 @@
     },
     {
       "name": "net-0003"
+    },
+    {
+      "name": "link-net-0001"
     }
   ],
   "subnets": [
@@ -70,14 +73,23 @@
       "network": "net-0003",
       "ipVersion": 4,
       "cidr": "10.0.1.0/24"
+    },
+    {
+      "name": "link-subnet-0001",
+      "network": "link-net-0001",
+      "ipVersion": 4,
+      "cidr": "192.168.0.0/30",
+      "disableDHCP": true
     }
   ],
   "routers": [
     {
-      "name": "router-0001"
+      "name": "router-0001",
+      "externalGateway": true
     },
     {
-      "name": "router-0002"
+      "name": "router-0002",
+      "externalGateway": true
     }
   ],
   "routerInterfaces": [
@@ -93,18 +105,23 @@
     },
     {
       "name": "rif-0003",
-      "router": "router-0001",
+      "router": "router-0002",
       "subnet": "subnet-0003"
     },
     {
       "name": "rif-0004",
-      "router": "router-0002",
+      "router": "router-0001",
       "subnet": "subnet-0004"
     },
     {
-      "name": "rif-0005",
+      "name": "link-rif-a-0001",
+      "router": "router-0002",
+      "subnet": "link-subnet-0001"
+    },
+    {
+      "name": "link-rif-b-0001",
       "router": "router-0001",
-      "subnet": "subnet-0005"
+      "port": "link-port-0001"
     }
   ],
   "securityGroups": [
@@ -112,18 +129,12 @@
       "name": "sg-0001",
       "rules": [
         {
-          "direction": "egress",
-          "etherType": "IPv4",
-          "protocol": "udp",
-          "portRangeMin": 37150,
-          "portRangeMax": 37150,
-          "remoteIPPrefix": "0.0.0.0/0"
-        },
-        {
-          "direction": "egress",
-          "etherType": "IPv4",
-          "protocol": "icmp",
-          "remoteIPPrefix": "0.0.0.0/0"
+          "direction": "ingress",
+          "etherType": "IPv6",
+          "protocol": "tcp",
+          "portRangeMin": 3158,
+          "portRangeMax": 3158,
+          "remoteGroup": "sg-0002"
         }
       ]
     },
@@ -132,27 +143,23 @@
       "rules": [
         {
           "direction": "ingress",
-          "etherType": "IPv4",
-          "protocol": "udp",
-          "portRangeMin": 61015,
-          "portRangeMax": 61015,
-          "remoteIPPrefix": "0.0.0.0/0"
-        },
-        {
-          "direction": "egress",
           "etherType": "IPv6",
-          "protocol": "udp",
-          "portRangeMin": 55883,
-          "portRangeMax": 55883,
+          "protocol": "icmp",
           "remoteIPPrefix": "::/0"
         },
         {
           "direction": "ingress",
-          "etherType": "IPv6",
+          "etherType": "IPv4",
           "protocol": "tcp",
-          "portRangeMin": 55189,
-          "portRangeMax": 55189,
-          "remoteGroup": "sg-0001"
+          "portRangeMin": 60820,
+          "portRangeMax": 60820,
+          "remoteIPPrefix": "0.0.0.0/0"
+        },
+        {
+          "direction": "ingress",
+          "etherType": "IPv4",
+          "protocol": "icmp",
+          "remoteIPPrefix": "0.0.0.0/0"
         }
       ]
     }
@@ -179,7 +186,6 @@
         }
       ],
       "securityGroups": [
-        "sg-0002",
         "sg-0001"
       ]
     },
@@ -188,11 +194,10 @@
       "network": "net-0002",
       "fixedIPs": [
         {
-          "subnet": "subnet-0003"
+          "subnet": "subnet-0004"
         }
       ],
       "securityGroups": [
-        "sg-0001",
         "sg-0002"
       ]
     },
@@ -201,7 +206,7 @@
       "network": "net-0003",
       "fixedIPs": [
         {
-          "subnet": "subnet-0006"
+          "subnet": "subnet-0005"
         }
       ],
       "securityGroups": [
@@ -213,13 +218,31 @@
       "network": "net-0003",
       "fixedIPs": [
         {
-          "subnet": "subnet-0005"
+          "subnet": "subnet-0006"
         }
       ],
       "securityGroups": [
-        "sg-0002",
-        "sg-0001"
+        "sg-0002"
       ]
+    },
+    {
+      "name": "link-port-0001",
+      "network": "link-net-0001",
+      "fixedIPs": [
+        {
+          "subnet": "link-subnet-0001",
+          "ipAddress": "192.168.0.2"
+        }
+      ],
+      "securityGroups": []
+    }
+  ],
+  "floatingIPs": [
+    {
+      "name": "fip-0001"
+    },
+    {
+      "name": "fip-0002"
     }
   ]
 }

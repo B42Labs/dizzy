@@ -30,6 +30,14 @@ type Resources struct {
 	Networks       int `yaml:"networks"`
 	Routers        int `yaml:"routers"`
 	SecurityGroups int `yaml:"security_groups"`
+	// RouterLinks is the number of router-to-router interconnects: each one adds
+	// a dedicated transit network, subnet, and port and wires two routers
+	// together. Requires at least two routers.
+	RouterLinks int `yaml:"router_links"`
+	// FloatingIPs is the number of floating IPs to allocate from the external
+	// network. They are created only when an external network is available at
+	// apply time.
+	FloatingIPs int `yaml:"floating_ips"`
 }
 
 // Distribution holds the per-parent count ranges and the ratios that shape how
@@ -41,6 +49,14 @@ type Distribution struct {
 	SubnetFromPoolRatio          float64 `yaml:"subnet_from_pool_ratio"`
 	IPv6Ratio                    float64 `yaml:"ipv6_ratio"`
 	SubnetsAttachedToRouterRatio float64 `yaml:"subnets_attached_to_router_ratio"`
+	// RoutersWithExternalGatewayRatio is the fraction of routers that intend to
+	// plug into an external network. Whether a gateway is actually attached
+	// depends on an external network being available at apply time.
+	RoutersWithExternalGatewayRatio float64 `yaml:"routers_with_external_gateway_ratio"`
+	// FloatingIPAssociatedRatio is the fraction of floating IPs that target an
+	// internal port reachable through an external-gateway router; the rest are
+	// allocated but left unassociated.
+	FloatingIPAssociatedRatio float64 `yaml:"floating_ip_associated_ratio"`
 }
 
 // Topology holds the shape controls for how resources relate to one another.
@@ -89,6 +105,8 @@ func (s Scenario) Validate() error {
 		{"resources.networks", s.Resources.Networks},
 		{"resources.routers", s.Resources.Routers},
 		{"resources.security_groups", s.Resources.SecurityGroups},
+		{"resources.router_links", s.Resources.RouterLinks},
+		{"resources.floating_ips", s.Resources.FloatingIPs},
 	} {
 		if c.value < 0 {
 			return fmt.Errorf("%s must not be negative, got %d", c.key, c.value)
@@ -119,6 +137,8 @@ func (s Scenario) Validate() error {
 		{"distribution.subnet_from_pool_ratio", s.Distribution.SubnetFromPoolRatio},
 		{"distribution.ipv6_ratio", s.Distribution.IPv6Ratio},
 		{"distribution.subnets_attached_to_router_ratio", s.Distribution.SubnetsAttachedToRouterRatio},
+		{"distribution.routers_with_external_gateway_ratio", s.Distribution.RoutersWithExternalGatewayRatio},
+		{"distribution.floating_ip_associated_ratio", s.Distribution.FloatingIPAssociatedRatio},
 	} {
 		if c.value < 0 || c.value > 1 {
 			return fmt.Errorf("%s must be between 0 and 1, got %v", c.key, c.value)
@@ -127,6 +147,10 @@ func (s Scenario) Validate() error {
 
 	if s.Distribution.SubnetFromPoolRatio > 0 && s.Resources.SubnetPools == 0 {
 		return fmt.Errorf("subnet_from_pool_ratio is %v but resources.subnet_pools is 0", s.Distribution.SubnetFromPoolRatio)
+	}
+
+	if s.Resources.RouterLinks > 0 && s.Resources.Routers < 2 {
+		return fmt.Errorf("resources.router_links is %d but needs at least 2 routers, got %d", s.Resources.RouterLinks, s.Resources.Routers)
 	}
 
 	switch s.Topology.RouterAttachStrategy {
@@ -155,6 +179,10 @@ func (s *Scenario) Set(key, value string) error {
 		return setInt(&s.Resources.Routers, key, value)
 	case "resources.security_groups":
 		return setInt(&s.Resources.SecurityGroups, key, value)
+	case "resources.router_links":
+		return setInt(&s.Resources.RouterLinks, key, value)
+	case "resources.floating_ips":
+		return setInt(&s.Resources.FloatingIPs, key, value)
 	case "distribution.subnets_per_network.min":
 		return setInt(&s.Distribution.SubnetsPerNetwork.Min, key, value)
 	case "distribution.subnets_per_network.max":
@@ -173,6 +201,10 @@ func (s *Scenario) Set(key, value string) error {
 		return setFloat(&s.Distribution.IPv6Ratio, key, value)
 	case "distribution.subnets_attached_to_router_ratio":
 		return setFloat(&s.Distribution.SubnetsAttachedToRouterRatio, key, value)
+	case "distribution.routers_with_external_gateway_ratio":
+		return setFloat(&s.Distribution.RoutersWithExternalGatewayRatio, key, value)
+	case "distribution.floating_ip_associated_ratio":
+		return setFloat(&s.Distribution.FloatingIPAssociatedRatio, key, value)
 	case "topology.router_attach_strategy":
 		s.Topology.RouterAttachStrategy = value
 		return nil

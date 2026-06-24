@@ -47,6 +47,7 @@ const (
 	KindSecurityGroup     Kind = "security-group"
 	KindSecurityGroupRule Kind = "security-group-rule"
 	KindPort              Kind = "port"
+	KindFloatingIP        Kind = "floating-ip"
 )
 
 // Resource is the cloud identity of a created resource. Logical is the plan's
@@ -102,6 +103,8 @@ func tagCollection(kind Kind) string {
 		return "security-groups"
 	case KindAddressScope:
 		return "address-scopes"
+	case KindFloatingIP:
+		return "floatingips"
 	default:
 		return ""
 	}

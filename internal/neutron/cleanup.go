@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/layer3/floatingips"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/layer3/routers"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/security/groups"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/subnetpools"
@@ -58,6 +59,9 @@ func (c *Client) listByTag(ctx context.Context, kind Kind, tag string) ([]Resour
 	case KindPort:
 		return listTagged(ctx, kind, ports.List(c.gc, ports.ListOpts{Tags: tag}),
 			ports.ExtractPorts, func(it ports.Port) (string, string) { return it.Name, it.ID })
+	case KindFloatingIP:
+		return listTagged(ctx, kind, floatingips.List(c.gc, floatingips.ListOpts{Tags: tag}),
+			floatingips.ExtractFloatingIPs, func(it floatingips.FloatingIP) (string, string) { return it.Description, it.ID })
 	default:
 		return nil, fmt.Errorf("list by tag not supported for kind %q", kind)
 	}
@@ -87,6 +91,46 @@ func listTagged[T any](
 		out = append(out, Resource{Kind: kind, Name: name, ID: id})
 	}
 	return out, nil
+}
+
+// DeleteNetworkPorts deletes the plain ports left on networkID — those with an
+// empty device_owner — and returns how many it removed. These are the ports the
+// run created on its own network that tag-based discovery can miss: a cancelled
+// run can create a port and then lose the context before tagging (and before the
+// rollback), leaving an untagged orphan that would otherwise block the network
+// delete with NetworkInUse. Ports with a device owner are left alone: router
+// interface and gateway ports are detached separately, and Neutron's own service
+// ports (DHCP/metadata) are removed by the network delete that follows. A port
+// already gone (404) is skipped so repeated cleanup stays idempotent.
+func (c *Client) DeleteNetworkPorts(ctx context.Context, networkID string) (int, error) {
+	var deleted int
+	err := c.timed(ctx, string(KindPort), func(ctx context.Context) error {
+		pages, err := ports.List(c.gc, ports.ListOpts{NetworkID: networkID}).AllPages(ctx)
+		if err != nil {
+			return err
+		}
+		items, err := ports.ExtractPorts(pages)
+		if err != nil {
+			return err
+		}
+		for _, p := range items {
+			if p.DeviceOwner != "" {
+				continue
+			}
+			if err := ports.Delete(ctx, c.gc, p.ID).ExtractErr(); err != nil {
+				if IsNotFound(err) {
+					continue
+				}
+				return err
+			}
+			deleted++
+		}
+		return nil
+	})
+	if err != nil {
+		return deleted, fmt.Errorf("deleting ports on network %s: %w", networkID, err)
+	}
+	return deleted, nil
 }
 
 // DetachRouterInterfaces detaches every interface port from routerID, returning
