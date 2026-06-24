@@ -23,3 +23,10 @@ distribution:
 topology:
   router_attach_strategy:    random
   port_security_group_count: { min: 1, max: 2 }
+
+chaos:                                 # `neutron chaos --scenario scenarios/small.yaml` runs as-is
+  duration: 5m                         # total runtime; the only hard stop besides Ctrl-C
+  interval: { min: 200ms, max: 3s }    # random delay drawn per churn tick
+  parallel: { max: 4 }                 # per-tick fan-out, drawn in [1, max]; capped by --concurrency
+  churn_ratio: 0.5                     # create bias at steady state (0..1)
+  target_fill: 0.8                     # fraction of the envelope kept populated (0..1)

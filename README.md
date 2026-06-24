@@ -219,15 +219,21 @@ chaos:
 Three ready-to-use profiles ship under `scenarios/`, selected by passing the
 file path to `--scenario`:
 
-| Profile | Networks | Routers | Subnets | Notes |
-|---------|----------|---------|---------|-------|
-| `small`  | 3   | 2  | ≤ 9  | Fits Neutron's default per-project quotas. |
-| `medium` | 100 | 20 | ~200 | The headline example above; needs raised quotas. |
-| `large`  | 200 | 40 | ~400 | Twice the headline; needs raised quotas, guarded by the `apply` quota pre-check. |
+| Profile | Networks | Routers | Subnets | Chaos duration | Notes |
+|---------|----------|---------|---------|----------------|-------|
+| `small`  | 3   | 2  | ≤ 9  | 5m  | Fits Neutron's default per-project quotas. |
+| `medium` | 100 | 20 | ~200 | 30m | The headline example above; needs raised quotas. |
+| `large`  | 200 | 40 | ~400 | 1h  | Twice the headline; needs raised quotas, guarded by the `apply` quota pre-check. |
+
+Every profile also carries a `chaos:` block (duration, intervals, fan-out, and
+controller knobs), so `neutron chaos` runs each one straight away with no extra
+flags. Override any of them on the CLI when you want a longer soak or denser
+churn.
 
 ```
 openstack-tester neutron generate  --scenario scenarios/medium.yaml [--out plan.json]
 openstack-tester neutron apply     --scenario scenarios/large.yaml  [--dry-run]
+openstack-tester neutron chaos     --scenario scenarios/small.yaml  # 5m churn, no flags needed
 ```
 
 ---
@@ -240,7 +246,7 @@ A single binary `openstack-tester` with subcommands (Neutron grouped under a
 ```
 openstack-tester neutron generate  --scenario medium.yaml [--out plan.json]
 openstack-tester neutron apply     --scenario medium.yaml [--dry-run]
-openstack-tester neutron chaos     --scenario medium.yaml --duration 30m
+openstack-tester neutron chaos     --scenario medium.yaml [--duration 30m]
 openstack-tester neutron status    --run run-<id>.json
 openstack-tester neutron report    --run run-<id>.json [--format table|json|csv]
 openstack-tester neutron cleanup   --run run-<id>.json   # or --run-id <id>
@@ -263,7 +269,9 @@ openstack-tester neutron verify    --run run-<id>.json   # Phase 2 (future)
   `--churn-ratio` and `--target-fill` (the create/delete controller — see §10);
   `--no-cleanup` (leave the topology in place); `--external-network` (as for
   `apply`). The same knobs can live in a `chaos:` block in the scenario YAML;
-  flags override the block. With `--seed` fixed (and identical settings) the
+  flags override the block. The three built-in profiles ship such a block, so
+  `--duration` (and the rest) is optional when running them. With `--seed` fixed
+  (and identical settings) the
   whole action schedule is reproducible. On a clean finish it tears the topology
   down by tag and runs a leak check; Ctrl-C / SIGTERM leaves the resources in
   place for an explicit `cleanup --run <id>`.

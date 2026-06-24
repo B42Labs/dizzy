@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/B42Labs/openstack-tester/scenarios"
 )
 
 // chaosScenarioYAML is sampleScenarioYAML extended with a chaos block, used to
@@ -69,6 +71,34 @@ func TestChaosValidatesScenarioBeforeCloud(t *testing.T) {
 	path := writeScenario(t, "name: bad\nresources:\n  networks: -1\n")
 	if _, err := execRoot(t, "neutron", "chaos", "--scenario", path, "--duration", "1m"); err == nil {
 		t.Fatal("chaos with an invalid scenario: expected error, got nil")
+	}
+}
+
+func TestChaosShippedProfilesRunWithoutDuration(t *testing.T) {
+	// Each built-in profile ships a chaos block, so `neutron chaos --scenario
+	// scenarios/<profile>.yaml` needs no --duration: the merged config validates
+	// and the run proceeds to authenticate, failing only at client creation with
+	// no reachable cloud. A missing or invalid chaos block would instead fail on
+	// the duration before any cloud call.
+	t.Setenv("OS_CLOUD", "")
+	t.Setenv("OS_CLIENT_CONFIG_FILE", "/nonexistent/clouds.yaml")
+
+	for _, name := range []string{"small", "medium", "large"} {
+		t.Run(name, func(t *testing.T) {
+			data, err := scenarios.Files.ReadFile(name + ".yaml")
+			if err != nil {
+				t.Fatalf("reading shipped profile %s.yaml: %v", name, err)
+			}
+			path := writeScenario(t, string(data))
+
+			_, err = execRoot(t, "neutron", "chaos", "--scenario", path)
+			if err == nil {
+				t.Fatalf("chaos %s without --duration: expected a cloud-auth failure, got nil", name)
+			}
+			if !strings.Contains(err.Error(), "network client") {
+				t.Errorf("chaos %s failed before reaching cloud auth: %q; the profile's chaos block should supply the duration", name, err.Error())
+			}
+		})
 	}
 }
 
