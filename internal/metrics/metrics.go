@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -223,42 +224,107 @@ func percentile(sorted []time.Duration, p float64) time.Duration {
 	return sorted[idx]
 }
 
-// Summary renders the aggregate as compact, human-readable text, mirroring the
-// style of plan.Summary. The "neutron apply" command prints it so a run
-// produces timing data even before the richer report formats land.
+// Summary renders the aggregate as human-readable tables: a per-type
+// throughput/latency table (with "overall" as the first row), followed by an
+// error breakdown and time-to-ready table when those have data. The "neutron
+// apply" command prints it so a run produces timing data even before the
+// richer report formats land.
 func (a Aggregate) Summary() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Run metrics (wall %s)\n", a.Wall.Round(time.Millisecond))
-	writeStats(&b, "overall", a.Overall)
+	fmt.Fprintf(&b, "Run metrics (wall %s)\n\n", a.Wall.Round(time.Millisecond))
+
+	headers := []string{"TYPE", "OPS", "OK", "FAILED", "OPS/S", "MIN", "MEAN", "P50", "P90", "P95", "P99", "MAX"}
+	// Only the TYPE column is text; every metric column is right-aligned.
+	align := []bool{false, true, true, true, true, true, true, true, true, true, true, true}
+	rows := [][]string{statsRow("overall", a.Overall)}
 	for _, s := range a.ByType {
-		writeStats(&b, s.Type, s)
+		rows = append(rows, statsRow(s.Type, s))
 	}
+	writeTable(&b, headers, rows, align)
+
 	if len(a.Errors) > 0 {
-		fmt.Fprint(&b, "  errors:\n")
+		fmt.Fprint(&b, "\nErrors\n")
+		rows := make([][]string, 0, len(a.Errors))
 		for _, e := range a.Errors {
-			fmt.Fprintf(&b, "    %-12s %d\n", e.Kind+":", e.Count)
+			rows = append(rows, []string{e.Kind, strconv.Itoa(e.Count)})
 		}
+		writeTable(&b, []string{"KIND", "COUNT"}, rows, []bool{false, true})
 	}
+
 	if len(a.Readiness) > 0 {
-		fmt.Fprint(&b, "  time-to-ready:\n")
+		fmt.Fprint(&b, "\nTime to ready\n")
+		rows := make([][]string, 0, len(a.Readiness))
 		for _, r := range a.Readiness {
-			fmt.Fprintf(&b, "    %-12s %d/%d ready, median %s, max %s\n",
-				r.Type+":", r.OK, r.Count,
-				r.Latency.Median.Round(time.Millisecond), r.Latency.Max.Round(time.Millisecond))
+			rows = append(rows, []string{
+				r.Type,
+				fmt.Sprintf("%d/%d", r.OK, r.Count),
+				dur(r.Latency.Median),
+				dur(r.Latency.Max),
+			})
 		}
+		writeTable(&b, []string{"TYPE", "READY", "MEDIAN", "MAX"}, rows, []bool{false, true, true, true})
 	}
+
 	return b.String()
 }
 
-// writeStats renders one Stats block under the given label.
-func writeStats(b *strings.Builder, label string, s Stats) {
-	fmt.Fprintf(b, "  %s: %d ops, %d ok, %d failed, %.1f ops/s\n",
-		label, s.Attempted, s.Succeeded, s.Failed, s.Throughput)
-	if s.Attempted > 0 {
-		fmt.Fprintf(b, "    latency min %s mean %s p50 %s p90 %s p95 %s p99 %s max %s\n",
-			s.Latency.Min.Round(time.Millisecond), s.Latency.Mean.Round(time.Millisecond),
-			s.Latency.Median.Round(time.Millisecond), s.Latency.P90.Round(time.Millisecond),
-			s.Latency.P95.Round(time.Millisecond), s.Latency.P99.Round(time.Millisecond),
-			s.Latency.Max.Round(time.Millisecond))
+// statsRow renders one Stats as a table row under the given label. Groups with
+// no samples show "-" in every latency column rather than a misleading "0s".
+func statsRow(label string, s Stats) []string {
+	row := []string{label, strconv.Itoa(s.Attempted), strconv.Itoa(s.Succeeded),
+		strconv.Itoa(s.Failed), fmt.Sprintf("%.1f", s.Throughput)}
+	if s.Attempted == 0 {
+		return append(row, "-", "-", "-", "-", "-", "-", "-")
+	}
+	return append(row,
+		dur(s.Latency.Min), dur(s.Latency.Mean), dur(s.Latency.Median),
+		dur(s.Latency.P90), dur(s.Latency.P95), dur(s.Latency.P99), dur(s.Latency.Max))
+}
+
+// dur formats a duration for the tables, rounded to the millisecond.
+func dur(d time.Duration) string { return d.Round(time.Millisecond).String() }
+
+// writeTable renders headers and rows as a column-aligned table with a dashed
+// separator under the header. Columns whose rightAlign entry is true are
+// right-aligned (numbers); the rest are left-aligned (labels). Every row,
+// including headers, is assumed to have len(headers) cells.
+func writeTable(b *strings.Builder, headers []string, rows [][]string, rightAlign []bool) {
+	widths := make([]int, len(headers))
+	for i, h := range headers {
+		widths[i] = len(h)
+	}
+	for _, row := range rows {
+		for i, cell := range row {
+			if len(cell) > widths[i] {
+				widths[i] = len(cell)
+			}
+		}
+	}
+
+	writeRow := func(cells []string) {
+		for i, cell := range cells {
+			if i > 0 {
+				b.WriteString("  ")
+			}
+			if rightAlign[i] {
+				fmt.Fprintf(b, "%*s", widths[i], cell)
+			} else if i == len(cells)-1 {
+				b.WriteString(cell) // avoid trailing padding on a left-aligned last column
+			} else {
+				fmt.Fprintf(b, "%-*s", widths[i], cell)
+			}
+		}
+		b.WriteString("\n")
+	}
+
+	sep := make([]string, len(headers))
+	for i := range sep {
+		sep[i] = strings.Repeat("-", widths[i])
+	}
+
+	writeRow(headers)
+	writeRow(sep)
+	for _, row := range rows {
+		writeRow(row)
 	}
 }
