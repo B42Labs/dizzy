@@ -99,13 +99,16 @@ func TestWrappers_Integration(t *testing.T) {
 	if rif.ID == "" {
 		t.Error("router interface returned an empty port id")
 	}
-	// The interface must be detached before the router or subnet can be deleted.
-	cleanups = append(cleanups, func(ctx context.Context) {
-		opts := routers.RemoveInterfaceOpts{SubnetID: sub.ID}
-		if _, err := routers.RemoveInterface(ctx, gc, router.ID, opts).Extract(); err != nil {
-			t.Logf("cleanup: detaching interface from router %s: %v", router.ID, err)
-		}
-	})
+	// Exercise the per-interface removal wrapper the chaos engine uses: detach
+	// this interface now (so the router/subnet can be deleted later) and confirm
+	// a repeat detach is a 404 the caller can treat as already-gone. No cleanup is
+	// registered for rif-0001 because it is detached here in the body.
+	if err := c.RemoveRouterInterface(ctx, router.ID, sub.ID, ""); err != nil {
+		t.Fatalf("RemoveRouterInterface: %v", err)
+	}
+	if err := c.RemoveRouterInterface(ctx, router.ID, sub.ID, ""); err == nil || !neutron.IsNotFound(err) {
+		t.Errorf("repeat RemoveRouterInterface = %v, want a 404 (IsNotFound)", err)
+	}
 
 	sg, err := c.CreateSecurityGroup(ctx, plan.SecurityGroup{Name: "sg-0001"})
 	if err != nil {

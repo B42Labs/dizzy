@@ -2,6 +2,7 @@ package neutron
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/layer3/routers"
 
@@ -50,4 +51,24 @@ func (c *Client) CreateRouterInterface(ctx context.Context, ri plan.RouterInterf
 		return Resource{}, wrapCreate(KindRouterInterface, ri.Name, err)
 	}
 	return Resource{Kind: KindRouterInterface, Logical: ri.Name, ID: resultPortID}, nil
+}
+
+// RemoveRouterInterface detaches a single interface from a router, mirroring
+// CreateRouterInterface: exactly one of subnetID or portID identifies the
+// interface to remove. It is the per-interface counterpart to cleanup's
+// DetachRouterInterfaces (which removes all of a router's interfaces); the chaos
+// churn engine needs it to delete one interface at a time, since the generic
+// Delete cannot remove a router interface. The call is timed under
+// KindRouterInterface and returns the error unwrapped enough for IsNotFound to
+// classify an already-detached interface so the caller can treat it as success.
+func (c *Client) RemoveRouterInterface(ctx context.Context, routerID, subnetID, portID string) error {
+	err := c.timed(ctx, string(KindRouterInterface), func(ctx context.Context) error {
+		opts := routers.RemoveInterfaceOpts{SubnetID: subnetID, PortID: portID}
+		_, rmErr := routers.RemoveInterface(ctx, c.gc, routerID, opts).Extract()
+		return rmErr
+	})
+	if err != nil {
+		return fmt.Errorf("removing interface from router %s: %w", routerID, err)
+	}
+	return nil
 }
