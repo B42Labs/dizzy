@@ -198,6 +198,22 @@ from non-overlapping ranges — explicit IPv4 subnets from `10.0.0.0/8`, IPv6
 subnets from `fd00::/16`, subnet pools from `172.16.0.0/12`, and router-link
 transit subnets as `/30`s from `192.168.0.0/16`.
 
+### Churn / soak mode (`chaos:`)
+
+The `neutron chaos` command (§7) reuses the same scenario as the spatial
+envelope but adds a temporal frame: the churn knobs. They can be set on the CLI
+or in an optional `chaos:` block in the scenario YAML (flags override the block);
+an omitted field falls back to the command's default.
+
+```yaml
+chaos:
+  duration: 30m                 # total runtime; the only hard stop besides Ctrl-C
+  interval: { min: 200ms, max: 3s }   # random delay drawn per tick
+  parallel: { max: 6 }          # per-tick fan-out, drawn in [1, max]; bounded by --concurrency
+  churn_ratio: 0.5              # create bias at steady state (0..1)
+  target_fill: 0.8              # fraction of the envelope to keep populated (0..1)
+```
+
 ### Built-in profiles
 
 Three ready-to-use profiles ship under `scenarios/`, selected by passing the
@@ -224,6 +240,7 @@ A single binary `openstack-tester` with subcommands (Neutron grouped under a
 ```
 openstack-tester neutron generate  --scenario medium.yaml [--out plan.json]
 openstack-tester neutron apply     --scenario medium.yaml [--dry-run]
+openstack-tester neutron chaos     --scenario medium.yaml --duration 30m
 openstack-tester neutron status    --run run-<id>.json
 openstack-tester neutron report    --run run-<id>.json [--format table|json|csv]
 openstack-tester neutron cleanup   --run run-<id>.json   # or --run-id <id>
@@ -235,6 +252,21 @@ openstack-tester neutron verify    --run run-<id>.json   # Phase 2 (future)
   run record + metrics. `--dry-run` validates and prints what would be created.
   `--external-network <name>` selects the external network for router gateways
   and floating IPs (default: auto-detect the first external network).
+- `chaos` — random churn / soak mode. Instead of building the topology once, it
+  runs for `--duration` and uses the scenario as the **envelope** (upper bound):
+  for the whole runtime it keeps creating *and* deleting resources at random,
+  seeded intervals and parallelism, so the live population never exceeds the
+  scenario's counts and only planned resources are ever created. Knobs:
+  `--duration` (the only hard stop besides Ctrl-C / SIGTERM); `--min-interval` /
+  `--max-interval` (the random delay range between actions); `--max-parallel`
+  (the per-tick fan-out cap, itself bounded by the global `--concurrency`);
+  `--churn-ratio` and `--target-fill` (the create/delete controller — see §10);
+  `--no-cleanup` (leave the topology in place); `--external-network` (as for
+  `apply`). The same knobs can live in a `chaos:` block in the scenario YAML;
+  flags override the block. With `--seed` fixed (and identical settings) the
+  whole action schedule is reproducible. On a clean finish it tears the topology
+  down by tag and runs a leak check; Ctrl-C / SIGTERM leaves the resources in
+  place for an explicit `cleanup --run <id>`.
 - `status` — re-query the current state of a run's resources from the API.
 - `report` — render metrics from a run record (table / JSON / CSV).
 - `cleanup` — delete all resources belonging to a run, in reverse dependency
@@ -299,6 +331,15 @@ The canonical run record itself is the `run-<id>.json` written by `apply`. An
 optional **Prometheus textfile** export to fit the testbed's monitoring is
 planned but not yet implemented.
 
+A **churn run** (`chaos`) records the same per-call metrics plus churn-specific
+statistics in the run record, which `report` renders after the standard summary:
+counts of create / delete operations and completed create→delete cycles, the
+live-population summary over the run (min / mean / max and the controller's
+target fill), and latency / error rate **bucketed over the run's duration** (to
+expose degradation over time, not just an aggregate). When the run finishes with
+teardown it also performs an end-of-run **leak check** — listing any resources
+still carrying the run tag after the topology should be gone.
+
 ---
 
 ## 10. Execution model
@@ -317,6 +358,26 @@ planned but not yet implemented.
   resources are instead reclaimed at cleanup from the run record, by id.
 - **Naming**: deterministic names like `ostester-<id>-net-0001` for easy
   identification in Horizon / the CLI.
+
+The **churn / soak mode** (`chaos`) reuses all of the above and adds a
+single-threaded, seeded **scheduler** over the plan: each tick it draws a random
+delay and a random fan-out, then picks valid create/delete actions and dispatches
+them through the same bounded worker pool and retry/backoff. The *decision*
+sequence (timings, fan-out, create-vs-delete picks, which resource) is fully
+deterministic for a given `scenario + seed + chaos settings`, even though the
+concurrent cloud-call completion order is not; a problematic run can be replayed
+exactly. The plan is a hard **ceiling**: the engine only creates planned
+resources whose parents already exist and only deletes resources whose dependents
+are already gone, so it never issues a dependency-violating operation of its own
+making and the live population never exceeds the scenario. A **controller** keeps
+the population oscillating inside the envelope rather than draining to empty or
+pinning to the ceiling: each action's create probability is
+`clamp(churn_ratio + (target_fill − current_fill), 0, 1)`, so `churn_ratio` is
+the neutral bias at equilibrium and `target_fill` pulls the population toward its
+level. By default a clean run tears the topology down by tag at the end;
+`--no-cleanup` opts out, and an interrupt (Ctrl-C / SIGTERM) always leaves the
+resources in place for an explicit `cleanup --run <id>` so an interrupt-to-inspect
+never destroys the topology.
 
 ---
 
@@ -378,6 +439,7 @@ contrib/openstack-tester/
 │   ├── plan/                 # expanded plan model (expected state)
 │   ├── neutron/              # gophercloud wrappers, one file per resource type
 │   ├── executor/             # dependency-ordered apply, worker pool, retry
+│   ├── chaos/                # random churn/soak engine over the plan envelope
 │   ├── metrics/              # timing collection + reporting
 │   ├── run/                  # run-record persistence
 │   └── verify/               # Phase 2: OVN/OVS reconciliation (stub for now)
@@ -398,6 +460,8 @@ contrib/openstack-tester/
          (Prometheus textfile export still pending.)
    - [x] Tag-based `cleanup`; quota pre-check.
    - [x] Built-in profiles (incl. the 20/100/200 example).
+   - [x] Random churn / soak mode (`chaos`): continuous seeded create/delete
+         within the scenario envelope for a configured duration.
 2. **Phase 2 — data-plane verification**
    - [ ] Compare API/plan against OVN NB/SB and OVS flows.
 3. **Phase 3+** — external connectivity, trunk ports, RBAC, QoS, more profiles,
