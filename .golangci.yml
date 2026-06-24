@@ -1,0 +1,3 @@
+# golangci-lint configuration (v2 schema).
+# Keeps the default linter set so CI is explicit and reproducible.
+version: "2"
