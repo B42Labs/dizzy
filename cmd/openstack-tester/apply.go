@@ -1,16 +1,29 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/B42Labs/openstack-tester/internal/config"
+	"github.com/B42Labs/openstack-tester/internal/executor"
+	"github.com/B42Labs/openstack-tester/internal/metrics"
+	"github.com/B42Labs/openstack-tester/internal/neutron"
 )
 
-// newApplyCmd builds "neutron apply". In Phase 1 only --dry-run is implemented:
-// it expands the scenario into a plan and prints a summary without making any
-// API calls. The non-dry-run executor is tracked in issue #4. This file
-// deliberately imports neither internal/config nor gophercloud so the dry-run
-// path cannot reach a cloud.
+// newApplyCmd builds "neutron apply". With --dry-run it expands the scenario
+// into a plan and prints a summary without making any API calls. Without
+// --dry-run it authenticates against the cloud, creates the full tagged
+// topology in dependency order, and prints the collected timing metrics. The
+// cloud client is constructed only on the non-dry-run path, after the early
+// return, so --dry-run never reaches a cloud.
 func newApplyCmd(opts *globalOptions) *cobra.Command {
 	var (
 		scenarioPath string
@@ -27,13 +40,49 @@ func newApplyCmd(opts *globalOptions) *cobra.Command {
 				return err
 			}
 
-			if !dryRun {
-				return fmt.Errorf("apply without --dry-run is not implemented yet (tracked in issue #4)")
+			if dryRun {
+				if _, err := fmt.Fprint(cmd.OutOrStdout(), p.Summary()); err != nil {
+					return fmt.Errorf("writing summary: %w", err)
+				}
+				return nil
 			}
 
-			if _, err := fmt.Fprint(cmd.OutOrStdout(), p.Summary()); err != nil {
-				return fmt.Errorf("writing summary: %w", err)
+			// Stop cleanly on Ctrl-C / SIGTERM: the derived context cancels the
+			// run so in-flight operations unwind instead of being killed.
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
+			runID, err := newRunID()
+			if err != nil {
+				return err
 			}
+
+			gc, err := config.NewNetworkClient(ctx, opts.osCloud)
+			if err != nil {
+				return fmt.Errorf("creating network client: %w", err)
+			}
+
+			collector := metrics.NewCollector()
+			client := neutron.New(gc, runID, collector)
+
+			slog.Info("applying plan", "run", runID, "scenario", p.Scenario,
+				"networks", len(p.Networks), "subnets", len(p.Subnets), "ports", len(p.Ports),
+				"concurrency", opts.concurrency)
+
+			start := time.Now()
+			res, applyErr := executor.Apply(ctx, runID, client, p, opts.concurrency, opts.timeout)
+			wall := time.Since(start)
+
+			// Print metrics even on partial failure so the run is never silent.
+			if _, err := fmt.Fprint(cmd.OutOrStdout(), collector.Aggregate(wall).Summary()); err != nil {
+				return fmt.Errorf("writing metrics: %w", err)
+			}
+
+			if applyErr != nil {
+				return fmt.Errorf("applying plan (run %s): %w", runID, applyErr)
+			}
+
+			slog.Info("apply complete", "run", runID, "created", len(res.Created), "wall", wall)
 			return nil
 		},
 	}
@@ -46,4 +95,14 @@ func newApplyCmd(opts *globalOptions) *cobra.Command {
 	_ = cmd.MarkFlagRequired("scenario")
 
 	return cmd
+}
+
+// newRunID returns a short random run identifier (8 lowercase hex characters)
+// used to name and tag every resource a run creates.
+func newRunID() (string, error) {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generating run id: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
 }

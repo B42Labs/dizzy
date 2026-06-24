@@ -25,15 +25,20 @@ func TestApplyDryRunSummaryNoAPICall(t *testing.T) {
 	}
 }
 
-func TestApplyWithoutDryRunNotImplemented(t *testing.T) {
+func TestApplyWithoutDryRunRequiresCloud(t *testing.T) {
+	// Point cloud configuration at nothing: the non-dry-run path must attempt
+	// to authenticate and fail at client creation, never reaching a real cloud.
+	t.Setenv("OS_CLOUD", "")
+	t.Setenv("OS_CLIENT_CONFIG_FILE", "/nonexistent/clouds.yaml")
+
 	path := writeScenario(t, sampleScenarioYAML)
 
 	_, err := execRoot(t, "neutron", "apply", "--scenario", path)
 	if err == nil {
 		t.Fatal("apply without --dry-run: expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "#4") {
-		t.Errorf("error %q does not reference issue #4", err.Error())
+	if !strings.Contains(err.Error(), "network client") {
+		t.Errorf("error %q does not mention network client creation", err.Error())
 	}
 }
 
