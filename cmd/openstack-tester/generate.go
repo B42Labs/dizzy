@@ -26,7 +26,7 @@ func newGenerateCmd(opts *globalOptions) *cobra.Command {
 		Use:   "generate",
 		Short: "Expand a scenario into a plan and dump it (never touches the API)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			p, err := buildPlanFromFlags(cmd, opts, scenarioPath, sets)
+			_, p, err := buildPlanFromFlags(cmd, opts, scenarioPath, sets)
 			if err != nil {
 				return err
 			}
@@ -73,26 +73,28 @@ func newGenerateCmd(opts *globalOptions) *cobra.Command {
 }
 
 // buildPlanFromFlags loads the scenario file, applies the --set overrides and
-// the global --seed override, and expands it into a plan. It is shared by the
-// generate and apply commands and makes no API calls.
-func buildPlanFromFlags(cmd *cobra.Command, opts *globalOptions, scenarioPath string, sets []string) (*plan.Plan, error) {
+// the global --seed override, and expands it into a plan. It returns the parsed
+// scenario alongside the plan so the chaos command can read the scenario's chaos
+// block; generate and apply ignore the scenario return. It is shared by the
+// generate, apply, and chaos commands and makes no API calls.
+func buildPlanFromFlags(cmd *cobra.Command, opts *globalOptions, scenarioPath string, sets []string) (scenario.Scenario, *plan.Plan, error) {
 	data, err := os.ReadFile(scenarioPath)
 	if err != nil {
-		return nil, fmt.Errorf("reading scenario: %w", err)
+		return scenario.Scenario{}, nil, fmt.Errorf("reading scenario: %w", err)
 	}
 
 	s, err := scenario.Parse(data)
 	if err != nil {
-		return nil, err
+		return scenario.Scenario{}, nil, err
 	}
 
 	for _, set := range sets {
 		key, value, ok := strings.Cut(set, "=")
 		if !ok {
-			return nil, fmt.Errorf("invalid --set %q: want key=value", set)
+			return scenario.Scenario{}, nil, fmt.Errorf("invalid --set %q: want key=value", set)
 		}
 		if err := s.Set(key, value); err != nil {
-			return nil, err
+			return scenario.Scenario{}, nil, err
 		}
 	}
 
@@ -103,7 +105,7 @@ func buildPlanFromFlags(cmd *cobra.Command, opts *globalOptions, scenarioPath st
 
 	p, err := s.Generate()
 	if err != nil {
-		return nil, err
+		return scenario.Scenario{}, nil, err
 	}
-	return p, nil
+	return s, p, nil
 }

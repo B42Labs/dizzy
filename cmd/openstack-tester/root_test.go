@@ -26,7 +26,7 @@ func TestNeutronSubcommandsRegistered(t *testing.T) {
 		t.Fatal("neutron command not registered on root")
 	}
 
-	want := []string{"generate", "apply", "status", "report", "cleanup", "verify"}
+	want := []string{"generate", "apply", "chaos", "status", "report", "cleanup", "verify"}
 	for _, name := range want {
 		t.Run(name, func(t *testing.T) {
 			if findSubcommand(neutron, name) == nil {

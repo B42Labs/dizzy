@@ -37,7 +37,7 @@ func newApplyCmd(opts *globalOptions) *cobra.Command {
 		Use:   "apply",
 		Short: "Create resources from a plan, poll states, and record a run",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			p, err := buildPlanFromFlags(cmd, opts, scenarioPath, sets)
+			_, p, err := buildPlanFromFlags(cmd, opts, scenarioPath, sets)
 			if err != nil {
 				return err
 			}
