@@ -8,9 +8,10 @@ through the Neutron API in a single project, records how long every operation
 takes and which states the resources reach, and is designed to later compare the
 intended (API) state against the actual data plane (OVN / OVS).
 
-> **Status:** Planning / design. This directory currently contains only this
-> README. No Go code has been written yet — this document describes what is to
-> be built and how.
+> **Status:** Phase 1 in progress. The Go module, the `openstack-tester` CLI
+> skeleton (the `neutron` command namespace with stub subcommands), and
+> `clouds.yaml`-based authentication now exist. The scenario generator,
+> executor, metrics, and reporting described below are still being built.
 
 ---
 
@@ -280,7 +281,7 @@ abort early with a clear message if they are insufficient.
 - `clouds.yaml` loading via
   `github.com/gophercloud/gophercloud/v2/openstack/config` +
   `.../openstack/config/clouds`.
-- CLI: `github.com/spf13/cobra` (subcommands) — to be confirmed.
+- CLI: `github.com/spf13/cobra` (subcommands).
 - Scenario files in **YAML**; run records / metrics in **JSON**.
 
 ## 14. Planned project layout
@@ -329,6 +330,7 @@ contrib/openstack-tester/
 - **IPv6**: include dual-stack subnets in Phase 1, or IPv4-only first?
 - **External connectivity**: skip gateways/FIPs in Phase 1, or wire them up if
   an external network is configured?
-- **CLI framework**: `cobra` vs. stdlib `flag` — `cobra` recommended.
-- **Module path**: e.g. `github.com/osism/testbed/contrib/openstack-tester`.
+- **CLI framework**: **resolved** — `cobra`.
+- **Module path**: **resolved** — `github.com/B42Labs/openstack-tester` (the
+  module lives at the repository root, not under `contrib/`).
 ```
