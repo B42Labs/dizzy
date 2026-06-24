@@ -16,8 +16,9 @@ intended (API) state against the actual data plane (OVN / OVS).
 > metrics) now exist. `apply` also pre-checks quotas before creating anything
 > and persists a `run-<id>.json` record; `status` re-queries live state,
 > `report` renders the metrics as table/JSON/CSV, and `cleanup` deletes a run's
-> tagged resources idempotently. The optional Prometheus textfile export and
-> the built-in scenario profiles are still being built.
+> tagged resources idempotently. The `small`, `medium`, and `large` scenario
+> profiles now ship under `scenarios/`; the optional Prometheus textfile export
+> is the remaining Phase 1 item.
 
 ---
 
@@ -151,7 +152,7 @@ topology:
 
 The example from the original request (20 routers / 100 networks / 200 subnets /
 a few subnet pools / various security groups / some ports) maps directly onto
-such a file and will ship as a built-in profile.
+such a file and ships as the `medium` built-in profile (see below).
 
 Parameters can be overridden on the CLI (e.g. `--set resources.networks=200`)
 without editing the file, to make sweeps easy.
@@ -161,6 +162,22 @@ byte-identical plan, stable across runs and Go versions. The global `--seed`
 flag overrides the scenario's `seed`. Plan CIDRs are allocated deterministically
 from non-overlapping ranges — explicit IPv4 subnets from `10.0.0.0/8`, IPv6
 subnets from `fd00::/16`, and subnet pools from `172.16.0.0/12`.
+
+### Built-in profiles
+
+Three ready-to-use profiles ship under `scenarios/`, selected by passing the
+file path to `--scenario`:
+
+| Profile | Networks | Routers | Subnets | Notes |
+|---------|----------|---------|---------|-------|
+| `small`  | 3   | 2  | ≤ 9  | Fits Neutron's default per-project quotas. |
+| `medium` | 100 | 20 | ~200 | The headline example above; needs raised quotas. |
+| `large`  | 200 | 40 | ~400 | Twice the headline; needs raised quotas, guarded by the `apply` quota pre-check. |
+
+```
+openstack-tester neutron generate  --scenario scenarios/medium.yaml [--out plan.json]
+openstack-tester neutron apply     --scenario scenarios/large.yaml  [--dry-run]
+```
 
 ---
 
@@ -334,7 +351,7 @@ contrib/openstack-tester/
    - [x] Run records, `status` re-query, and `report` (table/JSON/CSV).
          (Prometheus textfile export still pending.)
    - [x] Tag-based `cleanup`; quota pre-check.
-   - [ ] Built-in profiles (incl. the 20/100/200 example).
+   - [x] Built-in profiles (incl. the 20/100/200 example).
 2. **Phase 2 — data-plane verification**
    - [ ] Compare API/plan against OVN NB/SB and OVS flows.
 3. **Phase 3+** — external connectivity, trunk ports, RBAC, QoS, more profiles,
