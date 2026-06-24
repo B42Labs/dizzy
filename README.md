@@ -9,9 +9,10 @@ takes and which states the resources reach, and is designed to later compare the
 intended (API) state against the actual data plane (OVN / OVS).
 
 > **Status:** Phase 1 in progress. The Go module, the `openstack-tester` CLI
-> skeleton (the `neutron` command namespace with stub subcommands), and
-> `clouds.yaml`-based authentication now exist. The scenario generator,
-> executor, metrics, and reporting described below are still being built.
+> skeleton (the `neutron` command namespace), `clouds.yaml`-based
+> authentication, the YAML scenario schema, the deterministic plan generator,
+> the `generate` command, and `apply --dry-run` now exist. The apply executor,
+> metrics, and reporting described below are still being built.
 
 ---
 
@@ -149,6 +150,12 @@ such a file and will ship as a built-in profile.
 
 Parameters can be overridden on the CLI (e.g. `--set resources.networks=200`)
 without editing the file, to make sweeps easy.
+
+Generation is deterministic: the same `scenario + seed` always expands to a
+byte-identical plan, stable across runs and Go versions. The global `--seed`
+flag overrides the scenario's `seed`. Plan CIDRs are allocated deterministically
+from non-overlapping ranges — explicit IPv4 subnets from `10.0.0.0/8`, IPv6
+subnets from `fd00::/16`, and subnet pools from `172.16.0.0/12`.
 
 ---
 
@@ -325,9 +332,11 @@ contrib/openstack-tester/
 ## 16. Open questions / decisions to confirm
 
 - **Quotas**: document-and-require, or auto-raise via an admin cloud?
-- **Network types**: default to geneve/vxlan tenant networks only, or also
-  exercise VLAN/flat (which need provider config)?
-- **IPv6**: include dual-stack subnets in Phase 1, or IPv4-only first?
+- **Network types**: **resolved** — geneve/vxlan tenant networks only; the
+  generator emits plain tenant networks with no provider attributes (VLAN/flat
+  deferred to Phase 3).
+- **IPv6**: **resolved** — dual-stack subnets are emitted in Phase 1,
+  controlled by `distribution.ipv6_ratio` (set it to 0 for IPv4-only).
 - **External connectivity**: skip gateways/FIPs in Phase 1, or wire them up if
   an external network is configured?
 - **CLI framework**: **resolved** — `cobra`.
