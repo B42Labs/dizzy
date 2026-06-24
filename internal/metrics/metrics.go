@@ -119,47 +119,47 @@ func (c *Collector) Aggregate(wall time.Duration) Aggregate {
 // Aggregate is the computed summary of a run's samples. All slices are sorted
 // by their key so the output is deterministic for a given set of samples.
 type Aggregate struct {
-	Wall      time.Duration
-	Overall   Stats
-	ByType    []Stats
-	Errors    []ErrorCount
-	Readiness []ReadinessStats
+	Wall      time.Duration    `json:"wall"`
+	Overall   Stats            `json:"overall"`
+	ByType    []Stats          `json:"byType"`
+	Errors    []ErrorCount     `json:"errors"`
+	Readiness []ReadinessStats `json:"readiness"`
 }
 
 // Stats holds the counts, latency distribution, and throughput for one group of
 // samples. Type is empty for the overall group.
 type Stats struct {
-	Type       string
-	Attempted  int
-	Succeeded  int
-	Failed     int
-	Throughput float64
-	Latency    Latency
+	Type       string  `json:"type"`
+	Attempted  int     `json:"attempted"`
+	Succeeded  int     `json:"succeeded"`
+	Failed     int     `json:"failed"`
+	Throughput float64 `json:"throughput"`
+	Latency    Latency `json:"latency"`
 }
 
 // Latency is the distribution of call durations within a group.
 type Latency struct {
-	Min    time.Duration
-	Mean   time.Duration
-	Median time.Duration
-	P90    time.Duration
-	P95    time.Duration
-	P99    time.Duration
-	Max    time.Duration
+	Min    time.Duration `json:"min"`
+	Mean   time.Duration `json:"mean"`
+	Median time.Duration `json:"median"`
+	P90    time.Duration `json:"p90"`
+	P95    time.Duration `json:"p95"`
+	P99    time.Duration `json:"p99"`
+	Max    time.Duration `json:"max"`
 }
 
 // ErrorCount is the number of failed samples that classified to a given kind.
 type ErrorCount struct {
-	Kind  string
-	Count int
+	Kind  string `json:"kind"`
+	Count int    `json:"count"`
 }
 
 // ReadinessStats summarizes the time-to-ready records for one resource type.
 type ReadinessStats struct {
-	Type    string
-	Count   int
-	OK      int
-	Latency Latency
+	Type    string  `json:"type"`
+	Count   int     `json:"count"`
+	OK      int     `json:"ok"`
+	Latency Latency `json:"latency"`
 }
 
 // computeStats builds a Stats for one labeled group of samples over the given

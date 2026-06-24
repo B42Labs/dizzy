@@ -53,10 +53,10 @@ const (
 // reference name (e.g. "net-0001"); Name is the applied cloud name; ID is the
 // Neutron UUID. The executor collects these and a later cleanup consumes them.
 type Resource struct {
-	Kind    Kind
-	Logical string
-	Name    string
-	ID      string
+	Kind    Kind   `json:"kind"`
+	Logical string `json:"logical"`
+	Name    string `json:"name"`
+	ID      string `json:"id"`
 }
 
 // Client wraps an authenticated NetworkV2 service client, binding every created
