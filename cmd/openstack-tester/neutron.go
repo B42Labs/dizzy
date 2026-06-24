@@ -34,7 +34,7 @@ func newNeutronCmd(opts *globalOptions) *cobra.Command {
 		newGenerateCmd(opts),
 		newApplyCmd(opts),
 		newStatusCmd(opts),
-		stub("report", "Render metrics from a run record", errNotImplemented),
+		newReportCmd(opts),
 		stub("cleanup", "Delete all resources belonging to a run, by tag", errNotImplemented),
 		stub("verify", "Compare a run against OVN/OVS (Phase 2)", errors.New("not implemented yet (Phase 2)")),
 		newListNetworksCmd(opts),
