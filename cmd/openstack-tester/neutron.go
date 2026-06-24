@@ -11,9 +11,9 @@ import (
 var errNotImplemented = errors.New("not implemented yet")
 
 // newNeutronCmd builds the "neutron" command namespace and attaches its
-// subcommands. generate and apply --dry-run are implemented; the remaining
-// subcommands are stubs until their owning work packages land, and
-// list-networks is a working auth/connectivity smoke test.
+// subcommands. generate and apply are implemented; the remaining subcommands
+// are stubs until their owning work packages land, and list-networks is a
+// working auth/connectivity smoke test.
 func newNeutronCmd(opts *globalOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "neutron",
