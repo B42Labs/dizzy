@@ -83,7 +83,7 @@ func TestWrappers_Integration(t *testing.T) {
 	deleteOnCleanup(sub)
 	assertTagged("subnets", sub.ID)
 
-	router, err := c.CreateRouter(ctx, plan.Router{Name: "router-0001"})
+	router, err := c.CreateRouter(ctx, plan.Router{Name: "router-0001"}, "")
 	if err != nil {
 		t.Fatalf("CreateRouter: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestWrappers_Integration(t *testing.T) {
 
 	rif, err := c.CreateRouterInterface(ctx, plan.RouterInterface{
 		Name: "rif-0001", Router: "router-0001", Subnet: "subnet-0001",
-	}, router.ID, sub.ID)
+	}, router.ID, sub.ID, "")
 	if err != nil {
 		t.Fatalf("CreateRouterInterface: %v", err)
 	}
@@ -132,6 +132,81 @@ func TestWrappers_Integration(t *testing.T) {
 	deleteOnCleanup(port)
 	assertTagged("ports", port.ID)
 
+	// Router-to-router link: a dedicated transit network/subnet, with router-0001
+	// attached via the subnet (owning the gateway address) and a second router
+	// attached via an explicit port — the mechanism that wires two routers
+	// together.
+	linkNet, err := c.CreateNetwork(ctx, plan.Network{Name: "link-net-0001"})
+	if err != nil {
+		t.Fatalf("CreateNetwork(link): %v", err)
+	}
+	deleteOnCleanup(linkNet)
+	linkSub, err := c.CreateSubnet(ctx, plan.Subnet{
+		Name: "link-subnet-0001", Network: "link-net-0001", IPVersion: 4, CIDR: "192.168.250.0/30",
+	}, linkNet.ID, "")
+	if err != nil {
+		t.Fatalf("CreateSubnet(link): %v", err)
+	}
+	deleteOnCleanup(linkSub)
+	router2, err := c.CreateRouter(ctx, plan.Router{Name: "router-0002"}, "")
+	if err != nil {
+		t.Fatalf("CreateRouter(router-0002): %v", err)
+	}
+	deleteOnCleanup(router2)
+	if _, err := c.CreateRouterInterface(ctx, plan.RouterInterface{
+		Name: "link-rif-a-0001", Router: "router-0001", Subnet: "link-subnet-0001",
+	}, router.ID, linkSub.ID, ""); err != nil {
+		t.Fatalf("CreateRouterInterface(link subnet side): %v", err)
+	}
+	cleanups = append(cleanups, func(ctx context.Context) {
+		opts := routers.RemoveInterfaceOpts{SubnetID: linkSub.ID}
+		if _, err := routers.RemoveInterface(ctx, gc, router.ID, opts).Extract(); err != nil {
+			t.Logf("cleanup: detaching link subnet interface from router %s: %v", router.ID, err)
+		}
+	})
+	linkPort, err := c.CreatePort(ctx, plan.Port{
+		Name: "link-port-0001", Network: "link-net-0001",
+		FixedIPs: []plan.FixedIP{{Subnet: "link-subnet-0001", IPAddress: "192.168.250.2"}},
+	}, linkNet.ID, map[string]string{"link-subnet-0001": linkSub.ID}, nil)
+	if err != nil {
+		t.Fatalf("CreatePort(link): %v", err)
+	}
+	deleteOnCleanup(linkPort)
+	if _, err := c.CreateRouterInterface(ctx, plan.RouterInterface{
+		Name: "link-rif-b-0001", Router: "router-0002", Port: "link-port-0001",
+	}, router2.ID, "", linkPort.ID); err != nil {
+		t.Fatalf("CreateRouterInterface(link port side): %v", err)
+	}
+	cleanups = append(cleanups, func(ctx context.Context) {
+		opts := routers.RemoveInterfaceOpts{PortID: linkPort.ID}
+		if _, err := routers.RemoveInterface(ctx, gc, router2.ID, opts).Extract(); err != nil {
+			t.Logf("cleanup: detaching link port interface from router %s: %v", router2.ID, err)
+		}
+	})
+
+	// External connectivity, exercised only when the cloud has an external
+	// network: a gateway router plugged into it and a floating IP allocated from
+	// it. Skipped (with a log) otherwise so the test stays runnable everywhere.
+	if extNet, ok, err := neutron.FindExternalNetwork(ctx, gc, ""); err != nil {
+		t.Logf("external network discovery failed; skipping external checks: %v", err)
+	} else if !ok {
+		t.Log("no external network available; skipping gateway and floating-IP checks")
+	} else {
+		gwRouter, err := c.CreateRouter(ctx, plan.Router{Name: "router-0003", ExternalGateway: true}, extNet.ID)
+		if err != nil {
+			t.Fatalf("CreateRouter(gateway): %v", err)
+		}
+		deleteOnCleanup(gwRouter)
+		assertTagged("routers", gwRouter.ID)
+
+		fip, err := c.CreateFloatingIP(ctx, plan.FloatingIP{Name: "fip-0001"}, extNet.ID, "")
+		if err != nil {
+			t.Fatalf("CreateFloatingIP: %v", err)
+		}
+		deleteOnCleanup(fip)
+		assertTagged("floatingips", fip.ID)
+	}
+
 	// Time-to-ready and Get both round-trip against a live resource.
 	if err := c.WaitForReady(ctx, port); err != nil {
 		t.Errorf("WaitForReady(port): %v", err)
@@ -151,7 +226,7 @@ func TestWrappers_Integration(t *testing.T) {
 
 	// The quota pre-check passes for a one-network plan (or fails open if the
 	// project cannot read its own quota), so it must not error here.
-	if err := neutron.PrecheckQuota(ctx, gc, &plan.Plan{Networks: []plan.Network{{Name: "net-0001"}}}); err != nil {
+	if err := neutron.PrecheckQuota(ctx, gc, &plan.Plan{Networks: []plan.Network{{Name: "net-0001"}}}, false); err != nil {
 		t.Errorf("PrecheckQuota for a one-network plan: %v", err)
 	}
 }

@@ -16,9 +16,12 @@ intended (API) state against the actual data plane (OVN / OVS).
 > metrics) now exist. `apply` also pre-checks quotas before creating anything
 > and persists a `run-<id>.json` record; `status` re-queries live state,
 > `report` renders the metrics as table/JSON/CSV, and `cleanup` deletes a run's
-> tagged resources idempotently. The `small`, `medium`, and `large` scenario
-> profiles now ship under `scenarios/`; the optional Prometheus textfile export
-> is the remaining Phase 1 item.
+> tagged resources idempotently. Topologies can now also wire **internal routers
+> together** (transit-subnet links) and, when the target cloud has an external
+> network, plug a fraction of routers into it as a **gateway** and allocate
+> **floating IPs**. The `small`, `medium`, and `large` scenario profiles now ship
+> under `scenarios/`; the optional Prometheus textfile export is the remaining
+> Phase 1 item.
 
 ---
 
@@ -43,8 +46,9 @@ intended (API) state against the actual data plane (OVN / OVS).
 
 - **No VMs / Nova.** Phase 1 is networking only.
 - **No load balancers (Octavia).**
-- **No floating IPs / external gateways** as a hard requirement (optional, and
-  only if an external network is available — see roadmap).
+- **External gateways and floating IPs are optional, never required** — they are
+  used only when the target cloud has an external network (auto-detected or named
+  with `--external-network`); otherwise that part of the plan is a silent no-op.
 - Not a correctness test suite like Tempest; this is a **load, timing and
   consistency** tool. The two are complementary.
 
@@ -98,26 +102,32 @@ Created in dependency order; torn down in reverse.
 2. **Networks** — the bulk; tenant networks (geneve/vxlan by default).
 3. **Subnets** — multiple per network; some from explicit CIDRs, some allocated
    from a subnet pool; IPv4 and (optionally) IPv6.
-4. **Routers** — internal routers.
+4. **Routers** — internal routers, optionally plugged into an external network
+   as a gateway when one is available on the target cloud.
 5. **Router interfaces** — attach a subset of subnets to routers, forming
-   randomized but valid topologies (a subnet attaches to at most one router).
+   randomized but valid topologies (a subnet attaches to at most one router). An
+   interface attaches either a subnet (taking its gateway address) or a port —
+   the port form wires two routers together over a shared transit subnet.
 6. **Security groups** + **security group rules** — several groups, each with a
    randomized rule set (ingress/egress, protocols, port ranges, remote CIDR or
    remote-group references).
 7. **Ports** — created on networks/subnets, with security groups attached;
    fixed IPs either auto-allocated or explicitly assigned.
+8. **Floating IPs** — allocated from the external network (when available), some
+   associated with an internal port reachable through an external-gateway router.
 
 ### Dependency graph
 
 ```
-address scope ──► subnet pool ──► subnet ──► router interface ──► router
-                                    ▲
-network ────────────────────────────┘
-   └──────────────► port ◄────────── security group ◄── security group rule
+address scope ──► subnet pool ──► subnet ──► router interface ──► router ──► (external gateway)
+                                    ▲             ▲                            ▲
+network ────────────────────────────┘            │                            │
+   └──────────────► port ──────────────────────► (router-link port)    floating IP
+        ▲                                                                     │
+        └──────── security group ◄── security group rule                      ┘ (optional association)
 ```
 
-**Optional / later:** external router gateways, floating IPs, trunk ports,
-RBAC policies, port forwarding, QoS policies.
+**Optional / later:** trunk ports, RBAC policies, port forwarding, QoS policies.
 
 ---
 
@@ -136,6 +146,8 @@ resources:
   networks:       100
   routers:        20
   security_groups: 15
+  router_links:    5             # router-to-router transit links
+  floating_ips:    10            # allocated from the external network, if one exists
 
 distribution:
   subnets_per_network:   { min: 1, max: 3 }    # ~200 subnets total
@@ -144,11 +156,33 @@ distribution:
   subnet_from_pool_ratio: 0.4                   # 40% of subnets use a pool
   ipv6_ratio:            0.2
   subnets_attached_to_router_ratio: 0.6
+  routers_with_external_gateway_ratio: 0.3      # 30% of routers want an external gateway
+  floating_ip_associated_ratio:        0.5      # half the floating IPs target a port
 
 topology:
   router_attach_strategy: random   # how subnets are distributed across routers
   port_security_group_count: { min: 1, max: 3 }
 ```
+
+### External connectivity and router links
+
+Three topology features go beyond a single isolated project, all optional and
+all deterministic in the plan:
+
+- **External gateways** — `routers_with_external_gateway_ratio` marks that
+  fraction of routers as wanting an external gateway. The plan only records the
+  *intent*; the actual external network is discovered on the target cloud at
+  `apply` time (`--external-network <name>`, or the first external network found).
+  If the cloud has no external network, the intent is a silent no-op.
+- **Floating IPs** — `resources.floating_ips` allocates that many floating IPs
+  from the external network, of which `floating_ip_associated_ratio` are
+  associated with an internal port reachable through an external-gateway router
+  (each eligible port at most once); the rest stay unassociated. Floating IPs are
+  created only when an external network is available.
+- **Router links** — `resources.router_links` wires pairs of routers together.
+  Each link adds a dedicated transit network and `/30` subnet (allocated from
+  `192.168.0.0/16`) plus a port: one router owns the subnet's gateway address,
+  the peer attaches through the port. This needs at least two routers.
 
 The example from the original request (20 routers / 100 networks / 200 subnets /
 a few subnet pools / various security groups / some ports) maps directly onto
@@ -161,7 +195,8 @@ Generation is deterministic: the same `scenario + seed` always expands to a
 byte-identical plan, stable across runs and Go versions. The global `--seed`
 flag overrides the scenario's `seed`. Plan CIDRs are allocated deterministically
 from non-overlapping ranges — explicit IPv4 subnets from `10.0.0.0/8`, IPv6
-subnets from `fd00::/16`, and subnet pools from `172.16.0.0/12`.
+subnets from `fd00::/16`, subnet pools from `172.16.0.0/12`, and router-link
+transit subnets as `/30`s from `192.168.0.0/16`.
 
 ### Built-in profiles
 
@@ -198,6 +233,8 @@ openstack-tester neutron verify    --run run-<id>.json   # Phase 2 (future)
 - `generate` — expand a scenario into a plan and dump it; never touches the API.
 - `apply` — generate (or load) a plan, create resources, poll states, record a
   run record + metrics. `--dry-run` validates and prints what would be created.
+  `--external-network <name>` selects the external network for router gateways
+  and floating IPs (default: auto-detect the first external network).
 - `status` — re-query the current state of a run's resources from the API.
 - `report` — render metrics from a run record (table / JSON / CSV).
 - `cleanup` — delete all resources belonging to a run, in reverse dependency
@@ -293,7 +330,9 @@ raised first.
 This is resolved as **document-and-require** (see open questions): `apply`
 **pre-checks quotas** against the expanded plan and aborts early with an itemized
 message before creating anything if they are insufficient, leaving the operator
-to raise the quotas. The tool does **not** auto-raise quotas through an admin
+to raise the quotas. The pre-check accounts for the ports a subnet router
+interface and an external gateway each consume, and — when an external network
+is available — the floating IPs against their own quota. The tool does **not** auto-raise quotas through an admin
 cloud — that would require admin credentials it otherwise never needs. The
 pre-check fails open (it logs a warning and proceeds) when the project cannot
 read its own quota, with the executor's quota fast-fail as the backstop.
@@ -316,7 +355,8 @@ read its own quota, with the executor's quota fast-fail as the backstop.
 - **[gophercloud v2](https://github.com/gophercloud/gophercloud)** —
   `github.com/gophercloud/gophercloud/v2` and its
   `openstack/networking/v2/*` packages (`networks`, `subnets`, `subnetpools`,
-  `routers`, `ports`, `security/groups`, `security/rules`, `attributestags`).
+  `routers`, `ports`, `floatingips`, `external`, `security/groups`,
+  `security/rules`, `attributestags`).
 - `clouds.yaml` loading via
   `github.com/gophercloud/gophercloud/v2/openstack/config` +
   `.../openstack/config/clouds`.

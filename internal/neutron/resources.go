@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/layer3/addressscopes"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/layer3/floatingips"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/layer3/routers"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/security/groups"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/security/rules"
@@ -119,6 +120,12 @@ func (c *Client) observe(ctx context.Context, r Resource) (string, error) {
 	case KindAddressScope:
 		_, err := addressscopes.Get(ctx, c.gc, r.ID).Extract()
 		return "", err
+	case KindFloatingIP:
+		fip, err := floatingips.Get(ctx, c.gc, r.ID).Extract()
+		if err != nil {
+			return "", err
+		}
+		return fip.Status, nil
 	default:
 		return "", fmt.Errorf("observe not supported for kind %q", r.Kind)
 	}
@@ -147,6 +154,8 @@ func (c *Client) Delete(ctx context.Context, r Resource) error {
 			return rules.Delete(ctx, c.gc, r.ID).ExtractErr()
 		case KindAddressScope:
 			return addressscopes.Delete(ctx, c.gc, r.ID).ExtractErr()
+		case KindFloatingIP:
+			return floatingips.Delete(ctx, c.gc, r.ID).ExtractErr()
 		default:
 			return fmt.Errorf("delete not supported for kind %q", r.Kind)
 		}

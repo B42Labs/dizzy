@@ -37,11 +37,12 @@ type Neutron interface {
 	CreateSubnetPool(ctx context.Context, sp plan.SubnetPool, addressScopeID string) (neutron.Resource, error)
 	CreateNetwork(ctx context.Context, n plan.Network) (neutron.Resource, error)
 	CreateSubnet(ctx context.Context, s plan.Subnet, networkID, subnetPoolID string) (neutron.Resource, error)
-	CreateRouter(ctx context.Context, r plan.Router) (neutron.Resource, error)
-	CreateRouterInterface(ctx context.Context, ri plan.RouterInterface, routerID, subnetID string) (neutron.Resource, error)
+	CreateRouter(ctx context.Context, r plan.Router, externalNetworkID string) (neutron.Resource, error)
+	CreateRouterInterface(ctx context.Context, ri plan.RouterInterface, routerID, subnetID, portID string) (neutron.Resource, error)
 	CreateSecurityGroup(ctx context.Context, sg plan.SecurityGroup) (neutron.Resource, error)
 	CreateSecurityGroupRule(ctx context.Context, rule plan.SecurityGroupRule, sgID, remoteGroupID string) (neutron.Resource, error)
 	CreatePort(ctx context.Context, p plan.Port, networkID string, subnetIDByLogical map[string]string, sgIDs []string) (neutron.Resource, error)
+	CreateFloatingIP(ctx context.Context, fip plan.FloatingIP, externalNetworkID, portID string) (neutron.Resource, error)
 	WaitForReady(ctx context.Context, r neutron.Resource) error
 }
 
@@ -56,7 +57,13 @@ type Result struct {
 // each create retried on transient errors and bounded by opTimeout. The first
 // quota error, or any non-retryable error, stops the run and is returned along
 // with the resources created so far; ctx cancellation returns ctx.Err().
-func Apply(ctx context.Context, runID string, n Neutron, p *plan.Plan, concurrency int, opTimeout time.Duration) (*Result, error) {
+//
+// externalNetworkID is the external network discovered for this run, or "" when
+// the cloud has none. When set, routers marked for an external gateway are
+// plugged into it and floating IPs are allocated from it; when empty, both are
+// skipped — the plan's external-connectivity intent becomes a no-op rather than
+// a failure.
+func Apply(ctx context.Context, runID string, n Neutron, p *plan.Plan, concurrency int, opTimeout time.Duration, externalNetworkID string) (*Result, error) {
 	e := &applier{n: n, concurrency: concurrency, opTimeout: opTimeout}
 	result := &Result{}
 	// ids maps a plan logical name to its created cloud id. It is written only
@@ -100,9 +107,10 @@ func Apply(ctx context.Context, runID string, n Neutron, p *plan.Plan, concurren
 		ids[nw.Name] = res[i].ID
 	}
 
-	// Routers.
+	// Routers (plugged into the external network when they want a gateway and
+	// one was discovered).
 	res, err = stage(ctx, e, p.Routers, func(ctx context.Context, r plan.Router) (neutron.Resource, error) {
-		return e.n.CreateRouter(ctx, r)
+		return e.n.CreateRouter(ctx, r, externalNetworkID)
 	})
 	result.Created = appendCreated(result.Created, res)
 	if err != nil {
@@ -150,16 +158,9 @@ func Apply(ctx context.Context, runID string, n Neutron, p *plan.Plan, concurren
 		return result, err
 	}
 
-	// Router interfaces (resolve their router and subnet).
-	res, err = stage(ctx, e, p.RouterInterfaces, func(ctx context.Context, ri plan.RouterInterface) (neutron.Resource, error) {
-		return e.n.CreateRouterInterface(ctx, ri, ids[ri.Router], ids[ri.Subnet])
-	})
-	result.Created = appendCreated(result.Created, res)
-	if err != nil {
-		return result, err
-	}
-
 	// Ports (resolve their network, fixed-IP subnets, and security groups).
+	// Created before router interfaces so a port-based interface — the
+	// router-to-router link mechanism — can resolve the port it attaches.
 	res, err = stage(ctx, e, p.Ports, func(ctx context.Context, port plan.Port) (neutron.Resource, error) {
 		sgIDs := make([]string, 0, len(port.SecurityGroups))
 		for _, sg := range port.SecurityGroups {
@@ -174,6 +175,36 @@ func Apply(ctx context.Context, runID string, n Neutron, p *plan.Plan, concurren
 	result.Created = appendCreated(result.Created, res)
 	if err != nil {
 		return result, err
+	}
+	for i, port := range p.Ports {
+		ids[port.Name] = res[i].ID
+	}
+
+	// Router interfaces (resolve their router and either a subnet or a port).
+	res, err = stage(ctx, e, p.RouterInterfaces, func(ctx context.Context, ri plan.RouterInterface) (neutron.Resource, error) {
+		return e.n.CreateRouterInterface(ctx, ri, ids[ri.Router], ids[ri.Subnet], ids[ri.Port])
+	})
+	result.Created = appendCreated(result.Created, res)
+	if err != nil {
+		return result, err
+	}
+
+	// Floating IPs, allocated from the external network (resolving an optional
+	// internal port to associate). Skipped entirely when no external network was
+	// discovered, so the plan's intent degrades to a no-op rather than failing.
+	if externalNetworkID == "" {
+		if len(p.FloatingIPs) > 0 {
+			slog.Warn("skipping floating IPs: no external network available",
+				"floatingIPs", len(p.FloatingIPs))
+		}
+	} else {
+		res, err = stage(ctx, e, p.FloatingIPs, func(ctx context.Context, fip plan.FloatingIP) (neutron.Resource, error) {
+			return e.n.CreateFloatingIP(ctx, fip, externalNetworkID, ids[fip.Port])
+		})
+		result.Created = appendCreated(result.Created, res)
+		if err != nil {
+			return result, err
+		}
 	}
 
 	return result, nil

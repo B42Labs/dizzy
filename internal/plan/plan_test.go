@@ -61,6 +61,59 @@ func TestPlanValidate(t *testing.T) {
 			wantErr: `subnet "subnet-0001" is attached to more than one router`,
 		},
 		{
+			name: "port-based router interface is valid",
+			mutate: func(p *Plan) {
+				p.Ports = append(p.Ports, Port{Name: "port-link", Network: "net-0001", FixedIPs: []FixedIP{{Subnet: "subnet-0001"}}})
+				p.RouterInterfaces = append(p.RouterInterfaces,
+					RouterInterface{Name: "rif-link", Router: "router-0001", Port: "port-link"})
+			},
+		},
+		{
+			name: "router interface sets both subnet and port",
+			mutate: func(p *Plan) {
+				p.RouterInterfaces[0].Port = "port-0001"
+			},
+			wantErr: `router interface "rif-0001" sets both a subnet and a port; set exactly one`,
+		},
+		{
+			name: "router interface sets neither subnet nor port",
+			mutate: func(p *Plan) {
+				p.RouterInterfaces[0].Subnet = ""
+			},
+			wantErr: `router interface "rif-0001" sets neither a subnet nor a port; set exactly one`,
+		},
+		{
+			name: "router interface references unknown port",
+			mutate: func(p *Plan) {
+				p.RouterInterfaces[0].Subnet = ""
+				p.RouterInterfaces[0].Port = "port-9999"
+			},
+			wantErr: `router interface "rif-0001" references unknown port "port-9999"`,
+		},
+		{
+			name: "port attached to two routers",
+			mutate: func(p *Plan) {
+				p.RouterInterfaces[0].Subnet = ""
+				p.RouterInterfaces[0].Port = "port-0001"
+				p.RouterInterfaces = append(p.RouterInterfaces,
+					RouterInterface{Name: "rif-0002", Router: "router-0001", Port: "port-0001"})
+			},
+			wantErr: `port "port-0001" is attached to more than one router`,
+		},
+		{
+			name: "floating ip associated with a port is valid",
+			mutate: func(p *Plan) {
+				p.FloatingIPs = []FloatingIP{{Name: "fip-0001", Port: "port-0001"}}
+			},
+		},
+		{
+			name: "floating ip references unknown port",
+			mutate: func(p *Plan) {
+				p.FloatingIPs = []FloatingIP{{Name: "fip-0001", Port: "port-9999"}}
+			},
+			wantErr: `floating ip "fip-0001" references unknown port "port-9999"`,
+		},
+		{
 			name: "subnet references unknown network",
 			mutate: func(p *Plan) {
 				p.Subnets[0].Network = "net-9999"
@@ -162,6 +215,8 @@ func TestPlanSummary(t *testing.T) {
 		"router interfaces: 1",
 		"security groups:   1",
 		"ports:             1",
+		"floating IPs:      0",
+		"with external gateway",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("Summary() missing %q in:\n%s", want, got)

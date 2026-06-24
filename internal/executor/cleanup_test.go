@@ -16,17 +16,19 @@ import (
 // delete. It lets Cleanup's ordering, idempotency, and 404 handling be exercised
 // without a cloud, mirroring the fakeNeutron pattern.
 type fakeCleaner struct {
-	byKind     map[neutron.Kind][]neutron.Resource
-	gone       map[string]bool  // ids already deleted (a re-delete 404s)
-	failDelete map[string]error // id -> error Delete returns instead of succeeding
-	events     []string         // "detach:<id>" / "delete:<kind>" in call order
+	byKind       map[neutron.Kind][]neutron.Resource
+	gone         map[string]bool  // ids already deleted (a re-delete 404s)
+	failDelete   map[string]error // id -> error Delete returns instead of succeeding
+	networkPorts map[string]int   // network id -> plain (orphan) ports still on it
+	events       []string         // "detach:<id>" / "sweep:<netID>" / "delete:<kind>" in call order
 }
 
 func newFakeCleaner() *fakeCleaner {
 	return &fakeCleaner{
-		byKind:     make(map[neutron.Kind][]neutron.Resource),
-		gone:       make(map[string]bool),
-		failDelete: make(map[string]error),
+		byKind:       make(map[neutron.Kind][]neutron.Resource),
+		gone:         make(map[string]bool),
+		failDelete:   make(map[string]error),
+		networkPorts: make(map[string]int),
 	}
 }
 
@@ -43,6 +45,13 @@ func (f *fakeCleaner) ListByTag(ctx context.Context, kind neutron.Kind, runID st
 func (f *fakeCleaner) DetachRouterInterfaces(ctx context.Context, routerID string) (int, error) {
 	f.events = append(f.events, "detach:"+routerID)
 	return 1, nil
+}
+
+func (f *fakeCleaner) DeleteNetworkPorts(ctx context.Context, networkID string) (int, error) {
+	f.events = append(f.events, "sweep:"+networkID)
+	swept := f.networkPorts[networkID]
+	f.networkPorts[networkID] = 0
+	return swept, nil
 }
 
 func (f *fakeCleaner) Delete(ctx context.Context, r neutron.Resource) error {
@@ -74,9 +83,11 @@ func idx(events []string, event string) int {
 	return slices.Index(events, event)
 }
 
-// TestCleanupReverseDependencyOrder confirms ports are deleted before subnets
-// and networks, router interfaces are detached before subnets and routers are
-// removed, and subnets precede networks and subnet pools.
+// TestCleanupReverseDependencyOrder confirms the teardown order: our own ports
+// and detached interfaces precede the network delete (which cascades the subnet
+// service ports), networks precede subnets so that cascade can clear the DHCP
+// port that would otherwise block an explicit subnet delete, and subnets precede
+// the subnet pools they allocate from.
 func TestCleanupReverseDependencyOrder(t *testing.T) {
 	f := seedFullTopology()
 	deleted, err := Cleanup(context.Background(), f, "run0", nil)
@@ -99,14 +110,39 @@ func TestCleanupReverseDependencyOrder(t *testing.T) {
 			t.Fatalf("event %q never happened; log=%v", e, f.events)
 		}
 	}
-	if port >= subnet || port >= network {
-		t.Errorf("ports must be deleted before subnets and networks; log=%v", f.events)
+	if port >= network {
+		t.Errorf("our ports must be deleted before their networks (a network delete fails while user ports remain); log=%v", f.events)
 	}
-	if detach >= subnet || detach >= router {
-		t.Errorf("interfaces must be detached before subnets and routers are deleted; log=%v", f.events)
+	if detach >= network || detach >= router {
+		t.Errorf("interfaces must be detached before networks and routers are deleted; log=%v", f.events)
 	}
-	if subnet >= network || subnet >= pool {
-		t.Errorf("subnets must be deleted before networks and subnet pools; log=%v", f.events)
+	if network >= subnet {
+		t.Errorf("networks must be deleted before subnets so the cascade removes the DHCP ports; log=%v", f.events)
+	}
+	if subnet >= pool {
+		t.Errorf("subnets must be deleted before the subnet pools they allocate from; log=%v", f.events)
+	}
+}
+
+// TestCleanupSweepsOrphanNetworkPorts confirms that plain ports left on a tagged
+// network — untagged orphans a cancelled run can leave behind, which tag-based
+// discovery misses and which block the network delete — are swept (and counted)
+// before the network is deleted.
+func TestCleanupSweepsOrphanNetworkPorts(t *testing.T) {
+	f := seedFullTopology()
+	f.networkPorts["n1"] = 2
+
+	deleted, err := Cleanup(context.Background(), f, "run0", nil)
+	if err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	if deleted != 8 {
+		t.Errorf("deleted %d resources, want 8 (6 tagged + 2 swept orphan ports)", deleted)
+	}
+	sweep := idx(f.events, "sweep:n1")
+	network := idx(f.events, "delete:network")
+	if sweep < 0 || network < 0 || sweep >= network {
+		t.Errorf("orphan ports must be swept before the network is deleted; log=%v", f.events)
 	}
 }
 

@@ -11,12 +11,15 @@ import (
 // IP allocation ranges. The three ranges do not overlap, so explicit IPv4
 // subnets, subnet pools, and IPv6 subnets never collide.
 const (
-	ipv4Base       = uint32(10) << 24                 // 10.0.0.0, explicit IPv4 subnets as /24
-	ipv4BlockCount = 1 << 16                          // number of /24 blocks in 10.0.0.0/8
-	poolBase       = uint32(172)<<24 | uint32(16)<<16 // 172.16.0.0, subnet pools as /16
-	poolBlockCount = 16                               // number of /16 blocks in 172.16.0.0/12
-	poolPrefixLen  = 26                               // prefix length pools hand out to subnets
-	ipv6BlockCount = 1 << 16                          // number of /64 blocks enumerated under fd00::/16
+	ipv4Base       = uint32(10) << 24                  // 10.0.0.0, explicit IPv4 subnets as /24
+	ipv4BlockCount = 1 << 16                           // number of /24 blocks in 10.0.0.0/8
+	poolBase       = uint32(172)<<24 | uint32(16)<<16  // 172.16.0.0, subnet pools as /16
+	poolBlockCount = 16                                // number of /16 blocks in 172.16.0.0/12
+	poolPrefixLen  = 26                                // prefix length pools hand out to subnets
+	ipv6BlockCount = 1 << 16                           // number of /64 blocks enumerated under fd00::/16
+	linkBase       = uint32(192)<<24 | uint32(168)<<16 // 192.168.0.0, router-to-router transit subnets as /30
+	linkBlockCount = 1 << 14                           // number of /30 blocks in 192.168.0.0/16
+	linkPrefixLen  = 30                                // point-to-point transit subnets
 )
 
 // Generate expands the scenario and its seed into a fully-enumerated plan. The
@@ -101,7 +104,14 @@ func (s Scenario) Generate() (*plan.Plan, error) {
 
 	p.Routers = make([]plan.Router, 0, s.Resources.Routers)
 	for i := 0; i < s.Resources.Routers; i++ {
-		p.Routers = append(p.Routers, plan.Router{Name: fmt.Sprintf("router-%04d", i+1)})
+		router := plan.Router{Name: fmt.Sprintf("router-%04d", i+1)}
+		// Draw the external-gateway intent only when the ratio is set, so plans
+		// that do not use external connectivity stay byte-identical to before the
+		// feature existed (the RNG sequence is not disturbed).
+		if s.Distribution.RoutersWithExternalGatewayRatio > 0 {
+			router.ExternalGateway = g.rng.Float64() < s.Distribution.RoutersWithExternalGatewayRatio
+		}
+		p.Routers = append(p.Routers, router)
 	}
 
 	// Each subnet is considered once and attached to a random router with the
@@ -164,10 +174,147 @@ func (s Scenario) Generate() (*plan.Plan, error) {
 		}
 	}
 
+	// Router-to-router links. Each link adds a dedicated transit network, a /30
+	// transit subnet, and a port, then wires two distinct routers together: one
+	// router attaches to the subnet (owning the gateway address) and the other
+	// attaches through the explicit port. The underlying resources are appended
+	// to the existing slices so they create, quota-check, and clean up through
+	// the same paths as any other network/subnet/port. Generated only when
+	// requested, so link-free plans are byte-identical to before this feature.
+	if s.Resources.RouterLinks > 0 && len(p.Routers) >= 2 {
+		if err := g.appendRouterLinks(p, s.Resources.RouterLinks); err != nil {
+			return nil, err
+		}
+	}
+
+	// Floating IPs, allocated from the external network resolved at apply time.
+	// A fraction target an internal port that is reachable through an
+	// external-gateway router; the rest stay unassociated. Each eligible port is
+	// targeted at most once. Generated only when requested.
+	if s.Resources.FloatingIPs > 0 {
+		g.appendFloatingIPs(p, s.Resources.FloatingIPs, s.Distribution.FloatingIPAssociatedRatio)
+	}
+
 	if err := p.Validate(); err != nil {
 		return nil, fmt.Errorf("generated plan failed validation: %w", err)
 	}
 	return p, nil
+}
+
+// appendRouterLinks adds count router-to-router interconnects to p. For each
+// link it picks two distinct routers, allocates a transit subnet, and appends a
+// transit network, subnet, and port plus the two router interfaces that wire the
+// routers together. The caller guarantees len(p.Routers) >= 2.
+func (g *generator) appendRouterLinks(p *plan.Plan, count int) error {
+	for i := 0; i < count; i++ {
+		ia := g.rng.Intn(len(p.Routers))
+		ib := g.rng.Intn(len(p.Routers) - 1)
+		if ib >= ia {
+			ib++ // map [0,n-1) onto the routers other than ia, so a != b
+		}
+		routerA := p.Routers[ia].Name
+		routerB := p.Routers[ib].Name
+
+		cidr, portIP, err := g.nextLinkSubnet()
+		if err != nil {
+			return err
+		}
+
+		netName := fmt.Sprintf("link-net-%04d", i+1)
+		subnetName := fmt.Sprintf("link-subnet-%04d", i+1)
+		portName := fmt.Sprintf("link-port-%04d", i+1)
+
+		p.Networks = append(p.Networks, plan.Network{Name: netName})
+		p.Subnets = append(p.Subnets, plan.Subnet{
+			Name:      subnetName,
+			Network:   netName,
+			IPVersion: 4,
+			CIDR:      cidr,
+			// A /30 transit subnet has exactly one host address (the link port's);
+			// leaving DHCP on would let Neutron's DHCP port grab it first and make
+			// the link port fail with IpAddressAlreadyAllocated.
+			DisableDHCP: true,
+		})
+		p.Ports = append(p.Ports, plan.Port{
+			Name:           portName,
+			Network:        netName,
+			FixedIPs:       []plan.FixedIP{{Subnet: subnetName, IPAddress: portIP}},
+			SecurityGroups: []string{},
+		})
+		p.RouterInterfaces = append(p.RouterInterfaces,
+			plan.RouterInterface{Name: fmt.Sprintf("link-rif-a-%04d", i+1), Router: routerA, Subnet: subnetName},
+			plan.RouterInterface{Name: fmt.Sprintf("link-rif-b-%04d", i+1), Router: routerB, Port: portName},
+		)
+	}
+	return nil
+}
+
+// appendFloatingIPs adds count floating IPs to p, associating a fraction
+// (associatedRatio) of them with an internal port that is reachable through an
+// external-gateway router. Eligible ports are those whose fixed IP sits on a
+// subnet attached to a gateway router and that are not themselves a router
+// interface; each is targeted at most once so an association never collides.
+func (g *generator) appendFloatingIPs(p *plan.Plan, count int, associatedRatio float64) {
+	eligible := eligibleFloatingIPPorts(p)
+	order := g.rng.Perm(len(eligible))
+	used := 0
+
+	p.FloatingIPs = make([]plan.FloatingIP, 0, count)
+	for i := 0; i < count; i++ {
+		fip := plan.FloatingIP{Name: fmt.Sprintf("fip-%04d", i+1)}
+		if used < len(eligible) && g.rng.Float64() < associatedRatio {
+			fip.Port = eligible[order[used]]
+			used++
+		}
+		p.FloatingIPs = append(p.FloatingIPs, fip)
+	}
+}
+
+// eligibleFloatingIPPorts returns, in plan order, the ports a floating IP may be
+// associated with: a port whose fixed IP is on an IPv4 subnet attached to a
+// router that has an external gateway, excluding ports that are themselves
+// consumed as a router interface. The IPv4 requirement matters because a
+// floating IP is an IPv4 resource — Neutron rejects associating one with a port
+// that has no fixed IPv4 address (e.g. a port on an IPv6 subnet).
+func eligibleFloatingIPPorts(p *plan.Plan) []string {
+	gatewayRouter := make(map[string]bool, len(p.Routers))
+	for _, r := range p.Routers {
+		if r.ExternalGateway {
+			gatewayRouter[r.Name] = true
+		}
+	}
+
+	ipv4Subnet := make(map[string]bool, len(p.Subnets))
+	for _, s := range p.Subnets {
+		if s.IPVersion == 4 {
+			ipv4Subnet[s.Name] = true
+		}
+	}
+
+	externalSubnet := make(map[string]bool)
+	interfacePort := make(map[string]bool)
+	for _, ri := range p.RouterInterfaces {
+		if ri.Subnet != "" && gatewayRouter[ri.Router] && ipv4Subnet[ri.Subnet] {
+			externalSubnet[ri.Subnet] = true
+		}
+		if ri.Port != "" {
+			interfacePort[ri.Port] = true
+		}
+	}
+
+	var eligible []string
+	for _, pt := range p.Ports {
+		if interfacePort[pt.Name] {
+			continue
+		}
+		for _, fip := range pt.FixedIPs {
+			if externalSubnet[fip.Subnet] {
+				eligible = append(eligible, pt.Name)
+				break
+			}
+		}
+	}
+	return eligible
 }
 
 // generator carries the RNG and the monotonic IP-block cursors used while
@@ -177,6 +324,7 @@ type generator struct {
 	ipv4Next uint32
 	ipv6Next uint32
 	poolNext int
+	linkNext uint32
 }
 
 // randomRule draws a single valid security-group rule. numSGs is the total
@@ -225,6 +373,23 @@ func (g *generator) nextPoolPrefix() (string, error) {
 	g.poolNext++
 	a := netip.AddrFrom4([4]byte{byte(addr >> 24), byte(addr >> 16), byte(addr >> 8), byte(addr)})
 	return netip.PrefixFrom(a, 16).String(), nil
+}
+
+// nextLinkSubnet returns the next /30 transit block from 192.168.0.0/16 as a
+// CIDR together with the second usable address in that block. The first usable
+// address is the subnet's default gateway (taken by the router attached to the
+// subnet); the returned address is assigned to the port the peer router
+// attaches through.
+func (g *generator) nextLinkSubnet() (cidr, portIP string, err error) {
+	if g.linkNext >= linkBlockCount {
+		return "", "", fmt.Errorf("exhausted /30 transit blocks in 192.168.0.0/16")
+	}
+	base := linkBase + g.linkNext*4
+	g.linkNext++
+	network := netip.AddrFrom4([4]byte{byte(base >> 24), byte(base >> 16), byte(base >> 8), byte(base)})
+	port := base + 2
+	portAddr := netip.AddrFrom4([4]byte{byte(port >> 24), byte(port >> 16), byte(port >> 8), byte(port)})
+	return netip.PrefixFrom(network, linkPrefixLen).String(), portAddr.String(), nil
 }
 
 // nextIPv6CIDR returns the next /64 block from fd00::/16.

@@ -30,15 +30,32 @@ type needs struct {
 	securityRules  int
 	ports          int
 	subnetPools    int
+	floatingIPs    int
 }
 
-// planNeeds counts the quota-bounded resources a plan will create. Router
-// interfaces each create a port owned by the router, so they count against the
-// port quota alongside the explicit ports.
-func planNeeds(p *plan.Plan) needs {
+// planNeeds counts the quota-bounded resources a plan will create. Subnet-based
+// router interfaces each create a new gateway port owned by the router, so they
+// count against the port quota alongside the explicit ports; port-based
+// interfaces attach an already-counted port and add nothing. When an external
+// network is available, each external-gateway router also adds a gateway port,
+// and the floating IPs count against the floating-IP quota; without one, neither
+// is created, so neither is counted.
+func planNeeds(p *plan.Plan, externalAvailable bool) needs {
 	var rules int
 	for _, sg := range p.SecurityGroups {
 		rules += len(sg.Rules)
+	}
+	var subnetInterfaces int
+	for _, ri := range p.RouterInterfaces {
+		if ri.Subnet != "" {
+			subnetInterfaces++
+		}
+	}
+	ports := len(p.Ports) + subnetInterfaces
+	floatingIPs := 0
+	if externalAvailable {
+		ports += p.RoutersWithExternalGateway()
+		floatingIPs = len(p.FloatingIPs)
 	}
 	return needs{
 		networks:       len(p.Networks),
@@ -46,8 +63,9 @@ func planNeeds(p *plan.Plan) needs {
 		routers:        len(p.Routers),
 		securityGroups: len(p.SecurityGroups),
 		securityRules:  rules,
-		ports:          len(p.Ports) + len(p.RouterInterfaces),
+		ports:          ports,
 		subnetPools:    len(p.SubnetPools),
+		floatingIPs:    floatingIPs,
 	}
 }
 
@@ -59,7 +77,7 @@ func planNeeds(p *plan.Plan) needs {
 // quota fast-fail as the backstop. Any other read failure (a transient 5xx, a
 // timeout) is returned so the plan aborts before creating anything rather than
 // hitting the real quota wall mid-apply.
-func PrecheckQuota(ctx context.Context, gc *gophercloud.ServiceClient, p *plan.Plan) error {
+func PrecheckQuota(ctx context.Context, gc *gophercloud.ServiceClient, p *plan.Plan, externalAvailable bool) error {
 	projectID, ok := projectIDFromAuth(gc)
 	if !ok {
 		slog.Warn("quota pre-check skipped: project id unavailable from auth result")
@@ -73,7 +91,7 @@ func PrecheckQuota(ctx context.Context, gc *gophercloud.ServiceClient, p *plan.P
 		}
 		return fmt.Errorf("reading project quotas for pre-check: %w", err)
 	}
-	return checkQuota(planNeeds(p), quota)
+	return checkQuota(planNeeds(p, externalAvailable), quota)
 }
 
 // projectIDFromAuth extracts the authenticated project id from the v3 token auth
@@ -113,6 +131,7 @@ func checkQuota(need needs, q *quotas.Quota) error {
 	check("security group rules", need.securityRules, q.SecurityGroupRule)
 	check("ports", need.ports, q.Port)
 	check("subnet pools", need.subnetPools, q.SubnetPool)
+	check("floating IPs", need.floatingIPs, q.FloatingIP)
 	if len(over) == 0 {
 		return nil
 	}

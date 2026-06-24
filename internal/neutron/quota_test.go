@@ -14,36 +14,53 @@ import (
 	"github.com/B42Labs/openstack-tester/internal/plan"
 )
 
-// TestPlanNeedsCounts confirms planNeeds tallies each kind, summing nested
-// security-group rules and counting router interfaces against the port quota.
+// TestPlanNeedsCounts confirms planNeeds tallies each kind: it sums nested
+// security-group rules, counts subnet-based router interfaces (but not
+// port-based ones, which attach an already-counted port) against the port
+// quota, and — only when an external network is available — adds an
+// external-gateway port per gateway router and counts the floating IPs.
 func TestPlanNeedsCounts(t *testing.T) {
 	p := &plan.Plan{
 		Networks:    []plan.Network{{Name: "n1"}, {Name: "n2"}},
 		Subnets:     []plan.Subnet{{Name: "s1"}},
-		Routers:     []plan.Router{{Name: "r1"}},
+		Routers:     []plan.Router{{Name: "r1"}, {Name: "r2", ExternalGateway: true}},
 		SubnetPools: []plan.SubnetPool{{Name: "p1"}},
 		RouterInterfaces: []plan.RouterInterface{
-			{Name: "ri1"}, {Name: "ri2"},
+			{Name: "ri1", Router: "r1", Subnet: "s1"},  // subnet-based: +1 gateway port
+			{Name: "ri2", Router: "r2", Port: "port1"}, // port-based: attaches an existing port
 		},
 		SecurityGroups: []plan.SecurityGroup{
 			{Name: "sg1", Rules: []plan.SecurityGroupRule{{Direction: "ingress"}, {Direction: "egress"}}},
 			{Name: "sg2", Rules: []plan.SecurityGroupRule{{Direction: "ingress"}}},
 		},
-		Ports: []plan.Port{{Name: "port1"}},
+		Ports:       []plan.Port{{Name: "port1"}},
+		FloatingIPs: []plan.FloatingIP{{Name: "fip1"}},
 	}
 
-	got := planNeeds(p)
+	// With an external network: the gateway router adds a port and the floating
+	// IP counts.
+	got := planNeeds(p, true)
 	want := needs{
 		networks:       2,
 		subnets:        1,
-		routers:        1,
+		routers:        2,
 		securityGroups: 2,
 		securityRules:  3,
-		ports:          3, // 1 explicit port + 2 router-interface ports
+		ports:          3, // 1 explicit port + 1 subnet-interface port + 1 gateway port
 		subnetPools:    1,
+		floatingIPs:    1,
 	}
 	if got != want {
-		t.Errorf("planNeeds = %+v, want %+v", got, want)
+		t.Errorf("planNeeds(external) = %+v, want %+v", got, want)
+	}
+
+	// Without an external network: no gateway port, no floating IPs.
+	gotNoExt := planNeeds(p, false)
+	wantNoExt := want
+	wantNoExt.ports = 2 // 1 explicit port + 1 subnet-interface port
+	wantNoExt.floatingIPs = 0
+	if gotNoExt != wantNoExt {
+		t.Errorf("planNeeds(no external) = %+v, want %+v", gotNoExt, wantNoExt)
 	}
 }
 
@@ -112,7 +129,7 @@ func TestPrecheckQuotaSurfacesTransientReadError(t *testing.T) {
 	defer ts.Close()
 
 	gc := quotaPrecheckClient(ts)
-	err := PrecheckQuota(context.Background(), gc, &plan.Plan{Networks: []plan.Network{{Name: "n1"}}})
+	err := PrecheckQuota(context.Background(), gc, &plan.Plan{Networks: []plan.Network{{Name: "n1"}}}, false)
 	if err == nil {
 		t.Fatal("PrecheckQuota fell open on a transient 503 quota read; want a surfaced error")
 	}
@@ -128,7 +145,7 @@ func TestPrecheckQuotaFailsOpenWhenReadDenied(t *testing.T) {
 	defer ts.Close()
 
 	gc := quotaPrecheckClient(ts)
-	if err := PrecheckQuota(context.Background(), gc, &plan.Plan{Networks: []plan.Network{{Name: "n1"}}}); err != nil {
+	if err := PrecheckQuota(context.Background(), gc, &plan.Plan{Networks: []plan.Network{{Name: "n1"}}}, false); err != nil {
 		t.Errorf("PrecheckQuota should fail open on a 403 quota read denial, got %v", err)
 	}
 }

@@ -7,6 +7,8 @@ resources:
   networks:        200
   routers:         40
   security_groups: 30
+  router_links:    10            # router-to-router transit links
+  floating_ips:    20           # allocated from the external network, if one exists
 
 distribution:
   subnets_per_network:      { min: 1, max: 3 }    # ~400 subnets total
@@ -15,6 +17,8 @@ distribution:
   subnet_from_pool_ratio:   0.4
   ipv6_ratio:               0.2
   subnets_attached_to_router_ratio: 0.6
+  routers_with_external_gateway_ratio: 0.3
+  floating_ip_associated_ratio:        0.5
 
 topology:
   router_attach_strategy:    random
