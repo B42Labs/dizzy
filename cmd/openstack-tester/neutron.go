@@ -30,7 +30,7 @@ func newNeutronCmd(opts *globalOptions) *cobra.Command {
 	}
 
 	cmd.AddCommand(
-		stub("generate", "Expand a scenario into a plan and dump it (never touches the API)", errNotImplemented),
+		newGenerateCmd(opts),
 		stub("apply", "Create resources from a plan, poll states, and record a run", errNotImplemented),
 		stub("status", "Re-query the current state of a run's resources", errNotImplemented),
 		stub("report", "Render metrics from a run record", errNotImplemented),
