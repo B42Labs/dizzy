@@ -6,14 +6,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// errNotImplemented is returned by the subcommand stubs whose behavior is
-// implemented in later work packages.
-var errNotImplemented = errors.New("not implemented yet")
-
 // newNeutronCmd builds the "neutron" command namespace and attaches its
-// subcommands. generate and apply are implemented; the remaining subcommands
-// are stubs until their owning work packages land, and list-networks is a
-// working auth/connectivity smoke test.
+// subcommands. generate, apply, status, report, and cleanup are implemented;
+// verify is a Phase 2 stub, and list-networks is a working auth/connectivity
+// smoke test.
 func newNeutronCmd(opts *globalOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "neutron",
@@ -35,7 +31,7 @@ func newNeutronCmd(opts *globalOptions) *cobra.Command {
 		newApplyCmd(opts),
 		newStatusCmd(opts),
 		newReportCmd(opts),
-		stub("cleanup", "Delete all resources belonging to a run, by tag", errNotImplemented),
+		newCleanupCmd(opts),
 		stub("verify", "Compare a run against OVN/OVS (Phase 2)", errors.New("not implemented yet (Phase 2)")),
 		newListNetworksCmd(opts),
 	)
