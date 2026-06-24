@@ -92,7 +92,7 @@ func TestNeutronHelpRuns(t *testing.T) {
 }
 
 func TestNeutronStubsReturnNotImplemented(t *testing.T) {
-	for _, name := range []string{"generate", "apply", "status", "report", "cleanup", "verify"} {
+	for _, name := range []string{"status", "report", "cleanup", "verify"} {
 		t.Run(name, func(t *testing.T) {
 			root := newRootCmd()
 			root.SetOut(io.Discard)

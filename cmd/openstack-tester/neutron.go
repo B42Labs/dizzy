@@ -31,7 +31,7 @@ func newNeutronCmd(opts *globalOptions) *cobra.Command {
 
 	cmd.AddCommand(
 		newGenerateCmd(opts),
-		stub("apply", "Create resources from a plan, poll states, and record a run", errNotImplemented),
+		newApplyCmd(opts),
 		stub("status", "Re-query the current state of a run's resources", errNotImplemented),
 		stub("report", "Render metrics from a run record", errNotImplemented),
 		stub("cleanup", "Delete all resources belonging to a run, by tag", errNotImplemented),
