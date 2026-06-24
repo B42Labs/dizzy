@@ -1,0 +1,21 @@
+name: large
+seed: 7654321                 # deterministic; same seed => same plan
+
+resources:
+  subnet_pools:    6
+  address_scopes:  0
+  networks:        200
+  routers:         40
+  security_groups: 30
+
+distribution:
+  subnets_per_network:      { min: 1, max: 3 }    # ~400 subnets total
+  ports_per_network:        { min: 0, max: 5 }
+  rules_per_security_group: { min: 2, max: 12 }
+  subnet_from_pool_ratio:   0.4
+  ipv6_ratio:               0.2
+  subnets_attached_to_router_ratio: 0.6
+
+topology:
+  router_attach_strategy:    random
+  port_security_group_count: { min: 1, max: 3 }
