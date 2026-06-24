@@ -63,6 +63,12 @@ func newApplyCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("creating network client: %w", err)
 			}
 
+			// Abort an oversized plan before creating anything, turning a late,
+			// messy mid-apply quota failure into an early, clear one.
+			if err := neutron.PrecheckQuota(ctx, gc, p); err != nil {
+				return err
+			}
+
 			collector := metrics.NewCollector()
 			client := neutron.New(gc, runID, collector)
 

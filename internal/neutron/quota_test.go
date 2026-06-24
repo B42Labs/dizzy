@@ -1,0 +1,134 @@
+package neutron
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
+	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/quotas"
+
+	"github.com/B42Labs/openstack-tester/internal/plan"
+)
+
+// TestPlanNeedsCounts confirms planNeeds tallies each kind, summing nested
+// security-group rules and counting router interfaces against the port quota.
+func TestPlanNeedsCounts(t *testing.T) {
+	p := &plan.Plan{
+		Networks:    []plan.Network{{Name: "n1"}, {Name: "n2"}},
+		Subnets:     []plan.Subnet{{Name: "s1"}},
+		Routers:     []plan.Router{{Name: "r1"}},
+		SubnetPools: []plan.SubnetPool{{Name: "p1"}},
+		RouterInterfaces: []plan.RouterInterface{
+			{Name: "ri1"}, {Name: "ri2"},
+		},
+		SecurityGroups: []plan.SecurityGroup{
+			{Name: "sg1", Rules: []plan.SecurityGroupRule{{Direction: "ingress"}, {Direction: "egress"}}},
+			{Name: "sg2", Rules: []plan.SecurityGroupRule{{Direction: "ingress"}}},
+		},
+		Ports: []plan.Port{{Name: "port1"}},
+	}
+
+	got := planNeeds(p)
+	want := needs{
+		networks:       2,
+		subnets:        1,
+		routers:        1,
+		securityGroups: 2,
+		securityRules:  3,
+		ports:          3, // 1 explicit port + 2 router-interface ports
+		subnetPools:    1,
+	}
+	if got != want {
+		t.Errorf("planNeeds = %+v, want %+v", got, want)
+	}
+}
+
+// TestCheckQuotaBlocksOversized covers the "an oversized plan is blocked up
+// front" acceptance criterion: checkQuota returns an itemized error naming every
+// exceeded resource type.
+func TestCheckQuotaBlocksOversized(t *testing.T) {
+	need := needs{networks: 100, subnets: 200, routers: 20, securityGroups: 15, securityRules: 200, ports: 300, subnetPools: 3}
+	q := &quotas.Quota{Network: 10, Subnet: 10, Router: 10, SecurityGroup: 10, SecurityGroupRule: 100, Port: 50, SubnetPool: 10}
+
+	err := checkQuota(need, q)
+	if err == nil {
+		t.Fatal("expected an over-quota error, got nil")
+	}
+	for _, want := range []string{"networks", "subnets", "routers", "security groups", "security group rules", "ports"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not itemize %q", err.Error(), want)
+		}
+	}
+	// Subnet pools fit (3 <= 10) and must not be reported.
+	if strings.Contains(err.Error(), "subnet pools") {
+		t.Errorf("error %q reported subnet pools, which fit within quota", err.Error())
+	}
+}
+
+func TestCheckQuotaPassesWhenSufficient(t *testing.T) {
+	need := needs{networks: 5, subnets: 8, routers: 2, securityGroups: 3, securityRules: 20, ports: 40, subnetPools: 1}
+	q := &quotas.Quota{Network: 10, Subnet: 10, Router: 10, SecurityGroup: 10, SecurityGroupRule: 100, Port: 50, SubnetPool: 10}
+
+	if err := checkQuota(need, q); err != nil {
+		t.Errorf("checkQuota with sufficient quota returned %v, want nil", err)
+	}
+}
+
+// TestCheckQuotaTreatsNegativeAsUnlimited confirms a -1 limit (Neutron's
+// unlimited convention) never blocks, even for a large plan.
+func TestCheckQuotaTreatsNegativeAsUnlimited(t *testing.T) {
+	need := needs{networks: 100000, ports: 100000}
+	q := &quotas.Quota{Network: -1, Subnet: -1, Router: -1, SecurityGroup: -1, SecurityGroupRule: -1, Port: -1, SubnetPool: -1}
+
+	if err := checkQuota(need, q); err != nil {
+		t.Errorf("unlimited quota returned %v, want nil", err)
+	}
+}
+
+// quotaPrecheckClient builds a ServiceClient whose quota reads hit ts and whose
+// auth result yields a project id, so PrecheckQuota reaches the quota read.
+func quotaPrecheckClient(ts *httptest.Server) *gophercloud.ServiceClient {
+	gc := &gophercloud.ServiceClient{
+		ProviderClient: &gophercloud.ProviderClient{},
+		Endpoint:       ts.URL + "/",
+	}
+	ar := tokens.CreateResult{}
+	ar.Body = map[string]any{"token": map[string]any{"project": map[string]any{"id": "proj-1"}}}
+	_ = gc.SetTokenAndAuthResult(ar)
+	return gc
+}
+
+// TestPrecheckQuotaSurfacesTransientReadError covers the early-abort guarantee:
+// a transient quota-read failure (503) must surface as an error so the plan
+// aborts before creating anything, not fail open and let the apply proceed.
+func TestPrecheckQuotaSurfacesTransientReadError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer ts.Close()
+
+	gc := quotaPrecheckClient(ts)
+	err := PrecheckQuota(context.Background(), gc, &plan.Plan{Networks: []plan.Network{{Name: "n1"}}})
+	if err == nil {
+		t.Fatal("PrecheckQuota fell open on a transient 503 quota read; want a surfaced error")
+	}
+}
+
+// TestPrecheckQuotaFailsOpenWhenReadDenied confirms the one documented fail-open
+// case still holds: a 403 quota read denial (a common non-admin restriction) is
+// skipped with a warning rather than aborting the apply.
+func TestPrecheckQuotaFailsOpenWhenReadDenied(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer ts.Close()
+
+	gc := quotaPrecheckClient(ts)
+	if err := PrecheckQuota(context.Background(), gc, &plan.Plan{Networks: []plan.Network{{Name: "n1"}}}); err != nil {
+		t.Errorf("PrecheckQuota should fail open on a 403 quota read denial, got %v", err)
+	}
+}
