@@ -4,6 +4,7 @@ package neutron_test
 
 import (
 	"context"
+	"os"
 	"slices"
 	"strconv"
 	"testing"
@@ -24,14 +25,14 @@ import (
 // OpenStack, so the external dependency is exercised here rather than mocked.
 // Run with: OS_CLOUD=<cloud> go test -tags integration ./internal/neutron/
 func TestWrappers_Integration(t *testing.T) {
-	if testing.Short() {
-		t.Skip("integration test skipped in -short mode")
+	if os.Getenv("OS_CLOUD") == "" {
+		t.Skip("OS_CLOUD not set; skipping integration test")
 	}
 
 	ctx := t.Context()
 	gc, err := config.NewNetworkClient(ctx, "")
 	if err != nil {
-		t.Skipf("no usable cloud configured: %v", err)
+		t.Fatalf("NewNetworkClient: %v", err)
 	}
 
 	runID := "it" + strconv.FormatInt(time.Now().Unix(), 36)
