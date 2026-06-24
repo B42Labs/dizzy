@@ -309,6 +309,10 @@ func (e *engine) step(ctx context.Context, offset time.Duration) {
 
 	nd := e.nodes[idx]
 	e.decisions = append(e.decisions, Decision{Offset: offset, Action: action, Kind: nd.Kind, Key: nd.Key})
+	// Announce each scheduled action so a churn run shows what it is doing
+	// instead of going silent until its final report. Logged at info (per
+	// action); silence it with --log-level warn. No-ops are not logged.
+	slog.Info("churn "+action, "kind", nd.Kind, "key", nd.Key, "offset", offset.Round(time.Millisecond))
 	if action == "create" {
 		e.dispatchCreate(ctx, idx, offset)
 	} else {

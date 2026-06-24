@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -45,7 +46,8 @@ func newCleanupCmd(opts *globalOptions) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("creating network client: %w", err)
 			}
-			client := neutron.New(gc, id, metrics.NewCollector())
+			collector := metrics.NewCollector()
+			client := neutron.New(gc, id, collector)
 
 			// Address scopes cannot be discovered by tag and are reclaimed only
 			// from a run record. Cleaning up from a bare id leaves any behind.
@@ -53,7 +55,9 @@ func newCleanupCmd(opts *globalOptions) *cobra.Command {
 				slog.Warn("cleaning up by id without a run record; resources that cannot be discovered by tag (e.g. address scopes) will not be reclaimed — pass --run to reclaim them", "run", id)
 			}
 
+			hb := startHeartbeat(ctx, "cleanup in progress", collectorSnapshot(collector, time.Now()))
 			deleted, cleanupErr := executor.Cleanup(ctx, client, id, recorded)
+			hb.stop()
 			// Report progress even on partial failure so an interrupted sweep is
 			// never silent about what it already removed.
 			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "deleted %d resource(s) for run %s\n", deleted, id); err != nil {

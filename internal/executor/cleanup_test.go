@@ -1,7 +1,9 @@
 package executor
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"slices"
 	"strings"
 	"testing"
@@ -81,6 +83,32 @@ func seedFullTopology() *fakeCleaner {
 // idx returns the position of event in the log, or -1 if it never occurred.
 func idx(events []string, event string) int {
 	return slices.Index(events, event)
+}
+
+// TestCleanupLogsEachDelete confirms the teardown announces every resource it
+// removes, so an operator watching cleanup run sees what it is deleting rather
+// than only the final count. It captures the info-level logs (the package's
+// TestMain discards them by default) and checks a line per deleted id.
+func TestCleanupLogsEachDelete(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	defer slog.SetDefault(old)
+
+	f := seedFullTopology()
+	if _, err := Cleanup(context.Background(), f, "run0", nil); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	logged := buf.String()
+	for _, id := range []string{"p1", "r1", "s1", "g1", "n1", "sp1"} {
+		if !strings.Contains(logged, "id="+id) {
+			t.Errorf("no delete log line for id %q; log=%q", id, logged)
+		}
+	}
+	if got := strings.Count(logged, "deleting resource"); got != 6 {
+		t.Errorf("logged %d delete lines, want 6; log=%q", got, logged)
+	}
 }
 
 // TestCleanupReverseDependencyOrder confirms the teardown order: our own ports

@@ -60,6 +60,23 @@ func (c *Collector) RecordReadiness(r Readiness) {
 	c.readiness = append(c.readiness, r)
 }
 
+// Snapshot returns the live counts accumulated so far: the total number of
+// recorded API-call samples, how many succeeded, and how many failed. It is
+// cheap (a single pass, no percentile math) and safe for concurrent use, so a
+// progress heartbeat can poll it on its own goroutine while the executor's
+// workers keep recording into the collector.
+func (c *Collector) Snapshot() (attempted, succeeded, failed int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	attempted = len(c.samples)
+	for _, s := range c.samples {
+		if s.Success {
+			succeeded++
+		}
+	}
+	return attempted, succeeded, attempted - succeeded
+}
+
 // Aggregate summarizes every recorded sample over the supplied wall-clock
 // duration: overall and per-type counts, latency percentiles, and throughput,
 // plus an error breakdown by kind and per-type time-to-ready statistics.

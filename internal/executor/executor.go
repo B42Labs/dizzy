@@ -278,6 +278,10 @@ func (e *applier) provision(ctx context.Context, create func(context.Context) (n
 	if err != nil {
 		return neutron.Resource{}, err
 	}
+	// Announce each created resource so a long apply shows steady progress
+	// instead of going silent between its start and its final metrics. Logged at
+	// info (per resource); silence it with --log-level warn.
+	slog.Info("created resource", "kind", res.Kind, "logical", res.Logical, "id", res.ID)
 
 	readyCtx, cancel := context.WithTimeout(ctx, e.opTimeout)
 	defer cancel()

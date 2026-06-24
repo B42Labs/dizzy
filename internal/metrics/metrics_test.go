@@ -107,6 +107,26 @@ func TestAggregate(t *testing.T) {
 
 // TestAggregateEmpty confirms aggregating a collector with no samples is safe
 // and yields zeroed statistics rather than a panic or a divide-by-zero.
+// TestSnapshot covers the cheap live-count path a progress heartbeat polls:
+// the empty collector reports all zeros, and after a mix of successes and
+// failures the attempted/succeeded/failed split matches the recorded samples.
+func TestSnapshot(t *testing.T) {
+	c := NewCollector()
+	if a, s, f := c.Snapshot(); a != 0 || s != 0 || f != 0 {
+		t.Errorf("empty snapshot = (%d,%d,%d), want (0,0,0)", a, s, f)
+	}
+
+	c.Record(Sample{Type: "network", Duration: ms(10), Success: true})
+	c.Record(Sample{Type: "network", Duration: ms(20), Success: true})
+	c.Record(Sample{Type: "subnet", Duration: ms(30), Success: false, ErrKind: "http_500"})
+	// Readiness records are not API-call samples, so they must not move the count.
+	c.RecordReadiness(Readiness{Type: "network", Duration: ms(5), OK: true})
+
+	if a, s, f := c.Snapshot(); a != 3 || s != 2 || f != 1 {
+		t.Errorf("snapshot = (%d,%d,%d), want (3,2,1)", a, s, f)
+	}
+}
+
 func TestAggregateEmpty(t *testing.T) {
 	agg := NewCollector().Aggregate(0)
 	if agg.Overall.Attempted != 0 || agg.Overall.Throughput != 0 {

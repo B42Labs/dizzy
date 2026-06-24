@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/B42Labs/openstack-tester/internal/neutron"
 )
@@ -165,6 +166,10 @@ func deleteKind(ctx context.Context, c Cleaner, kind neutron.Kind, runID string)
 func deleteResources(ctx context.Context, c Cleaner, resources []neutron.Resource) (int, error) {
 	var deleted int
 	for _, r := range resources {
+		// Announce each delete so a teardown shows what it is removing instead of
+		// going silent until its final count. Logged at info (per resource);
+		// silence it with --log-level warn.
+		slog.Info("deleting resource", "kind", r.Kind, "id", r.ID)
 		if err := c.Delete(ctx, r); err != nil {
 			if neutron.IsNotFound(err) {
 				continue

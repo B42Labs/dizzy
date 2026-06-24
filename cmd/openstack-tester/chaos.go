@@ -112,7 +112,9 @@ func newChaosCmd(opts *globalOptions) *cobra.Command {
 				"maxParallel", cfg.MaxParallel, "concurrency", cfg.Concurrency)
 
 			start := time.Now()
+			hb := startHeartbeat(ctx, "churn in progress", collectorSnapshot(collector, start, "duration", cfg.Duration))
 			result, runErr := chaos.Run(ctx, client, p, cfg, chaos.RealClock{})
+			hb.stop()
 			finished := time.Now()
 			if runErr != nil {
 				return fmt.Errorf("running churn (run %s): %w", runID, runErr)

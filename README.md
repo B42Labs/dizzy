@@ -366,6 +366,14 @@ still carrying the run tag after the topology should be gone.
   resources are instead reclaimed at cleanup from the run record, by id.
 - **Naming**: deterministic names like `ostester-<id>-net-0001` for easy
   identification in Horizon / the CLI.
+- **Progress output**: long-running commands are not silent between their start
+  and their final summary. `apply`, `chaos`, and `cleanup` log a line per
+  operation to stderr — each created resource, each scheduled churn create /
+  delete, each teardown delete — plus a periodic one-line heartbeat with the
+  cumulative op count, the rate since the last tick, the ok/failed split, and
+  elapsed time. All of it is at `info`, so `--log-level warn` silences it while
+  keeping warnings and errors; the final metrics summary and run-record path
+  still go to stdout regardless.
 
 The **churn / soak mode** (`chaos`) reuses all of the above and adds a
 single-threaded, seeded **scheduler** over the plan: each tick it draws a random

@@ -1,12 +1,14 @@
 package chaos
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -609,6 +611,34 @@ func TestRunSkipsDoomedDescendantsOfFailedCreate(t *testing.T) {
 	// the cloud: dispatchDelete returns before issuing an empty-id delete.
 	if f.emptyDeletes != 0 {
 		t.Errorf("%d deletes were issued with an empty resource id, want 0", f.emptyDeletes)
+	}
+}
+
+// TestRunLogsEachAction confirms the engine announces every scheduled create
+// and delete, so a churn run shows what it is doing instead of going silent
+// until its final report. It captures the info-level logs (the package's
+// TestMain discards them by default) and checks the count of "churn create" and
+// "churn delete" lines matches the deterministic decision counts in the result.
+func TestRunLogsEachAction(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	defer slog.SetDefault(old)
+
+	r, err := Run(context.Background(), newFake(), churnPlan(), testConfig(), newFakeClock())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if r.Creates == 0 || r.Deletes == 0 {
+		t.Fatalf("run scheduled %d creates and %d deletes; the test needs both", r.Creates, r.Deletes)
+	}
+
+	logged := buf.String()
+	if got := strings.Count(logged, `msg="churn create"`); got != r.Creates {
+		t.Errorf("logged %d churn-create lines, want %d (one per decision); log=%q", got, r.Creates, logged)
+	}
+	if got := strings.Count(logged, `msg="churn delete"`); got != r.Deletes {
+		t.Errorf("logged %d churn-delete lines, want %d (one per decision); log=%q", got, r.Deletes, logged)
 	}
 }
 

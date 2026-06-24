@@ -97,7 +97,9 @@ func newApplyCmd(opts *globalOptions) *cobra.Command {
 				"concurrency", opts.concurrency)
 
 			start := time.Now()
+			hb := startHeartbeat(ctx, "apply in progress", collectorSnapshot(collector, start))
 			res, applyErr := executor.Apply(ctx, runID, client, p, opts.concurrency, opts.timeout, externalNetworkID)
+			hb.stop()
 			finished := time.Now()
 			wall := finished.Sub(start)
 			agg := collector.Aggregate(wall)

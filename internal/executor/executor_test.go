@@ -383,6 +383,33 @@ func TestApplyReadinessTimeoutWarns(t *testing.T) {
 	}
 }
 
+// TestApplyLogsEachCreatedResource confirms apply announces every resource it
+// creates, so a long apply shows steady progress instead of going silent until
+// its final metrics. It captures the info-level logs (the package's TestMain
+// discards them by default) and checks a line per created network.
+func TestApplyLogsEachCreatedResource(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	defer slog.SetDefault(old)
+
+	f := newFake()
+	p := &plan.Plan{Networks: []plan.Network{{Name: "net-0"}, {Name: "net-1"}, {Name: "net-2"}}}
+	if _, err := Apply(context.Background(), "run0", f, p, 2, time.Minute, ""); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	logged := buf.String()
+	for _, name := range []string{"net-0", "net-1", "net-2"} {
+		if !strings.Contains(logged, "logical="+name) {
+			t.Errorf("no created-resource log line for %q; log=%q", name, logged)
+		}
+	}
+	if got := strings.Count(logged, "created resource"); got != 3 {
+		t.Errorf("logged %d created-resource lines, want 3; log=%q", got, logged)
+	}
+}
+
 // TestApplyConflictRetriesCapped confirms a permanent 409 conflict fails after
 // conflictMaxAttempts rather than spending the full maxAttempts retry budget.
 func TestApplyConflictRetriesCapped(t *testing.T) {
