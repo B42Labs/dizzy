@@ -139,4 +139,19 @@ func TestWrappers_Integration(t *testing.T) {
 	if status, err := c.Get(ctx, net); err != nil || status == "" {
 		t.Errorf("Get(network) = %q, %v; want a status and no error", status, err)
 	}
+
+	// Tag-based discovery (the basis of cleanup) finds this run's network.
+	tagged, err := c.ListByTag(ctx, neutron.KindNetwork, runID)
+	if err != nil {
+		t.Errorf("ListByTag(network): %v", err)
+	}
+	if !slices.ContainsFunc(tagged, func(r neutron.Resource) bool { return r.ID == net.ID }) {
+		t.Errorf("ListByTag(network) did not find %s; got %v", net.ID, tagged)
+	}
+
+	// The quota pre-check passes for a one-network plan (or fails open if the
+	// project cannot read its own quota), so it must not error here.
+	if err := neutron.PrecheckQuota(ctx, gc, &plan.Plan{Networks: []plan.Network{{Name: "net-0001"}}}); err != nil {
+		t.Errorf("PrecheckQuota for a one-network plan: %v", err)
+	}
 }
