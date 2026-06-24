@@ -3,6 +3,7 @@ package scenario
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // mediumScenario returns the README §6 example values, a known-valid scenario
@@ -83,6 +84,145 @@ topology:
 	}
 	if want := mediumScenario(); got != want {
 		t.Errorf("Parse() = %+v, want %+v", got, want)
+	}
+}
+
+func TestParseChaosBlock(t *testing.T) {
+	const yaml = `
+name: churn
+resources:
+  networks: 1
+chaos:
+  duration: 30m
+  interval: { min: 200ms, max: 3s }
+  parallel: { max: 6 }
+  churn_ratio: 0.5
+  target_fill: 0.8
+`
+	got, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse() = %v, want nil", err)
+	}
+	if got.Chaos == nil {
+		t.Fatal("Parse() left Chaos nil for a scenario with a chaos block")
+	}
+	c := got.Chaos
+	if time.Duration(c.Duration) != 30*time.Minute {
+		t.Errorf("duration = %s, want 30m", time.Duration(c.Duration))
+	}
+	if time.Duration(c.Interval.Min) != 200*time.Millisecond {
+		t.Errorf("interval.min = %s, want 200ms", time.Duration(c.Interval.Min))
+	}
+	if time.Duration(c.Interval.Max) != 3*time.Second {
+		t.Errorf("interval.max = %s, want 3s", time.Duration(c.Interval.Max))
+	}
+	if c.Parallel.Max != 6 {
+		t.Errorf("parallel.max = %d, want 6", c.Parallel.Max)
+	}
+	if c.ChurnRatio != 0.5 || c.TargetFill != 0.8 {
+		t.Errorf("churn_ratio/target_fill = %v/%v, want 0.5/0.8", c.ChurnRatio, c.TargetFill)
+	}
+}
+
+func TestParseWithoutChaosBlockLeavesNil(t *testing.T) {
+	got, err := Parse([]byte("name: plain\nresources:\n  networks: 1\n"))
+	if err != nil {
+		t.Fatalf("Parse() = %v, want nil", err)
+	}
+	if got.Chaos != nil {
+		t.Errorf("Parse() set Chaos to %+v for a scenario with no chaos block, want nil", got.Chaos)
+	}
+}
+
+func TestParseRejectsUnknownChaosField(t *testing.T) {
+	const yaml = `
+name: churn
+chaos:
+  duration: 1m
+  parallelism: { max: 6 }
+`
+	if _, err := Parse([]byte(yaml)); err == nil {
+		t.Fatal("Parse() = nil, want error for unknown chaos field")
+	}
+}
+
+func TestParseRejectsBadChaosDuration(t *testing.T) {
+	const yaml = `
+name: churn
+chaos:
+  duration: soon
+`
+	if _, err := Parse([]byte(yaml)); err == nil {
+		t.Fatal("Parse() = nil, want error for unparseable chaos.duration")
+	}
+}
+
+func TestChaosBlockValidate(t *testing.T) {
+	base := func() *Chaos {
+		return &Chaos{
+			Duration:   Duration(30 * time.Minute),
+			Interval:   Interval{Min: Duration(200 * time.Millisecond), Max: Duration(3 * time.Second)},
+			Parallel:   Parallel{Max: 6},
+			ChurnRatio: 0.5,
+			TargetFill: 0.8,
+		}
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(c *Chaos)
+		wantErr string
+	}{
+		{name: "valid", mutate: func(*Chaos) {}},
+		{
+			name:    "interval min exceeds max",
+			mutate:  func(c *Chaos) { c.Interval = Interval{Min: Duration(3 * time.Second), Max: Duration(time.Second)} },
+			wantErr: "chaos.interval.min",
+		},
+		{
+			name:    "negative interval",
+			mutate:  func(c *Chaos) { c.Interval.Min = Duration(-time.Second) },
+			wantErr: "chaos.interval.min must not be negative",
+		},
+		{
+			name:    "negative parallel max",
+			mutate:  func(c *Chaos) { c.Parallel.Max = -1 },
+			wantErr: "chaos.parallel.max must not be negative",
+		},
+		{
+			name:    "churn ratio above one",
+			mutate:  func(c *Chaos) { c.ChurnRatio = 1.5 },
+			wantErr: "chaos.churn_ratio must be between 0 and 1",
+		},
+		{
+			name:    "target fill below zero",
+			mutate:  func(c *Chaos) { c.TargetFill = -0.1 },
+			wantErr: "chaos.target_fill must be between 0 and 1",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := mediumScenario()
+			c := base()
+			tc.mutate(c)
+			s.Chaos = c
+
+			err := s.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Validate() = nil, want error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("Validate() = %q, want it to contain %q", err.Error(), tc.wantErr)
+			}
+		})
 	}
 }
 
