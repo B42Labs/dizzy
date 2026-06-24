@@ -30,6 +30,35 @@ type Record struct {
 	Created    []neutron.Resource `json:"created"`
 	Error      string             `json:"error,omitempty"`
 	Metrics    metrics.Aggregate  `json:"metrics"`
+	// Chaos holds the churn-specific statistics of a soak/chaos run. It is nil
+	// for an apply run, so an apply record's shape is unchanged.
+	Chaos *ChaosStats `json:"chaos,omitempty"`
+}
+
+// ChaosStats holds the churn-specific statistics of a soak/chaos run, persisted
+// alongside the standard metrics: the create/delete and completed-cycle counts,
+// the live-population summary over the run, the controller's target fill, and
+// per-time-bucket latency/error statistics. The schema lives here, not in the
+// chaos package, so the read-side commands (report, status) can render it
+// without importing the engine. It mirrors chaos.Result.
+type ChaosStats struct {
+	Creates    int           `json:"creates"`
+	Deletes    int           `json:"deletes"`
+	Cycles     int           `json:"cycles"`
+	PopMin     int           `json:"popMin"`
+	PopMax     int           `json:"popMax"`
+	PopMean    float64       `json:"popMean"`
+	TargetFill float64       `json:"targetFill"`
+	Buckets    []ChaosBucket `json:"buckets,omitempty"`
+}
+
+// ChaosBucket is one equal-width time slice of a churn run: the operations whose
+// decision offset fell within it, summarized so latency and error degradation
+// over time is visible rather than only an aggregate.
+type ChaosBucket struct {
+	Start  time.Duration        `json:"start"`
+	Stats  metrics.Stats        `json:"stats"`
+	Errors []metrics.ErrorCount `json:"errors,omitempty"`
 }
 
 // Write marshals r as indented JSON and writes it to dir as run-<id>.json,

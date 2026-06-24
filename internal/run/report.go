@@ -21,18 +21,76 @@ var csvHeader = []string{
 }
 
 // WriteTable renders the run's metrics as the compact human-readable summary,
-// the default report format.
+// the default report format. For a churn run it appends the churn-specific
+// summary and the per-time-bucket latency/error table after the standard
+// metrics; an apply run (Chaos nil) renders exactly as before.
 func WriteTable(w io.Writer, r *Record) error {
 	if _, err := io.WriteString(w, r.Metrics.Summary()); err != nil {
 		return fmt.Errorf("writing table report: %w", err)
 	}
+	if r.Chaos != nil {
+		if err := writeChaosTable(w, r.Chaos); err != nil {
+			return fmt.Errorf("writing chaos report: %w", err)
+		}
+	}
 	return nil
 }
 
+// writeChaosTable renders the churn counters, the population summary, and a
+// per-bucket latency/error table.
+func writeChaosTable(w io.Writer, c *ChaosStats) error {
+	var b strings.Builder
+	b.WriteString("\nChurn summary\n")
+	fmt.Fprintf(&b, "  creates:    %d\n", c.Creates)
+	fmt.Fprintf(&b, "  deletes:    %d\n", c.Deletes)
+	fmt.Fprintf(&b, "  cycles:     %d\n", c.Cycles)
+	fmt.Fprintf(&b, "  population: min %d / mean %.1f / max %d (target fill %.2f)\n",
+		c.PopMin, c.PopMean, c.PopMax, c.TargetFill)
+
+	if len(c.Buckets) > 0 {
+		b.WriteString("\nLatency and errors over time\n")
+		fmt.Fprintf(&b, "%-12s  %5s  %5s  %6s  %10s  %10s  %s\n",
+			"START", "OPS", "OK", "FAILED", "P50", "P99", "ERRORS")
+		for _, bk := range c.Buckets {
+			fmt.Fprintf(&b, "%-12s  %5d  %5d  %6d  %10s  %10s  %s\n",
+				bk.Start.Round(time.Millisecond), bk.Stats.Attempted, bk.Stats.Succeeded, bk.Stats.Failed,
+				bk.Stats.Latency.Median.Round(time.Millisecond), bk.Stats.Latency.P99.Round(time.Millisecond),
+				formatBucketErrors(bk.Errors))
+		}
+	}
+
+	if _, err := io.WriteString(w, b.String()); err != nil {
+		return fmt.Errorf("writing chaos table: %w", err)
+	}
+	return nil
+}
+
+// formatBucketErrors renders a bucket's error breakdown as "kind=count" pairs,
+// or "-" when the bucket had no errors.
+func formatBucketErrors(errs []metrics.ErrorCount) string {
+	if len(errs) == 0 {
+		return "-"
+	}
+	parts := make([]string, 0, len(errs))
+	for _, e := range errs {
+		parts = append(parts, fmt.Sprintf("%s=%d", e.Kind, e.Count))
+	}
+	return strings.Join(parts, ", ")
+}
+
 // WriteJSON renders the run's metrics as indented JSON, the machine-readable
-// report format.
+// report format. A churn run additionally carries its chaos statistics under a
+// "chaos" key; an apply run (Chaos nil) marshals just the metrics aggregate, so
+// its JSON shape is unchanged.
 func WriteJSON(w io.Writer, r *Record) error {
-	data, err := json.MarshalIndent(r.Metrics, "", "  ")
+	var payload any = r.Metrics
+	if r.Chaos != nil {
+		payload = struct {
+			Metrics metrics.Aggregate `json:"metrics"`
+			Chaos   *ChaosStats       `json:"chaos"`
+		}{Metrics: r.Metrics, Chaos: r.Chaos}
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encoding metrics: %w", err)
 	}

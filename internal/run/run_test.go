@@ -59,6 +59,35 @@ func TestRecordRoundTrip(t *testing.T) {
 	}
 }
 
+// TestRecordRoundTripWithChaos confirms a churn record's chaos statistics
+// survive a write/load round trip intact.
+func TestRecordRoundTripWithChaos(t *testing.T) {
+	dir := t.TempDir()
+	rec := sampleRecord()
+	rec.RunID = "chaos001"
+	rec.Chaos = &ChaosStats{
+		Creates: 12, Deletes: 9, Cycles: 9,
+		PopMin: 0, PopMax: 5, PopMean: 3.25, TargetFill: 0.6,
+		Buckets: []ChaosBucket{{
+			Start:  10 * time.Second,
+			Stats:  metrics.Stats{Attempted: 2, Succeeded: 1, Failed: 1},
+			Errors: []metrics.ErrorCount{{Kind: "quota", Count: 1}},
+		}},
+	}
+
+	path, err := Write(dir, rec)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !reflect.DeepEqual(rec, loaded) {
+		t.Errorf("chaos round-trip mismatch:\n got %+v\nwant %+v", loaded, rec)
+	}
+}
+
 // TestLoadMissingFile confirms loading a record that does not exist returns an
 // error rather than a zero-valued record.
 func TestLoadMissingFile(t *testing.T) {
