@@ -267,7 +267,7 @@ func stage[T any](ctx context.Context, e *applier, items []T, create func(contex
 // of the parent context stops the run.
 func (e *applier) provision(ctx context.Context, create func(context.Context) (neutron.Resource, error)) (neutron.Resource, error) {
 	var res neutron.Resource
-	err := withRetry(ctx, e.opTimeout, func(ctx context.Context) error {
+	err := WithRetry(ctx, e.opTimeout, func(ctx context.Context) error {
 		r, err := create(ctx)
 		if err != nil {
 			return err
@@ -366,12 +366,14 @@ dispatch:
 	return results, nil
 }
 
-// withRetry runs fn, bounding each attempt with opTimeout, and retries transient
+// WithRetry runs fn, bounding each attempt with opTimeout, and retries transient
 // errors with exponential backoff up to maxAttempts (or conflictMaxAttempts for
 // 409 conflicts, which are usually permanent). It returns immediately on
 // success, on a quota error (so the run fails fast), or on any non-retryable
-// error. Backoff sleeps honor the parent context.
-func withRetry(ctx context.Context, opTimeout time.Duration, fn func(context.Context) error) error {
+// error. Backoff sleeps honor the parent context. It is exported so the chaos
+// churn engine drives its create/delete operations through the same transient/
+// conflict/quota backoff policy the apply executor uses.
+func WithRetry(ctx context.Context, opTimeout time.Duration, fn func(context.Context) error) error {
 	backoff := retryBaseDelay
 	var err error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {

@@ -16,8 +16,8 @@ func TestPercentileExact(t *testing.T) {
 		if got := percentile(nil, 50); got != 0 {
 			t.Errorf("percentile of empty = %s, want 0", got)
 		}
-		if got := computeLatency(nil); got != (Latency{}) {
-			t.Errorf("computeLatency of empty = %+v, want zero", got)
+		if got := ComputeLatency(nil); got != (Latency{}) {
+			t.Errorf("ComputeLatency of empty = %+v, want zero", got)
 		}
 	})
 
@@ -27,7 +27,7 @@ func TestPercentileExact(t *testing.T) {
 		for i := 1; i <= 100; i++ {
 			durs = append(durs, ms(i))
 		}
-		lat := computeLatency(durs)
+		lat := ComputeLatency(durs)
 		cases := []struct {
 			name string
 			got  time.Duration

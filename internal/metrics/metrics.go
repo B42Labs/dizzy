@@ -109,7 +109,7 @@ func (c *Collector) Aggregate(wall time.Duration) Aggregate {
 			}
 			durs = append(durs, r.Duration)
 		}
-		stats.Latency = computeLatency(durs)
+		stats.Latency = ComputeLatency(durs)
 		agg.Readiness = append(agg.Readiness, stats)
 	}
 	sort.Slice(agg.Readiness, func(i, j int) bool { return agg.Readiness[i].Type < agg.Readiness[j].Type })
@@ -175,16 +175,18 @@ func computeStats(typ string, samples []Sample, wall time.Duration) Stats {
 		durs = append(durs, s.Duration)
 	}
 	stats.Failed = stats.Attempted - stats.Succeeded
-	stats.Latency = computeLatency(durs)
+	stats.Latency = ComputeLatency(durs)
 	if wall > 0 {
 		stats.Throughput = float64(stats.Succeeded) / wall.Seconds()
 	}
 	return stats
 }
 
-// computeLatency returns the latency distribution of the supplied durations.
-// The zero Latency is returned for an empty input.
-func computeLatency(durs []time.Duration) Latency {
+// ComputeLatency returns the latency distribution of the supplied durations,
+// the same computation Aggregate applies per group. It is exported so the chaos
+// churn engine can summarize each time bucket's latency without re-implementing
+// the percentile math. The zero Latency is returned for an empty input.
+func ComputeLatency(durs []time.Duration) Latency {
 	if len(durs) == 0 {
 		return Latency{}
 	}
