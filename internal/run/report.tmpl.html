@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run report: {{.Header.RunID}}</title>
+<style>
+:root {
+  --fg: #1b1f24; --muted: #5b6570; --line: #d7dde3; --bg: #ffffff;
+  --panel: #f6f8fa; --ok: #2da44e; --fail: #cf222e; --bar: #4493f8;
+  --p50: #8250df; --p99: #bc4c00;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 24px; background: var(--bg); color: var(--fg);
+  font: 14px/1.5 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+}
+h1 { font-size: 20px; margin: 0 0 4px; }
+h2 { font-size: 16px; margin: 28px 0 10px; }
+.muted { color: var(--muted); }
+.banner { padding: 10px 14px; border-radius: 6px; margin: 12px 0; font-weight: 600; }
+.banner.ok { background: #dafbe1; color: #116329; }
+.banner.fail { background: #ffebe9; color: #82071e; }
+.banner .detail { font-weight: 400; margin-top: 4px; word-break: break-word; }
+.meta { color: var(--muted); }
+.meta b { color: var(--fg); font-weight: 600; }
+.kpis { display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0; }
+.kpi {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px 16px; min-width: 130px;
+}
+.kpi .v { font-size: 22px; font-weight: 700; }
+.kpi .l { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+table { border-collapse: collapse; width: 100%; }
+th, td { padding: 6px 10px; border-bottom: 1px solid var(--line); text-align: right; }
+th:first-child, td:first-child { text-align: left; }
+thead th { color: var(--muted); font-weight: 600; }
+.sortable thead th { cursor: pointer; user-select: none; white-space: nowrap; }
+.sortable thead th::after { content: ""; }
+.sortable thead th.asc::after { content: " \25B2"; }
+.sortable thead th.desc::after { content: " \25BC"; }
+svg { max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.lbl { fill: var(--fg); font-size: 12px; }
+.cap { fill: var(--muted); font-size: 12px; }
+.axis { fill: var(--muted); font-size: 11px; }
+.grid { stroke: var(--line); stroke-width: 1; }
+.lat-line { stroke: var(--muted); stroke-width: 2; }
+.lat-band { fill: var(--bar); }
+.seg-ok { fill: var(--ok); }
+.seg-fail { fill: var(--fail); }
+.bar { fill: var(--bar); }
+.bar-fail { fill: var(--fail); }
+.line-p50 { fill: none; stroke: var(--p50); stroke-width: 1.5; }
+.line-p99 { fill: none; stroke: var(--p99); stroke-width: 1.5; }
+.legend { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+.legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin: 0 4px 0 12px; }
+.toggle { cursor: pointer; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; font: inherit; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.chip { background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; font-size: 13px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+[hidden] { display: none; }
+</style>
+</head>
+<body>
+
+<h1>Run report: {{.Header.RunID}}</h1>
+{{if .Header.Error}}
+<div class="banner fail">Run failed
+  <div class="detail">{{.Header.Error}}</div>
+</div>
+{{else}}
+<div class="banner ok">Run completed</div>
+{{end}}
+
+<p class="meta">
+  <b>scenario</b> {{.Header.Scenario}} &nbsp; <b>seed</b> {{.Header.Seed}} &nbsp;
+  <b>started</b> {{.Header.StartedAt}} &nbsp; <b>finished</b> {{.Header.FinishedAt}} &nbsp;
+  <b>wall</b> {{.Header.Wall}}
+</p>
+
+<div class="kpis">
+{{range .KPIs}}
+  <div class="kpi"><div class="v">{{.Value}}</div><div class="l">{{.Label}}</div></div>
+{{end}}
+</div>
+
+<h2>Per-type metrics</h2>
+<table class="sortable">
+  <thead><tr>{{range .Columns}}<th>{{.}}</th>{{end}}</tr></thead>
+  <tbody>
+  {{range .PerType}}
+    <tr>{{range .Cells}}<td data-sort="{{.Sort}}">{{.Text}}</td>{{end}}</tr>
+  {{end}}
+  </tbody>
+</table>
+
+<h2>Latency by type</h2>
+<svg viewBox="0 0 720 {{.Latency.Height}}" role="img" aria-label="latency range per resource type">
+  {{range .Latency.Bars}}
+  <text class="lbl" x="0" y="{{.TextY}}">{{.Label}}</text>
+  <line class="lat-line" x1="{{.LineX1}}" y1="{{.Y}}" x2="{{.LineX2}}" y2="{{.Y}}"></line>
+  <rect class="lat-band" x="{{.BandX}}" y="{{.Y}}" width="{{.BandW}}" height="6" transform="translate(0,-3)"></rect>
+  <text class="cap" x="660" y="{{.TextY}}">{{.Caption}}</text>
+  {{end}}
+</svg>
+<p class="legend">range min–max, band p50–p99. axis max {{.Latency.AxisMax}}.</p>
+
+<h2>Volume by type</h2>
+<svg viewBox="0 0 720 {{.Volume.Height}}" role="img" aria-label="attempted, succeeded and failed per resource type">
+  {{range .Volume.Bars}}
+  <text class="lbl" x="0" y="{{.TextY}}">{{.Label}}</text>
+  <rect class="seg-ok" x="{{.OKX}}" y="{{.Y}}" width="{{.OKW}}" height="14"></rect>
+  <rect class="seg-fail" x="{{.FailX}}" y="{{.Y}}" width="{{.FailW}}" height="14"></rect>
+  <text class="cap" x="660" y="{{.TextY}}">{{.Caption}}</text>
+  {{end}}
+</svg>
+<p class="legend"><span class="sw" style="background:var(--ok)"></span>succeeded<span class="sw" style="background:var(--fail)"></span>failed (total = attempted)</p>
+
+{{if .Errors}}
+<h2>Error breakdown</h2>
+<svg viewBox="0 0 720 {{.Errors.Height}}" role="img" aria-label="error count by kind">
+  {{range .Errors.Rows}}
+  <text class="lbl" x="0" y="{{.TextY}}">{{.Label}}</text>
+  <rect class="bar-fail" x="150" y="{{.Y}}" width="{{.W}}" height="14"></rect>
+  <text class="cap" x="660" y="{{.TextY}}">{{.Caption}}</text>
+  {{end}}
+</svg>
+{{end}}
+
+{{if .Readiness}}
+<h2>Time to ready</h2>
+<table>
+  <thead><tr><th>type</th><th>ready</th><th>median</th><th>max</th></tr></thead>
+  <tbody>
+  {{range .Readiness}}
+    <tr><td>{{.Type}}</td><td>{{.Ready}}</td><td>{{.Median}}</td><td>{{.Max}}</td></tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+
+<h2>Created resources ({{.Inventory.Total}})</h2>
+<div class="chips">
+{{range .Inventory.Counts}}
+  <span class="chip">{{.Kind}} &times; {{.Count}}</span>
+{{end}}
+</div>
+<button class="toggle" data-target="inventory-table">Show inventory</button>
+<div id="inventory-table" hidden>
+  <table>
+    <thead><tr><th>kind</th><th>logical</th><th>cloud name</th><th>uuid</th></tr></thead>
+    <tbody>
+    {{range .Inventory.Items}}
+      <tr><td>{{.Kind}}</td><td>{{.Logical}}</td><td>{{.Name}}</td><td class="mono">{{.ID}}</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{if .Inventory.Truncated}}<p class="muted">&hellip;and {{.Inventory.Truncated}} more not shown</p>{{end}}
+</div>
+
+{{if .Chaos}}
+<h2>Chaos churn</h2>
+<div class="chips">
+  <span class="chip">creates {{.Chaos.Creates}}</span>
+  <span class="chip">deletes {{.Chaos.Deletes}}</span>
+  <span class="chip">cycles {{.Chaos.Cycles}}</span>
+  <span class="chip">population {{.Chaos.PopMin}} / {{.Chaos.PopMean}} / {{.Chaos.PopMax}}</span>
+  <span class="chip">target fill {{.Chaos.TargetFill}}</span>
+</div>
+{{if .Chaos.HasBuckets}}
+<h2>Throughput over time</h2>
+<svg viewBox="0 0 720 {{.Chaos.Volume.Height}}" role="img" aria-label="attempted and failed operations per time bucket">
+  <line class="grid" x1="46" y1="{{.Chaos.Volume.Baseline}}" x2="704" y2="{{.Chaos.Volume.Baseline}}"></line>
+  {{range .Chaos.Volume.Bars}}
+  <rect class="bar" x="{{.X}}" y="{{.Y}}" width="{{.W}}" height="{{.H}}"></rect>
+  {{if .HasFail}}<rect class="bar-fail" x="{{.X}}" y="{{.FailY}}" width="{{.W}}" height="{{.FailH}}"></rect>{{end}}
+  {{end}}
+  <text class="axis" x="46" y="{{.Chaos.Volume.Baseline}}" dy="16">{{.Chaos.Volume.FirstTime}}</text>
+  <text class="axis" x="704" y="{{.Chaos.Volume.Baseline}}" dy="16" text-anchor="end">{{.Chaos.Volume.LastTime}}</text>
+</svg>
+<p class="legend"><span class="sw" style="background:var(--bar)"></span>attempted<span class="sw" style="background:var(--fail)"></span>failed. axis max {{.Chaos.Volume.AxisMax}} ops/bucket.</p>
+
+<h2>Latency over time</h2>
+<svg viewBox="0 0 720 {{.Chaos.Latency.Height}}" role="img" aria-label="p50 and p99 latency per time bucket">
+  <line class="grid" x1="46" y1="{{.Chaos.Latency.Baseline}}" x2="704" y2="{{.Chaos.Latency.Baseline}}"></line>
+  <polyline class="line-p50" points="{{.Chaos.Latency.P50Points}}"></polyline>
+  <polyline class="line-p99" points="{{.Chaos.Latency.P99Points}}"></polyline>
+  <text class="axis" x="46" y="{{.Chaos.Latency.Baseline}}" dy="16">{{.Chaos.Latency.FirstTime}}</text>
+  <text class="axis" x="704" y="{{.Chaos.Latency.Baseline}}" dy="16" text-anchor="end">{{.Chaos.Latency.LastTime}}</text>
+</svg>
+<p class="legend"><span class="sw" style="background:var(--p50)"></span>p50<span class="sw" style="background:var(--p99)"></span>p99. axis max {{.Chaos.Latency.AxisMax}}.</p>
+{{end}}
+{{end}}
+
+<script>
+"use strict";
+document.querySelectorAll(".toggle").forEach(function (btn) {
+  btn.addEventListener("click", function () {
+    var el = document.getElementById(btn.dataset.target);
+    if (!el) { return; }
+    var hidden = el.hasAttribute("hidden");
+    if (hidden) { el.removeAttribute("hidden"); btn.textContent = "Hide inventory"; }
+    else { el.setAttribute("hidden", ""); btn.textContent = "Show inventory"; }
+  });
+});
+document.querySelectorAll("table.sortable").forEach(function (table) {
+  var headers = table.tHead.rows[0].cells;
+  Array.prototype.forEach.call(headers, function (th, col) {
+    th.addEventListener("click", function () {
+      var asc = !th.classList.contains("asc");
+      Array.prototype.forEach.call(headers, function (h) { h.classList.remove("asc", "desc"); });
+      th.classList.add(asc ? "asc" : "desc");
+      var body = table.tBodies[0];
+      var rows = Array.prototype.slice.call(body.rows);
+      rows.sort(function (a, b) {
+        var x = a.cells[col].dataset.sort, y = b.cells[col].dataset.sort;
+        var nx = parseFloat(x), ny = parseFloat(y);
+        var cmp = (!isNaN(nx) && !isNaN(ny)) ? nx - ny : String(x).localeCompare(String(y));
+        return asc ? cmp : -cmp;
+      });
+      rows.forEach(function (r) { body.appendChild(r); });
+    });
+  });
+});
+</script>
+</body>
+</html>
