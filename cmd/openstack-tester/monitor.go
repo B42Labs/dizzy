@@ -22,11 +22,12 @@ import (
 )
 
 // newMonitorCmd builds "neutron monitor": a loop driver that runs the existing
-// single-shot pipeline — pre-flight orphan sweep → apply → cleanup — on a fixed
-// cadence, unattended, for days or weeks, exporting the same per-operation and
-// per-iteration metrics (via --otel) so a single installation becomes observable
-// over time. It composes the existing executor, metrics collector, and cleanup
-// code paths unchanged and survives individual iteration failures.
+// single-shot pipeline — pre-flight orphan sweep → apply → cleanup —
+// continuously (the default) or on a fixed cadence, unattended, for days or
+// weeks, exporting the same per-operation and per-iteration metrics (via --otel)
+// so a single installation becomes observable over time. It composes the
+// existing executor, metrics collector, and cleanup code paths unchanged and
+// survives individual iteration failures.
 func newMonitorCmd(opts *globalOptions) *cobra.Command {
 	var (
 		scenarioPath    string
@@ -38,7 +39,7 @@ func newMonitorCmd(opts *globalOptions) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "monitor",
-		Short: "Run apply→cleanup iterations on a fixed cadence and export metrics",
+		Short: "Run apply→cleanup iterations continuously or on a cadence and export metrics",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, p, err := buildPlanFromFlags(cmd, opts, scenarioPath, sets)
 			if err != nil {
@@ -94,7 +95,12 @@ func newMonitorCmd(opts *globalOptions) *cobra.Command {
 				return err
 			}
 
-			slog.Info("starting monitor", "scenario", p.Scenario, "interval", cfg.interval,
+			// 0 means continuous; log it as such so the startup line explains itself.
+			interval := cfg.interval.String()
+			if cfg.interval == 0 {
+				interval = "continuous"
+			}
+			slog.Info("starting monitor", "scenario", p.Scenario, "interval", interval,
 				"iterations", cfg.iterations, "errorWait", cfg.errorWait, "otel", opts.otel)
 
 			// The plan is expanded once at startup, so every iteration reuses the
@@ -113,13 +119,12 @@ func newMonitorCmd(opts *globalOptions) *cobra.Command {
 	flags.StringVar(&scenarioPath, "scenario", "", "path to the scenario YAML file (required)")
 	flags.StringArrayVar(&sets, "set", nil, "override a scenario value, e.g. --set resources.networks=200 (repeatable)")
 	flags.StringVar(&externalNetwork, "external-network", "", "name of the external network for gateways and floating IPs (default: auto-detect the first external network)")
-	flags.DurationVar(&cfg.interval, "interval", 0, "target cadence between iteration starts, e.g. 15m (required); a longer iteration starts the next immediately")
+	flags.DurationVar(&cfg.interval, "interval", 0, "target cadence between iteration starts, e.g. 15m; a longer iteration starts the next immediately (default 0 = continuous: iterations run back-to-back)")
 	flags.IntVar(&cfg.iterations, "iterations", 0, "stop after this many iterations (0 = run forever)")
 	flags.DurationVar(&cfg.errorWait, "error-wait", 0, "extra pause after a failed iteration before the next starts (0 = off)")
 	flags.BoolVar(&keepRunRecords, "keep-run-records", false, "write a run-<id>.json per iteration (off by default: in monitor mode they accumulate unboundedly)")
-	// MarkFlagRequired only fails for an unknown flag; both were just added.
+	// MarkFlagRequired only fails for an unknown flag; scenario was just added.
 	_ = cmd.MarkFlagRequired("scenario")
-	_ = cmd.MarkFlagRequired("interval")
 
 	return cmd
 }
@@ -131,11 +136,12 @@ type monitorConfig struct {
 	iterations int
 }
 
-// validate rejects a non-positive interval and negative counts before the loop
-// touches the cloud, so a misconfiguration fails fast with a clear message.
+// validate rejects a negative interval and negative counts before the loop
+// touches the cloud, so a misconfiguration fails fast with a clear message. A
+// zero interval is valid: it runs iterations continuously, back-to-back.
 func (c monitorConfig) validate() error {
-	if c.interval <= 0 {
-		return fmt.Errorf("--interval must be positive, got %s", c.interval)
+	if c.interval < 0 {
+		return fmt.Errorf("--interval must not be negative, got %s", c.interval)
 	}
 	if c.iterations < 0 {
 		return fmt.Errorf("--iterations must be zero (run forever) or positive, got %d", c.iterations)
@@ -149,8 +155,12 @@ func (c monitorConfig) validate() error {
 // runMonitorLoop drives runOnce on cfg's cadence using clk, returning how many
 // iterations ran and how many failed. It paces on the target interval between
 // iteration starts: an iteration shorter than the interval sleeps the remainder;
-// one that overruns starts the next immediately (no overlap, no backlog). A
-// failed iteration additionally waits at least errorWait before the next start.
+// one that overruns starts the next immediately (no overlap, no backlog). An
+// interval of 0 runs iterations back-to-back: the next starts as soon as the
+// previous one finishes. A failed iteration additionally waits at least
+// errorWait, and never less than minFailureBackoff, before the next start — so a
+// fast-failing dependency in continuous mode (interval and errorWait both 0)
+// backs off instead of hot-looping.
 // iterations == 0 runs forever; a cancelled context ends the loop between or
 // during iterations. It is a pure function of the injected clock and runOnce, so
 // pacing and shutdown are tested on a fake clock without a cloud.
@@ -173,8 +183,19 @@ func runMonitorLoop(ctx context.Context, cfg monitorConfig, clk chaos.Clock, run
 		if delay < 0 {
 			delay = 0 // the iteration overran the interval: start the next now
 		}
-		if !ok && delay < cfg.errorWait {
-			delay = cfg.errorWait
+		if !ok {
+			// A failed iteration must never spin. Floor its wait at errorWait and
+			// at a fixed minimum, so that in continuous mode (interval and
+			// errorWait both 0, the default) a fast-failing dependency — e.g. an
+			// unreachable Keystone that refuses auth in ~1ms — backs off instead
+			// of hot-looping, which would pin a CPU and flood the logs.
+			const minFailureBackoff = 5 * time.Second
+			if delay < cfg.errorWait {
+				delay = cfg.errorWait
+			}
+			if delay < minFailureBackoff {
+				delay = minFailureBackoff
+			}
 		}
 		if err := clk.Sleep(ctx, delay); err != nil {
 			break
