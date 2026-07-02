@@ -16,7 +16,7 @@ import (
 // already-tagged group and so are not separately tagged.
 func (c *Client) CreateSecurityGroupRule(ctx context.Context, rule plan.SecurityGroupRule, sgID, remoteGroupID string) (Resource, error) {
 	var id string
-	err := c.timed(ctx, string(KindSecurityGroupRule), func(ctx context.Context) error {
+	err := c.timed(ctx, string(KindSecurityGroupRule), "create", func(ctx context.Context) error {
 		created, createErr := rules.Create(ctx, c.gc, rules.CreateOpts{
 			SecGroupID:     sgID,
 			Direction:      rules.RuleDirection(rule.Direction),

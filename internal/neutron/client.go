@@ -18,6 +18,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/attributestags"
 
 	"github.com/B42Labs/openstack-tester/internal/metrics"
+	"github.com/B42Labs/openstack-tester/internal/telemetry"
 )
 
 // Neutron status strings shared across resource kinds. Networks, routers, and
@@ -66,12 +67,21 @@ type Client struct {
 	gc      *gophercloud.ServiceClient
 	runID   string
 	metrics *metrics.Collector
+	tel     *telemetry.Telemetry
 }
 
 // New returns a Client that names and tags resources for runID and records
 // timing into m.
 func New(gc *gophercloud.ServiceClient, runID string, m *metrics.Collector) *Client {
 	return &Client{gc: gc, runID: runID, metrics: m}
+}
+
+// SetTelemetry attaches an OTEL export seam so each timed call and readiness
+// poll is recorded live alongside the in-memory collector, which stays the
+// source of truth for run records and reports. A nil t (the default after New)
+// leaves export disabled: every telemetry call is a no-op.
+func (c *Client) SetTelemetry(t *telemetry.Telemetry) {
+	c.tel = t
 }
 
 // resourceName builds the deterministic cloud name for a logical plan name.
@@ -111,17 +121,23 @@ func tagCollection(kind Kind) string {
 }
 
 // timed runs fn, records a Sample for the attempt (including the error
-// classification extracted from any gophercloud error), and returns fn's error
-// unchanged.
-func (c *Client) timed(ctx context.Context, typ string, fn func(context.Context) error) error {
+// classification extracted from any gophercloud error), mirrors the same
+// measurement live into telemetry under the low-cardinality op label, and
+// returns fn's error unchanged. The in-memory collector stays the source of
+// truth for run records and reports; the telemetry record is additive and a
+// no-op when export is disabled.
+func (c *Client) timed(ctx context.Context, typ, op string, fn func(context.Context) error) error {
 	start := time.Now()
 	err := fn(ctx)
+	d := time.Since(start)
+	ek := errKind(err)
 	c.metrics.Record(metrics.Sample{
 		Type:     typ,
-		Duration: time.Since(start),
+		Duration: d,
 		Success:  err == nil,
-		ErrKind:  errKind(err),
+		ErrKind:  ek,
 	})
+	c.tel.RecordOperation(ctx, typ, op, d, ek)
 	return err
 }
 
@@ -157,7 +173,7 @@ func (c *Client) tag(ctx context.Context, kind Kind, id string, record bool) err
 	if !record {
 		return do(ctx)
 	}
-	return c.timed(ctx, string(kind), do)
+	return c.timed(ctx, string(kind), "tag", do)
 }
 
 // tagWithRetry tags an already-created resource, retrying a transient failure a
@@ -196,7 +212,7 @@ func (c *Client) tagWithRetry(ctx context.Context, kind Kind, id string, record 
 func (c *Client) createTagged(ctx context.Context, kind Kind, logical string, create func(ctx context.Context, name string) (id string, err error)) (Resource, error) {
 	name := resourceName(c.runID, logical)
 	var id string
-	err := c.timed(ctx, string(kind), func(ctx context.Context) error {
+	err := c.timed(ctx, string(kind), "create", func(ctx context.Context) error {
 		var createErr error
 		id, createErr = create(ctx, name)
 		return createErr
@@ -255,10 +271,12 @@ func (c *Client) WaitForReady(ctx context.Context, r Resource) error {
 	for {
 		if status, err := c.status(ctx, r); err == nil {
 			if expectedReady(r.Kind, status) {
+				d := time.Since(start)
 				c.metrics.RecordReadiness(metrics.Readiness{
 					Type:     string(r.Kind),
-					Duration: time.Since(start), OK: true,
+					Duration: d, OK: true,
 				})
+				c.tel.RecordTimeToReady(ctx, string(r.Kind), d, true)
 				return nil
 			}
 		}
@@ -266,10 +284,12 @@ func (c *Client) WaitForReady(ctx context.Context, r Resource) error {
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
+			d := time.Since(start)
 			c.metrics.RecordReadiness(metrics.Readiness{
 				Type:     string(r.Kind),
-				Duration: time.Since(start), OK: false,
+				Duration: d, OK: false,
 			})
+			c.tel.RecordTimeToReady(ctx, string(r.Kind), d, false)
 			return ctx.Err()
 		}
 

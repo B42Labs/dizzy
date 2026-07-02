@@ -20,7 +20,7 @@ import (
 // by cleanup to confirm a resource exists.
 func (c *Client) Get(ctx context.Context, r Resource) (string, error) {
 	var status string
-	err := c.timed(ctx, string(r.Kind), func(ctx context.Context) error {
+	err := c.timed(ctx, string(r.Kind), "get", func(ctx context.Context) error {
 		var getErr error
 		status, getErr = c.status(ctx, r)
 		return getErr
@@ -63,7 +63,7 @@ func (c *Client) status(ctx context.Context, r Resource) (string, error) {
 // rather than as a failure. The status command drives this over a run's
 // resources.
 func (c *Client) Observe(ctx context.Context, r Resource) (status string, exists bool, err error) {
-	err = c.timed(ctx, string(r.Kind), func(ctx context.Context) error {
+	err = c.timed(ctx, string(r.Kind), "get", func(ctx context.Context) error {
 		s, getErr := c.observe(ctx, r)
 		if getErr != nil {
 			return getErr
@@ -136,7 +136,7 @@ func (c *Client) observe(ctx context.Context, r Resource) (string, error) {
 // that kind; the executor never calls it and a later cleanup detaches them
 // explicitly.
 func (c *Client) Delete(ctx context.Context, r Resource) error {
-	return c.timed(ctx, string(r.Kind), func(ctx context.Context) error {
+	return c.timed(ctx, string(r.Kind), "delete", func(ctx context.Context) error {
 		switch r.Kind {
 		case KindNetwork:
 			return networks.Delete(ctx, c.gc, r.ID).ExtractErr()
