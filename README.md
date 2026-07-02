@@ -631,8 +631,9 @@ three dashboards are there the moment Grafana is up — no manual import.
   of all API calls.
 - **Neutron API operations** (`ostester-api-operations`) — the report's
   per-type table over time: per-kind p95 and mean latency, a latency heatmap,
-  throughput, error+timeout rate, and an ops-by-outcome table. An extra
-  `operation` variable filters to `create`/`delete`/… .
+  throughput, error+timeout rate, an ops-by-outcome table, and an
+  errors-by-error-kind timeseries (from the dedicated errors counter, empty on
+  a healthy run). An extra `operation` variable filters to `create`/`delete`/… .
 - **Resource readiness** (`ostester-time-to-ready`) — time-to-ready
   percentiles by kind, a per-kind readiness success ratio, and a time-to-ready
   heatmap.
@@ -641,9 +642,11 @@ All three carry `cloud` and `scenario` template variables. They respect what
 the OTLP data actually carries: **percentiles are estimated from the histogram
 buckets** and labelled `p95 (est.)`, not true maxima; there are **no true
 per-run min/max series** (OTLP histogram min/max are not mapped), so
-distribution shape is shown with **heatmaps** over the `_bucket` series; and
-**error panels split by `outcome`** (`success`/`error`/`timeout`) only, because
-the schema collapses error kinds to the outcome by design.
+distribution shape is shown with **heatmaps** over the `_bucket` series; and the
+**outcome panels split by `outcome`** (`success`/`error`/`timeout`) from
+`operation.duration`, while the **errors-by-kind panel** uses the dedicated
+`operation.errors` counter for the `error_kind` breakdown — empty on a healthy
+run, since only failed operations create those series.
 
 > **Sampling cadence.** With the default continuous monitor
 > (`MONITOR_INTERVAL=0`) iterations run back-to-back, so the metrics flow

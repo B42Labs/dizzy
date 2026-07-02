@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "Neutron API operations over time: the report's per-type latency table as live panels. Latency percentiles are estimated from histogram buckets (labelled \"(est.)\"); true per-call min/max are not in the OTLP data, so the distribution shape is shown as a heatmap over the buckets instead. Error panels split by outcome only (success / error / timeout) — error kinds collapse to outcome by design. Sampling caveat: with the default continuous monitor (MONITOR_INTERVAL=0) metrics flow steadily; on a paced run they move only while an iteration runs. Panels use $__rate_interval with a 1m minimum interval.",
+  "description": "Neutron API operations over time: the report's per-type latency table as live panels. Latency percentiles are estimated from histogram buckets (labelled \"(est.)\"); true per-call min/max are not in the OTLP data, so the distribution shape is shown as a heatmap over the buckets instead. The outcome panels split failures by outcome (success / error / timeout); the \"Errors by error kind\" panel breaks them down further by error_kind (quota, http_<status>, ...) from the dedicated errors counter, empty on a healthy run. Sampling caveat: with the default continuous monitor (MONITOR_INTERVAL=0) metrics flow steadily; on a paced run they move only while an iteration runs. Panels use $__rate_interval with a 1m minimum interval.",
   "editable": true,
   "graphTooltip": 0,
   "id": null,
@@ -203,7 +203,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-      "description": "Non-success share of API calls (error + timeout) per resource kind and operation. Splits by outcome only; the error_kind breakdown lands with the dedicated errors counter.",
+      "description": "Non-success share of API calls (error + timeout) per resource kind and operation. Splits by outcome only; for the per-error_kind breakdown see the \"Errors by error kind\" panel below.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -293,6 +293,52 @@
         }
       ],
       "type": "table"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+      "description": "Failed API calls per second by error kind (quota, http_<status>, timeout, canceled, other), per resource kind and operation, from the dedicated errors counter — the report's Errors table over time. Empty on a healthy run: only failed operations create these series.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 30,
+            "gradientMode": "none",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "normal" }
+          },
+          "mappings": [],
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "id": 7,
+      "interval": "1m",
+      "options": {
+        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+          "editorMode": "code",
+          "expr": "sum by (kind, operation, error_kind) (rate(openstack_tester_operation_errors_total{operation=~\"$operation\", cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__rate_interval]))",
+          "legendFormat": "{{kind}} {{operation}} {{error_kind}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Errors by error kind",
+      "type": "timeseries"
     }
   ],
   "refresh": "1m",
