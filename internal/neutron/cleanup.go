@@ -24,7 +24,7 @@ import (
 func (c *Client) ListByTag(ctx context.Context, kind Kind, runID string) ([]Resource, error) {
 	tag := "ostester:run=" + runID
 	var found []Resource
-	err := c.timed(ctx, string(kind), func(ctx context.Context) error {
+	err := c.timed(ctx, string(kind), "list", func(ctx context.Context) error {
 		var listErr error
 		found, listErr = c.listByTag(ctx, kind, tag)
 		return listErr
@@ -104,7 +104,7 @@ func listTagged[T any](
 // already gone (404) is skipped so repeated cleanup stays idempotent.
 func (c *Client) DeleteNetworkPorts(ctx context.Context, networkID string) (int, error) {
 	var deleted int
-	err := c.timed(ctx, string(KindPort), func(ctx context.Context) error {
+	err := c.timed(ctx, string(KindPort), "delete", func(ctx context.Context) error {
 		pages, err := ports.List(c.gc, ports.ListOpts{NetworkID: networkID}).AllPages(ctx)
 		if err != nil {
 			return err
@@ -144,7 +144,7 @@ func (c *Client) DeleteNetworkPorts(ctx context.Context, networkID string) (int,
 // repeated cleanup stays idempotent.
 func (c *Client) DetachRouterInterfaces(ctx context.Context, routerID string) (int, error) {
 	var detached int
-	err := c.timed(ctx, string(KindRouterInterface), func(ctx context.Context) error {
+	err := c.timed(ctx, string(KindRouterInterface), "detach", func(ctx context.Context) error {
 		pages, err := ports.List(c.gc, ports.ListOpts{DeviceID: routerID, DeviceOwner: "network:router_interface"}).AllPages(ctx)
 		if err != nil {
 			return err

@@ -38,7 +38,7 @@ func (c *Client) CreateRouter(ctx context.Context, r plan.Router, externalNetwor
 // left empty because no separately-named cloud object exists.
 func (c *Client) CreateRouterInterface(ctx context.Context, ri plan.RouterInterface, routerID, subnetID, portID string) (Resource, error) {
 	var resultPortID string
-	err := c.timed(ctx, string(KindRouterInterface), func(ctx context.Context) error {
+	err := c.timed(ctx, string(KindRouterInterface), "create", func(ctx context.Context) error {
 		opts := routers.AddInterfaceOpts{SubnetID: subnetID, PortID: portID}
 		info, addErr := routers.AddInterface(ctx, c.gc, routerID, opts).Extract()
 		if addErr != nil {
@@ -62,7 +62,7 @@ func (c *Client) CreateRouterInterface(ctx context.Context, ri plan.RouterInterf
 // KindRouterInterface and returns the error unwrapped enough for IsNotFound to
 // classify an already-detached interface so the caller can treat it as success.
 func (c *Client) RemoveRouterInterface(ctx context.Context, routerID, subnetID, portID string) error {
-	err := c.timed(ctx, string(KindRouterInterface), func(ctx context.Context) error {
+	err := c.timed(ctx, string(KindRouterInterface), "delete", func(ctx context.Context) error {
 		opts := routers.RemoveInterfaceOpts{SubnetID: subnetID, PortID: portID}
 		_, rmErr := routers.RemoveInterface(ctx, c.gc, routerID, opts).Extract()
 		return rmErr
