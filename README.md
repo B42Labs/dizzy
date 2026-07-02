@@ -444,6 +444,7 @@ in-memory collector, which stays the source for run records and reports):
 | Instrument | Type | Unit | Attributes |
 |---|---|---|---|
 | `openstack_tester.operation.duration` | histogram | s | `kind`, `operation`, `outcome` |
+| `openstack_tester.operation.errors` | counter | | `kind`, `operation`, `error.kind` |
 | `openstack_tester.resource.time_to_ready` | histogram | s | `kind`, `outcome` |
 | `openstack_tester.iteration.duration` | histogram | s | `outcome` |
 | `openstack_tester.iteration.operations` | counter | | `result` |
@@ -456,6 +457,16 @@ Attribute value sets are bounded: `kind` is the resource type (`network`,
 iteration; `result` is `attempted`/`succeeded`/`failed`. **Cardinality rule:**
 run IDs, resource IDs, and names are **never** metric attributes — they stay in
 the run records and logs.
+
+`operation.errors` breaks failures down where `operation.duration`'s `outcome`
+collapses them: `error.kind` is the neutron client's classification —
+`quota`, `timeout`, `canceled`, `other`, or `http_<status>` with the exact
+status code (the small set Neutron returns: 400/401/403/404/409/429/5xx), the
+same values the report's Errors table shows. The counter is recorded **only for
+failed operations**, so a healthy run emits no series at all. On the Prometheus
+side it surfaces as `openstack_tester_operation_errors_total` with label
+`error_kind` (the `_total` suffix and the dot→underscore label translation
+follow the same naming rules the cookbook preamble below explains).
 
 #### Example collector setup
 
@@ -505,6 +516,9 @@ histogram_quantile(0.95, sum by (kind, operation, le) (
 # error + timeout rate per kind + operation (non-success share of all calls)
 sum by (kind, operation) (rate(openstack_tester_operation_duration_seconds_count{outcome!="success"}[5m]))
   / sum by (kind, operation) (rate(openstack_tester_operation_duration_seconds_count[5m]))
+
+# error rate by error kind, per kind + operation (only failed calls create series)
+sum by (kind, operation, error_kind) (rate(openstack_tester_operation_errors_total[15m]))
 
 # p95 time-to-ready per kind, over the last hour
 histogram_quantile(0.95, sum by (kind, le) (
@@ -582,6 +596,9 @@ Beyond the five metric families and their `cloud`/`scenario` labels,
 `otel-verify` confirms Grafana answers on `/api/health` and runs a
 data-independent query through Grafana's datasource proxy, so a broken
 Grafana→VictoriaMetrics wiring is distinguishable from "no data yet".
+`openstack_tester_operation_errors_total` is deliberately **not** among the
+required families: it only exists once operations have failed, so a healthy
+run's steady state is its absence, not a missing-metric failure.
 
 **How it works.** `make testbed-monitor` points
 `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` at
