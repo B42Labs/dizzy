@@ -375,5 +375,5 @@ type orphanCleaner struct{ *neutron.Client }
 // leftovers from any previous crashed or interrupted iteration whose run id is
 // no longer known.
 func (o orphanCleaner) ListByTag(ctx context.Context, kind neutron.Kind, _ string) ([]neutron.Resource, error) {
-	return o.Client.ListByTypeTag(ctx, kind)
+	return o.ListByTypeTag(ctx, kind)
 }
