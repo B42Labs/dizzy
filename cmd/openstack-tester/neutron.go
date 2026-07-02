@@ -7,7 +7,7 @@ import (
 )
 
 // newNeutronCmd builds the "neutron" command namespace and attaches its
-// subcommands. generate, apply, chaos, status, report, and cleanup are
+// subcommands. generate, apply, chaos, monitor, status, report, and cleanup are
 // implemented; verify is a Phase 2 stub, and list-networks is a working
 // auth/connectivity smoke test.
 func newNeutronCmd(opts *globalOptions) *cobra.Command {
@@ -30,6 +30,7 @@ func newNeutronCmd(opts *globalOptions) *cobra.Command {
 		newGenerateCmd(opts),
 		newApplyCmd(opts),
 		newChaosCmd(opts),
+		newMonitorCmd(opts),
 		newStatusCmd(opts),
 		newReportCmd(opts),
 		newCleanupCmd(opts),
