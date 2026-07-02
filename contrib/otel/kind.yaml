@@ -1,0 +1,28 @@
+# kind cluster for the local OTEL smoke stack (see README §9).
+#
+# A single-node cluster named "ostester-otel" whose control-plane node maps
+# host port 8428 to the node's NodePort 30428. The host binary and the browser
+# reach VictoriaMetrics at plain http://localhost:8428 through this mapping.
+#
+# Keep the cluster name, the host port, and the container port in sync with the
+# Makefile targets (otel-up/down/verify/ui, testbed-monitor) and with the
+# NodePort in victoria-metrics.yaml.
+---
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: ostester-otel
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30428
+        hostPort: 8428
+        # Bind the host-port publish to loopback. kind's default listenAddress
+        # is 0.0.0.0, which would publish 8428 on every host interface and hand
+        # the unauthenticated VictoriaMetrics store to the host's L2/L3 segment.
+        # This only governs the host-port mapping, though: the Service is a
+        # NodePort, so the store stays reachable at the kind node's docker-network
+        # IP on 30428 (from the docker host and sibling containers on the kind
+        # bridge). That residual exposure is scoped to the local docker network
+        # and accepted for a throwaway smoke stack.
+        listenAddress: "127.0.0.1"
+        protocol: TCP
