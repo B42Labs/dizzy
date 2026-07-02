@@ -18,13 +18,24 @@ OS_CACERT   ?= contrib/testbed.pem
 SCENARIO    ?= scenarios/small.yaml
 TESTBED_CMD ?= apply
 
+# --- Local OTEL smoke stack -------------------------------------------------
+# `make otel-up` boots a local kind cluster running VictoriaMetrics reachable
+# on http://localhost:8428; `make testbed-monitor` then runs `neutron monitor
+# --otel` against the testbed, pushing OTLP metrics into it; `make otel-ui`
+# opens VMUI, `make otel-verify` checks the stored schema, `make otel-down`
+# tears it all down. See README §9. Override the monitor cadence and count:
+#   make testbed-monitor MONITOR_INTERVAL=1m MONITOR_ITERATIONS=1
+MONITOR_INTERVAL   ?= 5m
+MONITOR_ITERATIONS ?= 0
+
 .DEFAULT_GOAL := build
 
-.PHONY: help build install run vet lint fmt test tidy clean testbed
+.PHONY: help build install run vet lint fmt test tidy clean testbed \
+	otel-up otel-down otel-verify otel-ui testbed-monitor
 
 ## help: Show this help.
 help:
-	@grep -E '^## ' $(MAKEFILE_LIST) | sed -e 's/## //' | awk -F': ' '{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^## ' $(MAKEFILE_LIST) | sed -e 's/## //' | awk -F': ' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
 ## build: Build the openstack-tester binary into the repo root.
 build:
@@ -85,3 +96,76 @@ tidy:
 clean:
 	$(GO) clean
 	rm -f $(BINARY)
+
+# --- Local OTEL smoke stack -------------------------------------------------
+
+## otel-up: Boot the kind cluster and deploy VictoriaMetrics on localhost:8428.
+otel-up:
+	@for tool in docker kind kubectl curl; do \
+		command -v $$tool >/dev/null 2>&1 || { echo "error: $$tool not found in PATH (required for the local OTEL stack)"; exit 1; }; \
+	done
+	@kind get clusters 2>/dev/null | grep -qx ostester-otel \
+		|| kind create cluster --config contrib/otel/kind.yaml
+	@kubectl --context kind-ostester-otel apply -f contrib/otel/victoria-metrics.yaml
+	@kubectl --context kind-ostester-otel -n ostester-otel rollout status deployment/victoria-metrics --timeout=180s
+	@echo "Waiting for VictoriaMetrics on http://localhost:8428/health ..."
+	@for i in $$(seq 1 30); do \
+		curl -fsS http://localhost:8428/health >/dev/null 2>&1 && { echo "VictoriaMetrics is up: http://localhost:8428/vmui"; exit 0; }; \
+		sleep 1; \
+	done; \
+	echo "error: VictoriaMetrics did not answer on http://localhost:8428/health within 30s"; exit 1
+
+## otel-down: Delete the kind cluster and all stored metrics.
+otel-down:
+	@command -v kind >/dev/null 2>&1 || { echo "error: kind not found in PATH"; exit 1; }
+	kind delete cluster --name ostester-otel
+
+## otel-verify: Check the five documented metric families are present in VictoriaMetrics.
+otel-verify:
+	@command -v curl >/dev/null 2>&1 || { echo "error: curl not found in PATH"; exit 1; }
+	@names=$$(curl -fsS 'http://localhost:8428/api/v1/label/__name__/values') \
+		|| { echo "error: cannot reach VictoriaMetrics on http://localhost:8428 (run 'make otel-up' first)"; exit 1; }; \
+	rc=0; \
+	for fam in \
+		openstack_tester_operation_duration_seconds \
+		openstack_tester_resource_time_to_ready_seconds \
+		openstack_tester_iteration_duration_seconds \
+		openstack_tester_iteration_operations_total \
+		openstack_tester_iterations_total; do \
+		if printf '%s' "$$names" | grep -q "\"$$fam"; then \
+			echo "ok:      $$fam"; \
+		else \
+			echo "MISSING: $$fam"; rc=1; \
+		fi; \
+	done; \
+	echo "cloud labels:    $$(curl -fsS 'http://localhost:8428/api/v1/label/cloud/values')"; \
+	echo "scenario labels: $$(curl -fsS 'http://localhost:8428/api/v1/label/scenario/values')"; \
+	exit $$rc
+
+## otel-ui: Open VMUI with pre-filled queries showing live data.
+otel-ui:
+	@url='http://localhost:8428/vmui/#/?g0.expr=histogram_quantile(0.95,%20sum(rate(openstack_tester_operation_duration_seconds_bucket%7Boperation%3D%22create%22%7D%5B15m%5D))%20by%20(kind,%20le))&g1.expr=sum(rate(openstack_tester_iterations_total%5B15m%5D))%20by%20(outcome)'; \
+	echo "Opening VMUI: $$url"; \
+	open "$$url" 2>/dev/null || xdg-open "$$url" 2>/dev/null || echo "open the URL above in your browser"
+
+## testbed-monitor: Run neutron monitor --otel against the testbed, exporting to VictoriaMetrics.
+# monitor applies and cleans up each iteration's resources itself, so this
+# target runs no post-run cleanup: unlike `testbed`, scanning run-*.json in the
+# shared working directory would tear down the resources of a concurrent
+# `make testbed` run that happens to write its record alongside.
+testbed-monitor: build
+	@test -f "$(CLOUDS_FILE)" || { echo "error: clouds file $(CLOUDS_FILE) not found"; exit 1; }
+	@test -f "$(OS_CACERT)"   || { echo "error: CA cert $(OS_CACERT) not found (clouds.yaml 'cacert')"; exit 1; }
+	@test -f "$(SCENARIO)"    || { echo "error: scenario $(SCENARIO) not found"; exit 1; }
+	@curl -fsS -m 2 http://localhost:8428/health >/dev/null 2>&1 \
+		|| echo "warning: VictoriaMetrics is not answering on localhost:8428 (run 'make otel-up' first); metrics will be exported into the void"
+	@echo "Running neutron monitor --otel against the OSISM testbed:"
+	@echo "  Cloud:    $(OS_CLOUD) ($(CLOUDS_FILE))"
+	@echo "  Scenario: $(SCENARIO)"
+	@echo "  Cadence:  interval $(MONITOR_INTERVAL), iterations $(MONITOR_ITERATIONS) (0 = forever, Ctrl-C to stop)"
+	@echo "  OTLP:     http://localhost:8428/opentelemetry/v1/metrics (15s export interval)"
+	@OS_CLIENT_CONFIG_FILE="$(CLOUDS_FILE)" \
+	OTEL_EXPORTER_OTLP_METRICS_ENDPOINT="http://localhost:8428/opentelemetry/v1/metrics" \
+	OTEL_METRIC_EXPORT_INTERVAL=15000 \
+	./$(BINARY) neutron monitor --os-cloud "$(OS_CLOUD)" --scenario "$(SCENARIO)" \
+		--interval "$(MONITOR_INTERVAL)" --iterations "$(MONITOR_ITERATIONS)" --otel $(ARGS)
