@@ -6,11 +6,12 @@ GOLANGCI    ?= golangci-lint
 
 # --- Testbed run ------------------------------------------------------------
 # `make testbed` runs a neutron scenario directly against the OSISM testbed
-# cloud defined in clouds.yaml. Override any variable at invocation, e.g.
+# cloud defined in contrib/clouds.yaml. Override any variable at invocation:
 #   make testbed SCENARIO=scenarios/medium.yaml
 #   make testbed TESTBED_CMD=chaos ARGS="--concurrency 16"
 OS_CLOUD    ?= test
-OS_CACERT   ?= testbed.pem
+CLOUDS_FILE ?= contrib/clouds.yaml
+OS_CACERT   ?= contrib/testbed.pem
 SCENARIO    ?= scenarios/small.yaml
 TESTBED_CMD ?= apply
 
@@ -36,12 +37,14 @@ run: build
 
 ## testbed: Run the neutron small scenario against the testbed cloud.
 testbed: build
-	@test -f "$(OS_CACERT)" || { echo "error: CA cert $(OS_CACERT) not found (clouds.yaml 'cacert')"; exit 1; }
-	@test -f "$(SCENARIO)"  || { echo "error: scenario $(SCENARIO) not found"; exit 1; }
+	@test -f "$(CLOUDS_FILE)" || { echo "error: clouds file $(CLOUDS_FILE) not found"; exit 1; }
+	@test -f "$(OS_CACERT)"   || { echo "error: CA cert $(OS_CACERT) not found (clouds.yaml 'cacert')"; exit 1; }
+	@test -f "$(SCENARIO)"    || { echo "error: scenario $(SCENARIO) not found"; exit 1; }
 	@echo "Running neutron $(TESTBED_CMD) against the OSISM testbed:"
-	@echo "  Cloud:    $(OS_CLOUD) (clouds.yaml)"
+	@echo "  Cloud:    $(OS_CLOUD) ($(CLOUDS_FILE))"
 	@echo "  Scenario: $(SCENARIO)"
 	@echo "  CA cert:  $(OS_CACERT)"
+	OS_CLIENT_CONFIG_FILE="$(CLOUDS_FILE)" \
 	./$(BINARY) neutron $(TESTBED_CMD) --os-cloud "$(OS_CLOUD)" --scenario "$(SCENARIO)" $(ARGS)
 
 ## vet: Run go vet across all packages.
