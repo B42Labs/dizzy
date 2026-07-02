@@ -37,22 +37,9 @@ func newGenerateCmd(opts *globalOptions) *cobra.Command {
 			}
 			data = append(data, '\n')
 
-			dest := "stdout"
-			if outPath == "" {
-				if _, err := cmd.OutOrStdout().Write(data); err != nil {
-					return fmt.Errorf("writing plan: %w", err)
-				}
-			} else {
-				// Write to a temp file and rename so a kill mid-write (SIGINT,
-				// OOM, disk-full) never leaves a truncated plan at outPath.
-				tmp := outPath + ".tmp"
-				if err := os.WriteFile(tmp, data, 0o644); err != nil {
-					return fmt.Errorf("writing plan to %s: %w", tmp, err)
-				}
-				if err := os.Rename(tmp, outPath); err != nil {
-					return fmt.Errorf("finalizing plan %s: %w", outPath, err)
-				}
-				dest = outPath
+			dest, err := writePlanOutput(cmd, outPath, data)
+			if err != nil {
+				return err
 			}
 
 			slog.Info("generated plan", "scenario", p.Scenario, "seed", p.Seed,
@@ -70,6 +57,28 @@ func newGenerateCmd(opts *globalOptions) *cobra.Command {
 	_ = cmd.MarkFlagRequired("scenario")
 
 	return cmd
+}
+
+// writePlanOutput writes the encoded plan to outPath (or stdout when empty),
+// returning the destination for the log line. When writing to a file it uses a
+// temp file and rename so a kill mid-write (SIGINT, OOM, disk-full) never leaves
+// a truncated plan at outPath. It is shared by the neutron and cinder generate
+// commands.
+func writePlanOutput(cmd *cobra.Command, outPath string, data []byte) (string, error) {
+	if outPath == "" {
+		if _, err := cmd.OutOrStdout().Write(data); err != nil {
+			return "", fmt.Errorf("writing plan: %w", err)
+		}
+		return "stdout", nil
+	}
+	tmp := outPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return "", fmt.Errorf("writing plan to %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, outPath); err != nil {
+		return "", fmt.Errorf("finalizing plan %s: %w", outPath, err)
+	}
+	return outPath, nil
 }
 
 // buildPlanFromFlags loads the scenario file, applies the --set overrides and
