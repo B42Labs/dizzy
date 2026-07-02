@@ -6,9 +6,12 @@ GOLANGCI    ?= golangci-lint
 
 # --- Testbed run ------------------------------------------------------------
 # `make testbed` runs a neutron scenario directly against the OSISM testbed
-# cloud defined in contrib/clouds.yaml. Override any variable at invocation:
+# cloud defined in contrib/clouds.yaml. Any run record the command leaves
+# behind (run-<id>.json) is cleaned up afterwards, even when the run itself
+# fails. Override any variable at invocation:
 #   make testbed SCENARIO=scenarios/medium.yaml
 #   make testbed TESTBED_CMD=chaos ARGS="--concurrency 16"
+#   make testbed KEEP=1   # skip the cleanup, keep resources and run record
 OS_CLOUD    ?= test
 CLOUDS_FILE ?= contrib/clouds.yaml
 OS_CACERT   ?= contrib/testbed.pem
@@ -35,7 +38,7 @@ install:
 run: build
 	./$(BINARY) $(ARGS)
 
-## testbed: Run the neutron small scenario against the testbed cloud.
+## testbed: Run the neutron small scenario against the testbed cloud, then clean up.
 testbed: build
 	@test -f "$(CLOUDS_FILE)" || { echo "error: clouds file $(CLOUDS_FILE) not found"; exit 1; }
 	@test -f "$(OS_CACERT)"   || { echo "error: CA cert $(OS_CACERT) not found (clouds.yaml 'cacert')"; exit 1; }
@@ -44,8 +47,19 @@ testbed: build
 	@echo "  Cloud:    $(OS_CLOUD) ($(CLOUDS_FILE))"
 	@echo "  Scenario: $(SCENARIO)"
 	@echo "  CA cert:  $(OS_CACERT)"
+	@before=$$(ls run-*.json 2>/dev/null); \
 	OS_CLIENT_CONFIG_FILE="$(CLOUDS_FILE)" \
-	./$(BINARY) neutron $(TESTBED_CMD) --os-cloud "$(OS_CLOUD)" --scenario "$(SCENARIO)" $(ARGS)
+	./$(BINARY) neutron $(TESTBED_CMD) --os-cloud "$(OS_CLOUD)" --scenario "$(SCENARIO)" $(ARGS); \
+	status=$$?; \
+	if [ -n "$(KEEP)" ]; then echo "KEEP set, skipping cleanup"; exit $$status; fi; \
+	for rec in run-*.json; do \
+		[ -e "$$rec" ] || continue; \
+		echo "$$before" | grep -Fqx "$$rec" && continue; \
+		echo "Cleaning up $$rec"; \
+		OS_CLIENT_CONFIG_FILE="$(CLOUDS_FILE)" \
+		./$(BINARY) neutron cleanup --os-cloud "$(OS_CLOUD)" --run "$$rec" && rm -f "$$rec" || status=1; \
+	done; \
+	exit $$status
 
 ## vet: Run go vet across all packages.
 vet:
