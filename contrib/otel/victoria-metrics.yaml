@@ -1,0 +1,82 @@
+# VictoriaMetrics single-node for the local OTEL smoke stack (see README §9).
+#
+# Plain manifests, no Helm: a Namespace, a single-replica Deployment, and a
+# NodePort Service. VictoriaMetrics ingests the tester's OTLP/HTTP push natively
+# at /opentelemetry/v1/metrics, so no OTel Collector is needed. VMUI (the
+# built-in query explorer) is served at /vmui.
+#
+# The NodePort (30428) must match the containerPort kind maps to host 8428 in
+# kind.yaml, and the namespace/labels must match the Makefile targets.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ostester-otel
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: victoria-metrics
+  namespace: ostester-otel
+  labels:
+    app: victoria-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: victoria-metrics
+  template:
+    metadata:
+      labels:
+        app: victoria-metrics
+    spec:
+      containers:
+        - name: victoria-metrics
+          # Pinned to the current stable at implementation time, by digest so a
+          # re-pushed tag can never swap the image out from under the stack. The
+          # -opentelemetry.promoteAllResourceAttributes flag below only exists
+          # from v1.145.0, so do not downgrade past it.
+          image: victoriametrics/victoria-metrics:v1.146.0@sha256:b8703ff12ed437effad4fc36492fec14824277f2890a5876b8a9e6cfe5139839
+          args:
+            - -storageDataPath=/victoria-metrics-data
+            - -retentionPeriod=30d
+            # Store OTLP series under the Prometheus canonical names the README
+            # §9 schema documents (openstack_tester_operation_duration_seconds_*,
+            # …), so the query cookbook works unchanged.
+            - -opentelemetry.usePrometheusNaming=true
+            # Promote the tester's OTLP resource attributes (cloud, scenario) to
+            # labels on every series. Set explicitly so the labels never depend
+            # on a version default (flag added in v1.145.0).
+            - -opentelemetry.promoteAllResourceAttributes=true
+          ports:
+            - name: http
+              containerPort: 8428
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+          volumeMounts:
+            - name: data
+              mountPath: /victoria-metrics-data
+      volumes:
+        # emptyDir: data survives monitor restarts but not `make otel-down`.
+        # Fine for a smoke stack (the issue's deliberate simplification).
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: victoria-metrics
+  namespace: ostester-otel
+  labels:
+    app: victoria-metrics
+spec:
+  type: NodePort
+  selector:
+    app: victoria-metrics
+  ports:
+    - name: http
+      port: 8428
+      targetPort: http
+      nodePort: 30428
