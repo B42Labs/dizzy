@@ -90,13 +90,16 @@ func TestInstrumentsMatchDocumentedSchema(t *testing.T) {
 	ctx := context.Background()
 
 	tel.RecordOperation(ctx, "network", "create", 100*time.Millisecond, "")
+	// A failing operation drives the operation.errors counter (a success alone
+	// creates no series on it).
+	tel.RecordOperation(ctx, "port", "delete", 50*time.Millisecond, "quota")
 	tel.RecordTimeToReady(ctx, "network", 200*time.Millisecond, true)
 	tel.RecordIteration(ctx, 5*time.Second, true)
 	tel.RecordIterationOperations(ctx, 10, 8, 2)
 
 	metrics := collectByName(t, reader)
 
-	// The five documented instruments must all be present, with the seconds unit
+	// The six documented instruments must all be present, with the seconds unit
 	// on the three histograms.
 	histograms := []string{
 		"openstack_tester.operation.duration",
@@ -112,7 +115,11 @@ func TestInstrumentsMatchDocumentedSchema(t *testing.T) {
 			t.Errorf("%s unit = %q, want %q", name, m.Unit, "s")
 		}
 	}
-	for _, name := range []string{"openstack_tester.iteration.operations", "openstack_tester.iterations"} {
+	for _, name := range []string{
+		"openstack_tester.operation.errors",
+		"openstack_tester.iteration.operations",
+		"openstack_tester.iterations",
+	} {
 		if _, ok := metrics[name]; !ok {
 			t.Fatalf("counter %s not emitted", name)
 		}
@@ -122,6 +129,11 @@ func TestInstrumentsMatchDocumentedSchema(t *testing.T) {
 	if _, ok := histoCount(t, metrics["openstack_tester.operation.duration"],
 		map[string]string{"kind": "network", "operation": "create", "outcome": "success"}); !ok {
 		t.Error("operation.duration missing the documented {kind,operation,outcome} attribute set")
+	}
+	// operation.errors carries exactly kind/operation/error.kind, incremented once.
+	if got, ok := sumValue(t, metrics["openstack_tester.operation.errors"],
+		map[string]string{"kind": "port", "operation": "delete", "error.kind": "quota"}); !ok || got != 1 {
+		t.Errorf("operation.errors{kind=port,operation=delete,error.kind=quota} = %d (present=%v), want 1", got, ok)
 	}
 	// time_to_ready carries exactly kind/outcome.
 	if _, ok := histoCount(t, metrics["openstack_tester.resource.time_to_ready"],
@@ -150,6 +162,40 @@ func TestRecordOperationOutcomeMapping(t *testing.T) {
 				"kind": "port", "operation": "delete", "outcome": tc.outcome,
 			}); !ok {
 				t.Errorf("errKind %q did not map to outcome %q", tc.errKind, tc.outcome)
+			}
+		})
+	}
+}
+
+func TestRecordOperationErrorsCounter(t *testing.T) {
+	// A successful operation must not create any operation.errors series.
+	t.Run("success creates no series", func(t *testing.T) {
+		tel, reader := newTestTelemetry(t)
+		tel.RecordOperation(context.Background(), "network", "create", 10*time.Millisecond, "")
+
+		if _, ok := collectByName(t, reader)["openstack_tester.operation.errors"]; ok {
+			t.Error("a successful operation created an openstack_tester.operation.errors series")
+		}
+	})
+
+	// A failed operation increments the counter once with the verbatim errKind as
+	// error.kind, for both the classifier's static kinds and its per-status codes.
+	tests := []struct {
+		errKind string
+	}{
+		{"quota"},
+		{"http_409"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.errKind, func(t *testing.T) {
+			tel, reader := newTestTelemetry(t)
+			tel.RecordOperation(context.Background(), "port", "delete", 10*time.Millisecond, tc.errKind)
+
+			m := collectByName(t, reader)["openstack_tester.operation.errors"]
+			if got, ok := sumValue(t, m, map[string]string{
+				"kind": "port", "operation": "delete", "error.kind": tc.errKind,
+			}); !ok || got != 1 {
+				t.Errorf("operation.errors{error.kind=%s} = %d (present=%v), want 1", tc.errKind, got, ok)
 			}
 		})
 	}

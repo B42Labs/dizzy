@@ -345,7 +345,16 @@ func errKind(err error) string {
 		return "canceled"
 	}
 	if s := httpStatus(err); s != 0 {
-		return fmt.Sprintf("http_%d", s)
+		// The status is the peer's: an endpoint behind a proxy, LB, or WAF can
+		// report any 3-digit code, so bound the label to the codes Neutron
+		// itself returns and collapse the rest to http_other. This keeps
+		// error.kind a bounded enum like every other metric label.
+		switch s {
+		case 400, 401, 403, 404, 409, 429, 500, 502, 503, 504:
+			return fmt.Sprintf("http_%d", s)
+		default:
+			return "http_other"
+		}
 	}
 	return "other"
 }
