@@ -477,14 +477,17 @@ service:
 Swap the `prometheusremotewrite` exporter for `influxdb`,
 `otlphttp` (Mimir), or a VictoriaMetrics remote-write endpoint to target those
 backends instead. Shipping or operating the collector/TSDB/Grafana stack is out
-of scope for the tester — this is only an example.
+of scope for the tester — this is only an example. For a ready-to-run local
+backend that needs no collector at all, see the local OTEL smoke stack below.
 
 #### Query cookbook (PromQL)
 
 The otel-collector's Prometheus exporter translates OTLP names dot→underscore
 and appends the unit, and counters gain a `_total` suffix — so
 `openstack_tester.operation.duration` (s) becomes
-`openstack_tester_operation_duration_seconds_*`. The metrics are designed for:
+`openstack_tester_operation_duration_seconds_*`. (VictoriaMetrics performs the
+same translation natively with `-opentelemetry.usePrometheusNaming`, as the
+local smoke stack below configures.) The metrics are designed for:
 
 ```promql
 # p95 operation latency per resource kind + operation, over time
@@ -506,6 +509,90 @@ sum(rate(openstack_tester_iterations_total{outcome="success"}[1h]))
 
 A ready-made Grafana dashboard under `contrib/` is a possible follow-up; it is
 not shipped yet.
+
+### Local OTEL smoke stack (kind + VictoriaMetrics + VMUI)
+
+To exercise `--otel` end to end without hand-assembling a backend, the repo
+ships a one-command local stack under `contrib/otel/`: a
+[kind](https://kind.sigs.k8s.io/) cluster running single-node
+[VictoriaMetrics](https://victoriametrics.com/), which ingests the tester's
+OTLP/HTTP push directly and serves **VMUI** — its built-in query explorer — in
+the browser. No OTel Collector (VictoriaMetrics ingests OTLP natively) and no
+Grafana (VMUI needs no provisioning).
+
+**Prerequisites:** `docker`, `kind`, `kubectl`, and `curl` on the host, plus
+testbed reachability with `contrib/clouds.yaml` (the same setup `make testbed`
+needs).
+
+The three-command flow:
+
+```console
+$ make otel-up          # boot kind + VictoriaMetrics, reachable on :8428
+$ make testbed-monitor  # run neutron monitor --otel against the testbed
+$ make otel-ui          # open VMUI with pre-filled queries
+```
+
+`make testbed-monitor` runs `neutron monitor --otel` on a cadence, exporting
+into the local VictoriaMetrics. Override the cadence, count, scenario, or add
+flags:
+
+```console
+$ make testbed-monitor MONITOR_INTERVAL=1m MONITOR_ITERATIONS=1
+$ make testbed-monitor SCENARIO=scenarios/medium.yaml ARGS="--error-wait 2m"
+```
+
+With `MONITOR_ITERATIONS=0` (the default) it runs forever; a single Ctrl-C
+stops it gracefully — the current iteration tears down, the exporter flushes,
+and any leftover `run-*.json` is swept, exactly as `make testbed` does. The
+export interval is pinned to 15 s for fast local feedback.
+
+Once the first iteration has completed, check the stored schema:
+
+```console
+$ make otel-verify  # all five metric families present, with cloud/scenario labels
+```
+
+**How it works.** `make testbed-monitor` points
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` at
+`http://localhost:8428/opentelemetry/v1/metrics`, which VictoriaMetrics ingests
+directly — no collector hop. The manifests run it with
+`-opentelemetry.usePrometheusNaming`, so the stored series carry exactly the
+Prometheus canonical names from the cookbook above
+(`openstack_tester_operation_duration_seconds_bucket`, …), and
+`-opentelemetry.promoteAllResourceAttributes`, so the `cloud` and `scenario`
+resource attributes become labels on every series. Storage is an `emptyDir`:
+data survives monitor restarts but not `make otel-down`.
+
+> **Use the signal-specific endpoint variable.**
+> `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` takes the full URL including the
+> `/opentelemetry/v1/metrics` path. The generic `OTEL_EXPORTER_OTLP_ENDPOINT`
+> would get `/v1/metrics` appended and miss VictoriaMetrics' ingestion path —
+> and because export failures degrade to warnings, the metrics would silently
+> vanish.
+
+#### Cookbook queries
+
+The cookbook above works against this stack unchanged. A few queries to paste
+into VMUI:
+
+```promql
+# p95 create latency per resource kind
+histogram_quantile(0.95, sum(rate(openstack_tester_operation_duration_seconds_bucket{operation="create"}[15m])) by (kind, le))
+
+# operation error+timeout rate
+sum(rate(openstack_tester_operation_duration_seconds_count{outcome!="success"}[15m]))
+  / sum(rate(openstack_tester_operation_duration_seconds_count[15m]))
+
+# p95 time-to-ready per kind
+histogram_quantile(0.95, sum(rate(openstack_tester_resource_time_to_ready_seconds_bucket[15m])) by (kind, le))
+
+# iteration success ratio
+sum(rate(openstack_tester_iterations_total{outcome="success"}[1h]))
+  / sum(rate(openstack_tester_iterations_total[1h]))
+```
+
+**Teardown.** `make otel-down` deletes the kind cluster and everything in it,
+including all stored metrics — nothing is left behind on the host.
 
 ---
 
