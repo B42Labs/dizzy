@@ -20,10 +20,13 @@ TESTBED_CMD ?= apply
 
 # --- Local OTEL smoke stack -------------------------------------------------
 # `make otel-up` boots a local kind cluster running VictoriaMetrics reachable
-# on http://localhost:8428; `make testbed-monitor` then runs `neutron monitor
+# on http://localhost:8428 and Grafana (anonymous, provisioned) on
+# http://localhost:3000; `make testbed-monitor` then runs `neutron monitor
 # --otel` against the testbed, pushing OTLP metrics into it; `make otel-ui`
-# opens VMUI, `make otel-verify` checks the stored schema, `make otel-down`
-# tears it all down. See README §9. Override the monitor cadence and count:
+# opens VMUI, `make otel-grafana` opens the Grafana overview dashboard,
+# `make otel-verify` checks the stored schema and Grafana health, `make
+# otel-down` tears it all down. See README §9. Override the monitor cadence and
+# count:
 #   make testbed-monitor MONITOR_INTERVAL=1m MONITOR_ITERATIONS=1
 MONITOR_INTERVAL   ?= 5m
 MONITOR_ITERATIONS ?= 0
@@ -31,7 +34,7 @@ MONITOR_ITERATIONS ?= 0
 .DEFAULT_GOAL := build
 
 .PHONY: help build install run vet lint fmt test tidy clean testbed \
-	otel-up otel-down otel-verify otel-ui testbed-monitor
+	otel-up otel-down otel-verify otel-ui otel-grafana testbed-monitor
 
 ## help: Show this help.
 help:
@@ -99,28 +102,37 @@ clean:
 
 # --- Local OTEL smoke stack -------------------------------------------------
 
-## otel-up: Boot the kind cluster and deploy VictoriaMetrics on localhost:8428.
+## otel-up: Boot the kind cluster and deploy VictoriaMetrics (:8428) and Grafana (:3000).
 otel-up:
 	@for tool in docker kind kubectl curl; do \
 		command -v $$tool >/dev/null 2>&1 || { echo "error: $$tool not found in PATH (required for the local OTEL stack)"; exit 1; }; \
 	done
 	@kind get clusters 2>/dev/null | grep -qx ostester-otel \
 		|| kind create cluster --config contrib/otel/kind.yaml
-	@kubectl --context kind-ostester-otel apply -f contrib/otel/victoria-metrics.yaml
+	@docker port ostester-otel-control-plane 30300/tcp >/dev/null 2>&1 \
+		|| { echo "error: the existing ostester-otel cluster predates Grafana (no host port 3000 mapping); kind cannot add it to a running cluster — run 'make otel-down && make otel-up' to recreate it"; exit 1; }
+	@kubectl --context kind-ostester-otel apply -k contrib/otel
 	@kubectl --context kind-ostester-otel -n ostester-otel rollout status deployment/victoria-metrics --timeout=180s
+	@kubectl --context kind-ostester-otel -n ostester-otel rollout status deployment/grafana --timeout=180s
 	@echo "Waiting for VictoriaMetrics on http://localhost:8428/health ..."
 	@for i in $$(seq 1 30); do \
-		curl -fsS http://localhost:8428/health >/dev/null 2>&1 && { echo "VictoriaMetrics is up: http://localhost:8428/vmui"; exit 0; }; \
+		curl -fsS http://localhost:8428/health >/dev/null 2>&1 && { echo "VictoriaMetrics is up: http://localhost:8428/vmui"; break; }; \
+		if [ "$$i" -eq 30 ]; then echo "error: VictoriaMetrics did not answer on http://localhost:8428/health within 30s"; exit 1; fi; \
 		sleep 1; \
-	done; \
-	echo "error: VictoriaMetrics did not answer on http://localhost:8428/health within 30s"; exit 1
+	done
+	@echo "Waiting for Grafana on http://localhost:3000/api/health ..."
+	@for i in $$(seq 1 60); do \
+		curl -fsS http://localhost:3000/api/health >/dev/null 2>&1 && { echo "Grafana is up: http://localhost:3000 ('make otel-grafana' opens the overview dashboard)"; break; }; \
+		if [ "$$i" -eq 60 ]; then echo "error: Grafana did not answer on http://localhost:3000/api/health within 60s"; exit 1; fi; \
+		sleep 1; \
+	done
 
 ## otel-down: Delete the kind cluster and all stored metrics.
 otel-down:
 	@command -v kind >/dev/null 2>&1 || { echo "error: kind not found in PATH"; exit 1; }
 	kind delete cluster --name ostester-otel
 
-## otel-verify: Check the five documented metric families are present in VictoriaMetrics.
+## otel-verify: Check the metric families in VictoriaMetrics and Grafana health.
 otel-verify:
 	@command -v curl >/dev/null 2>&1 || { echo "error: curl not found in PATH"; exit 1; }
 	@names=$$(curl -fsS 'http://localhost:8428/api/v1/label/__name__/values') \
@@ -140,12 +152,28 @@ otel-verify:
 	done; \
 	echo "cloud labels:    $$(curl -fsS 'http://localhost:8428/api/v1/label/cloud/values')"; \
 	echo "scenario labels: $$(curl -fsS 'http://localhost:8428/api/v1/label/scenario/values')"; \
+	if curl -fsS http://localhost:3000/api/health >/dev/null 2>&1; then \
+		echo "ok:      grafana /api/health"; \
+	else \
+		echo "MISSING: grafana /api/health (run 'make otel-up' first)"; rc=1; \
+	fi; \
+	if curl -fsS 'http://localhost:3000/api/datasources/proxy/uid/victoriametrics/api/v1/query?query=1' 2>/dev/null | grep -q '"status":"success"'; then \
+		echo "ok:      grafana -> victoriametrics datasource proxy"; \
+	else \
+		echo "MISSING: grafana -> victoriametrics datasource proxy"; rc=1; \
+	fi; \
 	exit $$rc
 
 ## otel-ui: Open VMUI with pre-filled queries showing live data.
 otel-ui:
 	@url='http://localhost:8428/vmui/#/?g0.expr=histogram_quantile(0.95,%20sum(rate(openstack_tester_operation_duration_seconds_bucket%7Boperation%3D%22create%22%7D%5B15m%5D))%20by%20(kind,%20le))&g1.expr=sum(rate(openstack_tester_iterations_total%5B15m%5D))%20by%20(outcome)'; \
 	echo "Opening VMUI: $$url"; \
+	open "$$url" 2>/dev/null || xdg-open "$$url" 2>/dev/null || echo "open the URL above in your browser"
+
+## otel-grafana: Open the provisioned Grafana overview dashboard.
+otel-grafana:
+	@url='http://localhost:3000/d/ostester-overview'; \
+	echo "Opening Grafana: $$url"; \
 	open "$$url" 2>/dev/null || xdg-open "$$url" 2>/dev/null || echo "open the URL above in your browser"
 
 ## testbed-monitor: Run neutron monitor --otel against the testbed, exporting to VictoriaMetrics.
