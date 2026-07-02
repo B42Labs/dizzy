@@ -24,7 +24,11 @@ intended (API) state against the actual data plane (OVN / OVS).
 > Phase 1 item. A `neutron monitor` command now re-runs a scenario
 > continuously or on a fixed cadence, unattended, and — with `--otel` — exports
 > per-operation and per-iteration metrics via **OpenTelemetry (OTLP)** so a
-> single installation can be observed over time.
+> single installation can be observed over time. A first **Cinder** (block
+> storage) slice now ships too, under the `cinder` command namespace: it
+> creates, extends (resizes), and snapshots volumes from `small`/`medium`/`large`
+> profiles, reusing the same plan → apply → record → report/status/cleanup
+> machinery (see §15).
 
 ---
 
@@ -62,7 +66,7 @@ intended (API) state against the actual data plane (OVN / OVS).
 | **1** | Generate + apply randomized networking topologies via the API; record timings and states; tag-based cleanup. | Planned (this README) |
 | **2** | Data-plane verification: reconcile API state against OVN NB/SB DB and OVS flows. | Future |
 | **3** | More scenario profiles, optional external connectivity (gateways, FIPs), trunk ports, RBAC, address scopes. | Future |
-| **later** | Extend beyond Neutron (Cinder, Nova, …) — hence the generic name `openstack-tester`. | Idea |
+| **later** | Extend beyond Neutron (Cinder, Nova, …) — hence the generic name `openstack-tester`. | Started: Cinder first slice (create / resize / snapshot volumes); `cinder monitor` and `cinder chaos` tracked in #31 and #32. |
 
 ---
 
@@ -137,7 +141,7 @@ network ────────────────────────
 ## 6. Scenario parametrization
 
 A scenario is defined by counts, ratios and distributions plus a seed. Example
-(`scenarios/medium.yaml`):
+(`scenarios/neutron/medium.yaml`):
 
 ```yaml
 name: medium
@@ -451,18 +455,26 @@ in-memory collector, which stays the source for run records and reports):
 | `openstack_tester.iterations` | counter | | `outcome` |
 
 Attribute value sets are bounded: `kind` is the resource type (`network`,
-`port`, `router`, …); `operation` is one of `create`, `delete`, `get`, `list`,
-`tag`, `detach`; `outcome` is `success`/`error`/`timeout` for an operation,
+`port`, `router`, … and, for Cinder, `volume` and `snapshot`); `operation` is
+one of `create`, `delete`, `get`, `list`, `tag`, `detach`, and — for Cinder's
+resize — `extend`; `outcome` is `success`/`error`/`timeout` for an operation,
 `success`/`timeout` for time-to-ready, and `success`/`failure` for an
 iteration; `result` is `attempted`/`succeeded`/`failed`. **Cardinality rule:**
 run IDs, resource IDs, and names are **never** metric attributes — they stay in
 the run records and logs.
 
+Cinder needs no schema change: the new `kind` values (`volume`, `snapshot`) and
+the new `operation` value (`extend`) flow through the same instruments, so a
+one-shot `cinder apply --otel` exports through the existing seam and appears in
+the Grafana API-operations dashboard (which keys panels on the `kind`/
+`operation` labels) with no dashboard changes.
+
 `operation.errors` breaks failures down where `operation.duration`'s `outcome`
-collapses them: `error.kind` is the neutron client's classification —
+collapses them: `error.kind` is the service client's classification —
 `quota`, `timeout`, `canceled`, `other`, or `http_<status>` with the exact
-status code (the small set Neutron returns: 400/401/403/404/409/429/5xx), the
-same values the report's Errors table shows. The counter is recorded **only for
+status code (the small set the service returns: 400/401/403/404/409/429/5xx for
+Neutron, plus Cinder's 413 over-limit), the same values the report's Errors
+table shows. The counter is recorded **only for
 failed operations**, so a healthy run emits no series at all. On the Prometheus
 side it surfaces as `openstack_tester_operation_errors_total` with label
 `error_kind` (the `_total` suffix and the dot→underscore label translation
@@ -796,18 +808,127 @@ contrib/openstack-tester/
 │       └── main.go
 ├── internal/
 │   ├── config/               # clouds.yaml + run configuration
-│   ├── scenario/             # scenario types + deterministic generator (seeded)
-│   ├── plan/                 # expanded plan model (expected state)
+│   ├── resource/             # shared created-resource identity (kind/name/id)
+│   ├── scenario/             # Neutron scenario types + deterministic generator
+│   ├── plan/                 # expanded Neutron plan model (expected state)
 │   ├── neutron/              # gophercloud wrappers, one file per resource type
 │   ├── executor/             # dependency-ordered apply, worker pool, retry
 │   ├── chaos/                # random churn/soak engine over the plan envelope
+│   ├── cinder/               # Cinder client + plan/scenario/executor subpackages
 │   ├── metrics/              # timing collection + reporting
 │   ├── run/                  # run-record persistence
 │   └── verify/               # Phase 2: OVN/OVS reconciliation (stub for now)
-└── scenarios/                # built-in profiles: small / medium / large
+└── scenarios/                # built-in profiles
+    ├── neutron/              #   small / medium / large
+    └── cinder/               #   small / medium / large
 ```
 
-## 15. Roadmap
+## 15. Cinder (block storage)
+
+The first slice beyond Neutron exercises **Cinder** through a sibling `cinder`
+command namespace that reuses the same plan → apply → run-record →
+report/status/cleanup machinery. It covers exactly three operations, mirroring
+how Neutron started:
+
+1. **Create volumes** — blank volumes, no image source, no attachments.
+2. **Resize (extend) volumes** — a configurable fraction of the created volumes
+   is grown by a random amount (the tool's first mutating action on an existing
+   resource).
+3. **Create snapshots** of the volumes.
+
+Attachments (Nova), boot-from-volume, image-backed volumes, backups, clones,
+transfers, restore-from-snapshot, retype/migration, and `cinder monitor` /
+`cinder chaos` are **out of scope** for this slice; the loop drivers stay
+Neutron-only. The monitor and chaos follow-ups are tracked in #31 and #32.
+
+### Commands
+
+```
+openstack-tester cinder generate   --scenario scenarios/cinder/small.yaml [--out plan.json]
+openstack-tester cinder apply      --scenario scenarios/cinder/small.yaml [--dry-run] [--volume-type <name>]
+openstack-tester cinder status     --run run-<id>.json
+openstack-tester cinder report     --run run-<id>.json [--format table|json|csv|html]
+openstack-tester cinder cleanup    --run run-<id>.json   # or --run-id <id>
+```
+
+`apply` runs three strictly ordered stages: create every volume and wait for
+`available`; extend the volumes with a resize target (`extending` → `available`)
+so only `available` volumes are extended; then snapshot the volumes. Snapshots
+of the **same** volume are created strictly one after another, while snapshots
+of **different** volumes run concurrently up to `--concurrency` — some backends
+reject a snapshot while the source volume is still `snapshotting`, so per-volume
+serialization is the robust default without giving up cross-volume throughput.
+`--dry-run` prints the plan summary (volumes, resized volumes, snapshots, total
+GiB) without touching the cloud.
+
+### Scenario schema
+
+Cinder has its **own** scenario schema (own `--set` keys), so a typo in either
+service's scenario keeps failing loudly. Fixed counts live under `resources`,
+ranges and ratios under `distribution`, and the run is deterministic via `seed`:
+
+```yaml
+name: small
+seed: 42
+
+resources:
+  volumes: 5
+
+distribution:
+  volume_size_gib:      { min: 1, max: 5 }   # initial size drawn per volume
+  volume_resized_ratio: 0.5                  # fraction of volumes to extend after creation
+  resize_growth_gib:    { min: 1, max: 4 }   # extend delta drawn per resized volume
+  snapshots_per_volume: { min: 0, max: 2 }   # drawn per volume
+```
+
+The resize intent lives **in the plan** (not decided at apply time), so the same
+scenario + seed always yields the same volumes, the same resize targets, and the
+same snapshot fan-out.
+
+Three profiles ship under `scenarios/cinder/`:
+
+| Profile | Volumes | Size (GiB) | Resized ratio | Growth (GiB) | Snapshots/volume |
+|---|---|---|---|---|---|
+| `small`  | 5  | 1–5  | 0.5 | 1–4 | 0–2 |
+| `medium` | 20 | 1–10 | 0.5 | 1–8 | 0–3 |
+| `large`  | 50 | 1–10 | 0.6 | 1–8 | 1–4 |
+
+The `small` profile is deliberately sized to fit Cinder's common default quotas
+of 10 volumes / 10 snapshots / 1000 GiB, so it runs against a fresh project with
+nothing raised.
+
+### `--volume-type`
+
+Like Neutron's external network, the volume type is a property of the target
+cloud, not of the cloud-independent plan: it is resolved at apply time and
+applied to every volume create. Unset means the cloud's default type; a named
+type that does not exist is an error. The chosen type is recorded in the run
+record for provenance.
+
+### Quotas
+
+The same document-and-require policy as Neutron (read-only, fail-open on 403,
+never auto-raise): before creating anything, `apply` reads the project's Cinder
+quotas and aborts an oversized plan with an itemized message covering `volumes`
+(count of planned volumes), `snapshots` (count of planned snapshots), and
+`gigabytes` (Σ final volume sizes after resize + Σ snapshot sizes at the source
+volume's final size, since both count against the shared gigabytes quota). When
+`--volume-type` is set, the per-type quotas (`volumes_<type>`, `snapshots_<type>`,
+`gigabytes_<type>`) are checked too. Cinder rejects an over-quota request with
+HTTP 413, which the executor's fast-fail handles as a backstop.
+
+### Identification and cleanup
+
+Cinder has no Neutron-style tag API, so run identity lives in **volume/snapshot
+metadata**: every resource is created with `ostester:run=<id>` and
+`ostester:type=<kind>`, plus the same deterministic `ostester-<runid>-<logical>`
+name. `cleanup` discovers a run's resources by that metadata, with the run
+record's created list as a belt-and-suspenders fallback, and deletes in reverse
+dependency order — **snapshots first, then volumes** (a volume with snapshots
+cannot be deleted). 404s count as success, so cleanup is idempotent and never
+touches resources without the run's metadata.
+
+## 16. Roadmap
 
 1. **Phase 1 — API load & timing**
    - [ ] Scaffold module, CLI, `clouds.yaml` auth.
@@ -829,8 +950,12 @@ contrib/openstack-tester/
    - [ ] Compare API/plan against OVN NB/SB and OVS flows.
 3. **Phase 3+** — external connectivity, trunk ports, RBAC, QoS, more profiles,
    other services.
+4. **Beyond Neutron**
+   - [x] Cinder first slice (`cinder` namespace): create / resize / snapshot
+         volumes with `small`/`medium`/`large` profiles (see §15).
+   - [ ] `cinder monitor` (#31) and `cinder chaos` (#32).
 
-## 16. Open questions / decisions to confirm
+## 17. Open questions / decisions to confirm
 
 - **Quotas**: **resolved** — document-and-require. `apply` pre-checks the
   expanded plan against the project quota and aborts early with an itemized
