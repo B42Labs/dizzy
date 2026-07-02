@@ -1,0 +1,185 @@
+# Grafana for the local OTEL smoke stack (see README §9).
+#
+# Plain manifests, no Helm: two provisioning ConfigMaps, a single-replica
+# Deployment, and a NodePort Service. Grafana is fully provisioned from files —
+# a VictoriaMetrics datasource and the dashboards under dashboards/ — so it comes
+# up with the curated views and needs zero clicking.
+#
+# The Namespace is NOT re-declared here: it lives in victoria-metrics.yaml, and
+# kustomize would reject the duplicate. The NodePort (30300) must match the
+# containerPort kind maps to host 3000 in kind.yaml.
+#
+# Loopback-only, anonymous read-only: this is a throwaway smoke stack, so login
+# is disabled and every visitor is a read-only Viewer. kind.yaml binds host port
+# 3000 to 127.0.0.1, so the host-port mapping never reaches Grafana from beyond
+# the host; the NodePort Service still leaves a docker-network-scoped residual
+# (see kind.yaml). Do not adopt this posture for anything exposed.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: ostester-otel
+  labels:
+    app: grafana
+data:
+  # One Prometheus-type datasource pointing at VictoriaMetrics over the
+  # in-cluster Service DNS. The fixed uid (victoriametrics) is what every
+  # dashboard panel references, so exports and permalinks stay stable.
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: VictoriaMetrics
+        type: prometheus
+        uid: victoriametrics
+        access: proxy
+        url: http://victoria-metrics:8428
+        isDefault: true
+        jsonData:
+          # Matches the 15s OTLP export interval the smoke stack pins, so
+          # $__rate_interval computes sane windows on the dashboards.
+          timeInterval: "15s"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: ostester-otel
+  labels:
+    app: grafana
+data:
+  # A file provider that loads every dashboard JSON mounted under
+  # /var/lib/grafana/dashboards. The JSONs themselves come from the
+  # kustomize-generated grafana-dashboards ConfigMap mounted there.
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: openstack-tester
+        type: file
+        disableDeletion: false
+        # In-UI edits are saved to the emptyDir SQLite and are throwaway by
+        # design; the provisioned files win again on the next re-provision.
+        allowUiUpdates: true
+        updateIntervalSeconds: 30
+        options:
+          path: /var/lib/grafana/dashboards
+          foldersFromFilesStructure: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: ostester-otel
+  labels:
+    app: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      # Grafana's image runs as uid/gid 472; fsGroup makes the emptyDir writable
+      # for it without running as root.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 472
+        runAsGroup: 472
+        fsGroup: 472
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: grafana
+          # Pinned to the current stable at implementation time, by digest so a
+          # re-pushed tag can never swap the image out from under the stack
+          # (same convention as the VictoriaMetrics image).
+          image: grafana/grafana:13.1.0@sha256:121a7a9ece6dc10b969f1f96eed64b4f07dfac0d0b8abc070f7cb83bbde86f63
+          env:
+            # Loopback-only smoke stack: no login, every visitor is an
+            # anonymous read-only Viewer. Viewer (not Admin) is deliberate — an
+            # anonymous Admin could add a datasource with an arbitrary URL and
+            # turn Grafana's datasource proxy into an SSRF primitive; a Viewer
+            # cannot add datasources, so that arbitrary-URL pivot is closed. The
+            # narrower residual stays open: a Viewer can still reach the
+            # provisioned VictoriaMetrics datasource through the datasource-proxy
+            # endpoint (arbitrary PromQL reads, and whatever else VictoriaMetrics
+            # accepts on that host), and the NodePort Service leaves Grafana on
+            # the kind node's docker-network IP. That is the same unauthenticated,
+            # docker-network-scoped exposure VictoriaMetrics itself already
+            # carries (see kind.yaml) — accepted for a throwaway smoke stack, not
+            # fully closed.
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: "Viewer"
+            - name: GF_AUTH_DISABLE_LOGIN_FORM
+              value: "true"
+            - name: GF_ANALYTICS_REPORTING_ENABLED
+              value: "false"
+            # Bare http://localhost:3000 lands on the overview dashboard.
+            - name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH
+              value: "/var/lib/grafana/dashboards/overview.json"
+          ports:
+            - name: http
+              containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/grafana
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+      volumes:
+        # emptyDir: Grafana's SQLite (UI state, in-UI dashboard edits) survives
+        # pod restarts but not `make otel-down`. Throwaway by design, like VM.
+        - name: data
+          emptyDir: {}
+        # kustomize rewrites this name to the content-hashed grafana-dashboards
+        # ConfigMap it generates from dashboards/*.json; editing a dashboard JSON
+        # changes the hash, which rolls this pod with the new dashboards.
+        - name: dashboards
+          configMap:
+            name: grafana-dashboards
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+        - name: dashboard-provider
+          configMap:
+            name: grafana-dashboard-provider
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: ostester-otel
+  labels:
+    app: grafana
+spec:
+  type: NodePort
+  selector:
+    app: grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      nodePort: 30300
