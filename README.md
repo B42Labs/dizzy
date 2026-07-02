@@ -21,10 +21,10 @@ intended (API) state against the actual data plane (OVN / OVS).
 > network, plug a fraction of routers into it as a **gateway** and allocate
 > **floating IPs**. The `small`, `medium`, and `large` scenario profiles now ship
 > under `scenarios/`; the optional Prometheus textfile export is the remaining
-> Phase 1 item. A `neutron monitor` command now re-runs a scenario on a fixed
-> cadence, unattended, and — with `--otel` — exports per-operation and
-> per-iteration metrics via **OpenTelemetry (OTLP)** so a single installation
-> can be observed over time.
+> Phase 1 item. A `neutron monitor` command now re-runs a scenario
+> continuously or on a fixed cadence, unattended, and — with `--otel` — exports
+> per-operation and per-iteration metrics via **OpenTelemetry (OTLP)** so a
+> single installation can be observed over time.
 
 ---
 
@@ -250,7 +250,7 @@ A single binary `openstack-tester` with subcommands (Neutron grouped under a
 openstack-tester neutron generate  --scenario medium.yaml [--out plan.json]
 openstack-tester neutron apply     --scenario medium.yaml [--dry-run]
 openstack-tester neutron chaos     --scenario medium.yaml [--duration 30m]
-openstack-tester neutron monitor   --scenario medium.yaml --interval 15m [--iterations n] [--error-wait 2m] [--keep-run-records] [--otel]
+openstack-tester neutron monitor   --scenario medium.yaml [--interval 15m] [--iterations n] [--error-wait 2m] [--keep-run-records] [--otel]
 openstack-tester neutron status    --run run-<id>.json
 openstack-tester neutron report    --run run-<id>.json [--format table|json|csv|html]
 openstack-tester neutron cleanup   --run run-<id>.json   # or --run-id <id>
@@ -279,15 +279,19 @@ openstack-tester neutron verify    --run run-<id>.json   # Phase 2 (future)
   whole action schedule is reproducible. On a clean finish it tears the topology
   down by tag and runs a leak check; Ctrl-C / SIGTERM leaves the resources in
   place for an explicit `cleanup --run <id>`.
-- `monitor` — periodic mode. It re-runs the single-shot pipeline (pre-flight
-  orphan sweep → `apply` → `cleanup`) on a fixed cadence, unattended, so an
-  installation can be observed over time. `--interval` is the target cadence
-  between iteration *starts*: an iteration shorter than the interval waits the
-  remainder, one that overruns starts the next immediately (no overlapping
-  iterations, no backlog). `--iterations` caps the run (`0` = run forever);
-  `--error-wait` adds a pause after a failed iteration to avoid hammering an
-  unhealthy cloud. It survives individual iteration failures and logs a
-  one-line summary per iteration. Ctrl-C / SIGTERM stops the loop, tears the
+- `monitor` — continuous or periodic mode. It re-runs the single-shot pipeline
+  (pre-flight orphan sweep → `apply` → `cleanup`) unattended, so an
+  installation can be observed over time. By default (no `--interval`, or
+  `--interval 0`) iterations run **continuously**, back-to-back: the next
+  starts the moment the previous one finishes. A positive `--interval` is the
+  target cadence between iteration *starts* instead: an iteration shorter than
+  the interval waits the remainder, one that overruns starts the next
+  immediately. Either way iterations never overlap and no backlog builds up.
+  `--iterations` caps the run (`0` = run forever); `--error-wait` adds a pause
+  after a failed iteration to avoid hammering an unhealthy cloud, and is the
+  recommended brake in continuous mode. It survives individual iteration
+  failures and logs a one-line summary per iteration. Ctrl-C / SIGTERM stops
+  the loop, tears the
   current iteration down, and flushes the exporter; a second signal aborts
   hard. Per-iteration `run-<id>.json` records are **off by default**
   (`--keep-run-records` re-enables them, but they accumulate unboundedly); the
@@ -375,20 +379,24 @@ still carrying the run tag after the topology should be gone.
 
 ### Monitoring over time (`neutron monitor`)
 
-`neutron monitor` re-runs the single-shot pipeline on a fixed cadence,
-unattended, for days or weeks, so control-plane slowdowns, upgrade regressions,
-and error-rate changes become visible as trends instead of being buried in
-per-run JSON files. One **iteration** is a pre-flight orphan sweep → `apply` →
+`neutron monitor` re-runs the single-shot pipeline continuously by default or
+on a fixed cadence, unattended, for days or weeks, so control-plane slowdowns,
+upgrade regressions, and error-rate changes become visible as trends instead of
+being buried in per-run JSON files. One **iteration** is a pre-flight orphan
+sweep → `apply` →
 `cleanup`, composing the same executor, metrics collector, and cleanup code
 paths a one-shot `apply` uses. An iteration is always `apply` → `cleanup`; a
 scenario's `chaos:` block is not used by `monitor` (chaos-soak iterations are a
 possible follow-up).
 
-- **Cadence.** `--interval` is the target time between iteration *starts*. A
-  fast iteration waits out the remainder of the interval; one that overruns it
-  starts the next immediately, so iterations never overlap and no backlog
-  builds up. `--iterations` caps the run (`0` = forever); `--error-wait` adds a
-  pause after a failed iteration.
+- **Cadence.** With `--interval` omitted or `0` (the default) the loop runs
+  **continuously**: the next iteration starts as soon as the previous one
+  finishes, back-to-back, until stopped. A positive `--interval` is the target
+  time between iteration *starts* instead. A fast iteration waits out the
+  remainder of the interval; one that overruns it starts the next immediately,
+  so iterations never overlap and no backlog builds up. `--iterations` caps the
+  run (`0` = forever); `--error-wait` adds a pause after a failed iteration and
+  is the brake that keeps a broken cloud from being hammered in a tight loop.
 - **Fixed seed by default.** The plan is expanded once at startup, so every
   iteration reuses the same seed and therefore the same topology. This is the
   comparability default: the same resources are created each time, so latency
@@ -547,19 +555,21 @@ $ make otel-grafana     # open the provisioned Grafana overview dashboard
 $ make otel-ui          # or open VMUI for ad-hoc queries
 ```
 
-`make testbed-monitor` runs `neutron monitor --otel` on a cadence, exporting
-into the local VictoriaMetrics. Override the cadence, count, scenario, or add
-flags:
+`make testbed-monitor` runs `neutron monitor --otel` continuously by default,
+exporting into the local VictoriaMetrics. Override the cadence, count,
+scenario, or add flags:
 
 ```console
-$ make testbed-monitor MONITOR_INTERVAL=1m MONITOR_ITERATIONS=1
+$ make testbed-monitor MONITOR_INTERVAL=5m MONITOR_ITERATIONS=1
 $ make testbed-monitor SCENARIO=scenarios/medium.yaml ARGS="--error-wait 2m"
 ```
 
-With `MONITOR_ITERATIONS=0` (the default) it runs forever; a single Ctrl-C
-stops it gracefully — the current iteration tears down, the exporter flushes,
-and any leftover `run-*.json` is swept, exactly as `make testbed` does. The
-export interval is pinned to 15 s for fast local feedback.
+With `MONITOR_INTERVAL=0` and `MONITOR_ITERATIONS=0` (both the default) it runs
+iterations back-to-back forever, driving the dashboards with a steady stream of
+data; `MONITOR_INTERVAL=5m` restores the paced behaviour. A single Ctrl-C stops
+it gracefully — the current iteration tears down, the exporter flushes, and any
+leftover `run-*.json` is swept, exactly as `make testbed` does. The export
+interval is pinned to 15 s for fast local feedback.
 
 Once the first iteration has completed, check the stored schema and the Grafana
 path:
@@ -618,11 +628,12 @@ distribution shape is shown with **heatmaps** over the `_bucket` series; and
 **error panels split by `outcome`** (`success`/`error`/`timeout`) only, because
 the schema collapses error kinds to the outcome by design.
 
-> **Sampling cadence.** Monitor iterations run every `MONITOR_INTERVAL`
-> (default 5 m) and the metrics only move while an iteration runs. The panels
-> use `$__rate_interval` with a 1 m minimum interval so short ranges don't
-> render gaps as zeros; the views are meaningful from a handful of iterations
-> upward.
+> **Sampling cadence.** With the default continuous monitor
+> (`MONITOR_INTERVAL=0`) iterations run back-to-back, so the metrics flow
+> steadily while it runs. On a paced run (`MONITOR_INTERVAL` set, e.g. `5m`) the
+> metrics only move while an iteration runs. The panels use `$__rate_interval`
+> with a 1 m minimum interval so short ranges don't render gaps as zeros; the
+> views are meaningful from a handful of iterations upward.
 
 > **Recreating a pre-Grafana cluster.** kind cannot add the host port 3000
 > mapping to a running cluster, so a cluster booted before Grafana was added
