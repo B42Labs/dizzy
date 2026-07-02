@@ -33,7 +33,7 @@ func TestResolveRun(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, gotRecorded, err := resolveRun(tc.runPath, tc.runID)
+			got, gotRec, err := resolveRun(tc.runPath, tc.runID)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got id %q", got)
@@ -46,8 +46,8 @@ func TestResolveRun(t *testing.T) {
 			if got != tc.want {
 				t.Errorf("resolveRun id = %q, want %q", got, tc.want)
 			}
-			if gotHas := len(gotRecorded) > 0; gotHas != tc.wantRecorded {
-				t.Errorf("resolveRun recorded = %v, want present=%v", gotRecorded, tc.wantRecorded)
+			if gotHas := gotRec != nil && len(gotRec.Created) > 0; gotHas != tc.wantRecorded {
+				t.Errorf("resolveRun recorded = %v, want present=%v", gotRec, tc.wantRecorded)
 			}
 		})
 	}
