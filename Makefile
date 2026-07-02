@@ -9,13 +9,13 @@ GOLANGCI    ?= golangci-lint
 # cloud defined in contrib/clouds.yaml. Any run record the command leaves
 # behind (run-<id>.json) is cleaned up afterwards, even when the run itself
 # fails. Override any variable at invocation:
-#   make testbed SCENARIO=scenarios/medium.yaml
+#   make testbed SCENARIO=scenarios/neutron/medium.yaml
 #   make testbed TESTBED_CMD=chaos ARGS="--concurrency 16"
 #   make testbed KEEP=1   # skip the cleanup, keep resources and run record
 OS_CLOUD    ?= test
 CLOUDS_FILE ?= contrib/clouds.yaml
 OS_CACERT   ?= contrib/testbed.pem
-SCENARIO    ?= scenarios/small.yaml
+SCENARIO    ?= scenarios/neutron/small.yaml
 TESTBED_CMD ?= apply
 
 # --- Local OTEL smoke stack -------------------------------------------------

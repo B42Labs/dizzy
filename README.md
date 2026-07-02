@@ -219,8 +219,8 @@ chaos:
 
 ### Built-in profiles
 
-Three ready-to-use profiles ship under `scenarios/`, selected by passing the
-file path to `--scenario`:
+Three ready-to-use profiles ship under `scenarios/neutron/`, selected by passing
+the file path to `--scenario`:
 
 | Profile | Networks | Routers | Subnets | Chaos duration | Notes |
 |---------|----------|---------|---------|----------------|-------|
@@ -234,9 +234,9 @@ flags. Override any of them on the CLI when you want a longer soak or denser
 churn.
 
 ```
-openstack-tester neutron generate  --scenario scenarios/medium.yaml [--out plan.json]
-openstack-tester neutron apply     --scenario scenarios/large.yaml  [--dry-run]
-openstack-tester neutron chaos     --scenario scenarios/small.yaml  # 5m churn, no flags needed
+openstack-tester neutron generate  --scenario scenarios/neutron/medium.yaml [--out plan.json]
+openstack-tester neutron apply     --scenario scenarios/neutron/large.yaml  [--dry-run]
+openstack-tester neutron chaos     --scenario scenarios/neutron/small.yaml  # 5m churn, no flags needed
 ```
 
 ---
@@ -575,7 +575,7 @@ scenario, or add flags:
 
 ```console
 $ make testbed-monitor MONITOR_INTERVAL=5m MONITOR_ITERATIONS=1
-$ make testbed-monitor SCENARIO=scenarios/medium.yaml ARGS="--error-wait 2m"
+$ make testbed-monitor SCENARIO=scenarios/neutron/medium.yaml ARGS="--error-wait 2m"
 ```
 
 With `MONITOR_INTERVAL=0` and `MONITOR_ITERATIONS=0` (both the default) it runs

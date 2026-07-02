@@ -7,7 +7,8 @@ import (
 	"github.com/B42Labs/openstack-tester/scenarios"
 )
 
-// profileNames are the built-in scenario profiles shipped under scenarios/.
+// profileNames are the built-in scenario profiles shipped under
+// scenarios/neutron/.
 var profileNames = []string{"small", "medium", "large"}
 
 // readProfile reads and parses a shipped profile by name from the embedded
@@ -15,7 +16,7 @@ var profileNames = []string{"small", "medium", "large"}
 // directory.
 func readProfile(t *testing.T, name string) Scenario {
 	t.Helper()
-	data, err := scenarios.Files.ReadFile(name + ".yaml")
+	data, err := scenarios.Files.ReadFile("neutron/" + name + ".yaml")
 	if err != nil {
 		t.Fatalf("reading profile %s.yaml: %v", name, err)
 	}
@@ -49,8 +50,8 @@ func TestProfilesGenerateValidPlans(t *testing.T) {
 
 // TestProfilesShipRunnableChaosBlock locks the requirement that every shipped
 // profile carries a chaos block with a positive duration, so `neutron chaos
-// --scenario scenarios/<profile>.yaml` runs straight away without --duration or
-// any other flag.
+// --scenario scenarios/neutron/<profile>.yaml` runs straight away without
+// --duration or any other flag.
 func TestProfilesShipRunnableChaosBlock(t *testing.T) {
 	for _, name := range profileNames {
 		t.Run(name, func(t *testing.T) {
@@ -86,7 +87,7 @@ func TestMediumProfileMatchesReadmeExample(t *testing.T) {
 	})
 	got.Chaos = nil
 	if want := mediumScenario(); got != want {
-		t.Errorf("scenarios/medium.yaml = %+v, want %+v", got, want)
+		t.Errorf("scenarios/neutron/medium.yaml = %+v, want %+v", got, want)
 	}
 }
 
@@ -106,7 +107,7 @@ func TestSmallProfileMatchesGoldenFixture(t *testing.T) {
 	})
 	got.Chaos = nil
 	if want := smallScenario(); got != want {
-		t.Errorf("scenarios/small.yaml = %+v, want %+v", got, want)
+		t.Errorf("scenarios/neutron/small.yaml = %+v, want %+v", got, want)
 	}
 }
 
@@ -117,10 +118,10 @@ func TestSmallProfileMatchesGoldenFixture(t *testing.T) {
 func assertChaos(t *testing.T, name string, got *Chaos, want Chaos) {
 	t.Helper()
 	if got == nil {
-		t.Fatalf("scenarios/%s.yaml has no chaos block; the chaos subcommand needs one to run without --duration", name)
+		t.Fatalf("scenarios/neutron/%s.yaml has no chaos block; the chaos subcommand needs one to run without --duration", name)
 	}
 	if *got != want {
-		t.Errorf("scenarios/%s.yaml chaos = %+v, want %+v", name, *got, want)
+		t.Errorf("scenarios/neutron/%s.yaml chaos = %+v, want %+v", name, *got, want)
 	}
 }
 
