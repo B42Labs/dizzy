@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/B42Labs/openstack-tester/internal/metrics"
-	"github.com/B42Labs/openstack-tester/internal/neutron"
+	"github.com/B42Labs/openstack-tester/internal/resource"
 )
 
 // Record is the persisted result of one apply. It is the canonical,
@@ -22,14 +22,23 @@ import (
 // Metrics holds the aggregated timing, and Error is the apply error message when
 // the run failed partway, empty otherwise.
 type Record struct {
-	RunID      string             `json:"runID"`
-	Scenario   string             `json:"scenario"`
-	Seed       int64              `json:"seed"`
-	StartedAt  time.Time          `json:"startedAt"`
-	FinishedAt time.Time          `json:"finishedAt"`
-	Created    []neutron.Resource `json:"created"`
-	Error      string             `json:"error,omitempty"`
-	Metrics    metrics.Aggregate  `json:"metrics"`
+	RunID string `json:"runID"`
+	// Service names the OpenStack service the run exercised (neutron or
+	// cinder). It is omitempty and read as "neutron" when absent, so run records
+	// written before Cinder support (which carry no service field) still load and
+	// report unchanged.
+	Service    string              `json:"service,omitempty"`
+	Scenario   string              `json:"scenario"`
+	Seed       int64               `json:"seed"`
+	StartedAt  time.Time           `json:"startedAt"`
+	FinishedAt time.Time           `json:"finishedAt"`
+	Created    []resource.Resource `json:"created"`
+	Error      string              `json:"error,omitempty"`
+	Metrics    metrics.Aggregate   `json:"metrics"`
+	// VolumeType records the Cinder volume type every volume of a cinder run was
+	// created with, for provenance. It is empty for a neutron run and for a
+	// cinder run that used the cloud's default type.
+	VolumeType string `json:"volumeType,omitempty"`
 	// Chaos holds the churn-specific statistics of a soak/chaos run. It is nil
 	// for an apply run, so an apply record's shape is unchanged.
 	Chaos *ChaosStats `json:"chaos,omitempty"`

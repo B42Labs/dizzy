@@ -18,6 +18,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/attributestags"
 
 	"github.com/B42Labs/openstack-tester/internal/metrics"
+	"github.com/B42Labs/openstack-tester/internal/resource"
 	"github.com/B42Labs/openstack-tester/internal/telemetry"
 )
 
@@ -34,8 +35,10 @@ const (
 var ErrQuota = errors.New("neutron: quota exceeded")
 
 // Kind names a Phase 1 Neutron resource type. It doubles as the metrics
-// "type" label and the tag value written under ostester:type.
-type Kind string
+// "type" label and the tag value written under ostester:type. It is an alias
+// for the shared resource.Kind so the neutron package API stays
+// source-compatible after the identity type moved to internal/resource.
+type Kind = resource.Kind
 
 // The Phase 1 resource kinds, in dependency order.
 const (
@@ -54,12 +57,9 @@ const (
 // Resource is the cloud identity of a created resource. Logical is the plan's
 // reference name (e.g. "net-0001"); Name is the applied cloud name; ID is the
 // Neutron UUID. The executor collects these and a later cleanup consumes them.
-type Resource struct {
-	Kind    Kind   `json:"kind"`
-	Logical string `json:"logical"`
-	Name    string `json:"name"`
-	ID      string `json:"id"`
-}
+// It is an alias for the shared resource.Resource so the neutron package API
+// stays source-compatible after the identity type moved to internal/resource.
+type Resource = resource.Resource
 
 // Client wraps an authenticated NetworkV2 service client, binding every created
 // resource to a run id and recording timing into a Collector.
