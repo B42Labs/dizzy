@@ -134,6 +134,9 @@ otel-down:
 	kind delete cluster --name ostester-otel
 
 ## otel-verify: Check the metric families in VictoriaMetrics and Grafana health.
+# openstack_tester_operation_errors_total is deliberately not a required family:
+# it only exists once operations have failed, so a healthy run's steady state is
+# its absence, not a missing-metric failure.
 otel-verify:
 	@command -v curl >/dev/null 2>&1 || { echo "error: curl not found in PATH"; exit 1; }
 	@names=$$(curl -fsS 'http://localhost:8428/api/v1/label/__name__/values') \
