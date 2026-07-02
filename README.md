@@ -576,18 +576,19 @@ The flow:
 
 ```console
 $ make otel-up          # boot kind + VictoriaMetrics (:8428) + Grafana (:3000)
-$ make testbed-monitor  # run neutron monitor --otel against the testbed
+$ make testbed-monitor  # run monitor --otel (SERVICE=neutron by default) against the testbed
 $ make otel-grafana     # open the provisioned Grafana overview dashboard
 $ make otel-ui          # or open VMUI for ad-hoc queries
 ```
 
 `make testbed-monitor` runs `neutron monitor --otel` continuously by default,
 exporting into the local VictoriaMetrics. Override the cadence, count,
-scenario, or add flags:
+scenario, service namespace, or add flags:
 
 ```console
 $ make testbed-monitor MONITOR_INTERVAL=5m MONITOR_ITERATIONS=1
 $ make testbed-monitor SCENARIO=scenarios/neutron/medium.yaml ARGS="--error-wait 2m"
+$ make testbed-monitor SERVICE=cinder  # scenarios/cinder/small.yaml, once cinder monitor exists (#31)
 ```
 
 With `MONITOR_INTERVAL=0` and `MONITOR_ITERATIONS=0` (both the default) it runs

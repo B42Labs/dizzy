@@ -5,23 +5,26 @@ GOFLAGS     ?=
 GOLANGCI    ?= golangci-lint
 
 # --- Testbed run ------------------------------------------------------------
-# `make testbed` runs a neutron scenario directly against the OSISM testbed
-# cloud defined in contrib/clouds.yaml. Any run record the command leaves
-# behind (run-<id>.json) is cleaned up afterwards, even when the run itself
-# fails. Override any variable at invocation:
+# `make testbed` runs a scenario for one service namespace (SERVICE, default
+# neutron) directly against the OSISM testbed cloud defined in
+# contrib/clouds.yaml. Any run record the command leaves behind (run-<id>.json)
+# is cleaned up afterwards, even when the run itself fails. Override any
+# variable at invocation:
 #   make testbed SCENARIO=scenarios/neutron/medium.yaml
+#   make testbed SERVICE=cinder   # runs scenarios/cinder/small.yaml
 #   make testbed TESTBED_CMD=chaos ARGS="--concurrency 16"
 #   make testbed KEEP=1   # skip the cleanup, keep resources and run record
 OS_CLOUD    ?= test
 CLOUDS_FILE ?= contrib/clouds.yaml
 OS_CACERT   ?= contrib/testbed.pem
-SCENARIO    ?= scenarios/neutron/small.yaml
+SERVICE     ?= neutron
+SCENARIO    ?= scenarios/$(SERVICE)/small.yaml
 TESTBED_CMD ?= apply
 
 # --- Local OTEL smoke stack -------------------------------------------------
 # `make otel-up` boots a local kind cluster running VictoriaMetrics reachable
 # on http://localhost:8428 and Grafana (anonymous, provisioned) on
-# http://localhost:3000; `make testbed-monitor` then runs `neutron monitor
+# http://localhost:3000; `make testbed-monitor` then runs `$(SERVICE) monitor
 # --otel` against the testbed, pushing OTLP metrics into it; `make otel-ui`
 # opens VMUI, `make otel-grafana` opens the Grafana overview dashboard,
 # `make otel-verify` checks the stored schema and Grafana health, `make
@@ -53,18 +56,18 @@ install:
 run: build
 	./$(BINARY) $(ARGS)
 
-## testbed: Run the neutron small scenario against the testbed cloud, then clean up.
+## testbed: Run the small scenario (SERVICE=neutron|cinder) against the testbed cloud, then clean up.
 testbed: build
 	@test -f "$(CLOUDS_FILE)" || { echo "error: clouds file $(CLOUDS_FILE) not found"; exit 1; }
 	@test -f "$(OS_CACERT)"   || { echo "error: CA cert $(OS_CACERT) not found (clouds.yaml 'cacert')"; exit 1; }
 	@test -f "$(SCENARIO)"    || { echo "error: scenario $(SCENARIO) not found"; exit 1; }
-	@echo "Running neutron $(TESTBED_CMD) against the OSISM testbed:"
+	@echo "Running $(SERVICE) $(TESTBED_CMD) against the OSISM testbed:"
 	@echo "  Cloud:    $(OS_CLOUD) ($(CLOUDS_FILE))"
 	@echo "  Scenario: $(SCENARIO)"
 	@echo "  CA cert:  $(OS_CACERT)"
 	@before=$$(ls run-*.json 2>/dev/null); \
 	OS_CLIENT_CONFIG_FILE="$(CLOUDS_FILE)" \
-	./$(BINARY) neutron $(TESTBED_CMD) --os-cloud "$(OS_CLOUD)" --scenario "$(SCENARIO)" $(ARGS); \
+	./$(BINARY) $(SERVICE) $(TESTBED_CMD) --os-cloud "$(OS_CLOUD)" --scenario "$(SCENARIO)" $(ARGS); \
 	status=$$?; \
 	if [ -n "$(KEEP)" ]; then echo "KEEP set, skipping cleanup"; exit $$status; fi; \
 	for rec in run-*.json; do \
@@ -72,7 +75,7 @@ testbed: build
 		echo "$$before" | grep -Fqx "$$rec" && continue; \
 		echo "Cleaning up $$rec"; \
 		OS_CLIENT_CONFIG_FILE="$(CLOUDS_FILE)" \
-		./$(BINARY) neutron cleanup --os-cloud "$(OS_CLOUD)" --run "$$rec" && rm -f "$$rec" || status=1; \
+		./$(BINARY) $(SERVICE) cleanup --os-cloud "$(OS_CLOUD)" --run "$$rec" && rm -f "$$rec" || status=1; \
 	done; \
 	exit $$status
 
@@ -180,7 +183,7 @@ otel-grafana:
 	echo "Opening Grafana: $$url"; \
 	open "$$url" 2>/dev/null || xdg-open "$$url" 2>/dev/null || echo "open the URL above in your browser"
 
-## testbed-monitor: Run neutron monitor --otel against the testbed, exporting to VictoriaMetrics.
+## testbed-monitor: Run monitor --otel (SERVICE=neutron|cinder) against the testbed, exporting to VictoriaMetrics.
 # monitor applies and cleans up each iteration's resources itself, so this
 # target runs no post-run cleanup: unlike `testbed`, scanning run-*.json in the
 # shared working directory would tear down the resources of a concurrent
@@ -191,7 +194,7 @@ testbed-monitor: build
 	@test -f "$(SCENARIO)"    || { echo "error: scenario $(SCENARIO) not found"; exit 1; }
 	@curl -fsS -m 2 http://localhost:8428/health >/dev/null 2>&1 \
 		|| echo "warning: VictoriaMetrics is not answering on localhost:8428 (run 'make otel-up' first); metrics will be exported into the void"
-	@echo "Running neutron monitor --otel against the OSISM testbed:"
+	@echo "Running $(SERVICE) monitor --otel against the OSISM testbed:"
 	@echo "  Cloud:    $(OS_CLOUD) ($(CLOUDS_FILE))"
 	@echo "  Scenario: $(SCENARIO)"
 	@echo "  Cadence:  interval $(MONITOR_INTERVAL) (0 = continuous), iterations $(MONITOR_ITERATIONS) (0 = forever, Ctrl-C to stop)"
@@ -199,5 +202,5 @@ testbed-monitor: build
 	@OS_CLIENT_CONFIG_FILE="$(CLOUDS_FILE)" \
 	OTEL_EXPORTER_OTLP_METRICS_ENDPOINT="http://localhost:8428/opentelemetry/v1/metrics" \
 	OTEL_METRIC_EXPORT_INTERVAL=15000 \
-	./$(BINARY) neutron monitor --os-cloud "$(OS_CLOUD)" --scenario "$(SCENARIO)" \
+	./$(BINARY) $(SERVICE) monitor --os-cloud "$(OS_CLOUD)" --scenario "$(SCENARIO)" \
 		--interval "$(MONITOR_INTERVAL)" --iterations "$(MONITOR_ITERATIONS)" --otel $(ARGS)
