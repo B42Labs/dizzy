@@ -65,7 +65,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-      "description": "Share of all Neutron API calls whose outcome is not success (error or timeout), over the dashboard time range. Error kinds collapse to outcome by design (quota, http_5xx, ... all map to error); a per-kind breakdown lands with the dedicated errors counter.",
+      "description": "Share of all Neutron API calls whose outcome is not success (error or timeout), over the dashboard time range. This is the outcome-level share; for the per-error_kind breakdown (quota, http_<status>, ...) see the \"Errors by error kind\" panel on the Neutron API operations dashboard.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
