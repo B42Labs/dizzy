@@ -4,14 +4,18 @@
 // as before: a nil *Telemetry is the no-op, and every method returns early on
 // it. When enabled via Setup it builds an OTLP exporter configured entirely
 // from the standard OTEL_EXPORTER_OTLP_* environment variables and records the
-// documented per-operation, time-to-ready, and per-iteration instruments
-// alongside the in-memory metrics.Collector, which stays the source of truth
-// for run records and reports.
+// documented per-operation, time-to-ready, and per-iteration instruments —
+// including the per-error-kind operation.errors counter — alongside the
+// in-memory metrics.Collector, which stays the source of truth for run records
+// and reports.
 //
 // Cardinality rule: metric attributes carry only bounded, low-cardinality
-// labels (kind, operation, outcome, result). A run id, resource id, or resource
-// name must never become a metric attribute; those live in the run records and
-// logs.
+// labels (kind, operation, outcome, result, error.kind). error.kind is the
+// neutron client's classification of a failure (quota, timeout, canceled,
+// other, or http_<status> for a fixed set of status codes, with any other code
+// collapsed to http_other), so it stays bounded. A run id, resource id, or
+// resource name must never become a metric attribute; those live in the run
+// records and logs.
 package telemetry
 
 import (
@@ -51,6 +55,7 @@ type Telemetry struct {
 	shutdown func(context.Context) error
 
 	operationDuration metric.Float64Histogram
+	operationErrors   metric.Int64Counter
 	timeToReady       metric.Float64Histogram
 	iterationDuration metric.Float64Histogram
 	iterationOps      metric.Int64Counter
@@ -111,7 +116,7 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 
 // NewWithProvider constructs the tester's instruments against mp. Setup uses it
 // with the OTLP-backed provider; tests use it with an in-memory ManualReader
-// provider to assert the emitted metric schema without a collector. All five
+// provider to assert the emitted metric schema without a collector. All six
 // instruments are built once here so recording on the hot path is a cheap
 // method call.
 func NewWithProvider(mp metric.MeterProvider) (*Telemetry, error) {
@@ -133,6 +138,10 @@ func NewWithProvider(mp metric.MeterProvider) (*Telemetry, error) {
 		metric.WithDescription("Duration of a single Neutron API operation."),
 		metric.WithUnit("s"), callBoundaries); err != nil {
 		return nil, fmt.Errorf("creating operation.duration instrument: %w", err)
+	}
+	if t.operationErrors, err = m.Int64Counter("openstack_tester.operation.errors",
+		metric.WithDescription("Failed Neutron API operations by error kind.")); err != nil {
+		return nil, fmt.Errorf("creating operation.errors instrument: %w", err)
 	}
 	if t.timeToReady, err = m.Float64Histogram("openstack_tester.resource.time_to_ready",
 		metric.WithDescription("Time from create returning to a resource reaching its expected status."),
@@ -180,7 +189,10 @@ func newExporter(ctx context.Context) (sdkmetric.Exporter, error) {
 
 // RecordOperation records one Neutron API call's duration under kind and op with
 // the outcome derived from errKind (as the neutron client classifies it): an
-// empty errKind is success, "timeout" is timeout, anything else is error.
+// empty errKind is success, "timeout" is timeout, anything else is error. A
+// failed call additionally increments operation.errors with the verbatim
+// errKind as error.kind, preserving the per-error-kind breakdown that outcome
+// collapses; a successful call creates no operation.errors series.
 func (t *Telemetry) RecordOperation(ctx context.Context, kind, op string, d time.Duration, errKind string) {
 	if t == nil {
 		return
@@ -190,6 +202,13 @@ func (t *Telemetry) RecordOperation(ctx context.Context, kind, op string, d time
 		attribute.String("operation", op),
 		attribute.String("outcome", operationOutcome(errKind)),
 	))
+	if errKind != "" {
+		t.operationErrors.Add(ctx, 1, metric.WithAttributes(
+			attribute.String("kind", kind),
+			attribute.String("operation", op),
+			attribute.String("error.kind", errKind),
+		))
+	}
 }
 
 // RecordTimeToReady records how long a status-bearing resource of kind took to

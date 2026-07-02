@@ -57,6 +57,50 @@ func hasHistoPoint(t *testing.T, reader *sdkmetric.ManualReader, name string, wa
 	return false
 }
 
+// hasSumPoint reports whether the named int64 counter has a data point whose
+// attributes exactly match want. It is the metricdata.Sum twin of hasHistoPoint.
+func hasSumPoint(t *testing.T, reader *sdkmetric.ManualReader, name string, want map[string]string) bool {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collecting metrics: %v", err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			s, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("%s is not an int64 sum: %T", name, m.Data)
+			}
+			for _, dp := range s.DataPoints {
+				if setMatches(dp.Attributes, want) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// hasMetric reports whether a metric of the given name was emitted at all.
+func hasMetric(t *testing.T, reader *sdkmetric.ManualReader, name string) bool {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collecting metrics: %v", err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // setMatches reports whether set has exactly the wanted string attributes.
 func setMatches(set attribute.Set, want map[string]string) bool {
 	if set.Len() != len(want) {
@@ -104,6 +148,10 @@ func TestTimedRecordsOperationTelemetry(t *testing.T) {
 		map[string]string{"kind": "network", "operation": "tag", "outcome": "success"}) {
 		t.Error("tag was not recorded as {kind=network, operation=tag, outcome=success}")
 	}
+	// An all-success flow must not create the operation.errors series at all.
+	if hasMetric(t, reader, "openstack_tester.operation.errors") {
+		t.Error("an all-success flow created an openstack_tester.operation.errors series")
+	}
 }
 
 // TestTimedRecordsErrorOutcome confirms a failed call maps to the error outcome
@@ -133,6 +181,13 @@ func TestTimedRecordsErrorOutcome(t *testing.T) {
 	if !hasHistoPoint(t, reader, "openstack_tester.operation.duration",
 		map[string]string{"kind": "network", "operation": "tag", "outcome": "error"}) {
 		t.Error("a failing tag PUT was not recorded with outcome=error")
+	}
+	// The same failure reaches operation.errors with the exact error.kind the
+	// classifier derives from the gophercloud 500 — parity with the report's
+	// Errors table, end to end.
+	if !hasSumPoint(t, reader, "openstack_tester.operation.errors",
+		map[string]string{"kind": "network", "operation": "tag", "error.kind": "http_500"}) {
+		t.Error("a failing tag PUT was not counted as {kind=network, operation=tag, error.kind=http_500}")
 	}
 }
 

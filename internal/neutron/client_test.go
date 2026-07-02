@@ -120,6 +120,7 @@ func TestClassification(t *testing.T) {
 		{"403 mentions quota but is not over-quota", respErr(403, "Not authorized to view quota"), false, false, "http_403", 403},
 		{"409 mentions quota but is not over-quota", respErr(409, "conflict with quota object"), true, false, "http_409", 409},
 		{"404", respErr(404, ""), false, false, "http_404", 404},
+		{"418 unlisted code collapses to http_other", respErr(418, ""), false, false, "http_other", 418},
 		{"timeout", context.DeadlineExceeded, false, false, "timeout", 0},
 		{"canceled", context.Canceled, false, false, "canceled", 0},
 		{"transport", errors.New("connection refused"), false, false, "other", 0},
