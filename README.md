@@ -380,7 +380,9 @@ unattended, for days or weeks, so control-plane slowdowns, upgrade regressions,
 and error-rate changes become visible as trends instead of being buried in
 per-run JSON files. One **iteration** is a pre-flight orphan sweep → `apply` →
 `cleanup`, composing the same executor, metrics collector, and cleanup code
-paths a one-shot `apply` uses.
+paths a one-shot `apply` uses. An iteration is always `apply` → `cleanup`; a
+scenario's `chaos:` block is not used by `monitor` (chaos-soak iterations are a
+possible follow-up).
 
 - **Cadence.** `--interval` is the target time between iteration *starts*. A
   fast iteration waits out the remainder of the interval; one that overruns it
