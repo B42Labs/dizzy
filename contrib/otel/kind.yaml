@@ -1,12 +1,19 @@
 # kind cluster for the local OTEL smoke stack (see README §9).
 #
-# A single-node cluster named "ostester-otel" whose control-plane node maps
-# host port 8428 to the node's NodePort 30428. The host binary and the browser
-# reach VictoriaMetrics at plain http://localhost:8428 through this mapping.
+# A single-node cluster named "ostester-otel" whose control-plane node maps two
+# host ports to node NodePorts: host 8428 to NodePort 30428 (VictoriaMetrics)
+# and host 3000 to NodePort 30300 (Grafana). The host binary and the browser
+# reach VictoriaMetrics at plain http://localhost:8428 and Grafana at
+# http://localhost:3000 through these mappings.
 #
-# Keep the cluster name, the host port, and the container port in sync with the
-# Makefile targets (otel-up/down/verify/ui, testbed-monitor) and with the
-# NodePort in victoria-metrics.yaml.
+# Keep the cluster name, the host ports, and the container ports in sync with
+# the Makefile targets (otel-up/down/verify/ui/grafana, testbed-monitor) and
+# with the NodePorts in victoria-metrics.yaml (30428) and grafana.yaml (30300).
+#
+# kind cannot add port mappings to a running cluster, so a cluster created
+# before the Grafana mapping was added has no host port 3000. otel-up guards
+# against that with a `docker port` check and asks for a recreate; there is no
+# in-place upgrade path.
 ---
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
@@ -24,5 +31,14 @@ nodes:
         # IP on 30428 (from the docker host and sibling containers on the kind
         # bridge). That residual exposure is scoped to the local docker network
         # and accepted for a throwaway smoke stack.
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      - containerPort: 30300
+        hostPort: 3000
+        # Bind Grafana to loopback for the same reason as 8428: Grafana runs with
+        # anonymous read-only (Viewer) access (no login) for this smoke stack and
+        # must never be reachable beyond the host. As above, the NodePort leaves a
+        # residual exposure on the kind node's docker-network IP (30300), scoped to
+        # the local docker network and accepted for a throwaway stack.
         listenAddress: "127.0.0.1"
         protocol: TCP
