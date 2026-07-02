@@ -67,6 +67,25 @@ func TestMonitorLoopStartsImmediatelyAfterOverrun(t *testing.T) {
 	}
 }
 
+func TestMonitorLoopContinuousRunsBackToBack(t *testing.T) {
+	clk := &fakeClock{now: time.Unix(0, 0)}
+	cfg := monitorConfig{interval: 0, iterations: 3} // continuous: no pacing gap
+	runOnce := func(ctx context.Context, iter int) bool {
+		clk.advance(2 * time.Minute) // however long an iteration takes,
+		return true                  // the next starts the moment it finishes
+	}
+
+	iterations, failures := runMonitorLoop(context.Background(), cfg, clk, runOnce)
+
+	if iterations != 3 || failures != 0 {
+		t.Fatalf("iterations=%d failures=%d, want 3/0", iterations, failures)
+	}
+	// Two inter-iteration sleeps, both exactly zero: back-to-back, no wait.
+	if len(clk.sleeps) != 2 || clk.sleeps[0] != 0 || clk.sleeps[1] != 0 {
+		t.Errorf("sleeps = %v, want [0s 0s] (iterations run back-to-back)", clk.sleeps)
+	}
+}
+
 func TestMonitorLoopAppliesErrorWait(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -77,6 +96,7 @@ func TestMonitorLoopAppliesErrorWait(t *testing.T) {
 	}{
 		{"error wait exceeds remaining", 10 * time.Minute, 20 * time.Minute, 2 * time.Minute, 20 * time.Minute},
 		{"remaining exceeds error wait", 30 * time.Minute, 5 * time.Minute, 2 * time.Minute, 28 * time.Minute},
+		{"continuous mode still waits after a failure", 0, 5 * time.Minute, 2 * time.Minute, 5 * time.Minute},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -97,6 +117,27 @@ func TestMonitorLoopAppliesErrorWait(t *testing.T) {
 				t.Errorf("sleeps = %v, want [%s]", clk.sleeps, tc.wantSleep)
 			}
 		})
+	}
+}
+
+func TestMonitorLoopFloorsFastFailureBackoff(t *testing.T) {
+	clk := &fakeClock{now: time.Unix(0, 0)}
+	cfg := monitorConfig{interval: 0, iterations: 2} // continuous, no error-wait
+	runOnce := func(ctx context.Context, iter int) bool {
+		clk.advance(time.Millisecond) // a dependency (e.g. Keystone) fails fast
+		return false
+	}
+
+	_, failures := runMonitorLoop(context.Background(), cfg, clk, runOnce)
+
+	if failures != 2 {
+		t.Fatalf("failures = %d, want 2", failures)
+	}
+	// With interval and error-wait both 0, a fast-failing iteration would yield a
+	// zero delay and hot-loop; the minimum failure backoff floors it at 5s so the
+	// loop backs off instead of self-DoSing the unhealthy dependency.
+	if len(clk.sleeps) != 1 || clk.sleeps[0] != 5*time.Second {
+		t.Errorf("sleeps = %v, want [5s] (fast failure floored to the minimum backoff)", clk.sleeps)
 	}
 }
 
@@ -142,6 +183,29 @@ func TestMonitorLoopStopsOnCancel(t *testing.T) {
 	}
 	if failures != 3 {
 		t.Errorf("failures = %d, want 3", failures)
+	}
+}
+
+func TestMonitorLoopContinuousStopsOnCancel(t *testing.T) {
+	clk := &fakeClock{now: time.Unix(0, 0)}
+	cfg := monitorConfig{interval: 0} // continuous and unbounded (run forever)
+	ctx, cancel := context.WithCancel(context.Background())
+	var calls int
+	runOnce := func(ctx context.Context, iter int) bool {
+		calls++
+		clk.advance(time.Second)
+		if calls == 3 {
+			cancel() // an operator interrupts the third back-to-back iteration
+		}
+		return true
+	}
+
+	iterations, _ := runMonitorLoop(ctx, cfg, clk, runOnce)
+
+	// Back-to-back iterations still end on cancel rather than spinning: the
+	// clock's Sleep observes the cancelled context even with a zero delay.
+	if iterations != 3 {
+		t.Errorf("iterations = %d, want 3 (continuous loop stops promptly on cancel)", iterations)
 	}
 }
 
@@ -273,7 +337,7 @@ func TestMonitorConfigValidate(t *testing.T) {
 		wantErr bool
 	}{
 		{"valid", monitorConfig{interval: time.Minute}, false},
-		{"zero interval", monitorConfig{interval: 0}, true},
+		{"zero interval (continuous)", monitorConfig{interval: 0}, false},
 		{"negative interval", monitorConfig{interval: -time.Minute}, true},
 		{"negative iterations", monitorConfig{interval: time.Minute, iterations: -1}, true},
 		{"negative error wait", monitorConfig{interval: time.Minute, errorWait: -time.Second}, true},
@@ -293,39 +357,43 @@ func TestMonitorRequiresScenario(t *testing.T) {
 	}
 }
 
-func TestMonitorRequiresInterval(t *testing.T) {
+func TestMonitorRejectsNegativeInterval(t *testing.T) {
 	path := writeScenario(t, sampleScenarioYAML)
-	tests := []struct {
-		name string
-		args []string
-	}{
-		{"missing interval", []string{"neutron", "monitor", "--scenario", path}},
-		{"zero interval", []string{"neutron", "monitor", "--scenario", path, "--interval", "0"}},
-		{"negative interval", []string{"neutron", "monitor", "--scenario", path, "--interval=-1m"}},
+	_, err := execRoot(t, "neutron", "monitor", "--scenario", path, "--interval=-1m")
+	if err == nil {
+		t.Fatal("monitor with a negative --interval: expected an error, got nil")
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, err := execRoot(t, tc.args...); err == nil {
-				t.Errorf("expected an error for args %v, got nil", tc.args)
-			}
-		})
+	if !strings.Contains(err.Error(), "--interval") {
+		t.Errorf("error = %q, want it to mention --interval", err.Error())
 	}
 }
 
 func TestMonitorWithValidConfigRequiresCloud(t *testing.T) {
 	// Point clouds.yaml resolution at a nonexistent file so auth fails
 	// deterministically, proving config validation and telemetry setup precede
-	// authentication — the interval is valid, yet the command still fails only at
-	// client creation.
+	// authentication — a missing, zero, or positive interval all validate, yet
+	// the command still fails only at client creation.
 	t.Setenv("OS_CLOUD", "")
 	t.Setenv("OS_CLIENT_CONFIG_FILE", "/nonexistent/clouds.yaml")
 
 	path := writeScenario(t, sampleScenarioYAML)
-	_, err := execRoot(t, "neutron", "monitor", "--scenario", path, "--interval", "1m", "--iterations", "1")
-	if err == nil {
-		t.Fatal("monitor with a valid config but no reachable cloud: expected an error, got nil")
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"paced", []string{"neutron", "monitor", "--scenario", path, "--iterations", "1", "--interval", "1m"}},
+		{"continuous by default", []string{"neutron", "monitor", "--scenario", path, "--iterations", "1"}},
+		{"explicit zero interval", []string{"neutron", "monitor", "--scenario", path, "--iterations", "1", "--interval", "0"}},
 	}
-	if !strings.Contains(err.Error(), "network client") {
-		t.Errorf("error = %q, want it to mention the network client (auth) step", err.Error())
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := execRoot(t, tc.args...)
+			if err == nil {
+				t.Fatal("monitor with a valid config but no reachable cloud: expected an error, got nil")
+			}
+			if !strings.Contains(err.Error(), "network client") {
+				t.Errorf("error = %q, want it to mention the network client (auth) step", err.Error())
+			}
+		})
 	}
 }
