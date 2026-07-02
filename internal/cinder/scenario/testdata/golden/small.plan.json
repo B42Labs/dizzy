@@ -1,0 +1,59 @@
+{
+  "scenario": "small",
+  "seed": 42,
+  "volumes": [
+    {
+      "name": "vol-0001",
+      "sizeGiB": 1,
+      "resizeToGiB": 2
+    },
+    {
+      "name": "vol-0002",
+      "sizeGiB": 4,
+      "resizeToGiB": 6
+    },
+    {
+      "name": "vol-0003",
+      "sizeGiB": 4
+    },
+    {
+      "name": "vol-0004",
+      "sizeGiB": 3,
+      "resizeToGiB": 4
+    },
+    {
+      "name": "vol-0005",
+      "sizeGiB": 4
+    }
+  ],
+  "snapshots": [
+    {
+      "name": "snap-0001",
+      "volume": "vol-0002"
+    },
+    {
+      "name": "snap-0002",
+      "volume": "vol-0002"
+    },
+    {
+      "name": "snap-0003",
+      "volume": "vol-0003"
+    },
+    {
+      "name": "snap-0004",
+      "volume": "vol-0004"
+    },
+    {
+      "name": "snap-0005",
+      "volume": "vol-0004"
+    },
+    {
+      "name": "snap-0006",
+      "volume": "vol-0005"
+    },
+    {
+      "name": "snap-0007",
+      "volume": "vol-0005"
+    }
+  ]
+}
