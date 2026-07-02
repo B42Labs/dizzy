@@ -135,12 +135,12 @@ func NewWithProvider(mp metric.MeterProvider) (*Telemetry, error) {
 	t := &Telemetry{}
 
 	if t.operationDuration, err = m.Float64Histogram("openstack_tester.operation.duration",
-		metric.WithDescription("Duration of a single Neutron API operation."),
+		metric.WithDescription("Duration of a single OpenStack API operation."),
 		metric.WithUnit("s"), callBoundaries); err != nil {
 		return nil, fmt.Errorf("creating operation.duration instrument: %w", err)
 	}
 	if t.operationErrors, err = m.Int64Counter("openstack_tester.operation.errors",
-		metric.WithDescription("Failed Neutron API operations by error kind.")); err != nil {
+		metric.WithDescription("Failed OpenStack API operations by error kind.")); err != nil {
 		return nil, fmt.Errorf("creating operation.errors instrument: %w", err)
 	}
 	if t.timeToReady, err = m.Float64Histogram("openstack_tester.resource.time_to_ready",
@@ -154,7 +154,7 @@ func NewWithProvider(mp metric.MeterProvider) (*Telemetry, error) {
 		return nil, fmt.Errorf("creating iteration.duration instrument: %w", err)
 	}
 	if t.iterationOps, err = m.Int64Counter("openstack_tester.iteration.operations",
-		metric.WithDescription("Neutron operations attempted, succeeded, and failed within an iteration.")); err != nil {
+		metric.WithDescription("OpenStack operations attempted, succeeded, and failed within an iteration.")); err != nil {
 		return nil, fmt.Errorf("creating iteration.operations instrument: %w", err)
 	}
 	if t.iterations, err = m.Int64Counter("openstack_tester.iterations",
