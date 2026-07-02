@@ -43,7 +43,7 @@ func newCinderStatusCmd(opts *globalOptions) *cobra.Command {
 			}
 			client := cinder.New(gc, rec.RunID, metrics.NewCollector())
 
-			return writeStatusTable(cmd, ctx, client, rec.Created)
+			return writeStatusTable(ctx, cmd, client, rec.Created)
 		},
 	}
 
