@@ -21,7 +21,10 @@ intended (API) state against the actual data plane (OVN / OVS).
 > network, plug a fraction of routers into it as a **gateway** and allocate
 > **floating IPs**. The `small`, `medium`, and `large` scenario profiles now ship
 > under `scenarios/`; the optional Prometheus textfile export is the remaining
-> Phase 1 item.
+> Phase 1 item. A `neutron monitor` command now re-runs a scenario on a fixed
+> cadence, unattended, and — with `--otel` — exports per-operation and
+> per-iteration metrics via **OpenTelemetry (OTLP)** so a single installation
+> can be observed over time.
 
 ---
 
@@ -247,6 +250,7 @@ A single binary `openstack-tester` with subcommands (Neutron grouped under a
 openstack-tester neutron generate  --scenario medium.yaml [--out plan.json]
 openstack-tester neutron apply     --scenario medium.yaml [--dry-run]
 openstack-tester neutron chaos     --scenario medium.yaml [--duration 30m]
+openstack-tester neutron monitor   --scenario medium.yaml --interval 15m [--iterations n] [--error-wait 2m] [--keep-run-records] [--otel]
 openstack-tester neutron status    --run run-<id>.json
 openstack-tester neutron report    --run run-<id>.json [--format table|json|csv|html]
 openstack-tester neutron cleanup   --run run-<id>.json   # or --run-id <id>
@@ -275,6 +279,21 @@ openstack-tester neutron verify    --run run-<id>.json   # Phase 2 (future)
   whole action schedule is reproducible. On a clean finish it tears the topology
   down by tag and runs a leak check; Ctrl-C / SIGTERM leaves the resources in
   place for an explicit `cleanup --run <id>`.
+- `monitor` — periodic mode. It re-runs the single-shot pipeline (pre-flight
+  orphan sweep → `apply` → `cleanup`) on a fixed cadence, unattended, so an
+  installation can be observed over time. `--interval` is the target cadence
+  between iteration *starts*: an iteration shorter than the interval waits the
+  remainder, one that overruns starts the next immediately (no overlapping
+  iterations, no backlog). `--iterations` caps the run (`0` = run forever);
+  `--error-wait` adds a pause after a failed iteration to avoid hammering an
+  unhealthy cloud. It survives individual iteration failures and logs a
+  one-line summary per iteration. Ctrl-C / SIGTERM stops the loop, tears the
+  current iteration down, and flushes the exporter; a second signal aborts
+  hard. Per-iteration `run-<id>.json` records are **off by default**
+  (`--keep-run-records` re-enables them, but they accumulate unboundedly); the
+  export via `--otel` is the intended way to keep the data. See §9 for the
+  cadence semantics, the fixed-seed default, and the pre-flight sweep's
+  exclusive-project caveat.
 - `status` — re-query the current state of a run's resources from the API.
 - `report` — render metrics from a run record (table / JSON / CSV / a
   self-contained visual HTML report).
@@ -285,7 +304,8 @@ openstack-tester neutron verify    --run run-<id>.json   # Phase 2 (future)
 - `verify` — (Phase 2) compare run/plan against OVN/OVS.
 
 Global flags: `--os-cloud` (defaults to `$OS_CLOUD`), `--concurrency`,
-`--timeout`, `--seed` (override scenario seed), `--log-level`.
+`--timeout`, `--seed` (override scenario seed), `--log-level`, `--otel` (export
+metrics via OpenTelemetry OTLP — see §9).
 
 ---
 
@@ -352,6 +372,138 @@ target fill), and latency / error rate **bucketed over the run's duration** (to
 expose degradation over time, not just an aggregate). When the run finishes with
 teardown it also performs an end-of-run **leak check** — listing any resources
 still carrying the run tag after the topology should be gone.
+
+### Monitoring over time (`neutron monitor`)
+
+`neutron monitor` re-runs the single-shot pipeline on a fixed cadence,
+unattended, for days or weeks, so control-plane slowdowns, upgrade regressions,
+and error-rate changes become visible as trends instead of being buried in
+per-run JSON files. One **iteration** is a pre-flight orphan sweep → `apply` →
+`cleanup`, composing the same executor, metrics collector, and cleanup code
+paths a one-shot `apply` uses.
+
+- **Cadence.** `--interval` is the target time between iteration *starts*. A
+  fast iteration waits out the remainder of the interval; one that overruns it
+  starts the next immediately, so iterations never overlap and no backlog
+  builds up. `--iterations` caps the run (`0` = forever); `--error-wait` adds a
+  pause after a failed iteration.
+- **Fixed seed by default.** The plan is expanded once at startup, so every
+  iteration reuses the same seed and therefore the same topology. This is the
+  comparability default: the same resources are created each time, so latency
+  and error trends compare like-for-like. Rotating the seed per iteration would
+  broaden coverage at the cost of that comparability; if you want it, run
+  several monitors with different `--seed` values.
+- **Self-healing pre-flight sweep.** Before each iteration the loop deletes
+  leftover `ostester`-tagged resources so a previous crashed or interrupted
+  iteration cannot accumulate. Because Neutron tag filtering is exact-match, the
+  sweep matches the `ostester:type=<kind>` tag and therefore reclaims **any**
+  tester-created resource in the project, not only `monitor`'s own. **Do not run
+  `monitor` concurrently with another `apply`/`chaos`/`monitor` run in the same
+  project** — the sweep would tear the other run down mid-flight. Address scopes
+  cannot be discovered by tag and are not swept (the same limitation
+  `cleanup --run-id` has).
+- **Graceful shutdown.** SIGINT/SIGTERM stops the loop, tears the current
+  iteration down (best effort, on a context that survives the signal so nothing
+  leaks), flushes the metrics exporter, and exits. A second signal aborts hard.
+
+### OpenTelemetry export (`--otel`)
+
+With `--otel`, `monitor` — and one-shot `apply`/`chaos` (flushed on exit) —
+export per-operation and per-iteration metrics via the OpenTelemetry SDK over
+OTLP, so any OTLP-compatible backend (Prometheus + otel-collector, Mimir,
+InfluxDB, VictoriaMetrics, Timescale, …) can store them.
+
+- **Enablement is explicit.** Only `--otel` turns export on. The standard
+  `OTEL_EXPORTER_OTLP_*` environment variables *configure* the exporter but
+  never *enable* it, so a globally exported `OTEL_EXPORTER_OTLP_ENDPOINT` does
+  not change the behavior of any command run without `--otel`.
+- **Configuration.** Endpoint, headers, and TLS come from the standard
+  `OTEL_EXPORTER_OTLP_*` env vars — there is no custom config surface. The
+  protocol is taken from `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` (falling back to
+  `OTEL_EXPORTER_OTLP_PROTOCOL`), defaulting to `http/protobuf` (port 4318);
+  set it to `grpc` for a gRPC-only collector endpoint (port 4317).
+  `OTEL_METRIC_EXPORT_INTERVAL` controls the push period. Export failures from
+  a down collector degrade to warnings and never fail a run.
+- **Resource attributes** identify one installation across time:
+  `service.name=openstack-tester`, `service.version`, plus `cloud` (the
+  `--os-cloud` name) and `scenario`.
+
+Instruments (recorded live at the Neutron client's timing seam alongside the
+in-memory collector, which stays the source for run records and reports):
+
+| Instrument | Type | Unit | Attributes |
+|---|---|---|---|
+| `openstack_tester.operation.duration` | histogram | s | `kind`, `operation`, `outcome` |
+| `openstack_tester.resource.time_to_ready` | histogram | s | `kind`, `outcome` |
+| `openstack_tester.iteration.duration` | histogram | s | `outcome` |
+| `openstack_tester.iteration.operations` | counter | | `result` |
+| `openstack_tester.iterations` | counter | | `outcome` |
+
+Attribute value sets are bounded: `kind` is the resource type (`network`,
+`port`, `router`, …); `operation` is one of `create`, `delete`, `get`, `list`,
+`tag`, `detach`; `outcome` is `success`/`error`/`timeout` for an operation,
+`success`/`timeout` for time-to-ready, and `success`/`failure` for an
+iteration; `result` is `attempted`/`succeeded`/`failed`. **Cardinality rule:**
+run IDs, resource IDs, and names are **never** metric attributes — they stay in
+the run records and logs.
+
+#### Example collector setup
+
+Point the tester at an [OpenTelemetry
+Collector](https://opentelemetry.io/docs/collector/) that fans out to your
+time-series backend. A minimal Prometheus-remote-write pipeline:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+processors:
+  batch:
+exporters:
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheusremotewrite]
+```
+
+Swap the `prometheusremotewrite` exporter for `influxdb`,
+`otlphttp` (Mimir), or a VictoriaMetrics remote-write endpoint to target those
+backends instead. Shipping or operating the collector/TSDB/Grafana stack is out
+of scope for the tester — this is only an example.
+
+#### Query cookbook (PromQL)
+
+The otel-collector's Prometheus exporter translates OTLP names dot→underscore
+and appends the unit, and counters gain a `_total` suffix — so
+`openstack_tester.operation.duration` (s) becomes
+`openstack_tester_operation_duration_seconds_*`. The metrics are designed for:
+
+```promql
+# p95 operation latency per resource kind + operation, over time
+histogram_quantile(0.95, sum by (kind, operation, le) (
+  rate(openstack_tester_operation_duration_seconds_bucket[5m])))
+
+# error + timeout rate per kind + operation (non-success share of all calls)
+sum by (kind, operation) (rate(openstack_tester_operation_duration_seconds_count{outcome!="success"}[5m]))
+  / sum by (kind, operation) (rate(openstack_tester_operation_duration_seconds_count[5m]))
+
+# p95 time-to-ready per kind, over the last hour
+histogram_quantile(0.95, sum by (kind, le) (
+  rate(openstack_tester_resource_time_to_ready_seconds_bucket[1h])))
+
+# iteration success rate
+sum(rate(openstack_tester_iterations_total{outcome="success"}[1h]))
+  / sum(rate(openstack_tester_iterations_total[1h]))
+```
+
+A ready-made Grafana dashboard under `contrib/` is a possible follow-up; it is
+not shipped yet.
 
 ---
 
@@ -483,6 +635,8 @@ contrib/openstack-tester/
    - [x] Built-in profiles (incl. the 20/100/200 example).
    - [x] Random churn / soak mode (`chaos`): continuous seeded create/delete
          within the scenario envelope for a configured duration.
+   - [x] Periodic monitor mode (`monitor`) with OpenTelemetry (OTLP) metrics
+         export, for observing a single installation over time.
 2. **Phase 2 — data-plane verification**
    - [ ] Compare API/plan against OVN NB/SB and OVS flows.
 3. **Phase 3+** — external connectivity, trunk ports, RBAC, QoS, more profiles,
