@@ -507,29 +507,44 @@ sum(rate(openstack_tester_iterations_total{outcome="success"}[1h]))
   / sum(rate(openstack_tester_iterations_total[1h]))
 ```
 
-A ready-made Grafana dashboard under `contrib/` is a possible follow-up; it is
-not shipped yet.
+Ready-made Grafana dashboards ship with the local OTEL smoke stack below, under
+`contrib/otel/dashboards/` — provisioned automatically, no manual import.
 
-### Local OTEL smoke stack (kind + VictoriaMetrics + VMUI)
+### Local OTEL smoke stack (kind + VictoriaMetrics + VMUI + Grafana)
 
 To exercise `--otel` end to end without hand-assembling a backend, the repo
 ships a one-command local stack under `contrib/otel/`: a
 [kind](https://kind.sigs.k8s.io/) cluster running single-node
 [VictoriaMetrics](https://victoriametrics.com/), which ingests the tester's
 OTLP/HTTP push directly and serves **VMUI** — its built-in query explorer — in
-the browser. No OTel Collector (VictoriaMetrics ingests OTLP natively) and no
-Grafana (VMUI needs no provisioning).
+the browser, plus a fully provisioned **Grafana** for curated dashboards. No
+OTel Collector is needed (VictoriaMetrics ingests OTLP natively). VMUI stays the
+ad-hoc query explorer; Grafana is the curated view — its datasource and
+dashboards come from files in the repo, so it comes up with no clicking.
+
+```text
+browser ─▶ http://localhost:3000 ──▶ kind hostPort 3000 ─▶ NodePort 30300
+                                       └─ Grafana ──(in-cluster)──▶ http://victoria-metrics:8428
+browser ─▶ http://localhost:8428/vmui (unchanged)
+tester  ─▶ OTLP/HTTP push to localhost:8428 (unchanged)
+```
+
+Grafana talks to VictoriaMetrics over the in-cluster Service DNS; nothing about
+the tester's export path changes. Both host ports bind to `127.0.0.1` only —
+Grafana runs with **anonymous read-only (Viewer) access** and must not be
+exposed beyond loopback.
 
 **Prerequisites:** `docker`, `kind`, `kubectl`, and `curl` on the host, plus
 testbed reachability with `contrib/clouds.yaml` (the same setup `make testbed`
 needs).
 
-The three-command flow:
+The flow:
 
 ```console
-$ make otel-up          # boot kind + VictoriaMetrics, reachable on :8428
+$ make otel-up          # boot kind + VictoriaMetrics (:8428) + Grafana (:3000)
 $ make testbed-monitor  # run neutron monitor --otel against the testbed
-$ make otel-ui          # open VMUI with pre-filled queries
+$ make otel-grafana     # open the provisioned Grafana overview dashboard
+$ make otel-ui          # or open VMUI for ad-hoc queries
 ```
 
 `make testbed-monitor` runs `neutron monitor --otel` on a cadence, exporting
@@ -546,11 +561,17 @@ stops it gracefully — the current iteration tears down, the exporter flushes,
 and any leftover `run-*.json` is swept, exactly as `make testbed` does. The
 export interval is pinned to 15 s for fast local feedback.
 
-Once the first iteration has completed, check the stored schema:
+Once the first iteration has completed, check the stored schema and the Grafana
+path:
 
 ```console
-$ make otel-verify  # all five metric families present, with cloud/scenario labels
+$ make otel-verify  # five metric families + cloud/scenario labels, Grafana health
 ```
+
+Beyond the five metric families and their `cloud`/`scenario` labels,
+`otel-verify` confirms Grafana answers on `/api/health` and runs a
+data-independent query through Grafana's datasource proxy, so a broken
+Grafana→VictoriaMetrics wiring is distinguishable from "no data yet".
 
 **How it works.** `make testbed-monitor` points
 `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` at
@@ -569,6 +590,52 @@ data survives monitor restarts but not `make otel-down`.
 > would get `/v1/metrics` appended and miss VictoriaMetrics' ingestion path —
 > and because export failures degrade to warnings, the metrics would silently
 > vanish.
+
+#### Grafana dashboards
+
+`make otel-up` provisions Grafana from `contrib/otel/grafana.yaml` (datasource
++ dashboard provider) and the JSON files under `contrib/otel/dashboards/`, so
+three dashboards are there the moment Grafana is up — no manual import.
+`make otel-grafana` opens the first one; the others are in the dashboard list.
+
+- **OpenStack Tester — Overview** (`ostester-overview`) — the landing page:
+  iteration success ratio, iterations by outcome, iteration-duration
+  percentiles, operations attempted/succeeded/failed, and the non-success share
+  of all API calls.
+- **Neutron API operations** (`ostester-api-operations`) — the report's
+  per-type table over time: per-kind p95 and mean latency, a latency heatmap,
+  throughput, error+timeout rate, and an ops-by-outcome table. An extra
+  `operation` variable filters to `create`/`delete`/… .
+- **Resource readiness** (`ostester-time-to-ready`) — time-to-ready
+  percentiles by kind, a per-kind readiness success ratio, and a time-to-ready
+  heatmap.
+
+All three carry `cloud` and `scenario` template variables. They respect what
+the OTLP data actually carries: **percentiles are estimated from the histogram
+buckets** and labelled `p95 (est.)`, not true maxima; there are **no true
+per-run min/max series** (OTLP histogram min/max are not mapped), so
+distribution shape is shown with **heatmaps** over the `_bucket` series; and
+**error panels split by `outcome`** (`success`/`error`/`timeout`) only, because
+the schema collapses error kinds to the outcome by design.
+
+> **Sampling cadence.** Monitor iterations run every `MONITOR_INTERVAL`
+> (default 5 m) and the metrics only move while an iteration runs. The panels
+> use `$__rate_interval` with a 1 m minimum interval so short ranges don't
+> render gaps as zeros; the views are meaningful from a handful of iterations
+> upward.
+
+> **Recreating a pre-Grafana cluster.** kind cannot add the host port 3000
+> mapping to a running cluster, so a cluster booted before Grafana was added
+> won't work. `make otel-up` detects this and asks you to
+> `make otel-down && make otel-up` to recreate it.
+
+**Editing the dashboards.** They are maintained via the UI-export roundtrip:
+edit in Grafana, export the dashboard JSON, and commit it under
+`contrib/otel/dashboards/`; `make otel-up` re-provisions it (the ConfigMap's
+content hash changes, which rolls the Grafana pod). Keep the stable `uid` on
+each dashboard so permalinks and exports stay reproducible. In-UI edits that
+aren't exported are throwaway — Grafana's state is an `emptyDir`, gone at
+`make otel-down`.
 
 #### Cookbook queries
 
@@ -591,8 +658,9 @@ sum(rate(openstack_tester_iterations_total{outcome="success"}[1h]))
   / sum(rate(openstack_tester_iterations_total[1h]))
 ```
 
-**Teardown.** `make otel-down` deletes the kind cluster and everything in it,
-including all stored metrics — nothing is left behind on the host.
+**Teardown.** `make otel-down` deletes the kind cluster and everything in it —
+VictoriaMetrics with all stored metrics, and Grafana with its throwaway UI
+state — nothing is left behind on the host.
 
 ---
 
