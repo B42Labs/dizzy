@@ -1,8 +1,9 @@
 // Package metrics collects per-call timing and time-to-ready samples emitted by
-// the Neutron wrappers during a run and aggregates them into latency
-// percentiles, throughput, and an error breakdown. The collector is safe for
-// use by the concurrent workers of the executor; the aggregation it produces is
-// pure data so callers can render or persist it however they need.
+// the service client wrappers (Neutron, Cinder) during a run and aggregates
+// them into latency percentiles, throughput, and an error breakdown. The
+// collector is safe for use by the concurrent workers of the executor; the
+// aggregation it produces is pure data so callers can render or persist it
+// however they need.
 package metrics
 
 import (
