@@ -240,7 +240,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "victoriametrics" },
           "editorMode": "code",
-          "expr": "sum by (kind, operation) (rate(openstack_tester_operation_duration_seconds_count{outcome!=\"success\", operation=~\"$operation\", cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__rate_interval])) / sum by (kind, operation) (rate(openstack_tester_operation_duration_seconds_count{operation=~\"$operation\", cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__rate_interval]))",
+          "expr": "(sum by (kind, operation) (rate(openstack_tester_operation_duration_seconds_count{operation=~\"$operation\", cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__rate_interval])) - sum by (kind, operation) (rate(openstack_tester_operation_duration_seconds_count{outcome=\"success\", operation=~\"$operation\", cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__rate_interval]))) / sum by (kind, operation) (rate(openstack_tester_operation_duration_seconds_count{operation=~\"$operation\", cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__rate_interval]))",
           "legendFormat": "{{kind}} {{operation}}",
           "range": true,
           "refId": "A"
