@@ -54,7 +54,7 @@ func newStatusCmd(opts *globalOptions) *cobra.Command {
 			}
 			client := neutron.New(gc, rec.RunID, metrics.NewCollector())
 
-			return writeStatusTable(cmd, ctx, client, rec.Created)
+			return writeStatusTable(ctx, cmd, client, rec.Created)
 		},
 	}
 
@@ -70,7 +70,7 @@ func newStatusCmd(opts *globalOptions) *cobra.Command {
 // logical name, kind, id, and current state. It returns an error when any
 // resource failed to re-query. It is shared by the neutron and cinder status
 // commands.
-func writeStatusTable(cmd *cobra.Command, ctx context.Context, obs observer, resources []resource.Resource) error {
+func writeStatusTable(ctx context.Context, cmd *cobra.Command, obs observer, resources []resource.Resource) error {
 	tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 	if _, err := fmt.Fprintln(tw, "LOGICAL\tKIND\tID\tSTATE"); err != nil {
 		return fmt.Errorf("writing status table: %w", err)
