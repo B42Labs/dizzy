@@ -1,0 +1,15 @@
+name: small
+seed: 42                       # deterministic; same seed => same plan
+
+resources:
+  volumes: 5
+
+distribution:
+  volume_size_gib:      { min: 1, max: 5 }   # initial size drawn per volume
+  volume_resized_ratio: 0.5                  # fraction of volumes extended after creation
+  resize_growth_gib:    { min: 1, max: 4 }   # extend delta drawn per resized volume
+  snapshots_per_volume: { min: 0, max: 2 }   # drawn per volume
+
+# Sized to fit Cinder's common default quotas of 10 volumes / 10 snapshots /
+# 1000 GiB, so `cinder apply --scenario scenarios/cinder/small.yaml` runs
+# without raising any quota.
