@@ -39,6 +39,43 @@ func TestListByTagSendsTagQuery(t *testing.T) {
 	}
 }
 
+// TestListByTypeTagSendsTypeQuery confirms ListByTypeTag filters server-side on
+// the ostester:type tag — the pre-flight sweep's "any tester run" discovery —
+// and parses the returned resources.
+func TestListByTypeTagSendsTypeQuery(t *testing.T) {
+	var gotTag string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/networks" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		gotTag = r.URL.Query().Get("tags")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"networks":[{"id":"n1","name":"ostester-old-net-0001"}]}`)
+	}))
+	defer ts.Close()
+
+	c := testServiceClient(ts)
+	got, err := c.ListByTypeTag(context.Background(), KindNetwork)
+	if err != nil {
+		t.Fatalf("ListByTypeTag: %v", err)
+	}
+	if gotTag != "ostester:type=network" {
+		t.Errorf("tags query = %q, want %q", gotTag, "ostester:type=network")
+	}
+	if len(got) != 1 || got[0].ID != "n1" || got[0].Kind != KindNetwork {
+		t.Errorf("ListByTypeTag = %+v, want one network n1", got)
+	}
+}
+
+// TestListByTypeTagRejectsUntaggableKind confirms an untaggable kind is rejected
+// rather than silently returning nothing, mirroring ListByTag.
+func TestListByTypeTagRejectsUntaggableKind(t *testing.T) {
+	c := New(nil, "run0", metrics.NewCollector())
+	if _, err := c.ListByTypeTag(context.Background(), KindSecurityGroupRule); err == nil {
+		t.Fatal("ListByTypeTag for an untaggable kind: expected an error, got nil")
+	}
+}
+
 // TestListByTagRejectsUntaggableKind confirms a kind with no tag-based discovery
 // (security-group rules) is rejected rather than silently returning nothing.
 func TestListByTagRejectsUntaggableKind(t *testing.T) {
