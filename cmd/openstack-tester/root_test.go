@@ -38,7 +38,7 @@ func TestNeutronSubcommandsRegistered(t *testing.T) {
 
 func TestGlobalFlagsRegistered(t *testing.T) {
 	flags := newRootCmd().PersistentFlags()
-	for _, name := range []string{"os-cloud", "concurrency", "timeout", "seed", "log-level"} {
+	for _, name := range []string{"os-cloud", "concurrency", "timeout", "seed", "log-level", "otel"} {
 		t.Run(name, func(t *testing.T) {
 			if flags.Lookup(name) == nil {
 				t.Errorf("persistent flag %q not registered", name)

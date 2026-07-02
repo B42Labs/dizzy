@@ -17,6 +17,17 @@ type globalOptions struct {
 	timeout     time.Duration
 	seed        int64
 	logLevel    string
+	otel        bool
+}
+
+// cloudName returns the cloud identity used as the OTEL "cloud" resource
+// attribute: the --os-cloud value, falling back to $OS_CLOUD (the same source
+// the network client resolves from when the flag is empty).
+func (o *globalOptions) cloudName() string {
+	if o.osCloud != "" {
+		return o.osCloud
+	}
+	return os.Getenv("OS_CLOUD")
 }
 
 // newRootCmd builds the openstack-tester root command, registers the global
@@ -49,6 +60,7 @@ func newRootCmd() *cobra.Command {
 	flags.DurationVar(&opts.timeout, "timeout", 60*time.Second, "per-operation timeout")
 	flags.Int64Var(&opts.seed, "seed", 0, "override the scenario RNG seed")
 	flags.StringVar(&opts.logLevel, "log-level", "info", "log level: debug, info, warn, or error")
+	flags.BoolVar(&opts.otel, "otel", false, "export metrics via OpenTelemetry OTLP; endpoint, protocol, headers, and TLS come from the OTEL_EXPORTER_OTLP_* environment variables")
 
 	cmd.AddCommand(newNeutronCmd(opts))
 

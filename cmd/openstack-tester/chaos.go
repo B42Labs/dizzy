@@ -18,6 +18,7 @@ import (
 	"github.com/B42Labs/openstack-tester/internal/neutron"
 	"github.com/B42Labs/openstack-tester/internal/run"
 	"github.com/B42Labs/openstack-tester/internal/scenario"
+	"github.com/B42Labs/openstack-tester/internal/telemetry"
 )
 
 // Built-in defaults for the chaos knobs, used when neither the scenario chaos
@@ -75,6 +76,16 @@ func newChaosCmd(opts *globalOptions) *cobra.Command {
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 
+			// Set up OTEL export (a no-op unless --otel is set) and flush it on
+			// exit so an ad-hoc churn run lands in the same database as monitor.
+			tel, err := telemetry.Setup(ctx, telemetry.Config{
+				Enabled: opts.otel, Cloud: opts.cloudName(), Scenario: p.Scenario,
+			})
+			if err != nil {
+				return fmt.Errorf("setting up telemetry: %w", err)
+			}
+			defer flushTelemetry(tel)
+
 			runID, err := newRunID()
 			if err != nil {
 				return err
@@ -106,6 +117,7 @@ func newChaosCmd(opts *globalOptions) *cobra.Command {
 
 			collector := metrics.NewCollector()
 			client := neutron.New(gc, runID, collector)
+			client.SetTelemetry(tel)
 
 			slog.Info("starting churn run", "run", runID, "scenario", p.Scenario,
 				"duration", cfg.Duration, "minInterval", cfg.MinInterval, "maxInterval", cfg.MaxInterval,
@@ -121,6 +133,12 @@ func newChaosCmd(opts *globalOptions) *cobra.Command {
 			}
 			wall := finished.Sub(start)
 			agg := collector.Aggregate(wall)
+
+			// A churn run is a single iteration: export the same per-iteration
+			// summary metrics from the pre-teardown aggregate, mirroring the run
+			// record. An interrupted run counts as a failed iteration.
+			tel.RecordIteration(ctx, wall, ctx.Err() == nil)
+			tel.RecordIterationOperations(ctx, agg.Overall.Attempted, agg.Overall.Succeeded, agg.Overall.Failed)
 
 			if _, err := fmt.Fprint(cmd.OutOrStdout(), agg.Summary()); err != nil {
 				return fmt.Errorf("writing metrics: %w", err)
