@@ -39,3 +39,31 @@ func NewNetworkClient(ctx context.Context, cloudName string) (*gophercloud.Servi
 
 	return client, nil
 }
+
+// NewBlockStorageClient authenticates against the cloud described in clouds.yaml
+// and returns a BlockStorageV3 (Cinder) service client. When cloudName is empty
+// the cloud is selected from the OS_CLOUD environment variable, following the
+// standard clouds.yaml search paths.
+func NewBlockStorageClient(ctx context.Context, cloudName string) (*gophercloud.ServiceClient, error) {
+	var parseOpts []clouds.ParseOption
+	if cloudName != "" {
+		parseOpts = append(parseOpts, clouds.WithCloudName(cloudName))
+	}
+
+	authOptions, endpointOptions, tlsConfig, err := clouds.Parse(parseOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("parsing clouds.yaml: %w", err)
+	}
+
+	provider, err := gcconfig.NewProviderClient(ctx, authOptions, gcconfig.WithTLSConfig(tlsConfig))
+	if err != nil {
+		return nil, fmt.Errorf("creating provider client: %w", err)
+	}
+
+	client, err := openstack.NewBlockStorageV3(provider, endpointOptions)
+	if err != nil {
+		return nil, fmt.Errorf("creating block storage v3 client: %w", err)
+	}
+
+	return client, nil
+}
