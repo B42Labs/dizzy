@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "OpenStack Tester overview: iteration outcomes, iteration duration, and API-call success at a glance. Sampling caveat: monitor iterations run every MONITOR_INTERVAL (default 5m) and metrics only move while an iteration runs; panels use $__rate_interval with a 1m minimum interval so short ranges do not render gaps as zeros. The view is meaningful from a handful of iterations upward. Percentiles are estimated from histogram buckets and labelled \"(est.)\".",
+  "description": "OpenStack Tester overview: iteration outcomes, iteration duration, and API-call success at a glance. Sampling caveat: with the default continuous monitor (MONITOR_INTERVAL=0) iterations run back-to-back and metrics flow steadily; on a paced run (MONITOR_INTERVAL>0) metrics only move while an iteration runs. Panels use $__rate_interval with a 1m minimum interval so short ranges do not render gaps as zeros. The view is meaningful from a handful of iterations upward. Percentiles are estimated from histogram buckets and labelled \"(est.)\".",
   "editable": true,
   "graphTooltip": 0,
   "id": null,
