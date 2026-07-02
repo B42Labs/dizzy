@@ -149,6 +149,7 @@ func newChaosCmd(opts *globalOptions) *cobra.Command {
 			// fails partway or the operator wants to inspect them.
 			rec := &run.Record{
 				RunID:      runID,
+				Service:    "neutron",
 				Scenario:   p.Scenario,
 				Seed:       p.Seed,
 				StartedAt:  start,

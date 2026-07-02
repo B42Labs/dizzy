@@ -132,6 +132,7 @@ func newApplyCmd(opts *globalOptions) *cobra.Command {
 			// created so far can be reported on and cleaned up by tag.
 			rec := &run.Record{
 				RunID:      runID,
+				Service:    "neutron",
 				Scenario:   p.Scenario,
 				Seed:       p.Seed,
 				StartedAt:  start,

@@ -327,6 +327,7 @@ func monitorRunOnce(opts *globalOptions, p *plan.Plan, tel *telemetry.Telemetry,
 func writeIterationRecord(p *plan.Plan, runID string, start time.Time, wall time.Duration, agg metrics.Aggregate, res iterationResult) {
 	rec := &run.Record{
 		RunID:      runID,
+		Service:    "neutron",
 		Scenario:   p.Scenario,
 		Seed:       p.Seed,
 		StartedAt:  start,
