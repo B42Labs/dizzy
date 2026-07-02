@@ -26,9 +26,10 @@ TESTBED_CMD ?= apply
 # opens VMUI, `make otel-grafana` opens the Grafana overview dashboard,
 # `make otel-verify` checks the stored schema and Grafana health, `make
 # otel-down` tears it all down. See README §9. Override the monitor cadence and
-# count:
-#   make testbed-monitor MONITOR_INTERVAL=1m MONITOR_ITERATIONS=1
-MONITOR_INTERVAL   ?= 5m
+# count (MONITOR_INTERVAL=0, the default, runs iterations back-to-back; set a
+# duration like 5m for a paced run):
+#   make testbed-monitor MONITOR_INTERVAL=5m MONITOR_ITERATIONS=1
+MONITOR_INTERVAL   ?= 0
 MONITOR_ITERATIONS ?= 0
 
 .DEFAULT_GOAL := build
@@ -190,7 +191,7 @@ testbed-monitor: build
 	@echo "Running neutron monitor --otel against the OSISM testbed:"
 	@echo "  Cloud:    $(OS_CLOUD) ($(CLOUDS_FILE))"
 	@echo "  Scenario: $(SCENARIO)"
-	@echo "  Cadence:  interval $(MONITOR_INTERVAL), iterations $(MONITOR_ITERATIONS) (0 = forever, Ctrl-C to stop)"
+	@echo "  Cadence:  interval $(MONITOR_INTERVAL) (0 = continuous), iterations $(MONITOR_ITERATIONS) (0 = forever, Ctrl-C to stop)"
 	@echo "  OTLP:     http://localhost:8428/opentelemetry/v1/metrics (15s export interval)"
 	@OS_CLIENT_CONFIG_FILE="$(CLOUDS_FILE)" \
 	OTEL_EXPORTER_OTLP_METRICS_ENDPOINT="http://localhost:8428/opentelemetry/v1/metrics" \
