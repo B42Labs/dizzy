@@ -1,0 +1,31 @@
+# kustomization for the local OTEL smoke stack (see README §9).
+#
+# `make otel-up` applies this with `kubectl apply -k contrib/otel`. It bundles
+# the VictoriaMetrics and Grafana manifests and packs the dashboard JSONs into a
+# ConfigMap via configMapGenerator — the JSONs are too large to inline into
+# manifest YAML, and this keeps them versioned as plain files under dashboards/.
+#
+# configMapGenerator appends a content-hash suffix to the ConfigMap name
+# (grafana-dashboards-<hash>) and rewrites the reference in grafana.yaml's
+# Deployment volume to match. Editing a dashboard JSON changes the hash, which
+# rolls the Grafana pod with the new dashboards on the next `make otel-up` — the
+# roll-on-edit mechanism. Do NOT set disableNameSuffixHash, or that breaks.
+#
+# `kubectl apply -k` does not prune, so superseded grafana-dashboards-<hash>
+# ConfigMaps accumulate across re-applies. Harmless for a smoke stack and gone
+# with the cluster at `make otel-down`.
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - victoria-metrics.yaml
+  - grafana.yaml
+
+configMapGenerator:
+  - name: grafana-dashboards
+    namespace: ostester-otel
+    files:
+      - dashboards/overview.json
+      - dashboards/api-operations.json
+      - dashboards/time-to-ready.json
