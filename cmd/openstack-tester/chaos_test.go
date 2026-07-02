@@ -76,16 +76,16 @@ func TestChaosValidatesScenarioBeforeCloud(t *testing.T) {
 
 func TestChaosShippedProfilesRunWithoutDuration(t *testing.T) {
 	// Each built-in profile ships a chaos block, so `neutron chaos --scenario
-	// scenarios/<profile>.yaml` needs no --duration: the merged config validates
-	// and the run proceeds to authenticate, failing only at client creation with
-	// no reachable cloud. A missing or invalid chaos block would instead fail on
-	// the duration before any cloud call.
+	// scenarios/neutron/<profile>.yaml` needs no --duration: the merged config
+	// validates and the run proceeds to authenticate, failing only at client
+	// creation with no reachable cloud. A missing or invalid chaos block would
+	// instead fail on the duration before any cloud call.
 	t.Setenv("OS_CLOUD", "")
 	t.Setenv("OS_CLIENT_CONFIG_FILE", "/nonexistent/clouds.yaml")
 
 	for _, name := range []string{"small", "medium", "large"} {
 		t.Run(name, func(t *testing.T) {
-			data, err := scenarios.Files.ReadFile(name + ".yaml")
+			data, err := scenarios.Files.ReadFile("neutron/" + name + ".yaml")
 			if err != nil {
 				t.Fatalf("reading shipped profile %s.yaml: %v", name, err)
 			}
