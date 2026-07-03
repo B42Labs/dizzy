@@ -53,7 +53,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "victoriametrics" },
           "editorMode": "code",
-          "expr": "sum(increase(openstack_tester_iterations_total{outcome=\"success\", cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__range])) / sum(increase(openstack_tester_iterations_total{cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__range]))",
+          "expr": "sum(increase(openstack_tester_iterations_total{outcome=\"success\", cloud=~\"$cloud\", scenario=~\"$scenario\", service=~\"$service\"}[$__range])) / sum(increase(openstack_tester_iterations_total{cloud=~\"$cloud\", scenario=~\"$scenario\", service=~\"$service\"}[$__range]))",
           "instant": true,
           "legendFormat": "success ratio",
           "range": false,
@@ -98,7 +98,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "victoriametrics" },
           "editorMode": "code",
-          "expr": "1 - sum(increase(openstack_tester_operation_duration_seconds_count{outcome=\"success\", cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__range])) / sum(increase(openstack_tester_operation_duration_seconds_count{cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__range]))",
+          "expr": "1 - sum(increase(openstack_tester_operation_duration_seconds_count{outcome=\"success\", cloud=~\"$cloud\", scenario=~\"$scenario\", service=~\"$service\"}[$__range])) / sum(increase(openstack_tester_operation_duration_seconds_count{cloud=~\"$cloud\", scenario=~\"$scenario\", service=~\"$service\"}[$__range]))",
           "instant": true,
           "legendFormat": "non-success share",
           "range": false,
@@ -145,7 +145,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "victoriametrics" },
           "editorMode": "code",
-          "expr": "sum by (outcome) (increase(openstack_tester_iterations_total{cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__rate_interval]))",
+          "expr": "sum by (outcome) (increase(openstack_tester_iterations_total{cloud=~\"$cloud\", scenario=~\"$scenario\", service=~\"$service\"}[$__rate_interval]))",
           "legendFormat": "{{outcome}}",
           "range": true,
           "refId": "A"
@@ -191,7 +191,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "victoriametrics" },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(openstack_tester_iteration_duration_seconds_bucket{cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(openstack_tester_iteration_duration_seconds_bucket{cloud=~\"$cloud\", scenario=~\"$scenario\", service=~\"$service\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "range": true,
           "refId": "A"
@@ -199,7 +199,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "victoriametrics" },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(openstack_tester_iteration_duration_seconds_bucket{cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(openstack_tester_iteration_duration_seconds_bucket{cloud=~\"$cloud\", scenario=~\"$scenario\", service=~\"$service\"}[$__rate_interval])))",
           "legendFormat": "p95 (est.)",
           "range": true,
           "refId": "B"
@@ -245,7 +245,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "victoriametrics" },
           "editorMode": "code",
-          "expr": "sum by (result) (rate(openstack_tester_iteration_operations_total{cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__rate_interval]))",
+          "expr": "sum by (result) (rate(openstack_tester_iteration_operations_total{cloud=~\"$cloud\", scenario=~\"$scenario\", service=~\"$service\"}[$__rate_interval]))",
           "legendFormat": "{{result}}",
           "range": true,
           "refId": "A"
@@ -295,6 +295,24 @@
         "regex": "",
         "sort": 1,
         "type": "query"
+      },
+      {
+        "current": {},
+        "datasource": { "type": "prometheus", "uid": "victoriametrics" },
+        "definition": "label_values(openstack_tester_operation_duration_seconds_count{cloud=~\"$cloud\", scenario=~\"$scenario\"}, service)",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "name": "service",
+        "options": [],
+        "query": {
+          "query": "label_values(openstack_tester_operation_duration_seconds_count{cloud=~\"$cloud\", scenario=~\"$scenario\"}, service)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
       }
     ]
   },
@@ -303,6 +321,6 @@
   "timezone": "",
   "title": "OpenStack Tester — Overview",
   "uid": "ostester-overview",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }
