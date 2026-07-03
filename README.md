@@ -66,7 +66,7 @@ intended (API) state against the actual data plane (OVN / OVS).
 | **1** | Generate + apply randomized networking topologies via the API; record timings and states; tag-based cleanup. | Planned (this README) |
 | **2** | Data-plane verification: reconcile API state against OVN NB/SB DB and OVS flows. | Future |
 | **3** | More scenario profiles, optional external connectivity (gateways, FIPs), trunk ports, RBAC, address scopes. | Future |
-| **later** | Extend beyond Neutron (Cinder, Nova, …) — hence the generic name `openstack-tester`. | Started: Cinder first slice (create / resize / snapshot volumes) plus `cinder monitor` (#31); `cinder chaos` tracked in #32. |
+| **later** | Extend beyond Neutron (Cinder, Nova, …) — hence the generic name `openstack-tester`. | Started: Cinder first slice (create / resize / snapshot volumes) plus `cinder monitor` (#31) and `cinder chaos` (#32). |
 
 ---
 
@@ -854,15 +854,16 @@ how Neutron started:
 3. **Create snapshots** of the volumes.
 
 Attachments (Nova), boot-from-volume, image-backed volumes, backups, clones,
-transfers, restore-from-snapshot, retype/migration, and `cinder chaos` are
-**out of scope** for this slice. `cinder monitor` (the unattended loop driver,
-below) is now implemented; the chaos/churn follow-up is tracked in #32.
+transfers, restore-from-snapshot, and retype/migration are **out of scope** for
+this slice. `cinder monitor` (the unattended loop driver, below) and `cinder
+chaos` (the churn/soak driver, below) are now implemented.
 
 ### Commands
 
 ```
 openstack-tester cinder generate   --scenario scenarios/cinder/small.yaml [--out plan.json]
 openstack-tester cinder apply      --scenario scenarios/cinder/small.yaml [--dry-run] [--volume-type <name>]
+openstack-tester cinder chaos      --scenario scenarios/cinder/small.yaml [--duration 30m] [--volume-type <name>] [--resize-ratio 0.3] [--no-cleanup] [--otel]
 openstack-tester cinder monitor    --scenario scenarios/cinder/small.yaml [--interval 15m] [--iterations n] [--error-wait 2m] [--volume-type <name>] [--keep-run-records] [--otel]
 openstack-tester cinder status     --run run-<id>.json
 openstack-tester cinder report     --run run-<id>.json [--format table|json|csv|html]
@@ -905,15 +906,65 @@ same snapshot fan-out.
 
 Three profiles ship under `scenarios/cinder/`:
 
-| Profile | Volumes | Size (GiB) | Resized ratio | Growth (GiB) | Snapshots/volume |
-|---|---|---|---|---|---|
-| `small`  | 5  | 1–5  | 0.5 | 1–4 | 0–2 |
-| `medium` | 20 | 1–10 | 0.5 | 1–8 | 0–3 |
-| `large`  | 50 | 1–10 | 0.6 | 1–8 | 1–4 |
+| Profile | Volumes | Size (GiB) | Resized ratio | Growth (GiB) | Snapshots/volume | Chaos duration |
+|---|---|---|---|---|---|---|
+| `small`  | 5  | 1–5  | 0.5 | 1–4 | 0–2 | 5m |
+| `medium` | 20 | 1–10 | 0.5 | 1–8 | 0–3 | 30m |
+| `large`  | 50 | 1–10 | 0.6 | 1–8 | 1–4 | 1h |
 
 The `small` profile is deliberately sized to fit Cinder's common default quotas
 of 10 volumes / 10 snapshots / 1000 GiB, so it runs against a fresh project with
-nothing raised.
+nothing raised. Every profile also ships a `chaos:` block, so `cinder chaos`
+runs each one straight away with no extra flags (see below).
+
+### Churn / soak mode (`cinder chaos`)
+
+`cinder chaos` is the block-storage companion to
+[`neutron chaos`](#churn--soak-mode-chaos): instead of building the volumes and
+snapshots once, it reuses the **same churn engine** to keep creating and
+deleting them at random, seeded intervals within the scenario envelope for a
+configured duration, producing time-resolved latency/error buckets — the steady-
+state churn under which block-storage backends (scheduler pressure, backend
+garbage collection, snapshot chains) tend to degrade. The temporal knobs
+(`duration`, `interval`, `parallel`, `churn_ratio`, `target_fill`) live in a
+`chaos:` block in the Cinder scenario or on the CLI (flags override the block),
+exactly as for Neutron.
+
+- **What churns.** Volumes have no parents; snapshots are parented on their
+  source volume. The engine's parents-must-outlive-children invariant gives the
+  right lifecycle for free: a snapshot is only created while its volume lives, a
+  volume with live snapshots is never a delete candidate, and snapshots churn
+  faster than their volumes. Snapshots of the **same** volume stay serialized,
+  as in `apply`.
+- **Readiness is part of the operation.** A `creating` volume can be neither
+  snapshotted, extended, nor reliably deleted, so create and extend operations
+  complete only when the resource reaches `available` (recording time-to-ready);
+  `error` / `error_extending` surface as **failed operations** in the stats, not
+  as engine wedges. A delete completes only once the resource is gone.
+- **Extend as a mutation (`resize_ratio`).** Each churn step draws, with
+  probability `resize_ratio` (a new chaos-block key, default `0.3`, overridable
+  with `--resize-ratio`; `0` disables it), a **mutation** of a live, not-yet-
+  resized volume that has a planned resize target — extending it to its plan's
+  `resizeToGiB`. A volume instance is extended **at most once per lifetime**,
+  always to its planned target; deleted and re-created, it may be extended again.
+  This keeps a week-long soak's gigabytes consumption inside the envelope the
+  quota pre-check validated (Σ planned final sizes) instead of growing without
+  bound. Mutations do not change the population, so the `churn_ratio` /
+  `target_fill` controller economics are untouched, and a mutation counts against
+  the per-tick fan-out (`parallel.max`) like any other API call.
+- **Outputs.** Same as Neutron chaos: a deterministic decision schedule per seed
+  and config, a run record carrying `ChaosStats` (creates / deletes / **mutates**
+  / cycles, population summary, time buckets), and OTEL export of every operation
+  — extends appear as `operation=extend` samples. On a clean finish it tears the
+  volumes and snapshots down by metadata (snapshots before volumes) and runs a
+  leak check; Ctrl-C / SIGTERM or `--no-cleanup` leaves them in place for an
+  explicit `cinder cleanup --run-id <id>` (metadata discovery reclaims a crashed
+  or interrupted run in full).
+
+```
+openstack-tester cinder chaos --scenario scenarios/cinder/small.yaml            # 5m churn, no flags needed
+openstack-tester cinder chaos --scenario scenarios/cinder/medium.yaml --duration 2m --resize-ratio 0.5
+```
 
 ### `--volume-type`
 
@@ -1000,7 +1051,8 @@ begins.
          volumes with `small`/`medium`/`large` profiles (see §15).
    - [x] `cinder monitor` (#31): unattended sweep→apply→cleanup loop with OTLP
          export (`service=cinder`).
-   - [ ] `cinder chaos` (#32).
+   - [x] `cinder chaos` (#32): seeded volume/snapshot churn with extend
+         mutations within the scenario envelope, reusing the Neutron churn engine.
 
 ## 17. Open questions / decisions to confirm
 
