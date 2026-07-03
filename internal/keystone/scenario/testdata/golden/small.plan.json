@@ -1,0 +1,199 @@
+{
+  "scenario": "small",
+  "seed": 42,
+  "domains": [
+    {
+      "name": "dom-0001"
+    }
+  ],
+  "roles": [
+    {
+      "name": "role-0001"
+    },
+    {
+      "name": "role-0002"
+    }
+  ],
+  "projects": [
+    {
+      "name": "proj-0001",
+      "domain": "dom-0001"
+    },
+    {
+      "name": "proj-0002",
+      "domain": "dom-0001"
+    },
+    {
+      "name": "proj-0003",
+      "domain": "dom-0001"
+    },
+    {
+      "name": "proj-0004",
+      "domain": "dom-0001"
+    },
+    {
+      "name": "proj-0005",
+      "domain": "dom-0001"
+    }
+  ],
+  "users": [
+    {
+      "name": "user-0001",
+      "domain": "dom-0001"
+    },
+    {
+      "name": "user-0002",
+      "domain": "dom-0001"
+    },
+    {
+      "name": "user-0003",
+      "domain": "dom-0001"
+    },
+    {
+      "name": "user-0004",
+      "domain": "dom-0001"
+    },
+    {
+      "name": "user-0005",
+      "domain": "dom-0001"
+    },
+    {
+      "name": "user-0006",
+      "domain": "dom-0001"
+    },
+    {
+      "name": "user-0007",
+      "domain": "dom-0001"
+    },
+    {
+      "name": "user-0008",
+      "domain": "dom-0001"
+    },
+    {
+      "name": "user-0009",
+      "domain": "dom-0001"
+    },
+    {
+      "name": "user-0010",
+      "domain": "dom-0001"
+    }
+  ],
+  "assignments": [
+    {
+      "user": "user-0001",
+      "role": "role-0002",
+      "project": "proj-0003"
+    },
+    {
+      "user": "user-0002",
+      "role": "role-0001",
+      "project": "proj-0001"
+    },
+    {
+      "user": "user-0002",
+      "role": "role-0001",
+      "project": "proj-0005"
+    },
+    {
+      "user": "user-0002",
+      "role": "role-0002",
+      "project": "proj-0005"
+    },
+    {
+      "user": "user-0003",
+      "role": "role-0002",
+      "project": "proj-0003"
+    },
+    {
+      "user": "user-0003",
+      "role": "role-0001",
+      "project": "proj-0005"
+    },
+    {
+      "user": "user-0004",
+      "role": "role-0002",
+      "project": "proj-0003"
+    },
+    {
+      "user": "user-0005",
+      "role": "role-0001",
+      "project": "proj-0005"
+    },
+    {
+      "user": "user-0005",
+      "role": "role-0001",
+      "project": "proj-0003"
+    },
+    {
+      "user": "user-0005",
+      "role": "role-0002",
+      "project": "proj-0005"
+    },
+    {
+      "user": "user-0006",
+      "role": "role-0002",
+      "project": "proj-0005"
+    },
+    {
+      "user": "user-0006",
+      "role": "role-0001",
+      "project": "proj-0002"
+    },
+    {
+      "user": "user-0007",
+      "role": "role-0002"
+    },
+    {
+      "user": "user-0008",
+      "role": "role-0001",
+      "project": "proj-0002"
+    },
+    {
+      "user": "user-0008",
+      "role": "role-0002"
+    },
+    {
+      "user": "user-0009",
+      "role": "role-0002",
+      "project": "proj-0002"
+    },
+    {
+      "user": "user-0009",
+      "role": "role-0001",
+      "project": "proj-0003"
+    },
+    {
+      "user": "user-0009",
+      "role": "role-0001",
+      "project": "proj-0001"
+    },
+    {
+      "user": "user-0010",
+      "role": "role-0002"
+    },
+    {
+      "user": "user-0010",
+      "role": "role-0002",
+      "project": "proj-0005"
+    },
+    {
+      "user": "user-0010",
+      "role": "role-0001",
+      "project": "proj-0005"
+    }
+  ],
+  "tokens": [
+    {
+      "user": "user-0003",
+      "project": "proj-0005"
+    },
+    {
+      "user": "user-0005",
+      "project": "proj-0005"
+    },
+    {
+      "user": "user-0010",
+      "project": "proj-0005"
+    }
+  ]
+}
