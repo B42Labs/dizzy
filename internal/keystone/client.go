@@ -17,6 +17,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
@@ -91,6 +92,14 @@ func resourceName(runID, logical string) string {
 // carry no tags.
 func runPrefix(runID string) string {
 	return namePrefix + runID + "-"
+}
+
+// HasNamePrefix reports whether name carries the ostester- prefix every resource
+// this tool creates. Cleanup uses it as a belt-and-suspenders guard so a reused
+// domain or role (which carries no prefix) is never disabled or deleted in
+// domain-manager mode.
+func HasNamePrefix(name string) bool {
+	return strings.HasPrefix(name, namePrefix)
 }
 
 // timed runs fn, records a Sample for the attempt (including the error
