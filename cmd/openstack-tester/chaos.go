@@ -47,8 +47,8 @@ type chaosFlags struct {
 // configured duration, continuously creates and deletes Neutron resources at
 // random intervals and parallelism, bounded by the scenario as the spatial
 // envelope. It authenticates, pre-checks quota against the full plan, runs the
-// churn, records the run, and — unless interrupted or --no-cleanup — tears the
-// topology down by tag and reports any leak.
+// churn, records the run, and — whether it completed or was interrupted, unless
+// --no-cleanup — tears the topology down by tag and reports any leak.
 func newChaosCmd(opts *globalOptions) *cobra.Command {
 	var (
 		scenarioPath    string
@@ -73,10 +73,17 @@ func newChaosCmd(opts *globalOptions) *cobra.Command {
 				return err
 			}
 
-			// Stop cleanly on Ctrl-C / SIGTERM: the derived context cancels the
-			// run so in-flight operations unwind instead of being killed.
+			// Two-phase shutdown: the first Ctrl-C / SIGTERM cancels the run so the
+			// churn stops and its resources unwind instead of being killed, then the
+			// teardown below tears the topology down. Unregistering the handler right
+			// after means a second signal takes the default disposition and kills the
+			// process — there is always a hard way out mid-teardown.
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
+			go func() {
+				<-ctx.Done()
+				stop()
+			}()
 
 			// Set up OTEL export (a no-op unless --otel is set) and flush it on
 			// exit so an ad-hoc churn run lands in the same database as monitor.
@@ -173,7 +180,7 @@ func newChaosCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("writing output: %w", err)
 			}
 
-			return finishChurn(ctx, cmd, client, runID, recordPath, result.Created, ctx.Err() != nil, noCleanup)
+			return finishChurn(ctx, cmd, client, runID, recordPath, result.Created, ctx.Err() != nil, noCleanup, opts.timeout)
 		},
 	}
 
@@ -186,7 +193,7 @@ func newChaosCmd(opts *globalOptions) *cobra.Command {
 	flags.IntVar(&f.maxParallel, "max-parallel", 0, "maximum concurrent in-flight churn operations (default: --concurrency)")
 	flags.Float64Var(&f.churnRatio, "churn-ratio", defaultChaosChurnRatio, "create bias at steady state, between 0 and 1")
 	flags.Float64Var(&f.targetFill, "target-fill", defaultChaosTargetFill, "fraction of the envelope to keep populated on average, between 0 and 1")
-	flags.BoolVar(&noCleanup, "no-cleanup", false, "leave the topology in place at the end instead of tearing it down by tag")
+	flags.BoolVar(&noCleanup, "no-cleanup", false, "leave the topology in place — at the end of the run or on interrupt — instead of tearing it down by tag")
 	flags.StringVar(&externalNetwork, "external-network", "", "name of the external network for gateways and floating IPs (default: auto-detect the first external network)")
 	// MarkFlagRequired only fails for an unknown flag; "scenario" was just added.
 	_ = cmd.MarkFlagRequired("scenario")
@@ -250,13 +257,17 @@ func mergeChaosConfig(cmd *cobra.Command, opts *globalOptions, s scenario.Scenar
 	return cfg
 }
 
-// finishChurn applies the teardown policy. An interrupted run, or one with
-// --no-cleanup, leaves the topology in place and prints the cleanup hint so an
-// operator can inspect it and reclaim it later. A clean run tears the topology
-// down by tag and runs a leak check.
-func finishChurn(ctx context.Context, cmd *cobra.Command, client *neutron.Client, runID, recordPath string, created []neutron.Resource, interrupted, noCleanup bool) error {
+// finishChurn applies the teardown policy. Unless --no-cleanup is set, the run —
+// whether it completed or was interrupted — tears the topology down by tag and
+// runs a leak check, exactly as a completed run always has; teardown and the
+// leak check run on a context.WithoutCancel of ctx so a first-signal interrupt
+// does not kill the teardown it triggered, and each op is bounded by opTimeout
+// so a wedged call cannot hang shutdown. With --no-cleanup the topology is left
+// in place and the cleanup hint is printed so an operator can inspect it and
+// reclaim it later — interrupt-to-inspect is now this explicit opt-out.
+func finishChurn(ctx context.Context, cmd *cobra.Command, c executor.Cleaner, runID, recordPath string, created []neutron.Resource, interrupted, noCleanup bool, opTimeout time.Duration) error {
 	out := cmd.OutOrStdout()
-	if interrupted || noCleanup {
+	if noCleanup {
 		reason := "churn complete"
 		if interrupted {
 			reason = "churn interrupted"
@@ -269,7 +280,13 @@ func finishChurn(ctx context.Context, cmd *cobra.Command, client *neutron.Client
 		return err
 	}
 
-	deleted, cleanupErr := executor.Cleanup(ctx, client, runID, created)
+	// The signal context is already cancelled on interrupt; run teardown on a
+	// context.WithoutCancel with a per-op bound so the first signal triggers it
+	// and a second signal (the hard abort) is the only thing that kills it.
+	tctx := context.WithoutCancel(ctx)
+	cleaner := timeoutCleaner{c, opTimeout}
+
+	deleted, cleanupErr := executor.Cleanup(tctx, cleaner, runID, created)
 	if _, err := fmt.Fprintf(out, "deleted %d resource(s) for run %s\n", deleted, runID); err != nil {
 		return fmt.Errorf("writing output: %w", err)
 	}
@@ -277,7 +294,7 @@ func finishChurn(ctx context.Context, cmd *cobra.Command, client *neutron.Client
 		return fmt.Errorf("tearing down run %s: %w", runID, cleanupErr)
 	}
 
-	leaked, err := leakCheck(ctx, client, runID)
+	leaked, err := leakCheck(tctx, cleaner, runID)
 	if err != nil {
 		return err
 	}
@@ -292,15 +309,16 @@ func finishChurn(ctx context.Context, cmd *cobra.Command, client *neutron.Client
 // leakCheck counts the resources still carrying the run tag after teardown,
 // across every tag-discoverable kind. Address scopes cannot be discovered by
 // tag (they are reclaimed from the run record by id), so they are not counted
-// here — the same limitation cleanup itself has.
-func leakCheck(ctx context.Context, client *neutron.Client, runID string) (int, error) {
+// here — the same limitation cleanup itself has. It takes the executor.Cleaner
+// seam so the listing shares the teardown's per-op timeout bound.
+func leakCheck(ctx context.Context, c executor.Cleaner, runID string) (int, error) {
 	kinds := []neutron.Kind{
 		neutron.KindFloatingIP, neutron.KindPort, neutron.KindNetwork, neutron.KindSubnet,
 		neutron.KindRouter, neutron.KindSecurityGroup, neutron.KindSubnetPool,
 	}
 	var total int
 	for _, kind := range kinds {
-		found, err := client.ListByTag(ctx, kind, runID)
+		found, err := c.ListByTag(ctx, kind, runID)
 		if err != nil {
 			return total, fmt.Errorf("leak check listing %s: %w", kind, err)
 		}
