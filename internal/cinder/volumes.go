@@ -71,30 +71,38 @@ func (c *Client) ExtendVolume(ctx context.Context, r resource.Resource, newSizeG
 
 // ListVolumesByMetadata returns the volumes carrying this run's
 // ostester:run=<runID> metadata, the discovery step metadata-based cleanup
-// deletes from. The metadata filter is requested server-side, but that filter is
-// not universally honored (older releases, backends that ignore unknown query
-// params, a proxy that strips it, a microversion mismatch can all return the
-// full volume list), so /volumes/detail's metadata is re-checked client-side —
-// mirroring the snapshot path — so the result never includes a volume the tool
-// did not tag, whatever the server returns.
+// deletes from.
 func (c *Client) ListVolumesByMetadata(ctx context.Context, runID string) ([]resource.Resource, error) {
+	return c.listVolumesByMetadata(ctx, map[string]string{metaRun: runID})
+}
+
+// listVolumesByMetadata is the shared streamed, client-side-rechecked volume
+// listing behind ListVolumesByMetadata (one run's metadata) and
+// ListByTypeMetadata (any run of one kind). The metadata filter is requested
+// server-side, but that filter is not universally honored (older releases,
+// backends that ignore unknown query params, a proxy that strips it, a
+// microversion mismatch can all return the full volume list), so
+// /volumes/detail's metadata is re-checked client-side against every filter
+// entry — mirroring the snapshot path — so the result never includes a volume
+// the tool did not tag with all of filter, whatever the server returns.
+func (c *Client) listVolumesByMetadata(ctx context.Context, filter map[string]string) ([]resource.Resource, error) {
 	var found []resource.Resource
 	err := c.timed(ctx, string(KindVolume), "list", func(ctx context.Context) error {
 		found = nil
 		// The server-side metadata filter is requested but not universally honored, so
-		// stream a page at a time and keep only this run's volumes rather than letting
+		// stream a page at a time and keep only the matching volumes rather than letting
 		// AllPages accumulate every volume in the project — at cleanup a project created
 		// by this tool is at peak resource count, and one allocation of the whole list is
 		// a memory spike that could OOM the very step that frees the billable resources.
 		return volumes.List(c.gc, volumes.ListOpts{
-			Metadata: map[string]string{metaRun: runID},
+			Metadata: filter,
 		}).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
 			items, err := volumes.ExtractVolumes(page)
 			if err != nil {
 				return false, err
 			}
 			for _, v := range items {
-				if v.Metadata[metaRun] != runID {
+				if !metadataMatches(v.Metadata, filter) {
 					continue // server-side filter not honored; never delete a volume this run did not tag
 				}
 				found = append(found, resource.Resource{Kind: KindVolume, Name: v.Name, ID: v.ID})

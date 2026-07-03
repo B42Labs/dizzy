@@ -39,17 +39,24 @@ func (c *Client) CreateSnapshot(ctx context.Context, s cinderplan.Snapshot, volu
 }
 
 // ListSnapshotsByMetadata returns the snapshots carrying this run's
-// ostester:run=<runID> metadata. gophercloud v2.12.0's snapshots.ListOpts has
-// no metadata field (unlike volumes), so the project's snapshots are listed and
-// filtered client-side on the metadata the tool itself wrote — selection is
-// still keyed exclusively on the run metadata, so it never includes snapshots
-// the tool did not create.
+// ostester:run=<runID> metadata. Selection is keyed exclusively on the run
+// metadata, so it never includes snapshots the tool did not create.
 func (c *Client) ListSnapshotsByMetadata(ctx context.Context, runID string) ([]resource.Resource, error) {
+	return c.listSnapshotsByMetadata(ctx, map[string]string{metaRun: runID})
+}
+
+// listSnapshotsByMetadata is the shared streamed, client-side-filtered snapshot
+// listing behind ListSnapshotsByMetadata (one run's metadata) and
+// ListByTypeMetadata (any run of one kind). gophercloud v2.12.0's
+// snapshots.ListOpts has no metadata field (unlike volumes), so the project's
+// snapshots are listed and filtered client-side against every filter entry on
+// the metadata the tool itself wrote.
+func (c *Client) listSnapshotsByMetadata(ctx context.Context, filter map[string]string) ([]resource.Resource, error) {
 	var found []resource.Resource
 	err := c.timed(ctx, string(KindSnapshot), "list", func(ctx context.Context) error {
 		found = nil
 		// The listing is unfiltered (ListOpts has no metadata field), so stream a
-		// page at a time and keep only this run's snapshots rather than letting
+		// page at a time and keep only the matching snapshots rather than letting
 		// AllPages accumulate every snapshot in the project — at cleanup a project
 		// created by this tool is at peak resource count, and one allocation of the
 		// whole list is a memory spike that could OOM the very step that frees the
@@ -60,7 +67,7 @@ func (c *Client) ListSnapshotsByMetadata(ctx context.Context, runID string) ([]r
 				return false, err
 			}
 			for _, s := range items {
-				if s.Metadata[metaRun] == runID {
+				if metadataMatches(s.Metadata, filter) {
 					found = append(found, resource.Resource{Kind: KindSnapshot, Name: s.Name, ID: s.ID})
 				}
 			}

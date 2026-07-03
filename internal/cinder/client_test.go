@@ -124,6 +124,71 @@ func TestListSnapshotsByMetadataFiltersClientSide(t *testing.T) {
 	}
 }
 
+// TestListByTypeMetadataVolumesAcrossRuns confirms the type-metadata sweep
+// discovers this tool's volumes regardless of their run id — the crash-recovery
+// contract, since the sweep runs before a new iteration and must reclaim
+// leftovers whose run id is no longer known — and that the client-side backstop
+// still drops volumes the tool did not tag with the type even when the server
+// ignores the metadata filter.
+func TestListByTypeMetadataVolumesAcrossRuns(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"volumes":[
+			{"id":"v-run0","name":"ostester-run0-vol-0001","metadata":{"ostester:run":"run0","ostester:type":"volume"}},
+			{"id":"v-run9","name":"ostester-run9-vol-0001","metadata":{"ostester:run":"run9","ostester:type":"volume"}},
+			{"id":"v-untagged","name":"untagged","metadata":{}},
+			{"id":"v-othertype","name":"ostester-run0-snap","metadata":{"ostester:type":"snapshot"}}
+		]}`)
+	}))
+	defer ts.Close()
+
+	got, err := testServiceClient(ts).ListByTypeMetadata(context.Background(), KindVolume)
+	if err != nil {
+		t.Fatalf("ListByTypeMetadata(volume): %v", err)
+	}
+	ids := map[string]bool{}
+	for _, r := range got {
+		ids[r.ID] = true
+	}
+	if len(got) != 2 || !ids["v-run0"] || !ids["v-run9"] {
+		t.Fatalf("ListByTypeMetadata(volume) = %+v, want the two type-tagged volumes across both runs", got)
+	}
+}
+
+// TestListByTypeMetadataSnapshotsFiltersClientSide confirms the snapshot sweep
+// keeps only the type-tagged snapshots via the unfiltered ListDetail path, the
+// client-side filter cleanup relies on since snapshots.ListOpts has no metadata
+// field to filter on server-side.
+func TestListByTypeMetadataSnapshotsFiltersClientSide(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"snapshots":[
+			{"id":"s-run0","name":"ostester-run0-snap-0001","metadata":{"ostester:run":"run0","ostester:type":"snapshot"}},
+			{"id":"s-run9","name":"ostester-run9-snap-0001","metadata":{"ostester:run":"run9","ostester:type":"snapshot"}},
+			{"id":"s-foreign","name":"someone-elses","metadata":{}}
+		]}`)
+	}))
+	defer ts.Close()
+
+	got, err := testServiceClient(ts).ListByTypeMetadata(context.Background(), KindSnapshot)
+	if err != nil {
+		t.Fatalf("ListByTypeMetadata(snapshot): %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ListByTypeMetadata(snapshot) = %+v, want the two type-tagged snapshots, dropping the untagged one", got)
+	}
+}
+
+// TestListByTypeMetadataUnsupportedKind confirms a kind Cinder does not create is
+// rejected rather than silently returning nothing, mirroring the status/delete
+// switches.
+func TestListByTypeMetadataUnsupportedKind(t *testing.T) {
+	c := New(&gophercloud.ServiceClient{ProviderClient: &gophercloud.ProviderClient{}}, "run0", metrics.NewCollector())
+	if _, err := c.ListByTypeMetadata(context.Background(), resource.Kind("router")); err == nil {
+		t.Fatal("ListByTypeMetadata for an unsupported kind: expected an error, got nil")
+	}
+}
+
 // TestResourceNameAndMetadata checks names and metadata are deterministic and
 // exact.
 func TestResourceNameAndMetadata(t *testing.T) {
