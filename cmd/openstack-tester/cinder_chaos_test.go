@@ -1,10 +1,17 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/spf13/cobra"
+
+	"github.com/B42Labs/openstack-tester/internal/cinder"
 	cinderscenario "github.com/B42Labs/openstack-tester/internal/cinder/scenario"
+	"github.com/B42Labs/openstack-tester/internal/resource"
 	"github.com/B42Labs/openstack-tester/scenarios"
 )
 
@@ -141,6 +148,89 @@ func TestCinderChaosShippedProfilesRunWithoutDuration(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), "block storage client") {
 				t.Errorf("cinder chaos %s failed before reaching cloud auth: %q; the profile's chaos block should supply the duration", name, err.Error())
+			}
+		})
+	}
+}
+
+func TestFinishCinderChurnTearsDownOnInterrupt(t *testing.T) {
+	tests := []struct {
+		name        string
+		interrupted bool
+	}{
+		{"completed run tears down", false},
+		{"interrupted run tears down too", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tc.interrupted {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel() // a first signal cancelled the run
+			}
+			c := &recordingCinderCleaner{}
+			// Snapshots must be deleted before their source volumes.
+			created := []resource.Resource{
+				{Kind: cinder.KindVolume, ID: "vol1"},
+				{Kind: cinder.KindSnapshot, ID: "snap1"},
+			}
+			cmd := &cobra.Command{}
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+
+			err := finishCinderChurn(ctx, cmd, c, "run1234", "run-run1234.json", created, tc.interrupted, false, time.Second)
+			if err != nil {
+				t.Fatalf("finishCinderChurn: %v", err)
+			}
+			// An interrupted run behaves as if the duration elapsed: teardown runs
+			// on a live context (never seeing the parent's cancellation).
+			if c.sawCancelled {
+				t.Error("teardown ran with a cancelled context; it must run on context.WithoutCancel")
+			}
+			if len(c.deleted) != 2 || c.deleted[0].ID != "snap1" || c.deleted[1].ID != "vol1" {
+				t.Errorf("deleted = %v, want the snapshot deleted before its volume", c.deleted)
+			}
+			s := out.String()
+			if !strings.Contains(s, "deleted 2 resource(s)") {
+				t.Errorf("output %q missing the deletion count", s)
+			}
+			if !strings.Contains(s, "leak check: no run-tagged resources remain") {
+				t.Errorf("output %q missing the leak-check line", s)
+			}
+		})
+	}
+}
+
+func TestFinishCinderChurnNoCleanupSkipsTeardown(t *testing.T) {
+	tests := []struct {
+		name        string
+		interrupted bool
+		wantReason  string
+	}{
+		{"completed run", false, "churn complete"},
+		{"interrupted run", true, "churn interrupted"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &recordingCinderCleaner{}
+			cmd := &cobra.Command{}
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+
+			err := finishCinderChurn(context.Background(), cmd, c, "run1234", "run-run1234.json", nil, tc.interrupted, true, time.Second)
+			if err != nil {
+				t.Fatalf("finishCinderChurn: %v", err)
+			}
+			if c.calls != 0 {
+				t.Errorf("cleaner was called %d times; --no-cleanup must leave everything in place", c.calls)
+			}
+			s := out.String()
+			if !strings.Contains(s, tc.wantReason) {
+				t.Errorf("output %q missing reason %q", s, tc.wantReason)
+			}
+			if !strings.Contains(s, "cinder cleanup --run run-run1234.json") {
+				t.Errorf("output %q missing the reclaim hint", s)
 			}
 		})
 	}

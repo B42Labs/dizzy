@@ -34,9 +34,9 @@ const defaultChaosResizeRatio = 0.3
 // and occasionally extends a live volume to its planned target, bounded by the
 // scenario as the spatial envelope. It authenticates, resolves the volume type,
 // pre-checks quota against the full plan, runs the churn, records the run, and —
-// unless interrupted or --no-cleanup — tears the resources down by metadata and
-// reports any leak. It mirrors "neutron chaos" plus --volume-type and the
-// block-storage-specific --resize-ratio.
+// whether it completed or was interrupted, unless --no-cleanup — tears the
+// resources down by metadata and reports any leak. It mirrors "neutron chaos"
+// plus --volume-type and the block-storage-specific --resize-ratio.
 func newCinderChaosCmd(opts *globalOptions) *cobra.Command {
 	var (
 		scenarioPath string
@@ -62,10 +62,17 @@ func newCinderChaosCmd(opts *globalOptions) *cobra.Command {
 				return err
 			}
 
-			// Stop cleanly on Ctrl-C / SIGTERM: the derived context cancels the
-			// run so in-flight operations unwind instead of being killed.
+			// Two-phase shutdown: the first Ctrl-C / SIGTERM cancels the run so the
+			// churn stops and its resources unwind instead of being killed, then the
+			// teardown below tears the volumes and snapshots down. Unregistering the
+			// handler right after means a second signal takes the default disposition
+			// and kills the process — there is always a hard way out mid-teardown.
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
+			go func() {
+				<-ctx.Done()
+				stop()
+			}()
 
 			// Set up OTEL export (a no-op unless --otel is set) and flush it on
 			// exit so an ad-hoc churn run lands in the same database as monitor.
@@ -176,7 +183,7 @@ func newCinderChaosCmd(opts *globalOptions) *cobra.Command {
 	flags.Float64Var(&f.churnRatio, "churn-ratio", defaultChaosChurnRatio, "create bias at steady state, between 0 and 1")
 	flags.Float64Var(&f.targetFill, "target-fill", defaultChaosTargetFill, "fraction of the envelope to keep populated on average, between 0 and 1")
 	flags.Float64Var(&resizeRatio, "resize-ratio", defaultChaosResizeRatio, "probability per churn step of extending a live, not-yet-resized volume to its planned target, between 0 and 1")
-	flags.BoolVar(&noCleanup, "no-cleanup", false, "leave the volumes and snapshots in place at the end instead of tearing them down by metadata")
+	flags.BoolVar(&noCleanup, "no-cleanup", false, "leave the volumes and snapshots in place — at the end of the run or on interrupt — instead of tearing them down by metadata")
 	flags.StringVar(&volumeType, "volume-type", "", "name of the Cinder volume type to create volumes with (default: the cloud's default type)")
 	// MarkFlagRequired only fails for an unknown flag; "scenario" was just added.
 	_ = cmd.MarkFlagRequired("scenario")
@@ -250,14 +257,17 @@ func mergeCinderChaosConfig(cmd *cobra.Command, opts *globalOptions, s cindersce
 	return cfg
 }
 
-// finishCinderChurn applies the teardown policy. An interrupted run, or one with
-// --no-cleanup, leaves the resources in place and prints the cleanup hint so an
-// operator can inspect them and reclaim them later. A clean run tears the
-// volumes and snapshots down by metadata (snapshots before volumes, each
-// operation bounded by opTimeout) and runs a leak check.
-func finishCinderChurn(ctx context.Context, cmd *cobra.Command, client *cinder.Client, runID, recordPath string, created []resource.Resource, interrupted, noCleanup bool, opTimeout time.Duration) error {
+// finishCinderChurn applies the teardown policy. Unless --no-cleanup is set, the
+// run — whether it completed or was interrupted — tears the volumes and
+// snapshots down by metadata (snapshots before volumes, each operation bounded
+// by opTimeout) and runs a leak check, exactly as a completed run always has;
+// teardown and the leak check run on a context.WithoutCancel of ctx so a
+// first-signal interrupt does not kill the teardown it triggered. With
+// --no-cleanup the resources are left in place and the cleanup hint is printed —
+// interrupt-to-inspect is now this explicit opt-out.
+func finishCinderChurn(ctx context.Context, cmd *cobra.Command, c cinderexec.Cleaner, runID, recordPath string, created []resource.Resource, interrupted, noCleanup bool, opTimeout time.Duration) error {
 	out := cmd.OutOrStdout()
-	if interrupted || noCleanup {
+	if noCleanup {
 		reason := "churn complete"
 		if interrupted {
 			reason = "churn interrupted"
@@ -270,7 +280,13 @@ func finishCinderChurn(ctx context.Context, cmd *cobra.Command, client *cinder.C
 		return err
 	}
 
-	deleted, cleanupErr := cinderexec.Cleanup(ctx, cinderTimeoutCleaner{client, opTimeout}, runID, created, opTimeout)
+	// The signal context is already cancelled on interrupt; run teardown on a
+	// context.WithoutCancel with a per-op bound so the first signal triggers it
+	// and a second signal (the hard abort) is the only thing that kills it.
+	tctx := context.WithoutCancel(ctx)
+	cleaner := cinderTimeoutCleaner{c, opTimeout}
+
+	deleted, cleanupErr := cinderexec.Cleanup(tctx, cleaner, runID, created, opTimeout)
 	if _, err := fmt.Fprintf(out, "deleted %d resource(s) for run %s\n", deleted, runID); err != nil {
 		return fmt.Errorf("writing output: %w", err)
 	}
@@ -278,7 +294,7 @@ func finishCinderChurn(ctx context.Context, cmd *cobra.Command, client *cinder.C
 		return fmt.Errorf("tearing down run %s: %w", runID, cleanupErr)
 	}
 
-	leaked, err := cinderLeakCheck(ctx, client, runID)
+	leaked, err := cinderLeakCheck(tctx, cleaner, runID)
 	if err != nil {
 		return err
 	}
@@ -291,13 +307,14 @@ func finishCinderChurn(ctx context.Context, cmd *cobra.Command, client *cinder.C
 }
 
 // cinderLeakCheck counts the volumes and snapshots still carrying the run's
-// ostester:run metadata after teardown.
-func cinderLeakCheck(ctx context.Context, client *cinder.Client, runID string) (int, error) {
-	vols, err := client.ListVolumesByMetadata(ctx, runID)
+// ostester:run metadata after teardown. It takes the cinderexec.Cleaner seam so
+// the listing shares the teardown's per-op timeout bound.
+func cinderLeakCheck(ctx context.Context, c cinderexec.Cleaner, runID string) (int, error) {
+	vols, err := c.ListVolumesByMetadata(ctx, runID)
 	if err != nil {
 		return 0, fmt.Errorf("leak check listing volumes: %w", err)
 	}
-	snaps, err := client.ListSnapshotsByMetadata(ctx, runID)
+	snaps, err := c.ListSnapshotsByMetadata(ctx, runID)
 	if err != nil {
 		return len(vols), fmt.Errorf("leak check listing snapshots: %w", err)
 	}
