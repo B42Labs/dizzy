@@ -1,14 +1,65 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/B42Labs/openstack-tester/internal/cinder"
 	cinderplan "github.com/B42Labs/openstack-tester/internal/cinder/plan"
+	"github.com/B42Labs/openstack-tester/internal/resource"
 	"github.com/B42Labs/openstack-tester/internal/run"
 )
+
+// recordingCinderCleaner is a fake cinderexec.Cleaner that records what it
+// deletes and whether the contexts it is handed were cancelled, the
+// block-storage twin of recordingCleaner. Its metadata listings return nothing,
+// so the only deletes are the recorded resources passed through the created
+// list — which lets a test assert snapshots are deleted before their volumes.
+type recordingCinderCleaner struct {
+	recordWritten      *bool
+	firstCallSawRecord bool
+	calls              int
+	sawCancelled       bool
+	deleted            []resource.Resource
+}
+
+func (c *recordingCinderCleaner) observe(ctx context.Context) {
+	c.calls++
+	if c.calls == 1 && c.recordWritten != nil {
+		c.firstCallSawRecord = *c.recordWritten
+	}
+	if ctx.Err() != nil {
+		c.sawCancelled = true
+	}
+}
+
+func (c *recordingCinderCleaner) ListVolumesByMetadata(ctx context.Context, _ string) ([]resource.Resource, error) {
+	c.observe(ctx)
+	return nil, nil
+}
+
+func (c *recordingCinderCleaner) ListSnapshotsByMetadata(ctx context.Context, _ string) ([]resource.Resource, error) {
+	c.observe(ctx)
+	return nil, nil
+}
+
+func (c *recordingCinderCleaner) Delete(ctx context.Context, r resource.Resource) error {
+	c.observe(ctx)
+	c.deleted = append(c.deleted, r)
+	return nil
+}
+
+func (c *recordingCinderCleaner) WaitForGone(ctx context.Context, _ resource.Resource) error {
+	c.observe(ctx)
+	return nil
+}
 
 // sampleCinderScenarioYAML is a small but complete Cinder scenario used by the
 // cinder command tests.
@@ -144,6 +195,113 @@ func TestCinderApplyWithoutDryRunRequiresCloud(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "block storage client") {
 		t.Errorf("error %q does not mention block storage client creation", err.Error())
+	}
+}
+
+func TestCinderApplyKeepOnAbortFlagParses(t *testing.T) {
+	// --dry-run returns before signal setup, so a successful parse proves the
+	// flag is registered without needing a cloud.
+	path := writeScenario(t, sampleCinderScenarioYAML)
+	if _, err := execRoot(t, "cinder", "apply", "--scenario", path, "--dry-run", "--keep-on-abort"); err != nil {
+		t.Fatalf("cinder apply --dry-run --keep-on-abort: %v", err)
+	}
+}
+
+func TestFinishAbortedCinderApplyTearsDownOnLiveContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // a first signal cancelled the run
+
+	recordWritten := false
+	c := &recordingCinderCleaner{recordWritten: &recordWritten}
+	// Snapshots must be deleted before their source volumes.
+	created := []resource.Resource{
+		{Kind: cinder.KindVolume, ID: "vol1"},
+		{Kind: cinder.KindSnapshot, ID: "snap1"},
+	}
+	var out bytes.Buffer
+	writeRecord := func() (string, error) {
+		recordWritten = true
+		return "run-abcd1234.json", nil
+	}
+
+	err := finishAbortedCinderApply(ctx, &out, c, "abcd1234", created, false, errors.New("apply boom"), time.Second, writeRecord)
+
+	if err == nil {
+		t.Fatal("finishAbortedCinderApply returned nil; an interrupted apply must exit non-zero")
+	}
+	if !strings.Contains(err.Error(), "abcd1234") {
+		t.Errorf("error %q does not name the run id", err)
+	}
+	if !strings.Contains(err.Error(), "interrupted") {
+		t.Errorf("error %q does not signal the interruption", err)
+	}
+	if c.sawCancelled {
+		t.Error("teardown ran with a cancelled context; it must run on context.WithoutCancel")
+	}
+	if !c.firstCallSawRecord {
+		t.Error("the run record was not written before teardown began")
+	}
+	if len(c.deleted) != 2 || c.deleted[0].ID != "snap1" || c.deleted[1].ID != "vol1" {
+		t.Errorf("deleted = %v, want the snapshot deleted before its volume", c.deleted)
+	}
+	if !strings.Contains(out.String(), "deleted 2 resource(s)") {
+		t.Errorf("output %q missing the deletion count", out.String())
+	}
+}
+
+func TestFinishAbortedCinderApplyBoundsWedgedTeardown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the signal context is already cancelled at teardown time
+
+	writeRecord := func() (string, error) { return "run-wedged.json", nil }
+
+	done := make(chan error, 1)
+	go func() {
+		done <- finishAbortedCinderApply(ctx, io.Discard, blockingCinderCleaner{}, "wedged", nil, false, errors.New("apply boom"), 10*time.Millisecond, writeRecord)
+	}()
+
+	select {
+	case err := <-done:
+		// DeadlineExceeded (not Canceled) proves both the context.WithoutCancel and
+		// the per-op timeout bound.
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err = %v, want it to wrap context.DeadlineExceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("finishAbortedCinderApply did not return; teardown was not bounded")
+	}
+}
+
+func TestFinishAbortedCinderApplyKeepOnAbortLeavesResources(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	tests := []struct {
+		name       string
+		recordPath string
+		wantHint   string
+	}{
+		{"with record path", "run-keep.json", "cinder cleanup --run run-keep.json"},
+		{"empty record path falls back to run-id", "", "cinder cleanup --run-id keep1234"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &recordingCinderCleaner{}
+			var out bytes.Buffer
+			writeRecord := func() (string, error) { return tc.recordPath, nil }
+
+			err := finishAbortedCinderApply(ctx, &out, c, "keep1234", nil, true, errors.New("apply boom"), time.Second, writeRecord)
+
+			if err == nil || !strings.Contains(err.Error(), "keep1234") {
+				t.Errorf("error = %v, want a non-nil error naming the run id", err)
+			}
+			if c.calls != 0 {
+				t.Errorf("cleaner was called %d times; --keep-on-abort must not tear anything down", c.calls)
+			}
+			if !strings.Contains(out.String(), tc.wantHint) {
+				t.Errorf("output %q missing hint %q", out.String(), tc.wantHint)
+			}
+		})
 	}
 }
 
