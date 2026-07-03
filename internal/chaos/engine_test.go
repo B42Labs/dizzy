@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -16,6 +19,13 @@ import (
 	"github.com/B42Labs/openstack-tester/internal/neutron"
 	"github.com/B42Labs/openstack-tester/internal/plan"
 )
+
+// update, when set via `go test -update`, rewrites the golden
+// decision-schedule file instead of comparing against it. It is set once to
+// capture the pre-refactor schedule and never again: the file's unchanged bytes
+// are the byte-for-byte proof that the engine seam refactor keeps the Neutron
+// decision schedule for a given seed intact.
+var update = flag.Bool("update", false, "rewrite golden files instead of comparing")
 
 // fakeNeutron is an in-process Neutron that tracks the live cloud population and
 // the parent/child relationships of every created resource, so the engine's
@@ -358,6 +368,48 @@ func TestRunDeterministicSchedule(t *testing.T) {
 	}
 	if !reflect.DeepEqual(r1.Decisions, r2.Decisions) {
 		t.Errorf("decision schedules differ for the same seed/config:\n #1 (%d) vs #2 (%d)", len(r1.Decisions), len(r2.Decisions))
+	}
+}
+
+// formatDecisions renders a decision schedule as one tab-separated line per
+// decision (offset, action, kind, key), no-ops included, for the golden file.
+func formatDecisions(ds []Decision) string {
+	var b strings.Builder
+	for _, d := range ds {
+		fmt.Fprintf(&b, "%s\t%s\t%s\t%s\n", d.Offset, d.Action, d.Kind, d.Key)
+	}
+	return b.String()
+}
+
+// TestGoldenDecisionSchedule locks the exact decision schedule the engine draws
+// for churnPlan() at seed 7 under testConfig() and a virtual clock. It is
+// generated once with -update against the pre-refactor engine; its bytes must
+// then survive the engine seam refactor and the later mutate-action addition
+// unchanged — the byte-for-byte proof that the Neutron churn schedule for a
+// given seed is not perturbed.
+func TestGoldenDecisionSchedule(t *testing.T) {
+	r, err := Run(context.Background(), newFake(), churnPlan(), testConfig(), newFakeClock())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got := formatDecisions(r.Decisions)
+
+	golden := filepath.Join("testdata", "golden", "decisions.txt")
+	if *update {
+		if err := os.MkdirAll(filepath.Dir(golden), 0o755); err != nil {
+			t.Fatalf("creating golden dir: %v", err)
+		}
+		if err := os.WriteFile(golden, []byte(got), 0o644); err != nil {
+			t.Fatalf("writing golden: %v", err)
+		}
+	}
+
+	want, err := os.ReadFile(golden)
+	if err != nil {
+		t.Fatalf("reading golden (run with -update to create it): %v", err)
+	}
+	if got != string(want) {
+		t.Errorf("decision schedule differs from golden %s; rerun with -update only if the change is intended", golden)
 	}
 }
 
