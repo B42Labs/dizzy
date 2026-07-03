@@ -39,8 +39,9 @@ func newRootCmd() *cobra.Command {
 		Use:   "openstack-tester",
 		Short: "Scenario-driven load and consistency tester for OpenStack",
 		Long: "openstack-tester builds large, randomized but reproducible Neutron\n" +
-			"topologies and Cinder volume workloads, records how long every operation\n" +
-			"takes, and tracks the states the resources reach.",
+			"topologies, Cinder volume workloads, and Keystone identity workloads,\n" +
+			"records how long every operation takes, and tracks the states the\n" +
+			"resources reach.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
@@ -62,7 +63,7 @@ func newRootCmd() *cobra.Command {
 	flags.StringVar(&opts.logLevel, "log-level", "info", "log level: debug, info, warn, or error")
 	flags.BoolVar(&opts.otel, "otel", false, "export metrics via OpenTelemetry OTLP; endpoint, protocol, headers, and TLS come from the OTEL_EXPORTER_OTLP_* environment variables")
 
-	cmd.AddCommand(newNeutronCmd(opts), newCinderCmd(opts))
+	cmd.AddCommand(newNeutronCmd(opts), newCinderCmd(opts), newKeystoneCmd(opts))
 
 	return cmd
 }
