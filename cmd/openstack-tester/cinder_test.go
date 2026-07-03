@@ -31,7 +31,7 @@ func TestCinderSubcommandsRegistered(t *testing.T) {
 		t.Fatal("cinder command not registered on root")
 	}
 
-	want := []string{"generate", "apply", "status", "report", "cleanup"}
+	want := []string{"generate", "apply", "monitor", "status", "report", "cleanup"}
 	for _, name := range want {
 		t.Run(name, func(t *testing.T) {
 			if findSubcommand(cinder, name) == nil {
