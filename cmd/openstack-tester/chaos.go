@@ -314,6 +314,7 @@ func chaosStats(r *chaos.Result) *run.ChaosStats {
 	cs := &run.ChaosStats{
 		Creates:    r.Creates,
 		Deletes:    r.Deletes,
+		Mutates:    r.Mutates,
 		Cycles:     r.Cycles,
 		PopMin:     r.PopMin,
 		PopMax:     r.PopMax,

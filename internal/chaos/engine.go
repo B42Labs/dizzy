@@ -3,12 +3,14 @@
 // deleting resources at random, seeded intervals and parallelism for a
 // configured duration, using a scenario plan as the spatial envelope: the live
 // population never exceeds the plan's resource set, and only planned resources
-// whose parents exist are ever created. The schedule of decisions is
-// deterministic for a given seed and config, while the concurrent cloud-call
-// completion order is not. The engine is service-neutral: per-service builders
-// under subpackages (neutrongraph, cindergraph) turn a plan into the
-// create/delete closures it schedules, each capturing its own cloud client, so
-// nothing in the engine names a specific service.
+// whose parents exist are ever created. It also draws an optional mutate action
+// — an in-place change of a live instance (e.g. a volume extend) that is neither
+// a create nor a delete, bounded to at most once per instance lifetime. The
+// schedule of decisions is deterministic for a given seed and config, while the
+// concurrent cloud-call completion order is not. The engine is service-neutral:
+// per-service builders under subpackages (neutrongraph, cindergraph) turn a plan
+// into the create/delete/mutate closures it schedules, each capturing its own
+// cloud client, so nothing in the engine names a specific service.
 package chaos
 
 import (
@@ -16,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/rand"
 	"runtime/debug"
 	"sort"
@@ -44,11 +47,14 @@ const (
 // random delay between ticks; MaxParallel caps the per-tick fan-out and, with
 // the global Concurrency, the in-flight operation count. ChurnRatio is the
 // neutral create bias at equilibrium and TargetFill the population level the
-// controller pulls toward. Classify optionally labels an operation error for
-// the per-bucket error breakdown; a service builder sets it to its own
-// classifier so the labels match the metrics report, and when nil a minimal
-// default labels only canceled/timeout/other. Per-operation retry and timeout
-// are the builder's concern, captured inside the node closures.
+// controller pulls toward. ResizeRatio is the per-step probability of drawing a
+// mutation (a live node's in-place change, e.g. a volume extend) instead of a
+// create/delete, and is only consulted when the graph has mutable nodes.
+// Classify optionally labels an operation error for the per-bucket error
+// breakdown; a service builder sets it to its own classifier so the labels
+// match the metrics report, and when nil a minimal default labels only
+// canceled/timeout/other. Per-operation retry and timeout are the builder's
+// concern, captured inside the node closures.
 type Config struct {
 	Duration    time.Duration
 	MinInterval time.Duration
@@ -56,6 +62,7 @@ type Config struct {
 	MaxParallel int
 	ChurnRatio  float64
 	TargetFill  float64
+	ResizeRatio float64
 	Concurrency int
 	Classify    func(error) string
 }
@@ -82,11 +89,14 @@ func (c Config) Validate() error {
 	if c.Concurrency < 1 {
 		return fmt.Errorf("concurrency must be at least 1, got %d", c.Concurrency)
 	}
-	if c.ChurnRatio < 0 || c.ChurnRatio > 1 {
+	if math.IsNaN(c.ChurnRatio) || c.ChurnRatio < 0 || c.ChurnRatio > 1 {
 		return fmt.Errorf("chaos churn-ratio must be between 0 and 1, got %v", c.ChurnRatio)
 	}
-	if c.TargetFill < 0 || c.TargetFill > 1 {
+	if math.IsNaN(c.TargetFill) || c.TargetFill < 0 || c.TargetFill > 1 {
 		return fmt.Errorf("chaos target-fill must be between 0 and 1, got %v", c.TargetFill)
+	}
+	if math.IsNaN(c.ResizeRatio) || c.ResizeRatio < 0 || c.ResizeRatio > 1 {
+		return fmt.Errorf("chaos resize-ratio must be between 0 and 1, got %v", c.ResizeRatio)
 	}
 	return nil
 }
@@ -100,6 +110,7 @@ type Result struct {
 	Created    []resource.Resource
 	Creates    int
 	Deletes    int
+	Mutates    int
 	Cycles     int
 	PopMin     int
 	PopMax     int
@@ -109,7 +120,7 @@ type Result struct {
 }
 
 // Decision is one scheduled action in the run's deterministic schedule. Action
-// is "create", "delete", or "noop"; Kind and Key are empty for a noop.
+// is "create", "delete", "mutate", or "noop"; Kind and Key are empty for a noop.
 type Decision struct {
 	Offset time.Duration
 	Action string
@@ -131,13 +142,18 @@ type Bucket struct {
 // Delete are closures a per-service builder supplies, each capturing its own
 // cloud client; they resolve parent cloud ids from ids (keyed by parent key,
 // which equals the parent's plan logical name). A create returns the cloud
-// identity of the resource; a delete removes it.
+// identity of the resource; a delete removes it. Mutate, when non-nil, is an
+// in-place change of a live instance (e.g. a volume extend to its planned
+// target) that is neither a create nor a delete; the engine draws it at most
+// once per instance lifetime. A nil Mutate marks a node the engine never
+// mutates.
 type Node struct {
 	Key     string
 	Kind    resource.Kind
 	Parents []string
 	Create  func(ctx context.Context, ids map[string]string) (resource.Resource, error)
 	Delete  func(ctx context.Context, ids map[string]string, res resource.Resource) error
+	Mutate  func(ctx context.Context, ids map[string]string, res resource.Resource) error
 }
 
 // Run executes a churn/soak run over nodes, bounded temporally by cfg and
@@ -173,10 +189,14 @@ type op struct {
 // nodeState is the scheduler's per-node bookkeeping, mutated only by the single
 // scheduler goroutine. present is the logical inventory; create points at the
 // current instance's create op (the resource source for the node and its
-// children); last is the most recent op (create or delete) and serializes a
-// node's own operations so its instance history stays linear.
+// children); last is the most recent op (create, delete, or mutate) and
+// serializes a node's own operations so its instance history stays linear.
+// mutated records that the current instance has already been mutated, so the
+// engine draws at most one mutation per lifetime; it is re-armed when the node
+// is created again.
 type nodeState struct {
 	present bool
+	mutated bool
 	create  *op
 	last    *op
 }
@@ -220,6 +240,7 @@ type engine struct {
 	cfg      Config
 	clk      Clock
 	rng      *rand.Rand
+	mutable  bool
 
 	sem     chan struct{}
 	pending chan struct{}
@@ -263,6 +284,17 @@ func newEngine(nodes []Node, seed int64, cfg Config, clk Clock) *engine {
 		limit = 1
 	}
 
+	// A graph is mutable when any node carries a Mutate closure. A non-mutable
+	// graph (every Neutron graph) never consults ResizeRatio, so its RNG stream —
+	// and thus its decision schedule — is untouched by the mutate action.
+	mutable := false
+	for _, nd := range nodes {
+		if nd.Mutate != nil {
+			mutable = true
+			break
+		}
+	}
+
 	return &engine{
 		nodes:    nodes,
 		parents:  parents,
@@ -270,6 +302,7 @@ func newEngine(nodes []Node, seed int64, cfg Config, clk Clock) *engine {
 		cfg:      cfg,
 		clk:      clk,
 		rng:      rand.New(rand.NewSource(seed)),
+		mutable:  mutable,
 		sem:      make(chan struct{}, limit),
 		pending:  make(chan struct{}, limit),
 		res:      &results{},
@@ -307,11 +340,30 @@ func (e *engine) drawDelay() time.Duration {
 	return e.cfg.MinInterval + time.Duration(e.rng.Int63n(span+1))
 }
 
-// step makes and dispatches one churn decision. It picks a create or a delete
-// from the currently valid candidates, biased by the controller, transitions the
-// logical inventory, records the decision, and launches the operation. With no
-// valid action it records a no-op.
+// step makes and dispatches one churn decision. When the graph is mutable it
+// first draws, with probability ResizeRatio, a mutation of a live, not-yet-
+// mutated node; otherwise it picks a create or a delete from the currently valid
+// candidates, biased by the controller. It transitions the logical inventory,
+// records the decision, and launches the operation. With no valid action it
+// records a no-op.
+//
+// The mutate draw is double-gated on mutable and ResizeRatio so a non-mutable
+// graph never touches the RNG here, keeping the create/delete decision schedule
+// for such a graph byte-for-byte what it was before mutations existed.
 func (e *engine) step(ctx context.Context, offset time.Duration) {
+	if e.mutable && e.cfg.ResizeRatio > 0 && e.rng.Float64() < e.cfg.ResizeRatio {
+		if cands := e.mutateCandidates(); len(cands) > 0 {
+			idx := cands[e.rng.Intn(len(cands))]
+			nd := e.nodes[idx]
+			e.decisions = append(e.decisions, Decision{Offset: offset, Action: "mutate", Kind: nd.Kind, Key: nd.Key})
+			slog.Info("churn mutate", "kind", nd.Kind, "key", nd.Key, "offset", offset.Round(time.Millisecond))
+			e.dispatchMutate(ctx, idx, offset)
+			e.samplePopulation()
+			return
+		}
+		// No live, un-mutated candidate this tick: fall through to create/delete.
+	}
+
 	creates := e.createCandidates()
 	deletes := e.deleteCandidates()
 
@@ -407,6 +459,20 @@ func (e *engine) deleteCandidates() []int {
 	return out
 }
 
+// mutateCandidates returns the indices of present, mutable nodes whose current
+// instance has not yet been mutated — the nodes a mutation may target. A node
+// stays a candidate across dependency changes (a mutation does not touch the
+// graph), so the only bounds are liveness and the once-per-lifetime flag.
+func (e *engine) mutateCandidates() []int {
+	var out []int
+	for i := range e.nodes {
+		if e.states[i].present && e.nodes[i].Mutate != nil && !e.states[i].mutated {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
 // samplePopulation records the live-node count after a decision into the
 // population series summary.
 func (e *engine) samplePopulation() {
@@ -435,6 +501,7 @@ func (e *engine) dispatchCreate(ctx context.Context, idx int, offset time.Durati
 	parentKeys, parentOps := e.parentOps(idx, &deps)
 
 	st.present = true
+	st.mutated = false // a fresh instance re-arms its at-most-once mutation
 	st.create = newOp
 	st.last = newOp
 	e.present++
@@ -508,6 +575,45 @@ func (e *engine) dispatchDelete(ctx context.Context, idx int, offset time.Durati
 		if err == nil {
 			e.res.cycle() // a create and its delete both succeeded: one full cycle
 		}
+	})
+}
+
+// dispatchMutate marks node idx mutated and launches its in-place change. It
+// mirrors dispatchDelete minus the population change and the dependent-delete
+// waits: the mutation waits for the node's previous operation (serialization and
+// resource source) and its parents' creates (cloud ids). Marking mutated at
+// decision time bounds attempts, not just successes, so the schedule stays
+// deterministic even when the mutation fails; the population is untouched, so
+// the churn controller's economics are unchanged.
+func (e *engine) dispatchMutate(ctx context.Context, idx int, offset time.Duration) {
+	nd := e.nodes[idx]
+	st := &e.states[idx]
+	newOp := &op{done: make(chan struct{})}
+	createOp := st.create // node is present, so this is its current create
+
+	deps := make([]*op, 0, len(e.parents[idx])+1)
+	deps = append(deps, st.last) // serializes this node's operations
+	parentKeys, parentOps := e.parentOps(idx, &deps)
+
+	st.mutated = true
+	st.last = newOp
+
+	e.launch(ctx, newOp, offset, func() {
+		if !e.await(ctx, deps) {
+			return
+		}
+		defer func() { <-e.sem }()
+		if parentOpFailed(parentOps) {
+			return
+		}
+		res := createOp.res
+		if res.ID == "" {
+			return // the create never produced a cloud resource; nothing to mutate
+		}
+		ids := resolveIDs(parentKeys, parentOps)
+		t0 := time.Now()
+		err := nd.Mutate(ctx, ids, res)
+		e.res.add(outcome{offset: offset, latency: time.Since(t0), success: err == nil, errKind: e.classify(err)})
 	})
 }
 
@@ -602,6 +708,8 @@ func (e *engine) result() *Result {
 			r.Creates++
 		case "delete":
 			r.Deletes++
+		case "mutate":
+			r.Mutates++
 		}
 	}
 	if e.popSamples > 0 {

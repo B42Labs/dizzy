@@ -108,7 +108,8 @@ func TestWriteJSONIsMetrics(t *testing.T) {
 
 // TestWriteTableChaosBlock confirms a churn record's table report appends the
 // churn summary and the per-bucket latency/error table, including the bucket's
-// error breakdown.
+// error breakdown. A record with no mutations (Mutates 0) omits the mutates row,
+// keeping a Neutron churn report byte-identical to before.
 func TestWriteTableChaosBlock(t *testing.T) {
 	var buf bytes.Buffer
 	if err := WriteTable(&buf, chaosRecord()); err != nil {
@@ -119,6 +120,24 @@ func TestWriteTableChaosBlock(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("chaos table report missing %q:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "mutates:") {
+		t.Errorf("chaos report with Mutates 0 unexpectedly shows a mutates row:\n%s", out)
+	}
+}
+
+// TestWriteTableChaosMutatesRow confirms the mutates row appears only when a
+// churn run actually mutated (a Cinder soak with volume extends).
+func TestWriteTableChaosMutatesRow(t *testing.T) {
+	rec := chaosRecord()
+	rec.Chaos.Mutates = 7
+
+	var buf bytes.Buffer
+	if err := WriteTable(&buf, rec); err != nil {
+		t.Fatalf("WriteTable: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "mutates:    7") {
+		t.Errorf("chaos report with Mutates 7 missing the mutates row:\n%s", out)
 	}
 }
 

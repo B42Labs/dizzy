@@ -51,8 +51,12 @@ type Record struct {
 // chaos package, so the read-side commands (report, status) can render it
 // without importing the engine. It mirrors chaos.Result.
 type ChaosStats struct {
-	Creates    int           `json:"creates"`
-	Deletes    int           `json:"deletes"`
+	Creates int `json:"creates"`
+	Deletes int `json:"deletes"`
+	// Mutates counts the in-place mutations (Cinder volume extends) a churn run
+	// drew. It is omitempty so a Neutron churn record, which never mutates, keeps
+	// its shape, and an older record without the field loads as zero.
+	Mutates    int           `json:"mutates,omitempty"`
 	Cycles     int           `json:"cycles"`
 	PopMin     int           `json:"popMin"`
 	PopMax     int           `json:"popMax"`
