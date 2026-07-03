@@ -87,6 +87,20 @@ func runMetadata(runID string, kind resource.Kind) map[string]string {
 	}
 }
 
+// metadataMatches reports whether md carries every key/value pair in filter. It
+// is the client-side backstop both metadata list paths apply, so a server that
+// ignores the metadata query never widens the result beyond what the tool
+// actually tagged. An empty filter matches everything, which is why the run-id
+// and type callers always pass a non-empty filter.
+func metadataMatches(md, filter map[string]string) bool {
+	for k, v := range filter {
+		if md[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
 // timed runs fn, records a Sample for the attempt (including the error
 // classification extracted from any gophercloud error), mirrors the same
 // measurement live into telemetry under the low-cardinality op label, and

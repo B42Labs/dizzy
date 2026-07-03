@@ -33,6 +33,27 @@ func (c *Client) status(ctx context.Context, r resource.Resource) (string, error
 	}
 }
 
+// ListByTypeMetadata returns the resources of kind carrying the
+// ostester:type=<kind> metadata, matching every tester run rather than one run's
+// ostester:run metadata. It is the discovery step for the monitor loop's
+// pre-flight orphan sweep, which must reclaim leftovers from a previous crashed
+// or interrupted iteration whose run id it no longer holds. The type value is a
+// fixed non-empty constant, so the empty-metadata hazard the run-id guard in
+// executor.Cleanup protects against cannot arise here. It is the metadata analog
+// of Neutron's ListByTypeTag and covers the kinds Cinder creates (volumes,
+// snapshots); other kinds return an error.
+func (c *Client) ListByTypeMetadata(ctx context.Context, kind resource.Kind) ([]resource.Resource, error) {
+	filter := map[string]string{metaType: string(kind)}
+	switch kind {
+	case KindVolume:
+		return c.listVolumesByMetadata(ctx, filter)
+	case KindSnapshot:
+		return c.listSnapshotsByMetadata(ctx, filter)
+	default:
+		return nil, fmt.Errorf("list by type metadata not supported for kind %q", kind)
+	}
+}
+
 // Observe re-queries the live state of a created resource, recording the call.
 // It returns the resource's status, whether the resource still exists, and any
 // error other than a 404. A 404 is reported as ("", false, nil) so a resource
