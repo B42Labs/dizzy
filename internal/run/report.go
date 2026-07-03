@@ -43,6 +43,11 @@ func writeChaosTable(w io.Writer, c *ChaosStats) error {
 	b.WriteString("\nChurn summary\n")
 	fmt.Fprintf(&b, "  creates:    %d\n", c.Creates)
 	fmt.Fprintf(&b, "  deletes:    %d\n", c.Deletes)
+	// Only a churn run that mutated (a Cinder soak with extends) shows this row,
+	// so a Neutron churn report's output stays byte-identical.
+	if c.Mutates > 0 {
+		fmt.Fprintf(&b, "  mutates:    %d\n", c.Mutates)
+	}
 	fmt.Fprintf(&b, "  cycles:     %d\n", c.Cycles)
 	fmt.Fprintf(&b, "  population: min %d / mean %.1f / max %d (target fill %.2f)\n",
 		c.PopMin, c.PopMean, c.PopMax, c.TargetFill)
