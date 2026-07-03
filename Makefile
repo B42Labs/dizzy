@@ -159,6 +159,7 @@ otel-verify:
 	done; \
 	echo "cloud labels:    $$(curl -fsS 'http://localhost:8428/api/v1/label/cloud/values')"; \
 	echo "scenario labels: $$(curl -fsS 'http://localhost:8428/api/v1/label/scenario/values')"; \
+	echo "service labels:  $$(curl -fsS 'http://localhost:8428/api/v1/label/service/values')"; \
 	if curl -fsS http://localhost:3000/api/health >/dev/null 2>&1; then \
 		echo "ok:      grafana /api/health"; \
 	else \
