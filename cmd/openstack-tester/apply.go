@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -25,13 +27,17 @@ import (
 // --dry-run it authenticates against the cloud, creates the full tagged
 // topology in dependency order, and prints the collected timing metrics. The
 // cloud client is constructed only on the non-dry-run path, after the early
-// return, so --dry-run never reaches a cloud.
+// return, so --dry-run never reaches a cloud. On Ctrl-C / SIGTERM the run record
+// is written and the partial topology is torn down in reverse dependency order
+// (--keep-on-abort leaves it in place with the cleanup hint); a second signal
+// aborts hard, leaving the record for manual cleanup.
 func newApplyCmd(opts *globalOptions) *cobra.Command {
 	var (
 		scenarioPath    string
 		dryRun          bool
 		sets            []string
 		externalNetwork string
+		keepOnAbort     bool
 	)
 
 	cmd := &cobra.Command{
@@ -50,10 +56,17 @@ func newApplyCmd(opts *globalOptions) *cobra.Command {
 				return nil
 			}
 
-			// Stop cleanly on Ctrl-C / SIGTERM: the derived context cancels the
-			// run so in-flight operations unwind instead of being killed.
+			// Two-phase shutdown: the first Ctrl-C / SIGTERM cancels the run so
+			// in-flight operations unwind instead of being killed, then the abort
+			// epilogue below tears down what was created. Unregistering the handler
+			// right after means a second signal takes the default disposition and
+			// kills the process — there is always a hard way out mid-teardown.
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
+			go func() {
+				<-ctx.Done()
+				stop()
+			}()
 
 			// Set up OTEL export (a no-op unless --otel is set) and flush it on
 			// exit so an ad-hoc apply lands in the same database as monitor runs. A
@@ -143,6 +156,16 @@ func newApplyCmd(opts *globalOptions) *cobra.Command {
 			if applyErr != nil {
 				rec.Error = applyErr.Error()
 			}
+
+			// An interrupted run tears itself down by default: write the record
+			// first (so a teardown that fails partway stays reclaimable), then
+			// delete the partial topology. A successful apply keeps its resources
+			// for the status/report/cleanup workflow, so this only fires on abort.
+			if runAborted(ctx, applyErr) {
+				return finishAbortedApply(ctx, cmd.OutOrStdout(), client, runID, res.Created, keepOnAbort, applyErr, opts.timeout,
+					func() (string, error) { return writeAbortedRunRecord(cmd.OutOrStdout(), rec) })
+			}
+
 			// A failed record write must not mask a successful apply: the tagged
 			// resources are live and must stay cleanable. Report the apply outcome
 			// first, then surface the write failure distinctly so it is never read
@@ -171,6 +194,7 @@ func newApplyCmd(opts *globalOptions) *cobra.Command {
 	flags.BoolVar(&dryRun, "dry-run", false, "validate the scenario and print the plan summary without making API calls")
 	flags.StringArrayVar(&sets, "set", nil, "override a scenario value, e.g. --set resources.networks=200 (repeatable)")
 	flags.StringVar(&externalNetwork, "external-network", "", "name of the external network for gateways and floating IPs (default: auto-detect the first external network)")
+	flags.BoolVar(&keepOnAbort, "keep-on-abort", false, "on interrupt, leave already-created resources in place and print the cleanup hint instead of tearing them down")
 	// MarkFlagRequired only fails for an unknown flag; "scenario" was just added.
 	_ = cmd.MarkFlagRequired("scenario")
 
@@ -185,4 +209,66 @@ func newRunID() (string, error) {
 		return "", fmt.Errorf("generating run id: %w", err)
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+
+// runAborted reports whether an apply run was aborted by a signal and should be
+// torn down: true only when the apply returned an error AND the context was
+// cancelled. A run that finished successfully keeps its resources even when the
+// signal lands just after the last operation (the issue's non-goal), and a run
+// that failed without a signal also keeps them for inspection, exactly as
+// today. executor.Apply returns ctx.Err() on cancellation, so both conditions
+// coincide in every real interrupt.
+func runAborted(ctx context.Context, applyErr error) bool {
+	return applyErr != nil && ctx.Err() != nil
+}
+
+// writeAbortedRunRecord persists an interrupted run's record before teardown so
+// the resources still live stay reclaimable, mirroring the non-abort path's
+// write. It returns the path written (empty on failure). A write failure is
+// logged and returned but not fatal to teardown — cleanup by tag can still
+// proceed without a record; a failed status print is logged, never fatal.
+func writeAbortedRunRecord(out io.Writer, rec *run.Record) (string, error) {
+	recordPath, err := run.Write(".", rec)
+	if err != nil {
+		slog.Error("writing run record failed; clean up by run id", "run", rec.RunID, "error", err)
+		return "", err
+	}
+	if _, err := fmt.Fprintf(out, "run record written to %s\n", recordPath); err != nil {
+		slog.Warn("writing run-record path to output failed", "run", rec.RunID, "error", err)
+	}
+	return recordPath, nil
+}
+
+// finishAbortedApply tears down what an interrupted neutron apply created, or —
+// with keepOnAbort — leaves it in place with the reclaim hint. writeRecord is
+// called first so a teardown that fails partway, or a second-signal hard abort
+// during it, still leaves a record to reclaim from. Teardown runs on a
+// context.WithoutCancel of ctx because the signal context is already cancelled
+// and must not kill the teardown it triggered, and each op is bounded by
+// opTimeout so a wedged call cannot hang shutdown. The partial Created list is
+// passed so address scopes — which carry no tag — are reclaimed by id. Every
+// return is a non-nil error naming the run id, so the command exits non-zero and
+// the run is never read as a clean apply.
+func finishAbortedApply(ctx context.Context, out io.Writer, c executor.Cleaner, runID string, created []neutron.Resource, keepOnAbort bool, applyErr error, opTimeout time.Duration, writeRecord func() (string, error)) error {
+	recordPath, _ := writeRecord()
+	hint := "--run-id " + runID
+	if recordPath != "" {
+		hint = "--run " + recordPath
+	}
+
+	if keepOnAbort {
+		if _, err := fmt.Fprintf(out, "apply interrupted; resources left in place — reclaim with: neutron cleanup %s\n", hint); err != nil {
+			slog.Warn("writing interrupt hint to output failed", "run", runID, "error", err)
+		}
+		return fmt.Errorf("applying plan (run %s): %w", runID, applyErr)
+	}
+
+	deleted, cleanupErr := executor.Cleanup(context.WithoutCancel(ctx), timeoutCleaner{c, opTimeout}, runID, created)
+	if _, err := fmt.Fprintf(out, "deleted %d resource(s) for run %s\n", deleted, runID); err != nil {
+		slog.Warn("writing teardown count to output failed", "run", runID, "error", err)
+	}
+	if cleanupErr != nil {
+		return fmt.Errorf("applying plan (run %s): %w; teardown incomplete after deleting %d resource(s): %w — reclaim the rest with: neutron cleanup %s", runID, applyErr, deleted, cleanupErr, hint)
+	}
+	return fmt.Errorf("applying plan (run %s): %w (interrupted; %d created resource(s) torn down)", runID, applyErr, deleted)
 }
