@@ -1,0 +1,22 @@
+name: large
+seed: 42
+
+resources:
+  domains:  3                  # admin-only (> 1 domain): domain-manager mode rejects this profile
+  roles:    4                  # admin-only; ignored in domain-manager mode
+  projects: 50
+  users:    150
+
+distribution:
+  projects_per_domain:            { min: 1, max: 8 }
+  assignments_per_user:           { min: 1, max: 3 }
+  domain_scoped_assignment_ratio: 0.1
+  users_issuing_tokens_ratio:     0.5
+
+chaos:
+  duration: 1h
+  interval: { min: 200ms, max: 3s }
+  parallel: { max: 4 }
+  churn_ratio: 0.5
+  target_fill: 0.8
+  token_ratio: 0.3
