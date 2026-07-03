@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/B42Labs/openstack-tester/internal/chaos"
+	"github.com/B42Labs/openstack-tester/internal/chaos/neutrongraph"
 	"github.com/B42Labs/openstack-tester/internal/config"
 	"github.com/B42Labs/openstack-tester/internal/executor"
 	"github.com/B42Labs/openstack-tester/internal/metrics"
@@ -67,6 +68,7 @@ func newChaosCmd(opts *globalOptions) *cobra.Command {
 			}
 
 			cfg := mergeChaosConfig(cmd, opts, s, f)
+			cfg.Classify = neutrongraph.Classify
 			if err := cfg.Validate(); err != nil {
 				return err
 			}
@@ -100,9 +102,10 @@ func newChaosCmd(opts *globalOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			var externalNetworkID string
 			switch {
 			case haveExternal:
-				cfg.ExternalNetworkID = extNet.ID
+				externalNetworkID = extNet.ID
 				slog.Info("using external network for gateways and floating IPs", "id", extNet.ID, "name", extNet.Name)
 			case p.RoutersWithExternalGateway() > 0 || len(p.FloatingIPs) > 0:
 				slog.Warn("plan wants external connectivity but no external network was found; gateways and floating IPs will be skipped",
@@ -119,13 +122,18 @@ func newChaosCmd(opts *globalOptions) *cobra.Command {
 			client := neutron.New(gc, runID, collector)
 			client.SetTelemetry(tel)
 
+			nodes, err := neutrongraph.Build(p, externalNetworkID, client, opts.timeout)
+			if err != nil {
+				return fmt.Errorf("building churn graph: %w", err)
+			}
+
 			slog.Info("starting churn run", "run", runID, "scenario", p.Scenario,
 				"duration", cfg.Duration, "minInterval", cfg.MinInterval, "maxInterval", cfg.MaxInterval,
 				"maxParallel", cfg.MaxParallel, "concurrency", cfg.Concurrency)
 
 			start := time.Now()
 			hb := startHeartbeat(ctx, "churn in progress", collectorSnapshot(collector, start, "duration", cfg.Duration))
-			result, runErr := chaos.Run(ctx, client, p, cfg, chaos.RealClock{})
+			result, runErr := chaos.Run(ctx, nodes, p.Seed, cfg, chaos.RealClock{})
 			hb.stop()
 			finished := time.Now()
 			if runErr != nil {
@@ -198,7 +206,6 @@ func mergeChaosConfig(cmd *cobra.Command, opts *globalOptions, s scenario.Scenar
 		ChurnRatio:  defaultChaosChurnRatio,
 		TargetFill:  defaultChaosTargetFill,
 		Concurrency: opts.concurrency,
-		OpTimeout:   opts.timeout,
 	}
 
 	if c := s.Chaos; c != nil {

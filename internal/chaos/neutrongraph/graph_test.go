@@ -1,9 +1,11 @@
-package chaos
+package neutrongraph
 
 import (
 	"sort"
 	"testing"
+	"time"
 
+	"github.com/B42Labs/openstack-tester/internal/chaos"
 	"github.com/B42Labs/openstack-tester/internal/neutron"
 	"github.com/B42Labs/openstack-tester/internal/plan"
 )
@@ -55,7 +57,7 @@ func externalPlan() *plan.Plan {
 	}
 }
 
-func nodeByKey(t *testing.T, nodes []Node, key string) Node {
+func nodeByKey(t *testing.T, nodes []chaos.Node, key string) chaos.Node {
 	t.Helper()
 	for _, n := range nodes {
 		if n.Key == key {
@@ -63,10 +65,10 @@ func nodeByKey(t *testing.T, nodes []Node, key string) Node {
 		}
 	}
 	t.Fatalf("no node with key %q in %d nodes", key, len(nodes))
-	return Node{}
+	return chaos.Node{}
 }
 
-func assertParents(t *testing.T, n Node, want ...string) {
+func assertParents(t *testing.T, n chaos.Node, want ...string) {
 	t.Helper()
 	got := append([]string(nil), n.Parents...)
 	sort.Strings(got)
@@ -82,7 +84,7 @@ func assertParents(t *testing.T, n Node, want ...string) {
 }
 
 func TestBuildOneNodePerResource(t *testing.T) {
-	nodes, err := Build(fullPlan(), "")
+	nodes, err := Build(fullPlan(), "", newFake(), time.Minute)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -103,7 +105,7 @@ func TestBuildOneNodePerResource(t *testing.T) {
 }
 
 func TestBuildParentEdges(t *testing.T) {
-	nodes, err := Build(fullPlan(), "")
+	nodes, err := Build(fullPlan(), "", newFake(), time.Minute)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -121,7 +123,7 @@ func TestBuildParentEdges(t *testing.T) {
 }
 
 func TestBuildPortSideInterfaceAndFloatingIPWithExternal(t *testing.T) {
-	nodes, err := Build(externalPlan(), "extnet")
+	nodes, err := Build(externalPlan(), "extnet", newFake(), time.Minute)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -134,7 +136,7 @@ func TestBuildPortSideInterfaceAndFloatingIPWithExternal(t *testing.T) {
 }
 
 func TestBuildOmitsFloatingIPsWithoutExternalNetwork(t *testing.T) {
-	nodes, err := Build(externalPlan(), "")
+	nodes, err := Build(externalPlan(), "", newFake(), time.Minute)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -153,7 +155,7 @@ func TestBuildRejectsInvalidPlan(t *testing.T) {
 		Networks: []plan.Network{{Name: "net-1"}},
 		Subnets:  []plan.Subnet{{Name: "subnet-1", Network: "ghost", IPVersion: 4, CIDR: "10.0.0.0/24"}},
 	}
-	if _, err := Build(p, ""); err == nil {
+	if _, err := Build(p, "", newFake(), time.Minute); err == nil {
 		t.Fatal("Build of a plan with a dangling reference: expected an error, got nil")
 	}
 }
