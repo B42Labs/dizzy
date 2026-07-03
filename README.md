@@ -28,7 +28,12 @@ intended (API) state against the actual data plane (OVN / OVS).
 > storage) slice now ships too, under the `cinder` command namespace: it
 > creates, extends (resizes), and snapshots volumes from `small`/`medium`/`large`
 > profiles, reusing the same plan → apply → record → report/status/cleanup
-> machinery (see §15).
+> machinery (see §15). A first **Keystone** (identity) slice now ships under the
+> `keystone` command namespace with the full driver set — `apply`, `chaos`, and
+> `monitor` — behind an **admin / domain-manager privilege pre-check** that
+> replaces the quota pre-check: it creates domains, roles, projects, users, role
+> assignments, and issues project-scoped tokens, reusing the same machinery (see
+> §16).
 
 ---
 
@@ -66,7 +71,7 @@ intended (API) state against the actual data plane (OVN / OVS).
 | **1** | Generate + apply randomized networking topologies via the API; record timings and states; tag-based cleanup. | Planned (this README) |
 | **2** | Data-plane verification: reconcile API state against OVN NB/SB DB and OVS flows. | Future |
 | **3** | More scenario profiles, optional external connectivity (gateways, FIPs), trunk ports, RBAC, address scopes. | Future |
-| **later** | Extend beyond Neutron (Cinder, Nova, …) — hence the generic name `openstack-tester`. | Started: Cinder first slice (create / resize / snapshot volumes) plus `cinder monitor` (#31) and `cinder chaos` (#32). |
+| **later** | Extend beyond Neutron (Cinder, Nova, …) — hence the generic name `openstack-tester`. | Started: Cinder first slice (create / resize / snapshot volumes) plus `cinder monitor` (#31) and `cinder chaos` (#32); Keystone identity slice (domains / users / projects / roles / assignments / token issue) with the full driver set (`apply` / `chaos` / `monitor`) behind an admin/domain-manager privilege pre-check (#39). |
 
 ---
 
@@ -452,12 +457,12 @@ InfluxDB, VictoriaMetrics, Timescale, …) can store them.
   a down collector degrade to warnings and never fail a run.
 - **Resource attributes** identify one installation across time:
   `service.name=openstack-tester`, `service.version`, plus `cloud` (the
-  `--os-cloud` name), `scenario`, and `service` (`neutron` | `cinder`). The
-  `service` attribute keeps the iteration-level series
+  `--os-cloud` name), `scenario`, and `service` (`neutron` | `cinder` |
+  `keystone`). The `service` attribute keeps the iteration-level series
   (`openstack_tester.iteration.*`), which carry no `kind`, distinguishable when a
-  Neutron and a Cinder monitor feed the same backend; it is a bespoke resource
-  attribute (like `cloud`/`scenario`), deliberately distinct from the semantic
-  `service.name`, and mirrors the run record's `service` field.
+  Neutron, a Cinder, and a Keystone monitor feed the same backend; it is a
+  bespoke resource attribute (like `cloud`/`scenario`), deliberately distinct
+  from the semantic `service.name`, and mirrors the run record's `service` field.
 
 Instruments (recorded live at the Neutron client's timing seam alongside the
 in-memory collector, which stays the source for run records and reports):
@@ -472,9 +477,11 @@ in-memory collector, which stays the source for run records and reports):
 | `openstack_tester.iterations` | counter | | `outcome` |
 
 Attribute value sets are bounded: `kind` is the resource type (`network`,
-`port`, `router`, … and, for Cinder, `volume` and `snapshot`); `operation` is
-one of `create`, `delete`, `get`, `list`, `tag`, `detach`, and — for Cinder's
-resize — `extend`; `outcome` is `success`/`error`/`timeout` for an operation,
+`port`, `router`, … ; for Cinder, `volume` and `snapshot`; for Keystone,
+`domain`, `project`, `user`, `role`, `role_assignment`, and `token`);
+`operation` is one of `create`, `delete`, `get`, `list`, `tag`, `detach`, — for
+Cinder's resize — `extend`, and — for Keystone's domain disable-before-delete —
+`update`; `outcome` is `success`/`error`/`timeout` for an operation,
 `success`/`timeout` for time-to-ready, and `success`/`failure` for an
 iteration; `result` is `attempted`/`succeeded`/`failed`. **Cardinality rule:**
 run IDs, resource IDs, and names are **never** metric attributes — they stay in
@@ -488,6 +495,16 @@ panels on the `kind`/`operation` labels) with no dashboard changes. The one
 addition is the `service` resource attribute above, so the iteration-level
 series stay per-service; the overview dashboard gains a matching `service`
 variable to filter on it.
+
+Keystone likewise needs no schema change: the new `kind` values (`domain`,
+`project`, `user`, `role`, `role_assignment`, `token`) and the new `operation`
+value (`update`, for the domain disable-before-delete) flow through the same
+instruments, and a `403` classifies as `http_403` in the existing `error.kind`
+enum. Keystone creates are synchronous, so `resource.time_to_ready` is largely
+unused — except the **token-issue** latency, which is recorded there with
+`kind=token` in addition to the `token`/`create` operation histogram. The
+Grafana dashboards key on the dynamic `kind`/`operation` labels, so they pick up
+the new values with no dashboard surgery.
 
 `operation.errors` breaks failures down where `operation.duration`'s `outcome`
 collapses them: `error.kind` is the service client's classification —
@@ -844,13 +861,16 @@ contrib/openstack-tester/
 │   ├── neutron/              # gophercloud wrappers, one file per resource type
 │   ├── executor/             # dependency-ordered apply, worker pool, retry
 │   ├── chaos/                # random churn/soak engine over the plan envelope
+│   │   └── keystonegraph/    #   Keystone churn graph over the stable scaffold
 │   ├── cinder/               # Cinder client + plan/scenario/executor subpackages
+│   ├── keystone/             # Keystone client + plan/scenario/executor subpackages
 │   ├── metrics/              # timing collection + reporting
 │   ├── run/                  # run-record persistence
 │   └── verify/               # Phase 2: OVN/OVS reconciliation (stub for now)
 └── scenarios/                # built-in profiles
     ├── neutron/              #   small / medium / large
-    └── cinder/               #   small / medium / large
+    ├── cinder/               #   small / medium / large
+    └── keystone/             #   small / medium / large
 ```
 
 ## 15. Cinder (block storage)
@@ -1042,7 +1062,217 @@ begins.
   instruments land in the existing schema with `service=cinder`; see
   [§9](#opentelemetry-export---otel).
 
-## 16. Roadmap
+## 16. Keystone (identity)
+
+The identity slice exercises **Keystone (Identity v3)** through a sibling
+`keystone` command namespace that reuses the same plan → apply → run-record →
+report/status/cleanup machinery. Per the user request it delivers the **full
+driver set at once** — `apply`, `chaos`, **and** `monitor`. It covers exactly
+six operations, in dependency order:
+
+1. **Create domain** — *admin only*.
+2. **Create user** — admin or domain manager.
+3. **Create project** — admin or domain manager.
+4. **Create role** — *admin only*.
+5. **Assign role** — a `(user, project|domain, role)` grant; admin or domain
+   manager (a manager may not grant `admin`).
+6. **Issue token** — authenticate *as a created user* and obtain a
+   project-scoped token, recording issue latency. This is the tool's first
+   authenticate-as-a-created-principal operation and doubles as an end-to-end
+   consistency check that the create→assign chain took effect: a failed issue is
+   a **failed operation**.
+
+Groups, application credentials, trusts, federation, the service catalog,
+unified limits, implied/inherited role trees, and password rotation are **out of
+scope** for this slice. Keystone creates and deletes are **synchronous** (the
+resource is usable on return), so there is no status-polling / time-to-ready
+stage; the token-issue latency is the one thing recorded on `time_to_ready`.
+
+### Privilege model (the headline)
+
+Unlike Neutron and Cinder — which run inside a single ordinary project —
+Keystone's operations are policy-gated. Before any write, `apply`/`chaos`/
+`monitor` run a **read-only privilege pre-check** that classifies the caller and
+fails fast rather than discovering a wall of 403s mid-run. This pre-check
+**replaces** the quota pre-check (Keystone has no default per-resource quotas).
+
+| Tier | Detected by | Domains? | Roles? | Users / projects / assignments / tokens |
+|---|---|---|---|---|
+| **admin** | `admin` role, any scope | ✅ create | ✅ create | ✅ |
+| **domain-manager** | `manager` role on a domain-scoped token | ❌ | ❌ | ✅ within that domain |
+| *neither* | — | — | — | **fail fast** with a clear message |
+
+The two tiers reuse the **same cloud-independent plan** via an apply-time binder,
+exactly like Neutron's `--external-network` and Cinder's `--volume-type`:
+
+- **admin mode** — the binder **creates** the plan's domains and roles; the rest
+  hangs off them. Fully self-contained.
+- **domain-manager mode** — the binder creates **no** domains or roles. It
+  **binds** every logical domain onto the single in-scope domain (the caller's,
+  or `--domain <name>`) and **reuses existing roles** discovered at apply time
+  (default `member,reader`, overridable with `--roles`; `admin` is never used).
+  Projects, users, assignments, and tokens then run inside that domain exactly as
+  in admin mode. A scenario asking for `resources.roles > 0` or
+  `resources.domains > 1` is **admin-only**; in domain-manager mode validation
+  requires `domains <= 1` and ignores `roles` (reuse instead).
+
+Flags (all honored by `apply`/`chaos`/`monitor`):
+
+- `--privilege auto|admin|domain-manager` (default `auto`) — override the
+  pre-check's tier classification. With an explicit override, a classification
+  read failure is not fatal (the operator asserted the tier; the executor's 403
+  fast-fail is the backstop).
+- `--domain <name>` — the in-scope domain for domain-manager mode (default: the
+  domain the caller's token is scoped to). Ignored in admin mode.
+- `--roles <csv>` — the existing roles to reuse in domain-manager mode (default
+  `member,reader`).
+
+**Caveat:** on **Keystone 2024.1 and older** the domain-manager policy is not
+guaranteed to be installed, so a bare `manager` role may still 403 on the manage
+calls; `--privilege admin` with a cloud admin is the always-works path, and
+domain-manager mode is best-effort with the executor's 403 fast-fail as the
+backstop. Discovery listings (domains, roles, users) that a manager may not read
+**fail open** (warn + empty), mirroring the quota pre-check's 403 policy.
+
+### Commands
+
+```
+openstack-tester keystone generate   --scenario scenarios/keystone/small.yaml [--out plan.json]
+openstack-tester keystone apply      --scenario scenarios/keystone/small.yaml [--dry-run] [--privilege auto|admin|domain-manager] [--domain <name>] [--roles member,reader] [--keep-on-abort]
+openstack-tester keystone chaos      --scenario scenarios/keystone/small.yaml [--duration 30m] [--token-ratio 0.3] [--no-cleanup] [--otel] (+ privilege flags)
+openstack-tester keystone monitor    --scenario scenarios/keystone/small.yaml [--interval 15m] [--iterations n] [--error-wait 2m] [--keep-run-records] [--otel] (+ privilege flags)
+openstack-tester keystone status     --run run-<id>.json
+openstack-tester keystone report     --run run-<id>.json [--format table|json|csv|html]
+openstack-tester keystone cleanup    --run run-<id>.json   # or --run-id <id>
+```
+
+`apply` runs strictly ordered stages: bind roots (create domains then roles in
+admin mode; map onto the in-scope domain and reused roles in domain-manager
+mode) → create projects and users concurrently → grant role assignments → issue
+tokens. A 403 policy denial fails fast (the privilege backstop), a 409 conflict
+is terminal (Keystone names are unique per scope), transient errors retry with
+backoff, and there is no readiness stage. `--dry-run` prints the plan summary
+(domains, roles, projects, users, assignments incl. the domain-scoped count,
+token issues) without touching the cloud. On Ctrl-C / SIGTERM the run record is
+written first, then the partial topology is torn down in reverse dependency order
+(unassign → users → projects → roles → disable+delete domains); `--keep-on-abort`
+leaves it in place with the `cleanup --run <path>` hint; a second signal aborts
+hard.
+
+### Scenario schema
+
+Keystone has its **own** scenario schema (own `--set` keys), so a typo in any
+service's file keeps failing loudly. Fixed counts live under `resources`, ranges
+and ratios under `distribution`, and the run is deterministic via `seed`:
+
+```yaml
+name: small
+seed: 42
+
+resources:
+  domains:  1          # admin-only; forced to the single in-scope domain in domain-manager mode
+  roles:    2          # admin-only; ignored (existing roles reused) in domain-manager mode
+  projects: 5
+  users:    10
+
+distribution:
+  projects_per_domain:            { min: 1, max: 3 }   # round-robin deal granularity, not a hard cap
+  assignments_per_user:           { min: 1, max: 3 }   # (user, project, role) grants drawn per user
+  domain_scoped_assignment_ratio: 0.1                  # fraction of grants targeting the domain, not a project
+  users_issuing_tokens_ratio:     0.5                  # fraction of users that authenticate for a scoped token
+```
+
+`projects_per_domain` is the **clustering granularity** of a round-robin deal of
+the fixed `resources.projects` count across the domains, not a per-domain cap:
+each turn cycles to the next domain and assigns a batch drawn from the range, so
+the project total stays exact while the range shapes how projects cluster. The
+grant and token intent lives **in the plan**, so the same scenario + seed always
+yields the same users, grants, and token issues.
+
+Three profiles ship under `scenarios/keystone/`:
+
+| Profile | Domains | Roles | Projects | Users | Tokens/run (approx) | Chaos duration |
+|---|---|---|---|---|---|---|
+| `small`  | 1 | 2 | 5  | 10  | ~5   | 5m  |
+| `medium` | 2 | 3 | 20 | 50  | ~25  | 30m |
+| `large`  | 3 | 4 | 50 | 150 | ~75  | 1h  |
+
+The `small` profile keeps a **single domain** so it stays runnable in
+domain-manager mode (which requires `domains <= 1`); `medium` and `large` are
+admin-only (more than one domain). Every profile also ships a `chaos:` block
+(with a `token_ratio`), so `keystone chaos` runs each one straight away with no
+extra flags.
+
+**Passwords are never in the plan or run record.** Each user's password is
+derived deterministically from `(seed, logical name)` at apply time, held only in
+memory for the token-issue step, so runs stay reproducible without persisting a
+credential.
+
+### Churn / soak mode (`keystone chaos`)
+
+`keystone chaos` reuses the **same churn engine** as Neutron and Cinder. The
+**domains and roles are the stable scaffold** — provisioned once at start
+(created in admin mode, bound in domain-manager mode), torn down at end — so
+chaos behaves identically in both tiers. The **churning population** is projects,
+users, and role assignments within that scaffold; the engine's
+parents-outlive-children invariant gives the right lifecycle for free (an
+assignment only lives while its user, project, and role live; a user or project
+with a live grant is not a delete candidate).
+
+**Token issue is a mutation, not a population change** — modeled like Cinder's
+`extend`: each churn step draws, with probability `token_ratio` (a chaos-block
+key, default `0.3`, `--token-ratio` override; `0` disables), a token issue as a
+live user with a live project assignment. A grant instance is issued a token
+**at most once per lifetime**, re-armed when it is deleted and re-created. It
+records latency, does not change the population, and counts against the per-tick
+fan-out. Outputs match the other services: a deterministic decision schedule per
+seed+config, a run record with `ChaosStats` (creates / deletes / **token
+issues** as `mutates` / cycles, population summary, time buckets), and OTLP
+export of every operation. At the end of the run — or on Ctrl-C / SIGTERM — it
+tears the resources down by name prefix and runs a leak check; `--no-cleanup`
+leaves them for an explicit `keystone cleanup --run-id <id>`.
+
+### Identification and cleanup
+
+Keystone has **no uniform tag API** — only **projects** support tags. So run
+identity lives primarily in the deterministic name prefix
+`ostester-<runid>-<logical>` (names are unique within their scope, a reliable
+handle), with projects additionally tagged `ostester:run=<id>` /
+`ostester:type=project` for a server-side filter. Discovery for cleanup:
+projects by tag (falling back to the name prefix); domains, users, and roles by
+the `ostester-<runid>-` **name prefix** (client-side, the metadata analog Cinder
+uses); plus the run record's created-list as a belt-and-suspenders handle.
+
+Teardown is reverse dependency order, idempotent (a 404 is success), and **never
+touches a resource without the run's prefix** — critical in domain-manager mode,
+where the run shares a pre-existing domain and reuses pre-existing roles that
+must **not** be deleted: (1) tokens need no teardown — they expire; (2) unassign
+role assignments; (3) delete users; (4) delete projects; (5) delete roles
+*(admin mode only — reused roles are never deleted)*; (6) disable then delete
+domains *(admin mode only)* — Keystone refuses to delete an enabled domain, so
+teardown `update`s `enabled=false` before `delete` (deleting a domain cascades
+its remaining contents). `keystone cleanup --run-id <id>` without a record still
+reclaims by prefix/tag, but role assignments are best reclaimed **with** a
+record (the authoritative handle).
+
+### Monitoring (`keystone monitor`)
+
+`keystone monitor` runs the sweep → apply → cleanup loop continuously (the
+default) or on a fixed cadence, unattended — the same loop as
+[`cinder monitor`](#monitoring-cinder-monitor), so `--interval` (default `0` =
+continuous), `--iterations`, `--error-wait`, fixed-seed comparability, and the
+graceful two-signal shutdown are identical. The **privilege pre-check and
+domain-manager resolution run once at startup** so a wrong tier fails fast before
+the loop; each iteration authenticates a fresh client under a fresh run id (in
+admin mode the domains and roles are recreated per iteration and torn down again;
+in domain-manager mode the startup resolution is reused). The **pre-flight
+sweep** reclaims leftover `ostester-<...>`-named identity resources across every
+tester run; as with the other services, **do not run two testers in the same
+domain concurrently** — the sweep matches by name prefix within the accessible
+scope and would tear a sibling run down. `--otel` lands the same instruments with
+`service=keystone`.
+
+## 17. Roadmap
 
 1. **Phase 1 — API load & timing**
    - [ ] Scaffold module, CLI, `clouds.yaml` auth.
@@ -1071,8 +1301,12 @@ begins.
          export (`service=cinder`).
    - [x] `cinder chaos` (#32): seeded volume/snapshot churn with extend
          mutations within the scenario envelope, reusing the Neutron churn engine.
+   - [x] Keystone first slice (`keystone` namespace, #39): domains / users /
+         projects / roles / assignments / token issue with the full driver set
+         (`apply` / `chaos` / `monitor`) behind an admin/domain-manager privilege
+         pre-check (see §16).
 
-## 17. Open questions / decisions to confirm
+## 18. Open questions / decisions to confirm
 
 - **Quotas**: **resolved** — document-and-require. `apply` pre-checks the
   expanded plan against the project quota and aborts early with an itemized
