@@ -12,8 +12,8 @@ import (
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
 
-	"github.com/B42Labs/openstack-tester/internal/metrics"
 	keystoneplan "github.com/B42Labs/openstack-tester/internal/keystone/plan"
+	"github.com/B42Labs/openstack-tester/internal/metrics"
 )
 
 // createResult builds a tokens.CreateResult whose Body is the parsed token
