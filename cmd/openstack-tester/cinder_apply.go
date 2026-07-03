@@ -36,7 +36,7 @@ func newCinderApplyCmd(opts *globalOptions) *cobra.Command {
 		Use:   "apply",
 		Short: "Create volumes, extend and snapshot them, poll states, and record a run",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			p, err := buildCinderPlanFromFlags(cmd, opts, scenarioPath, sets)
+			_, p, err := buildCinderPlanFromFlags(cmd, opts, scenarioPath, sets)
 			if err != nil {
 				return err
 			}

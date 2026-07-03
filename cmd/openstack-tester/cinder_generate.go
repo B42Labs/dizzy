@@ -27,7 +27,7 @@ func newCinderGenerateCmd(opts *globalOptions) *cobra.Command {
 		Use:   "generate",
 		Short: "Expand a Cinder scenario into a plan and dump it (never touches the API)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			p, err := buildCinderPlanFromFlags(cmd, opts, scenarioPath, sets)
+			_, p, err := buildCinderPlanFromFlags(cmd, opts, scenarioPath, sets)
 			if err != nil {
 				return err
 			}
@@ -60,26 +60,27 @@ func newCinderGenerateCmd(opts *globalOptions) *cobra.Command {
 }
 
 // buildCinderPlanFromFlags loads the Cinder scenario file, applies the --set
-// overrides and the global --seed override, and expands it into a plan. It is
-// shared by the cinder generate and apply commands and makes no API calls.
-func buildCinderPlanFromFlags(cmd *cobra.Command, opts *globalOptions, scenarioPath string, sets []string) (*cinderplan.Plan, error) {
+// overrides and the global --seed override, and expands it into a plan. It
+// returns the scenario too so the chaos command can read its chaos block; the
+// generate, apply, and monitor commands ignore it. It makes no API calls.
+func buildCinderPlanFromFlags(cmd *cobra.Command, opts *globalOptions, scenarioPath string, sets []string) (cinderscenario.Scenario, *cinderplan.Plan, error) {
 	data, err := os.ReadFile(scenarioPath)
 	if err != nil {
-		return nil, fmt.Errorf("reading scenario: %w", err)
+		return cinderscenario.Scenario{}, nil, fmt.Errorf("reading scenario: %w", err)
 	}
 
 	s, err := cinderscenario.Parse(data)
 	if err != nil {
-		return nil, err
+		return cinderscenario.Scenario{}, nil, err
 	}
 
 	for _, set := range sets {
 		key, value, ok := strings.Cut(set, "=")
 		if !ok {
-			return nil, fmt.Errorf("invalid --set %q: want key=value", set)
+			return cinderscenario.Scenario{}, nil, fmt.Errorf("invalid --set %q: want key=value", set)
 		}
 		if err := s.Set(key, value); err != nil {
-			return nil, err
+			return cinderscenario.Scenario{}, nil, err
 		}
 	}
 
@@ -90,7 +91,7 @@ func buildCinderPlanFromFlags(cmd *cobra.Command, opts *globalOptions, scenarioP
 
 	p, err := s.Generate()
 	if err != nil {
-		return nil, err
+		return cinderscenario.Scenario{}, nil, err
 	}
-	return p, nil
+	return s, p, nil
 }

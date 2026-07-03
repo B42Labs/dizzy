@@ -43,7 +43,7 @@ func newCinderMonitorCmd(opts *globalOptions) *cobra.Command {
 		Use:   "monitor",
 		Short: "Run sweep→apply→cleanup volume iterations continuously or on a cadence and export metrics",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			p, err := buildCinderPlanFromFlags(cmd, opts, scenarioPath, sets)
+			_, p, err := buildCinderPlanFromFlags(cmd, opts, scenarioPath, sets)
 			if err != nil {
 				return err
 			}
