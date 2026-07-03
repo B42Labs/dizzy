@@ -23,9 +23,9 @@ import (
 
 // retryBaseDelay, retryMaxDelay, and maxAttempts bound the per-operation retry
 // of transient errors. They duplicate the internal/executor policy rather than
-// sharing it: executor.WithRetry hardcodes the neutron classifiers and is
-// exported for the chaos engine, so a cross-service refactor would touch call
-// sites this slice does not need to.
+// sharing it: that package's WithRetry hardcodes the neutron classifiers (it
+// backs the neutron chaos graph), while this WithRetry uses the cinder
+// classifiers and backs both the apply path and the cinder chaos graph.
 const (
 	retryBaseDelay = 250 * time.Millisecond
 	retryMaxDelay  = 5 * time.Second
@@ -125,7 +125,7 @@ type applier struct {
 // wait fails, so a volume that exists but errored is still recorded for cleanup.
 func (e *applier) provisionVolume(ctx context.Context, v plan.Volume, volumeType string) (resource.Resource, error) {
 	var res resource.Resource
-	err := withRetry(ctx, e.opTimeout, func(ctx context.Context) error {
+	err := WithRetry(ctx, e.opTimeout, func(ctx context.Context) error {
 		r, err := e.c.CreateVolume(ctx, v, volumeType)
 		if err != nil {
 			return err
@@ -147,7 +147,7 @@ func (e *applier) provisionVolume(ctx context.Context, v plan.Volume, volumeType
 // extendVolume grows a volume to its resize target (retrying transient errors)
 // and re-waits for it to return to available.
 func (e *applier) extendVolume(ctx context.Context, r resource.Resource, newSizeGiB int) error {
-	if err := withRetry(ctx, e.opTimeout, func(ctx context.Context) error {
+	if err := WithRetry(ctx, e.opTimeout, func(ctx context.Context) error {
 		return e.c.ExtendVolume(ctx, r, newSizeGiB)
 	}); err != nil {
 		return err
@@ -165,7 +165,7 @@ func (e *applier) provisionSnapshots(ctx context.Context, g snapshotGroup, volum
 	created := make([]resource.Resource, 0, len(g.snaps))
 	for _, s := range g.snaps {
 		var res resource.Resource
-		err := withRetry(ctx, e.opTimeout, func(ctx context.Context) error {
+		err := WithRetry(ctx, e.opTimeout, func(ctx context.Context) error {
 			r, err := e.c.CreateSnapshot(ctx, s, volumeID)
 			if err != nil {
 				return err
@@ -318,11 +318,13 @@ dispatch:
 	return results, nil
 }
 
-// withRetry runs fn, bounding each attempt with opTimeout, and retries transient
+// WithRetry runs fn, bounding each attempt with opTimeout, and retries transient
 // errors with exponential backoff up to maxAttempts. It returns immediately on
 // success, on a quota error (so the run fails fast), or on any non-retryable
-// error. Backoff sleeps honor the parent context.
-func withRetry(ctx context.Context, opTimeout time.Duration, fn func(context.Context) error) error {
+// error. Backoff sleeps honor the parent context. It is exported so the cinder
+// chaos graph drives its create/delete/extend operations through the same
+// transient/quota backoff policy the apply path uses.
+func WithRetry(ctx context.Context, opTimeout time.Duration, fn func(context.Context) error) error {
 	backoff := retryBaseDelay
 	var err error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {

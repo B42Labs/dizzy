@@ -147,10 +147,19 @@ type Bucket struct {
 // target) that is neither a create nor a delete; the engine draws it at most
 // once per instance lifetime. A nil Mutate marks a node the engine never
 // mutates.
+//
+// Gate, when non-nil, serializes every operation of the nodes that share it: a
+// capacity-1 channel the engine acquires before granting a concurrency slot, so
+// at most one op per gate is ever in flight. A builder points a family of nodes
+// at one gate when the backend rejects concurrent operations on them (e.g. a
+// Cinder volume and its snapshots). Because the gate is taken before the slot, an
+// op parked behind a busy family never occupies a slot the rest of the pool could
+// use. A nil Gate (the common case) imposes no cross-node serialization.
 type Node struct {
 	Key     string
 	Kind    resource.Kind
 	Parents []string
+	Gate    chan struct{}
 	Create  func(ctx context.Context, ids map[string]string) (resource.Resource, error)
 	Delete  func(ctx context.Context, ids map[string]string, res resource.Resource) error
 	Mutate  func(ctx context.Context, ids map[string]string, res resource.Resource) error
@@ -507,10 +516,10 @@ func (e *engine) dispatchCreate(ctx context.Context, idx int, offset time.Durati
 	e.present++
 
 	e.launch(ctx, newOp, offset, func() {
-		if !e.await(ctx, deps) {
+		if !e.await(ctx, deps, nd.Gate) {
 			return
 		}
-		defer func() { <-e.sem }()
+		defer e.release(nd.Gate)
 		if parentOpFailed(parentOps) {
 			return // a parent's create failed (or produced no cloud id); skip the
 			// doomed child create instead of recording a bookkeeping-artifact failure
@@ -554,10 +563,10 @@ func (e *engine) dispatchDelete(ctx context.Context, idx int, offset time.Durati
 	e.present--
 
 	e.launch(ctx, newOp, offset, func() {
-		if !e.await(ctx, deps) {
+		if !e.await(ctx, deps, nd.Gate) {
 			return
 		}
-		defer func() { <-e.sem }()
+		defer e.release(nd.Gate)
 		ids := resolveIDs(parentKeys, parentOps)
 		res := createOp.res
 		if res.ID == "" {
@@ -599,16 +608,17 @@ func (e *engine) dispatchMutate(ctx context.Context, idx int, offset time.Durati
 	st.last = newOp
 
 	e.launch(ctx, newOp, offset, func() {
-		if !e.await(ctx, deps) {
+		if !e.await(ctx, deps, nd.Gate) {
 			return
 		}
-		defer func() { <-e.sem }()
+		defer e.release(nd.Gate)
 		if parentOpFailed(parentOps) {
 			return
 		}
 		res := createOp.res
-		if res.ID == "" {
-			return // the create never produced a cloud resource; nothing to mutate
+		if createOp.failed || res.ID == "" {
+			return // the create failed (e.g. never reached available) or produced no
+			// resource; a not-ready instance cannot be reliably mutated
 		}
 		ids := resolveIDs(parentKeys, parentOps)
 		t0 := time.Now()
@@ -672,15 +682,25 @@ func (e *engine) launch(ctx context.Context, o *op, offset time.Duration, work f
 	}()
 }
 
-// await blocks until every dependency operation has finished, then acquires a
-// concurrency slot. It returns false if the context is cancelled first, in which
-// case no slot was acquired and the operation must not run. Acquiring the slot
-// only after dependencies are satisfied keeps a blocked dependent from holding a
-// slot its dependency needs, so the bounded pool cannot deadlock.
-func (e *engine) await(ctx context.Context, deps []*op) bool {
+// await blocks until every dependency operation has finished, then takes the
+// node's family gate (if any) and a concurrency slot. It returns false if the
+// context is cancelled first, in which case nothing was acquired and the
+// operation must not run. Acquiring the slot only after dependencies are
+// satisfied keeps a blocked dependent from holding a slot its dependency needs,
+// so the bounded pool cannot deadlock. Taking the gate before the slot keeps an
+// op parked behind a busy family from occupying a slot: only the family's running
+// op holds one, leaving the pool free for other families to make progress.
+func (e *engine) await(ctx context.Context, deps []*op, gate chan struct{}) bool {
 	for _, d := range deps {
 		select {
 		case <-d.done:
+		case <-ctx.Done():
+			return false
+		}
+	}
+	if gate != nil {
+		select {
+		case gate <- struct{}{}:
 		case <-ctx.Done():
 			return false
 		}
@@ -689,7 +709,20 @@ func (e *engine) await(ctx context.Context, deps []*op) bool {
 	case e.sem <- struct{}{}:
 		return true
 	case <-ctx.Done():
+		if gate != nil {
+			<-gate // release the gate we took; no slot was acquired
+		}
 		return false
+	}
+}
+
+// release returns the concurrency slot and, when the node has a family gate, the
+// gate — the mirror of a successful await, run once per admitted operation. The
+// slot is returned before the gate, the reverse of the acquire order.
+func (e *engine) release(gate chan struct{}) {
+	<-e.sem
+	if gate != nil {
+		<-gate
 	}
 }
 
