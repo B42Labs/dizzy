@@ -56,7 +56,7 @@ install:
 run: build
 	./$(BINARY) $(ARGS)
 
-## testbed: Run the small scenario (SERVICE=neutron|cinder) against the testbed cloud, then clean up.
+## testbed: Run the small scenario (SERVICE=neutron|cinder|keystone) against the testbed cloud, then clean up.
 testbed: build
 	@test -f "$(CLOUDS_FILE)" || { echo "error: clouds file $(CLOUDS_FILE) not found"; exit 1; }
 	@test -f "$(OS_CACERT)"   || { echo "error: CA cert $(OS_CACERT) not found (clouds.yaml 'cacert')"; exit 1; }
@@ -184,7 +184,7 @@ otel-grafana:
 	echo "Opening Grafana: $$url"; \
 	open "$$url" 2>/dev/null || xdg-open "$$url" 2>/dev/null || echo "open the URL above in your browser"
 
-## testbed-monitor: Run monitor --otel (SERVICE=neutron|cinder) against the testbed, exporting to VictoriaMetrics.
+## testbed-monitor: Run monitor --otel (SERVICE=neutron|cinder|keystone) against the testbed, exporting to VictoriaMetrics.
 # monitor applies and cleans up each iteration's resources itself, so this
 # target runs no post-run cleanup: unlike `testbed`, scanning run-*.json in the
 # shared working directory would tear down the resources of a concurrent
