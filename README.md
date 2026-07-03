@@ -1140,7 +1140,7 @@ backstop. Discovery listings (domains, roles, users) that a manager may not read
 openstack-tester keystone generate   --scenario scenarios/keystone/small.yaml [--out plan.json]
 openstack-tester keystone apply      --scenario scenarios/keystone/small.yaml [--dry-run] [--privilege auto|admin|domain-manager] [--domain <name>] [--roles member,reader] [--keep-on-abort]
 openstack-tester keystone chaos      --scenario scenarios/keystone/small.yaml [--duration 30m] [--token-ratio 0.3] [--no-cleanup] [--otel] (+ privilege flags)
-openstack-tester keystone monitor    --scenario scenarios/keystone/small.yaml [--interval 15m] [--iterations n] [--error-wait 2m] [--keep-run-records] [--otel] (+ privilege flags)
+openstack-tester keystone monitor    --scenario scenarios/keystone/small.yaml [--interval 15m] [--iterations n] [--error-wait 2m] [--reclaim-orphans] [--keep-run-records] [--otel] (+ privilege flags)
 openstack-tester keystone status     --run run-<id>.json
 openstack-tester keystone report     --run run-<id>.json [--format table|json|csv|html]
 openstack-tester keystone cleanup    --run run-<id>.json   # or --run-id <id>
@@ -1265,12 +1265,15 @@ graceful two-signal shutdown are identical. The **privilege pre-check and
 domain-manager resolution run once at startup** so a wrong tier fails fast before
 the loop; each iteration authenticates a fresh client under a fresh run id (in
 admin mode the domains and roles are recreated per iteration and torn down again;
-in domain-manager mode the startup resolution is reused). The **pre-flight
-sweep** reclaims leftover `ostester-<...>`-named identity resources across every
-tester run; as with the other services, **do not run two testers in the same
-domain concurrently** — the sweep matches by name prefix within the accessible
-scope and would tear a sibling run down. `--otel` lands the same instruments with
-`service=keystone`.
+in domain-manager mode the startup resolution is reused). Each iteration always
+cleans up its own run-scoped resources; the cross-run **pre-flight orphan sweep**
+is opt-in via `--reclaim-orphans` and **off by default**. When enabled it
+reclaims leftover `ostester-<...>`-named identity resources across every tester
+run — and because an admin token lists cloud-wide (unlike the project-scoped
+other services), it is only safe when **no other tester process targets this
+cloud**: it would delete a concurrent run's in-flight users, roles, and whole
+domains. Left off, a monitor loop reclaims only its own iterations. `--otel`
+lands the same instruments with `service=keystone`.
 
 ## 17. Roadmap
 

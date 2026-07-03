@@ -25,8 +25,8 @@ import (
 // newKeystoneMonitorCmd builds "keystone monitor": the identity counterpart to
 // "neutron monitor" and "cinder monitor". It drives the same service-agnostic
 // loop (runMonitorLoop, runIteration) with a Keystone runOnce that composes the
-// single-shot pipeline — name-prefix pre-flight sweep -> apply -> cleanup —
-// continuously (the default) or on a fixed cadence, unattended, exporting the
+// single-shot pipeline — opt-in pre-flight sweep (--reclaim-orphans) -> apply ->
+// cleanup — continuously (the default) or on a fixed cadence, unattended, exporting the
 // same per-operation and per-iteration metrics (via --otel, tagged
 // service=keystone). The privilege pre-check and domain-manager resolution run
 // once at startup so a wrong tier fails fast before the loop begins.
@@ -35,6 +35,7 @@ func newKeystoneMonitorCmd(opts *globalOptions) *cobra.Command {
 		scenarioPath   string
 		sets           []string
 		keepRunRecords bool
+		reclaimOrphans bool
 		cfg            monitorConfig
 		priv           keystonePrivilegeFlags
 	)
@@ -90,7 +91,7 @@ func newKeystoneMonitorCmd(opts *globalOptions) *cobra.Command {
 
 			// The plan is expanded once at startup, so every iteration reuses the
 			// same seed and topology: comparable across time (the issue's default).
-			runOnce := keystoneMonitorRunOnce(opts, p, tel, tier, res, keepRunRecords)
+			runOnce := keystoneMonitorRunOnce(opts, p, tel, tier, res, keepRunRecords, reclaimOrphans)
 
 			iterations, failures := runMonitorLoop(ctx, cfg, chaos.RealClock{}, runOnce)
 			slog.Info("monitor finished", "iterations", iterations, "failures", failures)
@@ -105,6 +106,7 @@ func newKeystoneMonitorCmd(opts *globalOptions) *cobra.Command {
 	flags.IntVar(&cfg.iterations, "iterations", 0, "stop after this many iterations (0 = run forever)")
 	flags.DurationVar(&cfg.errorWait, "error-wait", 0, "extra pause after a failed iteration before the next starts (0 = off)")
 	flags.BoolVar(&keepRunRecords, "keep-run-records", false, "write a run-<id>.json per iteration (off by default: in monitor mode they accumulate unboundedly)")
+	flags.BoolVar(&reclaimOrphans, "reclaim-orphans", false, "before each iteration, delete leftover ostester- identity resources across ALL tester runs cloud-wide (off by default); only safe when no other tester process targets this cloud, since with an admin token it deletes a concurrent run's in-flight users, roles, and whole domains")
 	priv.register(flags)
 	// MarkFlagRequired only fails for an unknown flag; scenario was just added.
 	_ = cmd.MarkFlagRequired("scenario")
@@ -114,12 +116,12 @@ func newKeystoneMonitorCmd(opts *globalOptions) *cobra.Command {
 
 // keystoneMonitorRunOnce builds the production per-iteration closure the loop
 // drives. Each iteration gets a fresh run id, a fresh metrics collector, and its
-// own authenticated client; it runs the name-prefix pre-flight sweep (reclaiming
-// any tester leftovers across all runs), applies the plan in the startup-fixed
-// tier (admin mode recreates its roots per iteration under the fresh run id;
-// domain-manager mode reuses the startup resolution), and cleans up, then
-// records the per-iteration summary metrics and logs a one-line summary.
-func keystoneMonitorRunOnce(opts *globalOptions, p *keystoneplan.Plan, tel *telemetry.Telemetry, tier keystone.Tier, res keystone.Resolution, keepRunRecords bool) func(ctx context.Context, iter int) bool {
+// own authenticated client; it runs the opt-in pre-flight orphan sweep (only
+// with --reclaim-orphans; see keystonePreflight), applies the plan in the
+// startup-fixed tier (admin mode recreates its roots per iteration under the
+// fresh run id; domain-manager mode reuses the startup resolution), and cleans
+// up, then records the per-iteration summary metrics and logs a one-line summary.
+func keystoneMonitorRunOnce(opts *globalOptions, p *keystoneplan.Plan, tel *telemetry.Telemetry, tier keystone.Tier, res keystone.Resolution, keepRunRecords, reclaimOrphans bool) func(ctx context.Context, iter int) bool {
 	return func(ctx context.Context, iter int) bool {
 		runID, err := newRunID()
 		if err != nil {
@@ -139,12 +141,7 @@ func keystoneMonitorRunOnce(opts *globalOptions, p *keystoneplan.Plan, tel *tele
 		hb := startHeartbeat(ctx, "monitor iteration in progress",
 			collectorSnapshot(collector, start, "iteration", iter, "run", runID))
 		result := runIteration(ctx, iterationDeps{
-			preflight: func(ctx context.Context) (int, error) {
-				// The fresh run id satisfies Cleanup's non-empty guard; the orphan
-				// adapter ignores it and discovers by the any-run name prefix / type
-				// tag.
-				return keystoneexec.Cleanup(ctx, keystoneTimeoutCleaner{keystoneOrphanCleaner{client}, opts.timeout}, runID, nil, opts.timeout)
-			},
+			preflight: keystonePreflight(client, opts.timeout, runID, reclaimOrphans),
 			apply: func(ctx context.Context) ([]resource.Resource, error) {
 				r, err := keystoneexec.Apply(ctx, client, p, tier, res, opts.concurrency, opts.timeout)
 				return r.Created, err
@@ -189,6 +186,26 @@ func keystoneMonitorRunOnce(opts *globalOptions, p *keystoneplan.Plan, tel *tele
 		}
 		slog.Info("iteration complete", attrs...)
 		return result.ok
+	}
+}
+
+// keystonePreflight builds one iteration's pre-flight sweep. The sweep reclaims
+// tester leftovers across every run cloud-wide — by the any-run ostester- name
+// prefix and the ostester:type=project tag — so it is opt-in via --reclaim-orphans
+// and off by default: with an admin token those listings are unscoped, so an
+// unconditional sweep would delete a concurrent tester run's in-flight identity
+// resources (users and roles are cloud-global, and disabling then deleting an
+// ostester- domain cascades away its remaining contents). Off, it is a no-op that
+// issues no identity calls, so a monitor loop reclaims only its own iterations —
+// each iteration's own run-scoped cleanup still runs regardless.
+func keystonePreflight(client *keystone.Client, opTimeout time.Duration, runID string, reclaimOrphans bool) func(ctx context.Context) (int, error) {
+	if !reclaimOrphans {
+		return func(context.Context) (int, error) { return 0, nil }
+	}
+	return func(ctx context.Context) (int, error) {
+		// The fresh run id satisfies Cleanup's non-empty guard; the orphan adapter
+		// ignores it and discovers by the any-run name prefix / type tag.
+		return keystoneexec.Cleanup(ctx, keystoneTimeoutCleaner{keystoneOrphanCleaner{client}, opTimeout}, runID, nil, opTimeout)
 	}
 }
 
