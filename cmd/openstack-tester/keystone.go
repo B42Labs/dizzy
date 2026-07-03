@@ -33,7 +33,9 @@ func newKeystoneCmd(opts *globalOptions) *cobra.Command {
 	cmd.AddCommand(
 		newKeystoneGenerateCmd(opts),
 		newKeystoneApplyCmd(opts),
+		newKeystoneStatusCmd(opts),
 		newReportCmd(opts),
+		newKeystoneCleanupCmd(opts),
 	)
 
 	return cmd

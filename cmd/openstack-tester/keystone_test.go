@@ -14,6 +14,7 @@ import (
 	"github.com/B42Labs/openstack-tester/internal/keystone"
 	keystoneplan "github.com/B42Labs/openstack-tester/internal/keystone/plan"
 	"github.com/B42Labs/openstack-tester/internal/resource"
+	"github.com/B42Labs/openstack-tester/internal/run"
 )
 
 // sampleKeystoneScenarioYAML is a small but complete Keystone scenario used by
@@ -123,18 +124,57 @@ func (blockingKeystoneCleaner) Delete(ctx context.Context, _ resource.Resource) 
 	return ctx.Err()
 }
 
-func TestKeystoneGenerateAndApplyRegistered(t *testing.T) {
+func TestKeystoneSubcommandsRegistered(t *testing.T) {
 	root := newRootCmd()
 	ks := findSubcommand(root, "keystone")
 	if ks == nil {
 		t.Fatal("keystone command not registered on root")
 	}
-	for _, name := range []string{"generate", "apply", "report"} {
+	for _, name := range []string{"generate", "apply", "status", "report", "cleanup"} {
 		t.Run(name, func(t *testing.T) {
 			if findSubcommand(ks, name) == nil {
 				t.Errorf("keystone subcommand %q not registered", name)
 			}
 		})
+	}
+}
+
+func TestKeystoneStatusRequiresRunFlag(t *testing.T) {
+	if _, err := execRoot(t, "keystone", "status"); err == nil {
+		t.Fatal("status without --run: expected error, got nil")
+	}
+}
+
+func TestKeystoneCleanupRequiresRunOrRunID(t *testing.T) {
+	if _, err := execRoot(t, "keystone", "cleanup"); err == nil {
+		t.Fatal("cleanup with neither --run nor --run-id: expected error, got nil")
+	}
+}
+
+// TestKeystoneRejectsCinderRecord confirms the service guard stops a keystone
+// command from operating on a cinder run record (whose resource kinds the
+// keystone client cannot handle), and vice versa.
+func TestKeystoneRejectsCinderRecord(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := run.Write(dir, &run.Record{RunID: "cin00001", Service: "cinder"}); err != nil {
+		t.Fatalf("seeding cinder record: %v", err)
+	}
+	if _, err := run.Write(dir, &run.Record{RunID: "key00001", Service: "keystone"}); err != nil {
+		t.Fatalf("seeding keystone record: %v", err)
+	}
+	cinderRec := filepath.Join(dir, "run-cin00001.json")
+	keystoneRec := filepath.Join(dir, "run-key00001.json")
+
+	// keystone status/cleanup must reject a cinder record before touching a cloud.
+	if _, err := execRoot(t, "keystone", "status", "--run", cinderRec); err == nil || !strings.Contains(err.Error(), "service") {
+		t.Errorf("keystone status on a cinder record: err = %v, want a service mismatch error", err)
+	}
+	if _, err := execRoot(t, "keystone", "cleanup", "--run", cinderRec); err == nil || !strings.Contains(err.Error(), "service") {
+		t.Errorf("keystone cleanup on a cinder record: err = %v, want a service mismatch error", err)
+	}
+	// cinder status must reject a keystone record symmetrically.
+	if _, err := execRoot(t, "cinder", "status", "--run", keystoneRec); err == nil || !strings.Contains(err.Error(), "service") {
+		t.Errorf("cinder status on a keystone record: err = %v, want a service mismatch error", err)
 	}
 }
 
