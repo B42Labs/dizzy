@@ -9,6 +9,10 @@
 // in-memory metrics.Collector, which stays the source of truth for run records
 // and reports.
 //
+// The exported resource additionally carries bounded identifying attributes —
+// cloud, scenario, and service (neutron | cinder) — set from Config, so a single
+// backend can hold several installations and both service monitors at once.
+//
 // Cardinality rule: metric attributes carry only bounded, low-cardinality
 // labels (kind, operation, outcome, result, error.kind). error.kind is the
 // neutron client's classification of a failure (quota, timeout, canceled,
@@ -39,14 +43,18 @@ import (
 // meterName scopes the tester's instruments in the OTEL meter registry.
 const meterName = "github.com/B42Labs/openstack-tester"
 
-// Config carries the enablement flag and the two identifying attributes that
+// Config carries the enablement flag and the identifying attributes that
 // distinguish one installation across time in the backend. Cloud is the
-// --os-cloud name and Scenario is the plan's scenario name; both are omitted
-// from the resource when empty.
+// --os-cloud name, Scenario is the plan's scenario name, and Service names the
+// OpenStack service the run exercises (neutron or cinder, matching
+// run.Record.Service); each is omitted from the resource when empty. Service
+// keeps the iteration-level series — which carry no kind — distinguishable when
+// a neutron and a cinder monitor feed the same backend.
 type Config struct {
 	Enabled  bool
 	Cloud    string
 	Scenario string
+	Service  string
 }
 
 // Telemetry holds the constructed instruments and the provider shutdown hook.
@@ -80,20 +88,9 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 		return nil, err
 	}
 
-	attrs := []attribute.KeyValue{
-		semconv.ServiceName("openstack-tester"),
-		semconv.ServiceVersion(buildVersion()),
-	}
-	if cfg.Cloud != "" {
-		attrs = append(attrs, attribute.String("cloud", cfg.Cloud))
-	}
-	if cfg.Scenario != "" {
-		attrs = append(attrs, attribute.String("scenario", cfg.Scenario))
-	}
-	res, err := resource.Merge(resource.Default(),
-		resource.NewWithAttributes(semconv.SchemaURL, attrs...))
+	res, err := buildResource(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("building telemetry resource: %w", err)
+		return nil, err
 	}
 
 	// A down or misconfigured collector must degrade to warnings, not crash the
@@ -112,6 +109,34 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 	}
 	t.shutdown = mp.Shutdown
 	return t, nil
+}
+
+// buildResource assembles the OTEL resource that tags every exported series with
+// the run's identity: the fixed service.name/service.version plus the
+// bespoke cloud, scenario, and service attributes, each appended only when
+// non-empty. service (neutron | cinder) is deliberately distinct from the
+// semconv service.name (which stays openstack-tester) and mirrors
+// run.Record.Service, so the iteration-level series stay per-service.
+func buildResource(cfg Config) (*resource.Resource, error) {
+	attrs := []attribute.KeyValue{
+		semconv.ServiceName("openstack-tester"),
+		semconv.ServiceVersion(buildVersion()),
+	}
+	if cfg.Cloud != "" {
+		attrs = append(attrs, attribute.String("cloud", cfg.Cloud))
+	}
+	if cfg.Scenario != "" {
+		attrs = append(attrs, attribute.String("scenario", cfg.Scenario))
+	}
+	if cfg.Service != "" {
+		attrs = append(attrs, attribute.String("service", cfg.Service))
+	}
+	res, err := resource.Merge(resource.Default(),
+		resource.NewWithAttributes(semconv.SchemaURL, attrs...))
+	if err != nil {
+		return nil, fmt.Errorf("building telemetry resource: %w", err)
+	}
+	return res, nil
 }
 
 // NewWithProvider constructs the tester's instruments against mp. Setup uses it

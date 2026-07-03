@@ -85,6 +85,37 @@ func sumValue(t *testing.T, m metricdata.Metrics, want map[string]string) (int64
 	return 0, false
 }
 
+// TestBuildResourceAttributes confirms the identifying resource attributes are
+// emitted when set and omitted when empty. The service attribute is the addition
+// this change makes: it must appear for a cinder run and be absent (not an empty
+// series) when Config.Service is unset, so pre-change series still render under
+// the dashboard's "All".
+func TestBuildResourceAttributes(t *testing.T) {
+	t.Run("service present with cloud and scenario", func(t *testing.T) {
+		res, err := buildResource(Config{Cloud: "test", Scenario: "small", Service: "cinder"})
+		if err != nil {
+			t.Fatalf("buildResource: %v", err)
+		}
+		set := res.Set()
+		for k, want := range map[string]string{"cloud": "test", "scenario": "small", "service": "cinder"} {
+			got, ok := set.Value(attribute.Key(k))
+			if !ok || got.AsString() != want {
+				t.Errorf("resource attribute %q = %q (present=%v), want %q", k, got.AsString(), ok, want)
+			}
+		}
+	})
+
+	t.Run("empty service is omitted", func(t *testing.T) {
+		res, err := buildResource(Config{Cloud: "test", Scenario: "small"})
+		if err != nil {
+			t.Fatalf("buildResource: %v", err)
+		}
+		if _, ok := res.Set().Value(attribute.Key("service")); ok {
+			t.Error("service attribute present despite an empty Config.Service")
+		}
+	})
+}
+
 func TestInstrumentsMatchDocumentedSchema(t *testing.T) {
 	tel, reader := newTestTelemetry(t)
 	ctx := context.Background()
