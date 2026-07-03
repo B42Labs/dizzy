@@ -66,7 +66,7 @@ intended (API) state against the actual data plane (OVN / OVS).
 | **1** | Generate + apply randomized networking topologies via the API; record timings and states; tag-based cleanup. | Planned (this README) |
 | **2** | Data-plane verification: reconcile API state against OVN NB/SB DB and OVS flows. | Future |
 | **3** | More scenario profiles, optional external connectivity (gateways, FIPs), trunk ports, RBAC, address scopes. | Future |
-| **later** | Extend beyond Neutron (Cinder, Nova, …) — hence the generic name `openstack-tester`. | Started: Cinder first slice (create / resize / snapshot volumes); `cinder monitor` and `cinder chaos` tracked in #31 and #32. |
+| **later** | Extend beyond Neutron (Cinder, Nova, …) — hence the generic name `openstack-tester`. | Started: Cinder first slice (create / resize / snapshot volumes) plus `cinder monitor` (#31); `cinder chaos` tracked in #32. |
 
 ---
 
@@ -420,6 +420,10 @@ possible follow-up).
   iteration down (best effort, on a context that survives the signal so nothing
   leaks), flushes the metrics exporter, and exits. A second signal aborts hard.
 
+`cinder monitor` drives the same loop for block storage (pre-flight sweep →
+`apply` → `cleanup`) with identical cadence, fixed-seed, and shutdown semantics;
+see [§15](#15-cinder-block-storage) for its block-storage specifics.
+
 ### OpenTelemetry export (`--otel`)
 
 With `--otel`, `monitor` — and one-shot `apply`/`chaos` (flushed on exit) —
@@ -440,7 +444,12 @@ InfluxDB, VictoriaMetrics, Timescale, …) can store them.
   a down collector degrade to warnings and never fail a run.
 - **Resource attributes** identify one installation across time:
   `service.name=openstack-tester`, `service.version`, plus `cloud` (the
-  `--os-cloud` name) and `scenario`.
+  `--os-cloud` name), `scenario`, and `service` (`neutron` | `cinder`). The
+  `service` attribute keeps the iteration-level series
+  (`openstack_tester.iteration.*`), which carry no `kind`, distinguishable when a
+  Neutron and a Cinder monitor feed the same backend; it is a bespoke resource
+  attribute (like `cloud`/`scenario`), deliberately distinct from the semantic
+  `service.name`, and mirrors the run record's `service` field.
 
 Instruments (recorded live at the Neutron client's timing seam alongside the
 in-memory collector, which stays the source for run records and reports):
@@ -463,11 +472,14 @@ iteration; `result` is `attempted`/`succeeded`/`failed`. **Cardinality rule:**
 run IDs, resource IDs, and names are **never** metric attributes — they stay in
 the run records and logs.
 
-Cinder needs no schema change: the new `kind` values (`volume`, `snapshot`) and
-the new `operation` value (`extend`) flow through the same instruments, so a
-one-shot `cinder apply --otel` exports through the existing seam and appears in
-the Grafana API-operations dashboard (which keys panels on the `kind`/
-`operation` labels) with no dashboard changes.
+Cinder needs no new instruments: the new `kind` values (`volume`, `snapshot`)
+and the new `operation` value (`extend`) flow through the same instruments, so a
+one-shot `cinder apply --otel` (or a `cinder monitor` loop) exports through the
+existing seam and appears in the Grafana API-operations dashboard (which keys
+panels on the `kind`/`operation` labels) with no dashboard changes. The one
+addition is the `service` resource attribute above, so the iteration-level
+series stay per-service; the overview dashboard gains a matching `service`
+variable to filter on it.
 
 `operation.errors` breaks failures down where `operation.duration`'s `outcome`
 collapses them: `error.kind` is the service client's classification —
@@ -588,7 +600,7 @@ scenario, service namespace, or add flags:
 ```console
 $ make testbed-monitor MONITOR_INTERVAL=5m MONITOR_ITERATIONS=1
 $ make testbed-monitor SCENARIO=scenarios/neutron/medium.yaml ARGS="--error-wait 2m"
-$ make testbed-monitor SERVICE=cinder  # scenarios/cinder/small.yaml, once cinder monitor exists (#31)
+$ make testbed-monitor SERVICE=cinder  # scenarios/cinder/small.yaml, exports service=cinder
 ```
 
 With `MONITOR_INTERVAL=0` and `MONITOR_ITERATIONS=0` (both the default) it runs
@@ -651,7 +663,10 @@ three dashboards are there the moment Grafana is up — no manual import.
   percentiles by kind, a per-kind readiness success ratio, and a time-to-ready
   heatmap.
 
-All three carry `cloud` and `scenario` template variables. They respect what
+All three carry `cloud` and `scenario` template variables; the overview
+additionally carries a `service` variable (`neutron` | `cinder`) so its
+iteration-level panels can be filtered to one service when both monitors feed the
+same backend. They respect what
 the OTLP data actually carries: **percentiles are estimated from the histogram
 buckets** and labelled `p95 (est.)`, not true maxima; there are **no true
 per-run min/max series** (OTLP histogram min/max are not mapped), so
@@ -838,15 +853,16 @@ how Neutron started:
 3. **Create snapshots** of the volumes.
 
 Attachments (Nova), boot-from-volume, image-backed volumes, backups, clones,
-transfers, restore-from-snapshot, retype/migration, and `cinder monitor` /
-`cinder chaos` are **out of scope** for this slice; the loop drivers stay
-Neutron-only. The monitor and chaos follow-ups are tracked in #31 and #32.
+transfers, restore-from-snapshot, retype/migration, and `cinder chaos` are
+**out of scope** for this slice. `cinder monitor` (the unattended loop driver,
+below) is now implemented; the chaos/churn follow-up is tracked in #32.
 
 ### Commands
 
 ```
 openstack-tester cinder generate   --scenario scenarios/cinder/small.yaml [--out plan.json]
 openstack-tester cinder apply      --scenario scenarios/cinder/small.yaml [--dry-run] [--volume-type <name>]
+openstack-tester cinder monitor    --scenario scenarios/cinder/small.yaml [--interval 15m] [--iterations n] [--error-wait 2m] [--volume-type <name>] [--keep-run-records] [--otel]
 openstack-tester cinder status     --run run-<id>.json
 openstack-tester cinder report     --run run-<id>.json [--format table|json|csv|html]
 openstack-tester cinder cleanup    --run run-<id>.json   # or --run-id <id>
@@ -929,6 +945,33 @@ dependency order — **snapshots first, then volumes** (a volume with snapshots
 cannot be deleted). 404s count as success, so cleanup is idempotent and never
 touches resources without the run's metadata.
 
+### Monitoring (`cinder monitor`)
+
+`cinder monitor` re-runs the block-storage pipeline continuously by default or
+on a fixed cadence, unattended, for days or weeks — the same loop as
+[`neutron monitor`](#monitoring-over-time-neutron-monitor), so `--interval`
+(default `0` = continuous), `--iterations`, `--error-wait`, and the fixed-seed,
+graceful-shutdown, and minimum-failure-backoff semantics are identical. Each
+iteration is a pre-flight sweep → `apply` → `cleanup` with a fresh run id and a
+fresh Keystone auth (so token expiry over a multi-day loop fails one iteration
+rather than dead-looping). The volume type is resolved and the Cinder quotas are
+pre-checked once at startup, so a misconfiguration fails fast before the loop
+begins.
+
+- **Self-healing pre-flight sweep.** Before each iteration the loop reclaims
+  leftover `ostester`-metadata resources so a previous crashed or interrupted
+  iteration cannot accumulate. Discovery is by the `ostester:type=<kind>`
+  **metadata** (the metadata analog of Neutron's type tag), so it reclaims
+  **any** tester-created volume/snapshot in the project, snapshots before
+  volumes. **Do not run `cinder monitor` concurrently with another
+  `apply`/`monitor` run in the same project** — the sweep would tear the other
+  run down mid-flight.
+- **Bounded teardown.** Every cleanup operation is bounded by `--timeout`, so a
+  wedged Cinder call bounds one operation, not the whole loop.
+- **`--otel`.** Volume/snapshot operation histograms and the per-iteration
+  instruments land in the existing schema with `service=cinder`; see
+  [§9](#opentelemetry-export---otel).
+
 ## 16. Roadmap
 
 1. **Phase 1 — API load & timing**
@@ -954,7 +997,9 @@ touches resources without the run's metadata.
 4. **Beyond Neutron**
    - [x] Cinder first slice (`cinder` namespace): create / resize / snapshot
          volumes with `small`/`medium`/`large` profiles (see §15).
-   - [ ] `cinder monitor` (#31) and `cinder chaos` (#32).
+   - [x] `cinder monitor` (#31): unattended sweep→apply→cleanup loop with OTLP
+         export (`service=cinder`).
+   - [ ] `cinder chaos` (#32).
 
 ## 17. Open questions / decisions to confirm
 
