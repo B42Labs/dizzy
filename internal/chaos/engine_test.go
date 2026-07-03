@@ -92,7 +92,8 @@ type mutFake struct {
 	deletes     int
 	mutates     int
 	mutatesByID map[string]int
-	failCreate  bool
+	failCreate  bool // create returns no resource and an error
+	failReady   bool // create returns a resource but an error (readiness failure)
 }
 
 func newMutFake() *mutFake { return &mutFake{mutatesByID: make(map[string]int)} }
@@ -105,7 +106,13 @@ func (f *mutFake) create(logical string) (resource.Resource, error) {
 	}
 	f.creates++
 	f.nextID++
-	return resource.Resource{Kind: "volume", Logical: logical, ID: fmt.Sprintf("id-%d", f.nextID)}, nil
+	res := resource.Resource{Kind: "volume", Logical: logical, ID: fmt.Sprintf("id-%d", f.nextID)}
+	if f.failReady {
+		// The resource exists but the operation failed, as when a volume is
+		// created yet never reaches available.
+		return res, errors.New("simulated readiness failure")
+	}
+	return res, nil
 }
 
 func (f *mutFake) mutate(res resource.Resource) error {
@@ -275,6 +282,61 @@ func TestRunMutateIsPopulationNeutral(t *testing.T) {
 	}
 }
 
+// TestGatedFamilyDoesNotHoldSlotWhileParked pins the throughput contract of the
+// family gate: an operation waiting behind a busy gate must NOT occupy a
+// concurrency slot, so unrelated families keep churning at full concurrency. It
+// fails if the gate is ever acquired after the slot (the ordering that let a
+// blocked family op sit on a slot and collapse cross-family throughput to
+// serial). The existing family-violation check covers mutual exclusion; this one
+// covers that the exclusion is not paid for with a stalled slot.
+func TestGatedFamilyDoesNotHoldSlotWhileParked(t *testing.T) {
+	cfg := validConfig()
+	cfg.MaxParallel = 2
+	cfg.Concurrency = 2 // two concurrency slots
+	e := newEngine(nil, 7, cfg, newFakeClock())
+	ctx := context.Background()
+	gate := make(chan struct{}, 1)
+
+	// First family op takes the gate and one of the two slots.
+	if !e.await(ctx, nil, gate) {
+		t.Fatal("first await was not admitted")
+	}
+	if got := len(e.sem); got != 1 {
+		t.Fatalf("slots in use after one admitted op = %d, want 1", got)
+	}
+
+	// A second op on the same busy gate parks: the gate is taken before the slot,
+	// so it blocks on the held gate and never reaches the slot acquire.
+	started := make(chan struct{})
+	parked := make(chan bool, 1)
+	go func() {
+		close(started)
+		parked <- e.await(ctx, nil, gate)
+	}()
+	<-started
+	time.Sleep(50 * time.Millisecond) // let the parked op reach its blocking point
+
+	// It must still be parked, holding no slot: the second of the two slots stays
+	// free for an unrelated family. If the slot were taken before the gate, this
+	// op would sit on a slot while blocked and len(e.sem) would read 2.
+	select {
+	case <-parked:
+		t.Fatal("a same-family op was admitted while the gate was held; the gate is not serializing")
+	default:
+	}
+	if got := len(e.sem); got != 1 {
+		t.Fatalf("slots in use while a same-family op is parked = %d, want 1 "+
+			"(a parked op must not occupy a concurrency slot)", got)
+	}
+
+	// Freeing the first op releases the gate; the parked op then proceeds.
+	e.release(gate)
+	if !<-parked {
+		t.Fatal("the parked op was never admitted after the gate freed")
+	}
+	e.release(gate) // the formerly parked op's slot and gate
+}
+
 // TestRunMutateSkipsFailedCreate confirms a node whose create failed is still
 // drawn as a mutate candidate (it is optimistically present) but no mutation
 // reaches the cloud, since the failed create published no resource id.
@@ -296,5 +358,30 @@ func TestRunMutateSkipsFailedCreate(t *testing.T) {
 	}
 	if f.mutates != 0 {
 		t.Errorf("%d mutations reached the cloud for volumes whose create failed, want 0", f.mutates)
+	}
+}
+
+// TestRunMutateSkipsNotReadyCreate confirms a node whose create produced a
+// resource but failed (a volume that never reached available) is not mutated,
+// even though it is optimistically present and carries a cloud id — the failed
+// create flag alone gates the extend.
+func TestRunMutateSkipsNotReadyCreate(t *testing.T) {
+	f := newMutFake()
+	f.failReady = true
+	cfg := mutConfig()
+	cfg.ResizeRatio = 0.9
+
+	r, err := Run(context.Background(), mutableNodes(f, 3), 7, cfg, newFakeClock())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r.Mutates == 0 {
+		t.Fatal("no mutate decisions were drawn; the test exercises nothing")
+	}
+	if f.mutates != 0 {
+		t.Errorf("%d mutations reached the cloud for volumes that never became ready, want 0", f.mutates)
 	}
 }
