@@ -654,19 +654,20 @@ three dashboards are there the moment Grafana is up — no manual import.
   iteration success ratio, iterations by outcome, iteration-duration
   percentiles, operations attempted/succeeded/failed, and the non-success share
   of all API calls.
-- **Neutron API operations** (`ostester-api-operations`) — the report's
-  per-type table over time: per-kind p95 and mean latency, a latency heatmap,
-  throughput, error+timeout rate, an ops-by-outcome table, and an
-  errors-by-error-kind timeseries (from the dedicated errors counter, empty on
-  a healthy run). An extra `operation` variable filters to `create`/`delete`/… .
+- **API operations** (`ostester-api-operations`) — the report's
+  per-type table over time, covering every monitored service: per-kind p95 and
+  mean latency, a latency heatmap, throughput, error+timeout rate, an
+  ops-by-outcome table, and an errors-by-error-kind timeseries (from the
+  dedicated errors counter, empty on a healthy run). An extra `operation`
+  variable filters to `create`/`delete`/… .
 - **Resource readiness** (`ostester-time-to-ready`) — time-to-ready
   percentiles by kind, a per-kind readiness success ratio, and a time-to-ready
   heatmap.
 
-All three carry `cloud` and `scenario` template variables; the overview
-additionally carries a `service` variable (`neutron` | `cinder`) so its
-iteration-level panels can be filtered to one service when both monitors feed the
-same backend. They respect what
+All three carry `cloud` and `scenario` template variables; the overview and
+API-operations dashboards additionally carry a `service` variable
+(`neutron` | `cinder`) so their panels can be filtered to one service when both
+monitors feed the same backend. They respect what
 the OTLP data actually carries: **percentiles are estimated from the histogram
 buckets** and labelled `p95 (est.)`, not true maxima; there are **no true
 per-run min/max series** (OTLP histogram min/max are not mapped), so
