@@ -65,7 +65,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-      "description": "Share of all Neutron API calls whose outcome is not success (error or timeout), over the dashboard time range. This is the outcome-level share; for the per-error_kind breakdown (quota, http_<status>, ...) see the \"Errors by error kind\" panel on the Neutron API operations dashboard.",
+      "description": "Share of all API calls whose outcome is not success (error or timeout), over the dashboard time range. This is the outcome-level share; for the per-error_kind breakdown (quota, http_<status>, ...) see the \"Errors by error kind\" panel on the API operations dashboard.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -210,7 +210,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-      "description": "Neutron operations attempted, succeeded, and failed per second, aggregated across the selected clouds and scenarios.",
+      "description": "Operations attempted, succeeded, and failed per second, aggregated across the selected clouds, scenarios, and services.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -321,6 +321,6 @@
   "timezone": "",
   "title": "OpenStack Tester — Overview",
   "uid": "ostester-overview",
-  "version": 2,
+  "version": 3,
   "weekStart": ""
 }
