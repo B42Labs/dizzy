@@ -17,6 +17,7 @@ import (
 	"github.com/B42Labs/openstack-tester/internal/metrics"
 	"github.com/B42Labs/openstack-tester/internal/neutron"
 	"github.com/B42Labs/openstack-tester/internal/plan"
+	"github.com/B42Labs/openstack-tester/internal/resource"
 	"github.com/B42Labs/openstack-tester/internal/run"
 	"github.com/B42Labs/openstack-tester/internal/telemetry"
 )
@@ -205,11 +206,14 @@ func runMonitorLoop(ctx context.Context, cfg monitorConfig, clk chaos.Clock, run
 }
 
 // iterationDeps are the three cloud-touching phases of one iteration, injected
-// so the iteration policy is testable without a cloud.
+// so the iteration policy is testable without a cloud. They are typed on the
+// service-agnostic resource.Resource so the same runIteration policy drives both
+// the neutron and cinder per-iteration closures (neutron.Resource is an alias of
+// resource.Resource, so existing neutron closures satisfy it unchanged).
 type iterationDeps struct {
 	preflight func(ctx context.Context) (swept int, err error)
-	apply     func(ctx context.Context) (created []neutron.Resource, err error)
-	cleanup   func(ctx context.Context, created []neutron.Resource) (deleted int, err error)
+	apply     func(ctx context.Context) (created []resource.Resource, err error)
+	cleanup   func(ctx context.Context, created []resource.Resource) (deleted int, err error)
 }
 
 // iterationResult is one iteration's outcome, used for the summary line, the
@@ -217,7 +221,7 @@ type iterationDeps struct {
 type iterationResult struct {
 	ok      bool
 	swept   int
-	created []neutron.Resource
+	created []resource.Resource
 	deleted int
 	err     error
 }
@@ -304,7 +308,20 @@ func monitorRunOnce(opts *globalOptions, p *plan.Plan, tel *telemetry.Telemetry,
 			agg.Overall.Attempted, agg.Overall.Succeeded, agg.Overall.Failed)
 
 		if keepRunRecords {
-			writeIterationRecord(p, runID, start, wall, agg, res)
+			rec := &run.Record{
+				RunID:      runID,
+				Service:    "neutron",
+				Scenario:   p.Scenario,
+				Seed:       p.Seed,
+				StartedAt:  start,
+				FinishedAt: start.Add(wall),
+				Created:    res.created,
+				Metrics:    agg,
+			}
+			if res.err != nil {
+				rec.Error = res.err.Error()
+			}
+			writeIterationRecord(rec)
 		}
 
 		attrs := []any{
@@ -321,29 +338,18 @@ func monitorRunOnce(opts *globalOptions, p *plan.Plan, tel *telemetry.Telemetry,
 	}
 }
 
-// writeIterationRecord persists a run record for one iteration, mirroring what
-// apply writes (Error carries the first phase error). A write failure is logged,
-// never fatal: it must not abort the loop.
-func writeIterationRecord(p *plan.Plan, runID string, start time.Time, wall time.Duration, agg metrics.Aggregate, res iterationResult) {
-	rec := &run.Record{
-		RunID:      runID,
-		Service:    "neutron",
-		Scenario:   p.Scenario,
-		Seed:       p.Seed,
-		StartedAt:  start,
-		FinishedAt: start.Add(wall),
-		Created:    res.created,
-		Metrics:    agg,
-	}
-	if res.err != nil {
-		rec.Error = res.err.Error()
-	}
+// writeIterationRecord persists a caller-built run record for one iteration,
+// mirroring what apply writes (the caller sets Error to the first phase error).
+// It is service-agnostic — the neutron and cinder closures each build their own
+// run.Record — and a write failure is logged, never fatal: it must not abort the
+// loop.
+func writeIterationRecord(rec *run.Record) {
 	path, err := run.Write(".", rec)
 	if err != nil {
-		slog.Error("writing iteration run record failed", "run", runID, "error", err)
+		slog.Error("writing iteration run record failed", "run", rec.RunID, "error", err)
 		return
 	}
-	slog.Info("run record written", "run", runID, "path", path)
+	slog.Info("run record written", "run", rec.RunID, "path", path)
 }
 
 // timeoutCleaner wraps a Cleaner so every cloud operation executor.Cleanup
