@@ -1,3 +1,14 @@
+// Package chaos runs a random churn/soak load against an OpenStack service.
+// Instead of building a topology once and stopping, it keeps creating and
+// deleting resources at random, seeded intervals and parallelism for a
+// configured duration, using a scenario plan as the spatial envelope: the live
+// population never exceeds the plan's resource set, and only planned resources
+// whose parents exist are ever created. The schedule of decisions is
+// deterministic for a given seed and config, while the concurrent cloud-call
+// completion order is not. The engine is service-neutral: per-service builders
+// under subpackages (neutrongraph, cindergraph) turn a plan into the
+// create/delete closures it schedules, each capturing its own cloud client, so
+// nothing in the engine names a specific service.
 package chaos
 
 import (
@@ -11,10 +22,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/executor"
 	"github.com/B42Labs/openstack-tester/internal/metrics"
-	"github.com/B42Labs/openstack-tester/internal/neutron"
-	"github.com/B42Labs/openstack-tester/internal/plan"
+	"github.com/B42Labs/openstack-tester/internal/resource"
 )
 
 // bucketCount is the number of equal-width time buckets the run's duration is
@@ -35,18 +44,20 @@ const (
 // random delay between ticks; MaxParallel caps the per-tick fan-out and, with
 // the global Concurrency, the in-flight operation count. ChurnRatio is the
 // neutral create bias at equilibrium and TargetFill the population level the
-// controller pulls toward. OpTimeout bounds each operation; ExternalNetworkID is
-// the network floating IPs and gateways use ("" when the cloud has none).
+// controller pulls toward. Classify optionally labels an operation error for
+// the per-bucket error breakdown; a service builder sets it to its own
+// classifier so the labels match the metrics report, and when nil a minimal
+// default labels only canceled/timeout/other. Per-operation retry and timeout
+// are the builder's concern, captured inside the node closures.
 type Config struct {
-	Duration          time.Duration
-	MinInterval       time.Duration
-	MaxInterval       time.Duration
-	MaxParallel       int
-	ChurnRatio        float64
-	TargetFill        float64
-	Concurrency       int
-	OpTimeout         time.Duration
-	ExternalNetworkID string
+	Duration    time.Duration
+	MinInterval time.Duration
+	MaxInterval time.Duration
+	MaxParallel int
+	ChurnRatio  float64
+	TargetFill  float64
+	Concurrency int
+	Classify    func(error) string
 }
 
 // Validate checks the merged config (defaults, YAML block, and flag overrides
@@ -86,7 +97,7 @@ func (c Config) Validate() error {
 // statistics.
 type Result struct {
 	Decisions  []Decision
-	Created    []neutron.Resource
+	Created    []resource.Resource
 	Creates    int
 	Deletes    int
 	Cycles     int
@@ -102,7 +113,7 @@ type Result struct {
 type Decision struct {
 	Offset time.Duration
 	Action string
-	Kind   neutron.Kind
+	Kind   resource.Kind
 	Key    string
 }
 
@@ -114,32 +125,48 @@ type Bucket struct {
 	Errors []metrics.ErrorCount
 }
 
-// Run executes a churn/soak run against n, bounded spatially by p and
-// temporally by cfg, drawing every decision from a seed taken from the plan.
-// It returns when cfg.Duration elapses on clk or ctx is cancelled, after letting
-// in-flight operations drain. A non-nil error means the config or plan was
-// rejected before any work started; operation-level failures are tolerated and
-// reported in the result.
-func Run(ctx context.Context, n Neutron, p *plan.Plan, cfg Config, clk Clock) (*Result, error) {
+// Node is one planned resource in the churn graph: a unit the engine can create
+// and later delete. Key uniquely identifies it; Parents lists the keys of the
+// nodes whose creation it depends on (and which must outlive it). Create and
+// Delete are closures a per-service builder supplies, each capturing its own
+// cloud client; they resolve parent cloud ids from ids (keyed by parent key,
+// which equals the parent's plan logical name). A create returns the cloud
+// identity of the resource; a delete removes it.
+type Node struct {
+	Key     string
+	Kind    resource.Kind
+	Parents []string
+	Create  func(ctx context.Context, ids map[string]string) (resource.Resource, error)
+	Delete  func(ctx context.Context, ids map[string]string, res resource.Resource) error
+}
+
+// Run executes a churn/soak run over nodes, bounded temporally by cfg and
+// drawing every decision from seed. nodes come from a per-service builder, each
+// carrying create/delete closures that capture their cloud client. It returns
+// when cfg.Duration elapses on clk or ctx is cancelled, after letting in-flight
+// operations drain. A non-nil error means the config was rejected before any
+// work started; operation-level failures are tolerated and reported in the
+// result.
+func Run(ctx context.Context, nodes []Node, seed int64, cfg Config, clk Clock) (*Result, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	nodes, err := Build(p, cfg.ExternalNetworkID)
-	if err != nil {
-		return nil, err
-	}
-	return newEngine(nodes, n, p.Seed, cfg, clk).run(ctx), nil
+	return newEngine(nodes, seed, cfg, clk).run(ctx), nil
 }
 
 // op is one in-flight create or delete of a node instance. done is closed when
 // the operation finishes (success, failure, or cancellation); the close
-// publishes res to any goroutine that reads it after waiting on done.
-// deleteFailed is set on a delete op when the cloud delete did not confirm the
-// resource was removed (so it may still exist); it is read by liveResources
-// after the drain to keep the run record authoritative.
+// publishes res to any goroutine that reads it after waiting on done. failed is
+// set on a create op when the create closure returned an error, so a doomed
+// child (whose parent create failed) is skipped even when the failed create
+// still published a partial resource. deleteFailed is set on a delete op when
+// the cloud delete did not confirm the resource was removed (so it may still
+// exist); it is read by liveResources after the drain to keep the run record
+// authoritative.
 type op struct {
 	done         chan struct{}
-	res          neutron.Resource
+	res          resource.Resource
+	failed       bool
 	deleteFailed bool
 }
 
@@ -193,7 +220,6 @@ type engine struct {
 	cfg      Config
 	clk      Clock
 	rng      *rand.Rand
-	n        Neutron
 
 	sem     chan struct{}
 	pending chan struct{}
@@ -211,7 +237,7 @@ type engine struct {
 
 // newEngine builds the engine's static graph indices, the concurrency limiter
 // (sem), and the scheduler backpressure pool (pending), both sized to limit.
-func newEngine(nodes []Node, n Neutron, seed int64, cfg Config, clk Clock) *engine {
+func newEngine(nodes []Node, seed int64, cfg Config, clk Clock) *engine {
 	index := make(map[string]int, len(nodes))
 	for i, nd := range nodes {
 		index[nd.Key] = i
@@ -244,7 +270,6 @@ func newEngine(nodes []Node, n Neutron, seed int64, cfg Config, clk Clock) *engi
 		cfg:      cfg,
 		clk:      clk,
 		rng:      rand.New(rand.NewSource(seed)),
-		n:        n,
 		sem:      make(chan struct{}, limit),
 		pending:  make(chan struct{}, limit),
 		res:      &results{},
@@ -419,23 +444,21 @@ func (e *engine) dispatchCreate(ctx context.Context, idx int, offset time.Durati
 			return
 		}
 		defer func() { <-e.sem }()
-		ids := resolveIDs(parentKeys, parentOps)
-		if missingParentID(ids) {
-			return // a parent's create failed (no cloud id); skip the doomed
-			// child create instead of recording a bookkeeping-artifact failure
+		if parentOpFailed(parentOps) {
+			return // a parent's create failed (or produced no cloud id); skip the
+			// doomed child create instead of recording a bookkeeping-artifact failure
 		}
+		ids := resolveIDs(parentKeys, parentOps)
 		t0 := time.Now()
-		var res neutron.Resource
-		err := executor.WithRetry(ctx, e.cfg.OpTimeout, func(ctx context.Context) error {
-			r, createErr := nd.Create(ctx, e.n, ids)
-			if createErr != nil {
-				return createErr
-			}
-			res = r
-			return nil
-		})
+		// Publish whatever the closure returned even on failure: a create that
+		// yielded a resource but failed readiness (a cinder volume stuck at
+		// error) must stay deletable and in the run record, while a create that
+		// yielded nothing publishes a zero resource. failed skips its doomed
+		// children regardless of whether an id was produced.
+		res, err := nd.Create(ctx, ids)
 		newOp.res = res
-		e.res.add(outcome{offset: offset, latency: time.Since(t0), success: err == nil, errKind: classify(err)})
+		newOp.failed = err != nil
+		e.res.add(outcome{offset: offset, latency: time.Since(t0), success: err == nil, errKind: e.classify(err)})
 	})
 }
 
@@ -475,17 +498,13 @@ func (e *engine) dispatchDelete(ctx context.Context, idx int, offset time.Durati
 		}
 		// Assume the resource survives until the delete confirms otherwise, so a
 		// failed (or panicking) delete keeps it in the run record rather than
-		// leaking it — address scopes can only be reclaimed by recorded id.
+		// leaking it — address scopes can only be reclaimed by recorded id. The
+		// delete closure owns retry and already-gone (404) tolerance.
 		newOp.deleteFailed = true
 		t0 := time.Now()
-		err := executor.WithRetry(ctx, e.cfg.OpTimeout, func(ctx context.Context) error {
-			return nd.Delete(ctx, e.n, ids, res)
-		})
-		if err != nil && neutron.IsNotFound(err) {
-			err = nil // a resource already gone is a successful delete (idempotent)
-		}
+		err := nd.Delete(ctx, ids, res)
 		newOp.deleteFailed = err != nil
-		e.res.add(outcome{offset: offset, latency: time.Since(t0), success: err == nil, errKind: classify(err)})
+		e.res.add(outcome{offset: offset, latency: time.Since(t0), success: err == nil, errKind: e.classify(err)})
 		if err == nil {
 			e.res.cycle() // a create and its delete both succeeded: one full cycle
 		}
@@ -603,8 +622,8 @@ func (e *engine) result() *Result {
 // recorded when it is logically present, or when its last delete did not confirm
 // removal: the resource may still be in the cloud, and dropping it would leak a
 // kind cleanup can only reclaim by recorded id (address scopes) silently.
-func (e *engine) liveResources() []neutron.Resource {
-	var live []neutron.Resource
+func (e *engine) liveResources() []resource.Resource {
+	var live []resource.Resource
 	for i := range e.nodes {
 		st := &e.states[i]
 		if st.create == nil || st.create.res.ID == "" {
@@ -666,13 +685,12 @@ func (e *engine) buckets(outcomes []outcome) []Bucket {
 	return buckets
 }
 
-// missingParentID reports whether any resolved parent id is empty. An empty id
-// means that parent's create failed (a node logically present with no cloud id),
-// so an operation that resolves it can only fail; callers skip such operations
-// to keep the cascade of a failed create out of the latency/error report.
-func missingParentID(ids map[string]string) bool {
-	for _, id := range ids {
-		if id == "" {
+// parentOpFailed reports whether any parent's create op failed or produced no
+// cloud id. Such a parent cannot support a child operation, so callers skip the
+// child to keep the cascade of a failed create out of the latency/error report.
+func parentOpFailed(ops []*op) bool {
+	for _, o := range ops {
+		if o.failed || o.res.ID == "" {
 			return true
 		}
 	}
@@ -703,10 +721,14 @@ func sortedErrorCounts(m map[string]int) []metrics.ErrorCount {
 	return out
 }
 
-// classify labels an operation error for the per-bucket error breakdown, reusing
-// the neutron classification helpers so the labels match the kinds operators
-// already see in the metrics report.
-func classify(err error) string {
+// classify labels an operation error for the per-bucket error breakdown. It
+// defers to the service-supplied Config.Classify when set so the labels match
+// the kinds operators already see in that service's metrics report; otherwise a
+// minimal default covers only the service-agnostic outcomes.
+func (e *engine) classify(err error) string {
+	if e.cfg.Classify != nil {
+		return e.cfg.Classify(err)
+	}
 	switch {
 	case err == nil:
 		return ""
@@ -714,14 +736,6 @@ func classify(err error) string {
 		return "canceled"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "timeout"
-	case errors.Is(err, neutron.ErrQuota):
-		return "quota"
-	case neutron.IsNotFound(err):
-		return "not-found"
-	case neutron.IsConflict(err):
-		return "conflict"
-	case neutron.IsRetryable(err):
-		return "transient"
 	default:
 		return "other"
 	}
