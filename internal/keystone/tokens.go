@@ -7,8 +7,8 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
 
-	"github.com/B42Labs/openstack-tester/internal/metrics"
 	keystoneplan "github.com/B42Labs/openstack-tester/internal/keystone/plan"
+	"github.com/B42Labs/openstack-tester/internal/metrics"
 )
 
 // IssueToken authenticates as the created user t.User (with its derived

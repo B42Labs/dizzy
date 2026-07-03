@@ -13,8 +13,8 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 
-	"github.com/B42Labs/openstack-tester/internal/metrics"
 	keystoneplan "github.com/B42Labs/openstack-tester/internal/keystone/plan"
+	"github.com/B42Labs/openstack-tester/internal/metrics"
 	"github.com/B42Labs/openstack-tester/internal/resource"
 )
 
