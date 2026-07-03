@@ -56,7 +56,7 @@ func newCinderApplyCmd(opts *globalOptions) *cobra.Command {
 			// Set up OTEL export (a no-op unless --otel is set) and flush it on
 			// exit so an ad-hoc apply lands in the same database as monitor runs.
 			tel, err := telemetry.Setup(ctx, telemetry.Config{
-				Enabled: opts.otel, Cloud: opts.cloudName(), Scenario: p.Scenario,
+				Enabled: opts.otel, Cloud: opts.cloudName(), Scenario: p.Scenario, Service: "cinder",
 			})
 			if err != nil {
 				return fmt.Errorf("setting up telemetry: %w", err)

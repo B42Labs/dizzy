@@ -60,7 +60,7 @@ func newApplyCmd(opts *globalOptions) *cobra.Command {
 			// misconfigured protocol fails fast here rather than silently dropping
 			// metrics later.
 			tel, err := telemetry.Setup(ctx, telemetry.Config{
-				Enabled: opts.otel, Cloud: opts.cloudName(), Scenario: p.Scenario,
+				Enabled: opts.otel, Cloud: opts.cloudName(), Scenario: p.Scenario, Service: "neutron",
 			})
 			if err != nil {
 				return fmt.Errorf("setting up telemetry: %w", err)
