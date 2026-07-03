@@ -1,7 +1,9 @@
 package scenario
 
 import (
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/B42Labs/openstack-tester/scenarios"
 )
@@ -49,10 +51,28 @@ func TestProfilesGenerateValidPlans(t *testing.T) {
 
 // TestSmallProfileMatchesGoldenFixture asserts the shipped small profile equals
 // the smallScenario fixture, tying it transitively to the golden plan locked by
-// TestGenerateGolden.
+// TestGenerateGolden. It uses reflect.DeepEqual rather than == because Scenario
+// now carries a *Chaos pointer, which == would compare by identity.
 func TestSmallProfileMatchesGoldenFixture(t *testing.T) {
-	if got, want := readProfile(t, "small"), smallScenario(); got != want {
+	if got, want := readProfile(t, "small"), smallScenario(); !reflect.DeepEqual(got, want) {
 		t.Errorf("scenarios/cinder/small.yaml = %+v, want %+v", got, want)
+	}
+}
+
+// TestProfilesShipChaosBlock asserts every shipped Cinder profile carries a
+// chaos block with a positive duration, so `cinder chaos --scenario
+// scenarios/cinder/<profile>.yaml` runs without a --duration flag.
+func TestProfilesShipChaosBlock(t *testing.T) {
+	for _, name := range profileNames {
+		t.Run(name, func(t *testing.T) {
+			s := readProfile(t, name)
+			if s.Chaos == nil {
+				t.Fatalf("profile cinder/%s.yaml has no chaos block", name)
+			}
+			if s.Chaos.Duration <= 0 {
+				t.Errorf("profile cinder/%s.yaml chaos.duration = %s, want positive", name, time.Duration(s.Chaos.Duration))
+			}
+		})
 	}
 }
 

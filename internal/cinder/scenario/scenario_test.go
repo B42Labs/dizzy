@@ -2,7 +2,12 @@ package scenario
 
 import (
 	"testing"
+	"time"
 )
+
+// floatPtr returns a pointer to f, for building the *float64 chaos fields
+// (ResizeRatio) in test fixtures.
+func floatPtr(f float64) *float64 { return &f }
 
 // smallScenario is the compact scenario backing the golden test; it mirrors the
 // shipped scenarios/cinder/small.yaml so the profile test can tie to it.
@@ -18,6 +23,14 @@ func smallScenario() Scenario {
 			VolumeResizedRatio: 0.5,
 			ResizeGrowthGiB:    Range{Min: 1, Max: 4},
 			SnapshotsPerVolume: Range{Min: 0, Max: 2},
+		},
+		Chaos: &Chaos{
+			Duration:    Duration(5 * time.Minute),
+			Interval:    Interval{Min: Duration(200 * time.Millisecond), Max: Duration(3 * time.Second)},
+			Parallel:    Parallel{Max: 4},
+			ChurnRatio:  0.5,
+			TargetFill:  0.8,
+			ResizeRatio: floatPtr(0.3),
 		},
 	}
 }
@@ -115,6 +128,80 @@ func TestSet(t *testing.T) {
 			}
 			if !k.check(s) {
 				t.Errorf("Set(%q,%q) did not apply", k.key, k.value)
+			}
+		})
+	}
+}
+
+// TestParseChaosBlock confirms a full chaos block — including the
+// block-storage-specific resize_ratio — parses and validates, that a scenario
+// with no chaos block is valid, and that an unknown chaos key fails strict
+// unmarshal loudly.
+func TestParseChaosBlock(t *testing.T) {
+	yaml := `name: c
+seed: 1
+resources:
+  volumes: 1
+distribution:
+  volume_size_gib: { min: 1, max: 1 }
+chaos:
+  duration: 10m
+  interval: { min: 200ms, max: 3s }
+  parallel: { max: 4 }
+  churn_ratio: 0.5
+  target_fill: 0.8
+  resize_ratio: 0.3
+`
+	s, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if s.Chaos == nil {
+		t.Fatal("chaos block did not parse into a non-nil Chaos")
+	}
+	if s.Chaos.ResizeRatio == nil || *s.Chaos.ResizeRatio != 0.3 {
+		t.Errorf("resize_ratio = %v, want 0.3", s.Chaos.ResizeRatio)
+	}
+	if s.Chaos.Duration != Duration(10*time.Minute) {
+		t.Errorf("duration = %s, want 10m", time.Duration(s.Chaos.Duration))
+	}
+	if err := s.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil for a well-formed chaos block", err)
+	}
+
+	// A scenario with no chaos block validates the same as before.
+	if err := smallScenario().Validate(); err != nil {
+		t.Errorf("Validate() with a chaos block = %v, want nil", err)
+	}
+
+	// An unknown chaos key must fail strict unmarshal, not be silently ignored.
+	if _, err := Parse([]byte("name: c\nresources:\n  volumes: 1\nchaos:\n  nope: 1\n")); err == nil {
+		t.Error("Parse of a chaos block with an unknown key: expected an error, got nil")
+	}
+}
+
+// TestValidateChaosBlockRejects covers each way a chaos block can be
+// semantically invalid, one violated rule at a time.
+func TestValidateChaosBlockRejects(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Chaos)
+	}{
+		{"negative duration", func(c *Chaos) { c.Duration = Duration(-time.Second) }},
+		{"negative interval min", func(c *Chaos) { c.Interval.Min = Duration(-time.Millisecond) }},
+		{"interval min above max", func(c *Chaos) { c.Interval.Min = c.Interval.Max + Duration(time.Second) }},
+		{"negative parallel max", func(c *Chaos) { c.Parallel.Max = -1 }},
+		{"churn_ratio above one", func(c *Chaos) { c.ChurnRatio = 1.5 }},
+		{"target_fill below zero", func(c *Chaos) { c.TargetFill = -0.1 }},
+		{"resize_ratio above one", func(c *Chaos) { c.ResizeRatio = floatPtr(1.5) }},
+		{"resize_ratio below zero", func(c *Chaos) { c.ResizeRatio = floatPtr(-0.1) }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := smallScenario()
+			tc.mutate(s.Chaos)
+			if err := s.Validate(); err == nil {
+				t.Fatal("Validate() = nil, want error")
 			}
 		})
 	}

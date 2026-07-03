@@ -10,4 +10,12 @@ distribution:
   resize_growth_gib:    { min: 1, max: 8 }   # extend delta drawn per resized volume
   snapshots_per_volume: { min: 0, max: 3 }   # drawn per volume
 
+chaos:
+  duration: 30m
+  interval: { min: 200ms, max: 3s }
+  parallel: { max: 6 }
+  churn_ratio: 0.5
+  target_fill: 0.8
+  resize_ratio: 0.3
+
 # Needs raised quotas; guarded by the apply quota pre-check.
