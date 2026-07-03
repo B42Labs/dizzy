@@ -252,8 +252,8 @@ A single binary `openstack-tester` with subcommands (Neutron grouped under a
 
 ```
 openstack-tester neutron generate  --scenario medium.yaml [--out plan.json]
-openstack-tester neutron apply     --scenario medium.yaml [--dry-run]
-openstack-tester neutron chaos     --scenario medium.yaml [--duration 30m]
+openstack-tester neutron apply     --scenario medium.yaml [--dry-run] [--keep-on-abort]
+openstack-tester neutron chaos     --scenario medium.yaml [--duration 30m] [--no-cleanup]
 openstack-tester neutron monitor   --scenario medium.yaml [--interval 15m] [--iterations n] [--error-wait 2m] [--keep-run-records] [--otel]
 openstack-tester neutron status    --run run-<id>.json
 openstack-tester neutron report    --run run-<id>.json [--format table|json|csv|html]
@@ -265,7 +265,14 @@ openstack-tester neutron verify    --run run-<id>.json   # Phase 2 (future)
 - `apply` — generate (or load) a plan, create resources, poll states, record a
   run record + metrics. `--dry-run` validates and prints what would be created.
   `--external-network <name>` selects the external network for router gateways
-  and floating IPs (default: auto-detect the first external network).
+  and floating IPs (default: auto-detect the first external network). On Ctrl-C /
+  SIGTERM the run record is written first, then the partial topology is torn down
+  in reverse dependency order (address scopes included via the record's created
+  list), the deletion count is logged, and the command exits non-zero naming the
+  run id; a second signal aborts hard, leaving the record for manual cleanup.
+  `--keep-on-abort` leaves everything in place with the `cleanup --run <path>`
+  hint. A *successful* apply keeps its resources for the status/report/cleanup
+  workflow, unchanged.
 - `chaos` — random churn / soak mode. Instead of building the topology once, it
   runs for `--duration` and uses the scenario as the **envelope** (upper bound):
   for the whole runtime it keeps creating *and* deleting resources at random,
@@ -275,14 +282,15 @@ openstack-tester neutron verify    --run run-<id>.json   # Phase 2 (future)
   `--max-interval` (the random delay range between actions); `--max-parallel`
   (the per-tick fan-out cap, itself bounded by the global `--concurrency`);
   `--churn-ratio` and `--target-fill` (the create/delete controller — see §10);
-  `--no-cleanup` (leave the topology in place); `--external-network` (as for
-  `apply`). The same knobs can live in a `chaos:` block in the scenario YAML;
-  flags override the block. The three built-in profiles ship such a block, so
-  `--duration` (and the rest) is optional when running them. With `--seed` fixed
-  (and identical settings) the
-  whole action schedule is reproducible. On a clean finish it tears the topology
-  down by tag and runs a leak check; Ctrl-C / SIGTERM leaves the resources in
-  place for an explicit `cleanup --run <id>`.
+  `--no-cleanup` (leave the topology in place, at the end of the run or on
+  interrupt); `--external-network` (as for `apply`). The same knobs can live in a
+  `chaos:` block in the scenario YAML; flags override the block. The three
+  built-in profiles ship such a block, so `--duration` (and the rest) is optional
+  when running them. With `--seed` fixed (and identical settings) the whole action
+  schedule is reproducible. At the end of the run — or on Ctrl-C / SIGTERM — it
+  tears the topology down by tag and runs a leak check; `--no-cleanup` leaves the
+  resources in place for an explicit `cleanup --run <id>` (interrupt-to-inspect is
+  now the explicit opt-out).
 - `monitor` — continuous or periodic mode. It re-runs the single-shot pipeline
   (pre-flight orphan sweep → `apply` → `cleanup`) unattended, so an
   installation can be observed over time. By default (no `--interval`, or
@@ -764,10 +772,15 @@ the population oscillating inside the envelope rather than draining to empty or
 pinning to the ceiling: each action's create probability is
 `clamp(churn_ratio + (target_fill − current_fill), 0, 1)`, so `churn_ratio` is
 the neutral bias at equilibrium and `target_fill` pulls the population toward its
-level. By default a clean run tears the topology down by tag at the end;
-`--no-cleanup` opts out, and an interrupt (Ctrl-C / SIGTERM) always leaves the
-resources in place for an explicit `cleanup --run <id>` so an interrupt-to-inspect
-never destroys the topology.
+level. By default a churn run tears its resources down at the end **or when
+interrupted**: the run record is written first, then teardown (by tag for
+Neutron, by `ostester:run` metadata with snapshots deleted before their volumes
+for Cinder) plus a leak check, all on a `context.WithoutCancel` so the first
+signal triggers the teardown rather than killing it. `--no-cleanup` is the single
+opt-out — it leaves everything in place for an explicit `cleanup --run <id>`, so
+interrupt-to-inspect is now the explicit choice rather than the silent default. A
+second signal aborts hard, leaving the run record plus the tag/metadata sweep as
+the recovery path.
 
 ---
 
@@ -862,7 +875,7 @@ chaos` (the churn/soak driver, below) are now implemented.
 
 ```
 openstack-tester cinder generate   --scenario scenarios/cinder/small.yaml [--out plan.json]
-openstack-tester cinder apply      --scenario scenarios/cinder/small.yaml [--dry-run] [--volume-type <name>]
+openstack-tester cinder apply      --scenario scenarios/cinder/small.yaml [--dry-run] [--volume-type <name>] [--keep-on-abort]
 openstack-tester cinder chaos      --scenario scenarios/cinder/small.yaml [--duration 30m] [--volume-type <name>] [--resize-ratio 0.3] [--no-cleanup] [--otel]
 openstack-tester cinder monitor    --scenario scenarios/cinder/small.yaml [--interval 15m] [--iterations n] [--error-wait 2m] [--volume-type <name>] [--keep-run-records] [--otel]
 openstack-tester cinder status     --run run-<id>.json
@@ -878,7 +891,12 @@ of **different** volumes run concurrently up to `--concurrency` — some backend
 reject a snapshot while the source volume is still `snapshotting`, so per-volume
 serialization is the robust default without giving up cross-volume throughput.
 `--dry-run` prints the plan summary (volumes, resized volumes, snapshots, total
-GiB) without touching the cloud.
+GiB) without touching the cloud. On Ctrl-C / SIGTERM the run record is written
+first, then the partial volumes and snapshots are torn down (snapshots deleted
+before their volumes), the deletion count is logged, and the command exits
+non-zero naming the run id; a second signal aborts hard, leaving the record for
+manual cleanup. `--keep-on-abort` leaves everything in place with the `cleanup
+--run <path>` hint. A *successful* apply keeps its resources unchanged.
 
 ### Scenario schema
 
@@ -955,11 +973,11 @@ exactly as for Neutron.
 - **Outputs.** Same as Neutron chaos: a deterministic decision schedule per seed
   and config, a run record carrying `ChaosStats` (creates / deletes / **mutates**
   / cycles, population summary, time buckets), and OTEL export of every operation
-  — extends appear as `operation=extend` samples. On a clean finish it tears the
-  volumes and snapshots down by metadata (snapshots before volumes) and runs a
-  leak check; Ctrl-C / SIGTERM or `--no-cleanup` leaves them in place for an
-  explicit `cinder cleanup --run-id <id>` (metadata discovery reclaims a crashed
-  or interrupted run in full).
+  — extends appear as `operation=extend` samples. At the end of the run — or on
+  Ctrl-C / SIGTERM — it tears the volumes and snapshots down by metadata
+  (snapshots before volumes) and runs a leak check; `--no-cleanup` leaves them in
+  place for an explicit `cinder cleanup --run-id <id>` with the reclaim hint
+  (metadata discovery reclaims a crashed or interrupted run in full).
 
 ```
 openstack-tester cinder chaos --scenario scenarios/cinder/small.yaml            # 5m churn, no flags needed
