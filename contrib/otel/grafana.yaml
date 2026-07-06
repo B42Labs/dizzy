@@ -54,7 +54,7 @@ data:
   dashboards.yaml: |
     apiVersion: 1
     providers:
-      - name: openstack-tester
+      - name: dizzy
         type: file
         disableDeletion: false
         # In-UI edits are saved to the emptyDir SQLite and are throwaway by

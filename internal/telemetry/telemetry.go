@@ -115,11 +115,11 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 // the run's identity: the fixed service.name/service.version plus the
 // bespoke cloud, scenario, and service attributes, each appended only when
 // non-empty. service (neutron | cinder) is deliberately distinct from the
-// semconv service.name (which stays openstack-tester) and mirrors
+// semconv service.name (which stays dizzy) and mirrors
 // run.Record.Service, so the iteration-level series stay per-service.
 func buildResource(cfg Config) (*resource.Resource, error) {
 	attrs := []attribute.KeyValue{
-		semconv.ServiceName("openstack-tester"),
+		semconv.ServiceName("dizzy"),
 		semconv.ServiceVersion(buildVersion()),
 	}
 	if cfg.Cloud != "" {

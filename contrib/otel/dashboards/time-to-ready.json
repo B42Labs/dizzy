@@ -168,7 +168,7 @@
   ],
   "refresh": "1m",
   "schemaVersion": 39,
-  "tags": ["openstack-tester"],
+  "tags": ["dizzy"],
   "templating": {
     "list": [
       {
