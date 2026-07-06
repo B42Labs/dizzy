@@ -1,4 +1,4 @@
-// Command openstack-tester is a scenario-driven load and consistency tester for
+// Command dizzy is a scenario-driven load and consistency tester for
 // OpenStack, starting with Neutron (networking).
 package main
 
