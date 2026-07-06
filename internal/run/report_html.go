@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/metrics"
 )
 
 // htmlTemplateSrc is the single-file HTML report template, embedded so the

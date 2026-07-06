@@ -13,10 +13,10 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/attributestags"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/layer3/routers"
 
-	"github.com/B42Labs/openstack-tester/internal/config"
-	"github.com/B42Labs/openstack-tester/internal/metrics"
-	"github.com/B42Labs/openstack-tester/internal/neutron"
-	"github.com/B42Labs/openstack-tester/internal/plan"
+	"github.com/B42Labs/dizzy/internal/config"
+	"github.com/B42Labs/dizzy/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/neutron"
+	"github.com/B42Labs/dizzy/internal/plan"
 )
 
 // TestWrappers_Integration creates one of each Phase 1 resource against a real

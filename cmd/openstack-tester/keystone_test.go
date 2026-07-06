@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/keystone"
-	keystoneplan "github.com/B42Labs/openstack-tester/internal/keystone/plan"
-	"github.com/B42Labs/openstack-tester/internal/resource"
-	"github.com/B42Labs/openstack-tester/internal/run"
+	"github.com/B42Labs/dizzy/internal/keystone"
+	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
+	"github.com/B42Labs/dizzy/internal/resource"
+	"github.com/B42Labs/dizzy/internal/run"
 )
 
 // sampleKeystoneScenarioYAML is a small but complete Keystone scenario used by

@@ -8,8 +8,8 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/snapshots"
 	"github.com/gophercloud/gophercloud/v2/pagination"
 
-	cinderplan "github.com/B42Labs/openstack-tester/internal/cinder/plan"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	cinderplan "github.com/B42Labs/dizzy/internal/cinder/plan"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // CreateSnapshot creates a snapshot of volumeID with the deterministic name and

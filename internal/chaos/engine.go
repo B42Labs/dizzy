@@ -25,8 +25,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/metrics"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	"github.com/B42Labs/dizzy/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // bucketCount is the number of equal-width time buckets the run's duration is

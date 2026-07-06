@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/metrics"
 )
 
 // heartbeatInterval is how often a long-running command logs a one-line progress

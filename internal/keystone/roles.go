@@ -9,8 +9,8 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/roles"
 	"github.com/gophercloud/gophercloud/v2/pagination"
 
-	keystoneplan "github.com/B42Labs/openstack-tester/internal/keystone/plan"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // CreateRole creates a global role (no domain) with the deterministic name. A

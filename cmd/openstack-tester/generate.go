@@ -9,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/B42Labs/openstack-tester/internal/plan"
-	"github.com/B42Labs/openstack-tester/internal/scenario"
+	"github.com/B42Labs/dizzy/internal/plan"
+	"github.com/B42Labs/dizzy/internal/scenario"
 )
 
 // newGenerateCmd builds "neutron generate", which expands a scenario into a plan

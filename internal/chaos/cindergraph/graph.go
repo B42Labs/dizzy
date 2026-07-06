@@ -16,11 +16,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/chaos"
-	"github.com/B42Labs/openstack-tester/internal/cinder"
-	cinderexec "github.com/B42Labs/openstack-tester/internal/cinder/executor"
-	cinderplan "github.com/B42Labs/openstack-tester/internal/cinder/plan"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	"github.com/B42Labs/dizzy/internal/chaos"
+	"github.com/B42Labs/dizzy/internal/cinder"
+	cinderexec "github.com/B42Labs/dizzy/internal/cinder/executor"
+	cinderplan "github.com/B42Labs/dizzy/internal/cinder/plan"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // Cinder is the create/extend/delete-and-wait surface the chaos engine drives

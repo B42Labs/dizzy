@@ -9,10 +9,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/B42Labs/openstack-tester/internal/cinder"
-	cinderexec "github.com/B42Labs/openstack-tester/internal/cinder/executor"
-	"github.com/B42Labs/openstack-tester/internal/config"
-	"github.com/B42Labs/openstack-tester/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/cinder"
+	cinderexec "github.com/B42Labs/dizzy/internal/cinder/executor"
+	"github.com/B42Labs/dizzy/internal/config"
+	"github.com/B42Labs/dizzy/internal/metrics"
 )
 
 // newCinderCleanupCmd builds "cinder cleanup", which deletes every volume and

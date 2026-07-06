@@ -10,8 +10,8 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/users"
 	"github.com/gophercloud/gophercloud/v2/pagination"
 
-	keystoneplan "github.com/B42Labs/openstack-tester/internal/keystone/plan"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // CreateUser creates an enabled user in domainID with the derived password. The

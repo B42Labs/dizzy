@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/metrics"
-	"github.com/B42Labs/openstack-tester/internal/run"
+	"github.com/B42Labs/dizzy/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/run"
 )
 
 // writeReportRecord seeds a run record carrying a distinctive network

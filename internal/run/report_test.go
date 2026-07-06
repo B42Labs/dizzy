@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/metrics"
 )
 
 // chaosRecord builds a record carrying churn statistics, including a bucket with

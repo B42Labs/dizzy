@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/chaos"
-	"github.com/B42Labs/openstack-tester/internal/cinder"
-	cinderplan "github.com/B42Labs/openstack-tester/internal/cinder/plan"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	"github.com/B42Labs/dizzy/internal/chaos"
+	"github.com/B42Labs/dizzy/internal/cinder"
+	cinderplan "github.com/B42Labs/dizzy/internal/cinder/plan"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // volInstance is a live volume in the fake cloud.

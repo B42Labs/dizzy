@@ -10,7 +10,7 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 
-	"github.com/B42Labs/openstack-tester/internal/neutron"
+	"github.com/B42Labs/dizzy/internal/neutron"
 )
 
 // fakeCleaner is an in-process Cleaner that serves tagged resources per kind,

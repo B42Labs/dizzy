@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/executor"
-	"github.com/B42Labs/openstack-tester/internal/neutron"
+	"github.com/B42Labs/dizzy/internal/executor"
+	"github.com/B42Labs/dizzy/internal/neutron"
 )
 
 // timeoutCleaner wraps a Cleaner so every cloud operation executor.Cleanup

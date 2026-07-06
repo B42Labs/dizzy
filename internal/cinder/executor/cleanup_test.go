@@ -8,8 +8,8 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 
-	"github.com/B42Labs/openstack-tester/internal/cinder"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	"github.com/B42Labs/dizzy/internal/cinder"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // fakeCleaner is an in-process Cleaner that serves volumes and snapshots by

@@ -17,9 +17,9 @@ import (
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/attributestags"
 
-	"github.com/B42Labs/openstack-tester/internal/metrics"
-	"github.com/B42Labs/openstack-tester/internal/resource"
-	"github.com/B42Labs/openstack-tester/internal/telemetry"
+	"github.com/B42Labs/dizzy/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/resource"
+	"github.com/B42Labs/dizzy/internal/telemetry"
 )
 
 // Neutron status strings shared across resource kinds. Networks, routers, and

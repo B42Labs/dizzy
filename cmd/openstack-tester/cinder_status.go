@@ -8,10 +8,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/B42Labs/openstack-tester/internal/cinder"
-	"github.com/B42Labs/openstack-tester/internal/config"
-	"github.com/B42Labs/openstack-tester/internal/metrics"
-	"github.com/B42Labs/openstack-tester/internal/run"
+	"github.com/B42Labs/dizzy/internal/cinder"
+	"github.com/B42Labs/dizzy/internal/config"
+	"github.com/B42Labs/dizzy/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/run"
 )
 
 // newCinderStatusCmd builds "cinder status", which loads a cinder run record,

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/B42Labs/openstack-tester/internal/neutron"
+	"github.com/B42Labs/dizzy/internal/neutron"
 )
 
 // Cleaner is the tag-scoped teardown surface Cleanup drives: discover a run's

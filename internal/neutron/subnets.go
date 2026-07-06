@@ -6,7 +6,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/subnets"
 
-	"github.com/B42Labs/openstack-tester/internal/plan"
+	"github.com/B42Labs/dizzy/internal/plan"
 )
 
 // CreateSubnet creates a tagged subnet on networkID. The plan sets exactly one

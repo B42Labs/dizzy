@@ -9,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	cinderplan "github.com/B42Labs/openstack-tester/internal/cinder/plan"
-	cinderscenario "github.com/B42Labs/openstack-tester/internal/cinder/scenario"
+	cinderplan "github.com/B42Labs/dizzy/internal/cinder/plan"
+	cinderscenario "github.com/B42Labs/dizzy/internal/cinder/scenario"
 )
 
 // newCinderGenerateCmd builds "cinder generate", which expands a Cinder scenario

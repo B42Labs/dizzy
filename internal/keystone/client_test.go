@@ -13,9 +13,9 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 
-	keystoneplan "github.com/B42Labs/openstack-tester/internal/keystone/plan"
-	"github.com/B42Labs/openstack-tester/internal/metrics"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
+	"github.com/B42Labs/dizzy/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // respErr builds a gophercloud unexpected-response error for the given status

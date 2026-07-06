@@ -9,10 +9,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/B42Labs/openstack-tester/internal/keystone"
-	keystonescenario "github.com/B42Labs/openstack-tester/internal/keystone/scenario"
-	"github.com/B42Labs/openstack-tester/internal/resource"
-	"github.com/B42Labs/openstack-tester/scenarios"
+	"github.com/B42Labs/dizzy/internal/keystone"
+	keystonescenario "github.com/B42Labs/dizzy/internal/keystone/scenario"
+	"github.com/B42Labs/dizzy/internal/resource"
+	"github.com/B42Labs/dizzy/scenarios"
 )
 
 // keystoneChaosScenarioYAML is sampleKeystoneScenarioYAML extended with a chaos

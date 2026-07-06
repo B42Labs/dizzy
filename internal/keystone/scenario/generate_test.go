@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/B42Labs/openstack-tester/internal/keystone/plan"
+	"github.com/B42Labs/dizzy/internal/keystone/plan"
 )
 
 var update = flag.Bool("update", false, "update golden files")

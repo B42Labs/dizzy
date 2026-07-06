@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/chaos"
-	"github.com/B42Labs/openstack-tester/internal/neutron"
-	"github.com/B42Labs/openstack-tester/internal/plan"
+	"github.com/B42Labs/dizzy/internal/chaos"
+	"github.com/B42Labs/dizzy/internal/neutron"
+	"github.com/B42Labs/dizzy/internal/plan"
 )
 
 // fullPlan is a small plan exercising every kind and cross-reference, mirroring

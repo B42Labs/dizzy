@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/B42Labs/openstack-tester/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/metrics"
 )
 
 // TestListByTagSendsTagQuery confirms ListByTag filters server-side with the

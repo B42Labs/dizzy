@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/metrics"
 )
 
 // csvHeader names the columns WriteCSV emits, one stats row per resource type

@@ -9,10 +9,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/B42Labs/openstack-tester/internal/cinder"
-	cinderscenario "github.com/B42Labs/openstack-tester/internal/cinder/scenario"
-	"github.com/B42Labs/openstack-tester/internal/resource"
-	"github.com/B42Labs/openstack-tester/scenarios"
+	"github.com/B42Labs/dizzy/internal/cinder"
+	cinderscenario "github.com/B42Labs/dizzy/internal/cinder/scenario"
+	"github.com/B42Labs/dizzy/internal/resource"
+	"github.com/B42Labs/dizzy/scenarios"
 )
 
 // cinderChaosScenarioYAML is sampleCinderScenarioYAML extended with a chaos

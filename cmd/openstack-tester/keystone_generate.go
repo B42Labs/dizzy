@@ -9,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	keystoneplan "github.com/B42Labs/openstack-tester/internal/keystone/plan"
-	keystonescenario "github.com/B42Labs/openstack-tester/internal/keystone/scenario"
+	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
+	keystonescenario "github.com/B42Labs/dizzy/internal/keystone/scenario"
 )
 
 // newKeystoneGenerateCmd builds "keystone generate", which expands a Keystone

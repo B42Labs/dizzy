@@ -1,4 +1,4 @@
-module github.com/B42Labs/openstack-tester
+module github.com/B42Labs/dizzy
 
 go 1.26.1
 

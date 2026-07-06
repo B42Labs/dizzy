@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/metrics"
 )
 
 // attrValue pulls the value following key in a flat slog-style key/value slice.

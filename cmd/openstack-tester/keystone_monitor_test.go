@@ -12,8 +12,8 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 
-	"github.com/B42Labs/openstack-tester/internal/keystone"
-	"github.com/B42Labs/openstack-tester/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/keystone"
+	"github.com/B42Labs/dizzy/internal/metrics"
 )
 
 func TestKeystoneMonitorRequiresScenario(t *testing.T) {

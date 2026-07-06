@@ -6,7 +6,7 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/quotasets"
 
-	"github.com/B42Labs/openstack-tester/internal/cinder/plan"
+	"github.com/B42Labs/dizzy/internal/cinder/plan"
 )
 
 // quotaPlan is a plan needing 3 volumes, 2 snapshots, and (2+3+4 volumes)+(2+3

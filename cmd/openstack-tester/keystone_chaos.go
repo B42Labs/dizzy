@@ -11,16 +11,16 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/B42Labs/openstack-tester/internal/chaos"
-	"github.com/B42Labs/openstack-tester/internal/chaos/keystonegraph"
-	"github.com/B42Labs/openstack-tester/internal/config"
-	"github.com/B42Labs/openstack-tester/internal/keystone"
-	keystoneexec "github.com/B42Labs/openstack-tester/internal/keystone/executor"
-	keystonescenario "github.com/B42Labs/openstack-tester/internal/keystone/scenario"
-	"github.com/B42Labs/openstack-tester/internal/metrics"
-	"github.com/B42Labs/openstack-tester/internal/resource"
-	"github.com/B42Labs/openstack-tester/internal/run"
-	"github.com/B42Labs/openstack-tester/internal/telemetry"
+	"github.com/B42Labs/dizzy/internal/chaos"
+	"github.com/B42Labs/dizzy/internal/chaos/keystonegraph"
+	"github.com/B42Labs/dizzy/internal/config"
+	"github.com/B42Labs/dizzy/internal/keystone"
+	keystoneexec "github.com/B42Labs/dizzy/internal/keystone/executor"
+	keystonescenario "github.com/B42Labs/dizzy/internal/keystone/scenario"
+	"github.com/B42Labs/dizzy/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/resource"
+	"github.com/B42Labs/dizzy/internal/run"
+	"github.com/B42Labs/dizzy/internal/telemetry"
 )
 
 // defaultChaosTokenRatio is the built-in per-step probability of issuing a token

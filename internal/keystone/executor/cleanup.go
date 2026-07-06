@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/keystone"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	"github.com/B42Labs/dizzy/internal/keystone"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // Cleaner is the prefix/tag-scoped teardown surface Cleanup drives: discover a

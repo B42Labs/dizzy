@@ -20,9 +20,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/keystone"
-	"github.com/B42Labs/openstack-tester/internal/keystone/plan"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	"github.com/B42Labs/dizzy/internal/keystone"
+	"github.com/B42Labs/dizzy/internal/keystone/plan"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // retryBaseDelay, retryMaxDelay, and maxAttempts bound the per-operation retry

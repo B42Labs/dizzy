@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/chaos"
-	"github.com/B42Labs/openstack-tester/internal/keystone"
-	keystoneplan "github.com/B42Labs/openstack-tester/internal/keystone/plan"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	"github.com/B42Labs/dizzy/internal/chaos"
+	"github.com/B42Labs/dizzy/internal/keystone"
+	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // assignInfo records which user and project a live grant belongs to, so the

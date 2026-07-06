@@ -11,11 +11,11 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/B42Labs/openstack-tester/internal/config"
-	"github.com/B42Labs/openstack-tester/internal/executor"
-	"github.com/B42Labs/openstack-tester/internal/metrics"
-	"github.com/B42Labs/openstack-tester/internal/neutron"
-	"github.com/B42Labs/openstack-tester/internal/run"
+	"github.com/B42Labs/dizzy/internal/config"
+	"github.com/B42Labs/dizzy/internal/executor"
+	"github.com/B42Labs/dizzy/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/neutron"
+	"github.com/B42Labs/dizzy/internal/run"
 )
 
 // newCleanupCmd builds "neutron cleanup", which deletes every resource a run

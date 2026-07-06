@@ -11,7 +11,7 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
-	"github.com/B42Labs/openstack-tester/internal/telemetry"
+	"github.com/B42Labs/dizzy/internal/telemetry"
 )
 
 // telemetryClient builds a Client whose calls hit ts with an in-memory

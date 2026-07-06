@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/cinder"
-	cinderplan "github.com/B42Labs/openstack-tester/internal/cinder/plan"
-	"github.com/B42Labs/openstack-tester/internal/resource"
-	"github.com/B42Labs/openstack-tester/internal/run"
+	"github.com/B42Labs/dizzy/internal/cinder"
+	cinderplan "github.com/B42Labs/dizzy/internal/cinder/plan"
+	"github.com/B42Labs/dizzy/internal/resource"
+	"github.com/B42Labs/dizzy/internal/run"
 )
 
 // recordingCinderCleaner is a fake cinderexec.Cleaner that records what it

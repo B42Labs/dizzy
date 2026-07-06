@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 
-	"github.com/B42Labs/openstack-tester/internal/keystone/plan"
+	"github.com/B42Labs/dizzy/internal/keystone/plan"
 )
 
 // Generate expands the scenario and its seed into a fully-enumerated plan. The

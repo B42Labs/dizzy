@@ -10,9 +10,9 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 
-	"github.com/B42Labs/openstack-tester/internal/keystone"
-	"github.com/B42Labs/openstack-tester/internal/keystone/plan"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	"github.com/B42Labs/dizzy/internal/keystone"
+	"github.com/B42Labs/dizzy/internal/keystone/plan"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // fakeKeystone is an in-process Keystone implementation that records call order,

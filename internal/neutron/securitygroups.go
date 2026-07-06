@@ -5,7 +5,7 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/security/groups"
 
-	"github.com/B42Labs/openstack-tester/internal/plan"
+	"github.com/B42Labs/dizzy/internal/plan"
 )
 
 // CreateSecurityGroup creates a tagged security group. Its rules are created
