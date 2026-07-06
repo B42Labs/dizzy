@@ -1,5 +1,5 @@
-BINARY      := openstack-tester
-PKG         := ./cmd/openstack-tester
+BINARY      := dizzy
+PKG         := ./cmd/dizzy
 GO          ?= go
 GOFLAGS     ?=
 GOLANGCI    ?= golangci-lint
@@ -44,7 +44,7 @@ MONITOR_ITERATIONS ?= 0
 help:
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed -e 's/## //' | awk -F': ' '{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
-## build: Build the openstack-tester binary into the repo root.
+## build: Build the dizzy binary into the repo root.
 build:
 	$(GO) build $(GOFLAGS) -o $(BINARY) $(PKG)
 
