@@ -1,4 +1,4 @@
-# openstack-tester
+# dizzy
 
 A scenario-driven load and consistency tester for OpenStack, starting with an
 intensive focus on **Neutron** (networking).
@@ -8,7 +8,7 @@ through the Neutron API in a single project, records how long every operation
 takes and which states the resources reach, and is designed to later compare the
 intended (API) state against the actual data plane (OVN / OVS).
 
-> **Status:** Phase 1 in progress. The Go module, the `openstack-tester` CLI
+> **Status:** Phase 1 in progress. The Go module, the `dizzy` CLI
 > skeleton (the `neutron` command namespace), `clouds.yaml`-based
 > authentication, the YAML scenario schema, the deterministic plan generator,
 > the `generate` command, and `apply` (both `--dry-run` and the live executor,
@@ -71,7 +71,7 @@ intended (API) state against the actual data plane (OVN / OVS).
 | **1** | Generate + apply randomized networking topologies via the API; record timings and states; tag-based cleanup. | Planned (this README) |
 | **2** | Data-plane verification: reconcile API state against OVN NB/SB DB and OVS flows. | Future |
 | **3** | More scenario profiles, optional external connectivity (gateways, FIPs), trunk ports, RBAC, address scopes. | Future |
-| **later** | Extend beyond Neutron (Cinder, Nova, …) — hence the generic name `openstack-tester`. | Started: Cinder first slice (create / resize / snapshot volumes) plus `cinder monitor` (#31) and `cinder chaos` (#32); Keystone identity slice (domains / users / projects / roles / assignments / token issue) with the full driver set (`apply` / `chaos` / `monitor`) behind an admin/domain-manager privilege pre-check (#39). |
+| **later** | Extend beyond Neutron (Cinder, Nova, …). | Started: Cinder first slice (create / resize / snapshot volumes) plus `cinder monitor` (#31) and `cinder chaos` (#32); Keystone identity slice (domains / users / projects / roles / assignments / token issue) with the full driver set (`apply` / `chaos` / `monitor`) behind an admin/domain-manager privilege pre-check (#39). |
 
 ---
 
@@ -243,27 +243,27 @@ flags. Override any of them on the CLI when you want a longer soak or denser
 churn.
 
 ```
-openstack-tester neutron generate  --scenario scenarios/neutron/medium.yaml [--out plan.json]
-openstack-tester neutron apply     --scenario scenarios/neutron/large.yaml  [--dry-run]
-openstack-tester neutron chaos     --scenario scenarios/neutron/small.yaml  # 5m churn, no flags needed
+dizzy neutron generate  --scenario scenarios/neutron/medium.yaml [--out plan.json]
+dizzy neutron apply     --scenario scenarios/neutron/large.yaml  [--dry-run]
+dizzy neutron chaos     --scenario scenarios/neutron/small.yaml  # 5m churn, no flags needed
 ```
 
 ---
 
 ## 7. CLI design
 
-A single binary `openstack-tester` with subcommands (Neutron grouped under a
+A single binary `dizzy` with subcommands (Neutron grouped under a
 `neutron` namespace to leave room for other services later):
 
 ```
-openstack-tester neutron generate  --scenario medium.yaml [--out plan.json]
-openstack-tester neutron apply     --scenario medium.yaml [--dry-run] [--keep-on-abort]
-openstack-tester neutron chaos     --scenario medium.yaml [--duration 30m] [--no-cleanup]
-openstack-tester neutron monitor   --scenario medium.yaml [--interval 15m] [--iterations n] [--error-wait 2m] [--keep-run-records] [--otel]
-openstack-tester neutron status    --run run-<id>.json
-openstack-tester neutron report    --run run-<id>.json [--format table|json|csv|html]
-openstack-tester neutron cleanup   --run run-<id>.json   # or --run-id <id>
-openstack-tester neutron verify    --run run-<id>.json   # Phase 2 (future)
+dizzy neutron generate  --scenario medium.yaml [--out plan.json]
+dizzy neutron apply     --scenario medium.yaml [--dry-run] [--keep-on-abort]
+dizzy neutron chaos     --scenario medium.yaml [--duration 30m] [--no-cleanup]
+dizzy neutron monitor   --scenario medium.yaml [--interval 15m] [--iterations n] [--error-wait 2m] [--keep-run-records] [--otel]
+dizzy neutron status    --run run-<id>.json
+dizzy neutron report    --run run-<id>.json [--format table|json|csv|html]
+dizzy neutron cleanup   --run run-<id>.json   # or --run-id <id>
+dizzy neutron verify    --run run-<id>.json   # Phase 2 (future)
 ```
 
 - `generate` — expand a scenario into a plan and dump it; never touches the API.
@@ -456,7 +456,7 @@ InfluxDB, VictoriaMetrics, Timescale, …) can store them.
   `OTEL_METRIC_EXPORT_INTERVAL` controls the push period. Export failures from
   a down collector degrade to warnings and never fail a run.
 - **Resource attributes** identify one installation across time:
-  `service.name=openstack-tester`, `service.version`, plus `cloud` (the
+  `service.name=dizzy`, `service.version`, plus `cloud` (the
   `--os-cloud` name), `scenario`, and `service` (`neutron` | `cinder` |
   `keystone`). The `service` attribute keeps the iteration-level series
   (`openstack_tester.iteration.*`), which carry no `kind`, distinguishable when a
@@ -847,11 +847,11 @@ read its own quota, with the executor's quota fast-fail as the backstop.
 ## 14. Planned project layout
 
 ```
-contrib/openstack-tester/
+contrib/dizzy/
 ├── README.md                 # this file (only this exists today)
 ├── go.mod
 ├── cmd/
-│   └── openstack-tester/
+│   └── dizzy/
 │       └── main.go
 ├── internal/
 │   ├── config/               # clouds.yaml + run configuration
@@ -894,13 +894,13 @@ chaos` (the churn/soak driver, below) are now implemented.
 ### Commands
 
 ```
-openstack-tester cinder generate   --scenario scenarios/cinder/small.yaml [--out plan.json]
-openstack-tester cinder apply      --scenario scenarios/cinder/small.yaml [--dry-run] [--volume-type <name>] [--keep-on-abort]
-openstack-tester cinder chaos      --scenario scenarios/cinder/small.yaml [--duration 30m] [--volume-type <name>] [--resize-ratio 0.3] [--no-cleanup] [--otel]
-openstack-tester cinder monitor    --scenario scenarios/cinder/small.yaml [--interval 15m] [--iterations n] [--error-wait 2m] [--volume-type <name>] [--keep-run-records] [--otel]
-openstack-tester cinder status     --run run-<id>.json
-openstack-tester cinder report     --run run-<id>.json [--format table|json|csv|html]
-openstack-tester cinder cleanup    --run run-<id>.json   # or --run-id <id>
+dizzy cinder generate   --scenario scenarios/cinder/small.yaml [--out plan.json]
+dizzy cinder apply      --scenario scenarios/cinder/small.yaml [--dry-run] [--volume-type <name>] [--keep-on-abort]
+dizzy cinder chaos      --scenario scenarios/cinder/small.yaml [--duration 30m] [--volume-type <name>] [--resize-ratio 0.3] [--no-cleanup] [--otel]
+dizzy cinder monitor    --scenario scenarios/cinder/small.yaml [--interval 15m] [--iterations n] [--error-wait 2m] [--volume-type <name>] [--keep-run-records] [--otel]
+dizzy cinder status     --run run-<id>.json
+dizzy cinder report     --run run-<id>.json [--format table|json|csv|html]
+dizzy cinder cleanup    --run run-<id>.json   # or --run-id <id>
 ```
 
 `apply` runs three strictly ordered stages: create every volume and wait for
@@ -1000,8 +1000,8 @@ exactly as for Neutron.
   (metadata discovery reclaims a crashed or interrupted run in full).
 
 ```
-openstack-tester cinder chaos --scenario scenarios/cinder/small.yaml            # 5m churn, no flags needed
-openstack-tester cinder chaos --scenario scenarios/cinder/medium.yaml --duration 2m --resize-ratio 0.5
+dizzy cinder chaos --scenario scenarios/cinder/small.yaml            # 5m churn, no flags needed
+dizzy cinder chaos --scenario scenarios/cinder/medium.yaml --duration 2m --resize-ratio 0.5
 ```
 
 ### `--volume-type`
@@ -1137,13 +1137,13 @@ backstop. Discovery listings (domains, roles, users) that a manager may not read
 ### Commands
 
 ```
-openstack-tester keystone generate   --scenario scenarios/keystone/small.yaml [--out plan.json]
-openstack-tester keystone apply      --scenario scenarios/keystone/small.yaml [--dry-run] [--privilege auto|admin|domain-manager] [--domain <name>] [--roles member,reader] [--keep-on-abort]
-openstack-tester keystone chaos      --scenario scenarios/keystone/small.yaml [--duration 30m] [--token-ratio 0.3] [--no-cleanup] [--otel] (+ privilege flags)
-openstack-tester keystone monitor    --scenario scenarios/keystone/small.yaml [--interval 15m] [--iterations n] [--error-wait 2m] [--reclaim-orphans] [--keep-run-records] [--otel] (+ privilege flags)
-openstack-tester keystone status     --run run-<id>.json
-openstack-tester keystone report     --run run-<id>.json [--format table|json|csv|html]
-openstack-tester keystone cleanup    --run run-<id>.json   # or --run-id <id>
+dizzy keystone generate   --scenario scenarios/keystone/small.yaml [--out plan.json]
+dizzy keystone apply      --scenario scenarios/keystone/small.yaml [--dry-run] [--privilege auto|admin|domain-manager] [--domain <name>] [--roles member,reader] [--keep-on-abort]
+dizzy keystone chaos      --scenario scenarios/keystone/small.yaml [--duration 30m] [--token-ratio 0.3] [--no-cleanup] [--otel] (+ privilege flags)
+dizzy keystone monitor    --scenario scenarios/keystone/small.yaml [--interval 15m] [--iterations n] [--error-wait 2m] [--reclaim-orphans] [--keep-run-records] [--otel] (+ privilege flags)
+dizzy keystone status     --run run-<id>.json
+dizzy keystone report     --run run-<id>.json [--format table|json|csv|html]
+dizzy keystone cleanup    --run run-<id>.json   # or --run-id <id>
 ```
 
 `apply` runs strictly ordered stages: bind roots (create domains then roles in
@@ -1323,6 +1323,6 @@ lands the same instruments with `service=keystone`.
 - **External connectivity**: skip gateways/FIPs in Phase 1, or wire them up if
   an external network is configured?
 - **CLI framework**: **resolved** — `cobra`.
-- **Module path**: **resolved** — `github.com/B42Labs/openstack-tester` (the
+- **Module path**: **resolved** — `github.com/B42Labs/dizzy` (the
   module lives at the repository root, not under `contrib/`).
 ```
