@@ -30,15 +30,15 @@ func (o *globalOptions) cloudName() string {
 	return os.Getenv("OS_CLOUD")
 }
 
-// newRootCmd builds the openstack-tester root command, registers the global
+// newRootCmd builds the dizzy root command, registers the global
 // flags, configures structured logging, and attaches the subcommand tree.
 func newRootCmd() *cobra.Command {
 	opts := &globalOptions{}
 
 	cmd := &cobra.Command{
-		Use:   "openstack-tester",
+		Use:   "dizzy",
 		Short: "Scenario-driven load and consistency tester for OpenStack",
-		Long: "openstack-tester builds large, randomized but reproducible Neutron\n" +
+		Long: "dizzy builds large, randomized but reproducible Neutron\n" +
 			"topologies, Cinder volume workloads, and Keystone identity workloads,\n" +
 			"records how long every operation takes, and tracks the states the\n" +
 			"resources reach.",
