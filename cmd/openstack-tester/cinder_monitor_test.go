@@ -12,9 +12,9 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 
-	"github.com/B42Labs/openstack-tester/internal/cinder"
-	"github.com/B42Labs/openstack-tester/internal/metrics"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	"github.com/B42Labs/dizzy/internal/cinder"
+	"github.com/B42Labs/dizzy/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 func TestCinderMonitorRequiresScenario(t *testing.T) {

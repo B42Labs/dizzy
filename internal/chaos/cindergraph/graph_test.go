@@ -4,9 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/chaos"
-	"github.com/B42Labs/openstack-tester/internal/cinder"
-	cinderplan "github.com/B42Labs/openstack-tester/internal/cinder/plan"
+	"github.com/B42Labs/dizzy/internal/chaos"
+	"github.com/B42Labs/dizzy/internal/cinder"
+	cinderplan "github.com/B42Labs/dizzy/internal/cinder/plan"
 )
 
 func nodeByKey(t *testing.T, nodes []chaos.Node, key string) chaos.Node {

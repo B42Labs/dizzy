@@ -41,7 +41,7 @@ import (
 )
 
 // meterName scopes the tester's instruments in the OTEL meter registry.
-const meterName = "github.com/B42Labs/openstack-tester"
+const meterName = "github.com/B42Labs/dizzy"
 
 // Config carries the enablement flag and the identifying attributes that
 // distinguish one installation across time in the backend. Cloud is the

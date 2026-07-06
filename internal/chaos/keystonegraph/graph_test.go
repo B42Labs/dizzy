@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/chaos"
-	"github.com/B42Labs/openstack-tester/internal/keystone"
-	keystoneexec "github.com/B42Labs/openstack-tester/internal/keystone/executor"
-	keystoneplan "github.com/B42Labs/openstack-tester/internal/keystone/plan"
+	"github.com/B42Labs/dizzy/internal/chaos"
+	"github.com/B42Labs/dizzy/internal/keystone"
+	keystoneexec "github.com/B42Labs/dizzy/internal/keystone/executor"
+	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
 )
 
 // testBindings is the stable scaffold every test churns within: one real domain

@@ -12,11 +12,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/chaos"
-	"github.com/B42Labs/openstack-tester/internal/executor"
-	"github.com/B42Labs/openstack-tester/internal/neutron"
-	"github.com/B42Labs/openstack-tester/internal/plan"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	"github.com/B42Labs/dizzy/internal/chaos"
+	"github.com/B42Labs/dizzy/internal/executor"
+	"github.com/B42Labs/dizzy/internal/neutron"
+	"github.com/B42Labs/dizzy/internal/plan"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // Neutron is the create/delete surface the chaos engine drives through the

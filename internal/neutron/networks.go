@@ -5,7 +5,7 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/networks"
 
-	"github.com/B42Labs/openstack-tester/internal/plan"
+	"github.com/B42Labs/dizzy/internal/plan"
 )
 
 // CreateNetwork creates a tagged tenant network.

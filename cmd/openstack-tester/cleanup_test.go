@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/B42Labs/openstack-tester/internal/neutron"
-	"github.com/B42Labs/openstack-tester/internal/run"
+	"github.com/B42Labs/dizzy/internal/neutron"
+	"github.com/B42Labs/dizzy/internal/run"
 )
 
 func TestResolveRun(t *testing.T) {

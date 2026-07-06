@@ -8,7 +8,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/networks"
 	"github.com/spf13/cobra"
 
-	"github.com/B42Labs/openstack-tester/internal/config"
+	"github.com/B42Labs/dizzy/internal/config"
 )
 
 // newListNetworksCmd builds "neutron list-networks", a read-only diagnostic that

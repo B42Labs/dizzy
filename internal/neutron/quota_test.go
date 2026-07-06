@@ -11,7 +11,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/quotas"
 
-	"github.com/B42Labs/openstack-tester/internal/plan"
+	"github.com/B42Labs/dizzy/internal/plan"
 )
 
 // TestPlanNeedsCounts confirms planNeeds tallies each kind: it sums nested

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/B42Labs/openstack-tester/internal/run"
+	"github.com/B42Labs/dizzy/internal/run"
 )
 
 func TestStatusRequiresRunFlag(t *testing.T) {

@@ -11,15 +11,15 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/B42Labs/openstack-tester/internal/chaos"
-	"github.com/B42Labs/openstack-tester/internal/cinder"
-	cinderexec "github.com/B42Labs/openstack-tester/internal/cinder/executor"
-	cinderplan "github.com/B42Labs/openstack-tester/internal/cinder/plan"
-	"github.com/B42Labs/openstack-tester/internal/config"
-	"github.com/B42Labs/openstack-tester/internal/metrics"
-	"github.com/B42Labs/openstack-tester/internal/resource"
-	"github.com/B42Labs/openstack-tester/internal/run"
-	"github.com/B42Labs/openstack-tester/internal/telemetry"
+	"github.com/B42Labs/dizzy/internal/chaos"
+	"github.com/B42Labs/dizzy/internal/cinder"
+	cinderexec "github.com/B42Labs/dizzy/internal/cinder/executor"
+	cinderplan "github.com/B42Labs/dizzy/internal/cinder/plan"
+	"github.com/B42Labs/dizzy/internal/config"
+	"github.com/B42Labs/dizzy/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/resource"
+	"github.com/B42Labs/dizzy/internal/run"
+	"github.com/B42Labs/dizzy/internal/telemetry"
 )
 
 // newCinderMonitorCmd builds "cinder monitor": the block-storage counterpart to

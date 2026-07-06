@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/neutron"
-	"github.com/B42Labs/openstack-tester/internal/plan"
+	"github.com/B42Labs/dizzy/internal/neutron"
+	"github.com/B42Labs/dizzy/internal/plan"
 )
 
 // retryBaseDelay, retryMaxDelay, and maxAttempts bound the per-operation retry

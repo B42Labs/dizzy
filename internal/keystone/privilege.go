@@ -18,7 +18,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/domains"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
 
-	keystoneplan "github.com/B42Labs/openstack-tester/internal/keystone/plan"
+	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
 )
 
 // Tier is the privilege class a caller is resolved into.

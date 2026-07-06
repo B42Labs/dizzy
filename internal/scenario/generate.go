@@ -5,7 +5,7 @@ import (
 	"math/rand"
 	"net/netip"
 
-	"github.com/B42Labs/openstack-tester/internal/plan"
+	"github.com/B42Labs/dizzy/internal/plan"
 )
 
 // IP allocation ranges. The three ranges do not overlap, so explicit IPv4

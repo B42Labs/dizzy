@@ -19,11 +19,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/chaos"
-	"github.com/B42Labs/openstack-tester/internal/keystone"
-	keystoneexec "github.com/B42Labs/openstack-tester/internal/keystone/executor"
-	keystoneplan "github.com/B42Labs/openstack-tester/internal/keystone/plan"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	"github.com/B42Labs/dizzy/internal/chaos"
+	"github.com/B42Labs/dizzy/internal/keystone"
+	keystoneexec "github.com/B42Labs/dizzy/internal/keystone/executor"
+	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // Keystone is the create/assign/issue/delete surface the chaos engine drives

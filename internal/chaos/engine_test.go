@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // fakeClock is a virtual clock: Sleep advances time instantly and records the

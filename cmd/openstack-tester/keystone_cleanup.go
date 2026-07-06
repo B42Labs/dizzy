@@ -10,10 +10,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/B42Labs/openstack-tester/internal/config"
-	"github.com/B42Labs/openstack-tester/internal/keystone"
-	keystoneexec "github.com/B42Labs/openstack-tester/internal/keystone/executor"
-	"github.com/B42Labs/openstack-tester/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/config"
+	"github.com/B42Labs/dizzy/internal/keystone"
+	keystoneexec "github.com/B42Labs/dizzy/internal/keystone/executor"
+	"github.com/B42Labs/dizzy/internal/metrics"
 )
 
 // newKeystoneCleanupCmd builds "keystone cleanup", which deletes every domain,

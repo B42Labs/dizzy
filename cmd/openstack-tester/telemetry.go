@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/telemetry"
+	"github.com/B42Labs/dizzy/internal/telemetry"
 )
 
 // flushTelemetry shuts down the OTEL export seam on command exit, flushing any

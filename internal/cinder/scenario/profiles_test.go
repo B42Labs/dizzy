@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/scenarios"
+	"github.com/B42Labs/dizzy/scenarios"
 )
 
 // profileNames are the built-in Cinder scenario profiles shipped under

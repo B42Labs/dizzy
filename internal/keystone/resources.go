@@ -10,7 +10,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/users"
 	"github.com/gophercloud/gophercloud/v2/pagination"
 
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // Observe re-queries the live state of a created resource, recording the call.

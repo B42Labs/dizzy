@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/B42Labs/openstack-tester/internal/plan"
+	"github.com/B42Labs/dizzy/internal/plan"
 )
 
 var update = flag.Bool("update", false, "update golden files")

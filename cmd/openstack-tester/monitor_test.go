@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/neutron"
+	"github.com/B42Labs/dizzy/internal/neutron"
 )
 
 // fakeClock is a virtual clock for the loop tests: Sleep advances time instantly

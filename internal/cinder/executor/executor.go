@@ -16,9 +16,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/B42Labs/openstack-tester/internal/cinder"
-	"github.com/B42Labs/openstack-tester/internal/cinder/plan"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	"github.com/B42Labs/dizzy/internal/cinder"
+	"github.com/B42Labs/dizzy/internal/cinder/plan"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // retryBaseDelay, retryMaxDelay, and maxAttempts bound the per-operation retry

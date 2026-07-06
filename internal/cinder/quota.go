@@ -16,7 +16,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/quotasets"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
 
-	"github.com/B42Labs/openstack-tester/internal/cinder/plan"
+	"github.com/B42Labs/dizzy/internal/cinder/plan"
 )
 
 // needs is the count of each quota-bounded resource an expanded plan requires:

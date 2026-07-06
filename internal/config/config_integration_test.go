@@ -6,7 +6,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/B42Labs/openstack-tester/internal/config"
+	"github.com/B42Labs/dizzy/internal/config"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/networks"
 )
 

@@ -9,8 +9,8 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 
-	"github.com/B42Labs/openstack-tester/internal/keystone"
-	"github.com/B42Labs/openstack-tester/internal/resource"
+	"github.com/B42Labs/dizzy/internal/keystone"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // fakeCleaner serves a run's resources by prefix/tag, records disable and delete
