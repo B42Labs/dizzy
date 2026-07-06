@@ -1,5 +1,5 @@
 # Built binary
-/openstack-tester
+/dizzy
 
 # Go test/coverage artifacts
 *.test
