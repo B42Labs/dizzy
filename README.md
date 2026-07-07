@@ -37,6 +37,50 @@ intended (API) state against the actual data plane (OVN / OVS).
 
 ---
 
+## Installation
+
+Pre-built binaries for **linux/amd64**, **linux/arm64**, and **darwin/arm64**
+are published on the [releases page](https://github.com/B42Labs/dizzy/releases).
+Each release ships the raw binaries plus a `checksums.txt`, a cosign signature
+(`.sig`) and certificate (`.pem`) for every file, and SPDX/CycloneDX SBOMs.
+
+Download the binary for your platform, verify it, and put it on your `PATH`:
+
+```sh
+# Pick the tag and asset for your platform.
+VERSION=v0.1.0
+ASSET=dizzy-linux-amd64
+
+# Download the binary and the checksum file.
+curl -fsSLO https://github.com/B42Labs/dizzy/releases/download/$VERSION/$ASSET
+curl -fsSLO https://github.com/B42Labs/dizzy/releases/download/$VERSION/checksums.txt
+
+# Verify the SHA-256 checksum, then install.
+grep " $ASSET$" checksums.txt | sha256sum -c -
+chmod +x $ASSET
+sudo install $ASSET /usr/local/bin/dizzy
+
+dizzy --version
+```
+
+To additionally verify the cosign signature (keyless / Sigstore), download the
+`$ASSET.sig` and `$ASSET.pem` alongside the binary and run:
+
+```sh
+cosign verify-blob \
+  --certificate $ASSET.pem \
+  --signature $ASSET.sig \
+  --certificate-identity-regexp 'https://github.com/B42Labs/dizzy/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  $ASSET
+```
+
+Releases are cut by pushing a `v*` tag; the
+[`release` workflow](.github/workflows/release.yml) builds, signs, and publishes
+the binaries. To build from source instead, run `make build` (see §14).
+
+---
+
 ## 1. Goals
 
 - Create **complex, randomized network scenarios** via the Neutron API, e.g.

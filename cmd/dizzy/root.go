@@ -42,6 +42,9 @@ func newRootCmd() *cobra.Command {
 			"topologies, Cinder volume workloads, and Keystone identity workloads,\n" +
 			"records how long every operation takes, and tracks the states the\n" +
 			"resources reach.",
+		// Version is set from the main package's build-time variable, so
+		// "dizzy --version" prints the release tag (or "dev" for local builds).
+		Version:       version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
@@ -54,6 +57,10 @@ func newRootCmd() *cobra.Command {
 			return nil
 		},
 	}
+
+	// Print "dizzy <version>" for --version rather than cobra's default
+	// "dizzy version <version>".
+	cmd.SetVersionTemplate("dizzy {{.Version}}\n")
 
 	flags := cmd.PersistentFlags()
 	flags.StringVar(&opts.osCloud, "os-cloud", "", "cloud name in clouds.yaml (defaults to $OS_CLOUD)")
