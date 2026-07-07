@@ -19,7 +19,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: grafana-datasources
-  namespace: ostester-otel
+  namespace: dizzy-otel
   labels:
     app: grafana
 data:
@@ -44,7 +44,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: grafana-dashboard-provider
-  namespace: ostester-otel
+  namespace: dizzy-otel
   labels:
     app: grafana
 data:
@@ -69,7 +69,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: grafana
-  namespace: ostester-otel
+  namespace: dizzy-otel
   labels:
     app: grafana
 spec:
@@ -171,7 +171,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: grafana
-  namespace: ostester-otel
+  namespace: dizzy-otel
   labels:
     app: grafana
 spec:

@@ -567,7 +567,7 @@ InfluxDB, VictoriaMetrics, Timescale, …) can store them.
   `service.name=dizzy`, `service.version`, plus `cloud` (the
   `--os-cloud` name), `scenario`, and `service` (`neutron` | `cinder` |
   `keystone`). The `service` attribute keeps the iteration-level series
-  (`openstack_tester.iteration.*`), which carry no `kind`, distinguishable when a
+  (`dizzy.iteration.*`), which carry no `kind`, distinguishable when a
   Neutron, a Cinder, and a Keystone monitor feed the same backend; it is a
   bespoke resource attribute (like `cloud`/`scenario`), deliberately distinct
   from the semantic `service.name`, and mirrors the run record's `service` field.
@@ -577,12 +577,12 @@ in-memory collector, which stays the source for run records and reports):
 
 | Instrument | Type | Unit | Attributes |
 |---|---|---|---|
-| `openstack_tester.operation.duration` | histogram | s | `kind`, `operation`, `outcome` |
-| `openstack_tester.operation.errors` | counter | | `kind`, `operation`, `error.kind` |
-| `openstack_tester.resource.time_to_ready` | histogram | s | `kind`, `outcome` |
-| `openstack_tester.iteration.duration` | histogram | s | `outcome` |
-| `openstack_tester.iteration.operations` | counter | | `result` |
-| `openstack_tester.iterations` | counter | | `outcome` |
+| `dizzy.operation.duration` | histogram | s | `kind`, `operation`, `outcome` |
+| `dizzy.operation.errors` | counter | | `kind`, `operation`, `error.kind` |
+| `dizzy.resource.time_to_ready` | histogram | s | `kind`, `outcome` |
+| `dizzy.iteration.duration` | histogram | s | `outcome` |
+| `dizzy.iteration.operations` | counter | | `result` |
+| `dizzy.iterations` | counter | | `outcome` |
 
 Attribute value sets are bounded: `kind` is the resource type (`network`,
 `port`, `router`, … ; for Cinder, `volume` and `snapshot`; for Keystone,
@@ -621,7 +621,7 @@ status code (the small set the service returns: 400/401/403/404/409/429/5xx for
 Neutron, plus Cinder's 413 over-limit), the same values the report's Errors
 table shows. The counter is recorded **only for
 failed operations**, so a healthy run emits no series at all. On the Prometheus
-side it surfaces as `openstack_tester_operation_errors_total` with label
+side it surfaces as `dizzy_operation_errors_total` with label
 `error_kind` (the `_total` suffix and the dot→underscore label translation
 follow the same naming rules the cookbook preamble below explains).
 
@@ -660,30 +660,30 @@ backend that needs no collector at all, see the local OTEL smoke stack below.
 
 The otel-collector's Prometheus exporter translates OTLP names dot→underscore
 and appends the unit, and counters gain a `_total` suffix — so
-`openstack_tester.operation.duration` (s) becomes
-`openstack_tester_operation_duration_seconds_*`. (VictoriaMetrics performs the
+`dizzy.operation.duration` (s) becomes
+`dizzy_operation_duration_seconds_*`. (VictoriaMetrics performs the
 same translation natively with `-opentelemetry.usePrometheusNaming`, as the
 local smoke stack below configures.) The metrics are designed for:
 
 ```promql
 # p95 operation latency per resource kind + operation, over time
 histogram_quantile(0.95, sum by (kind, operation, le) (
-  rate(openstack_tester_operation_duration_seconds_bucket[5m])))
+  rate(dizzy_operation_duration_seconds_bucket[5m])))
 
 # error + timeout rate per kind + operation (non-success share of all calls)
-sum by (kind, operation) (rate(openstack_tester_operation_duration_seconds_count{outcome!="success"}[5m]))
-  / sum by (kind, operation) (rate(openstack_tester_operation_duration_seconds_count[5m]))
+sum by (kind, operation) (rate(dizzy_operation_duration_seconds_count{outcome!="success"}[5m]))
+  / sum by (kind, operation) (rate(dizzy_operation_duration_seconds_count[5m]))
 
 # error rate by error kind, per kind + operation (only failed calls create series)
-sum by (kind, operation, error_kind) (rate(openstack_tester_operation_errors_total[15m]))
+sum by (kind, operation, error_kind) (rate(dizzy_operation_errors_total[15m]))
 
 # p95 time-to-ready per kind, over the last hour
 histogram_quantile(0.95, sum by (kind, le) (
-  rate(openstack_tester_resource_time_to_ready_seconds_bucket[1h])))
+  rate(dizzy_resource_time_to_ready_seconds_bucket[1h])))
 
 # iteration success rate
-sum(rate(openstack_tester_iterations_total{outcome="success"}[1h]))
-  / sum(rate(openstack_tester_iterations_total[1h]))
+sum(rate(dizzy_iterations_total{outcome="success"}[1h]))
+  / sum(rate(dizzy_iterations_total[1h]))
 ```
 
 Ready-made Grafana dashboards ship with the local OTEL smoke stack below, under
@@ -755,7 +755,7 @@ Beyond the five metric families and their `cloud`/`scenario` labels,
 `otel-verify` confirms Grafana answers on `/api/health` and runs a
 data-independent query through Grafana's datasource proxy, so a broken
 Grafana→VictoriaMetrics wiring is distinguishable from "no data yet".
-`openstack_tester_operation_errors_total` is deliberately **not** among the
+`dizzy_operation_errors_total` is deliberately **not** among the
 required families: it only exists once operations have failed, so a healthy
 run's steady state is its absence, not a missing-metric failure.
 
@@ -765,7 +765,7 @@ run's steady state is its absence, not a missing-metric failure.
 directly — no collector hop. The manifests run it with
 `-opentelemetry.usePrometheusNaming`, so the stored series carry exactly the
 Prometheus canonical names from the cookbook above
-(`openstack_tester_operation_duration_seconds_bucket`, …), and
+(`dizzy_operation_duration_seconds_bucket`, …), and
 `-opentelemetry.promoteAllResourceAttributes`, so the `cloud` and `scenario`
 resource attributes become labels on every series. Storage is an `emptyDir`:
 data survives monitor restarts but not `make otel-down`.
@@ -784,17 +784,17 @@ data survives monitor restarts but not `make otel-down`.
 three dashboards are there the moment Grafana is up — no manual import.
 `make otel-grafana` opens the first one; the others are in the dashboard list.
 
-- **OpenStack Tester — Overview** (`ostester-overview`) — the landing page:
+- **Overview** (`dizzy-overview`) — the landing page:
   iteration success ratio, iterations by outcome, iteration-duration
   percentiles, operations attempted/succeeded/failed, and the non-success share
   of all API calls.
-- **API operations** (`ostester-api-operations`) — the report's
+- **API operations** (`dizzy-api-operations`) — the report's
   per-type table over time, covering every monitored service: per-kind p95 and
   mean latency, a latency heatmap, throughput, error+timeout rate, an
   ops-by-outcome table, and an errors-by-error-kind timeseries (from the
   dedicated errors counter, empty on a healthy run). An extra `operation`
   variable filters to `create`/`delete`/… .
-- **Resource readiness** (`ostester-time-to-ready`) — time-to-ready
+- **Resource readiness** (`dizzy-time-to-ready`) — time-to-ready
   percentiles by kind, a per-kind readiness success ratio, and a time-to-ready
   heatmap.
 
@@ -838,18 +838,18 @@ into VMUI:
 
 ```promql
 # p95 create latency per resource kind
-histogram_quantile(0.95, sum(rate(openstack_tester_operation_duration_seconds_bucket{operation="create"}[15m])) by (kind, le))
+histogram_quantile(0.95, sum(rate(dizzy_operation_duration_seconds_bucket{operation="create"}[15m])) by (kind, le))
 
 # operation error+timeout rate
-sum(rate(openstack_tester_operation_duration_seconds_count{outcome!="success"}[15m]))
-  / sum(rate(openstack_tester_operation_duration_seconds_count[15m]))
+sum(rate(dizzy_operation_duration_seconds_count{outcome!="success"}[15m]))
+  / sum(rate(dizzy_operation_duration_seconds_count[15m]))
 
 # p95 time-to-ready per kind
-histogram_quantile(0.95, sum(rate(openstack_tester_resource_time_to_ready_seconds_bucket[15m])) by (kind, le))
+histogram_quantile(0.95, sum(rate(dizzy_resource_time_to_ready_seconds_bucket[15m])) by (kind, le))
 
 # iteration success ratio
-sum(rate(openstack_tester_iterations_total{outcome="success"}[1h]))
-  / sum(rate(openstack_tester_iterations_total[1h]))
+sum(rate(dizzy_iterations_total{outcome="success"}[1h]))
+  / sum(rate(dizzy_iterations_total[1h]))
 ```
 
 **Teardown.** `make otel-down` deletes the kind cluster and everything in it —
@@ -867,12 +867,12 @@ state — nothing is left behind on the host.
 - **Retry/backoff**: transient errors (5xx, 409 conflicts, rate limiting) are
   retried with exponential backoff; quota errors fail fast with a clear message.
 - **Tagging**: every created resource is tagged with a run identifier (e.g.
-  `ostester:run=<id>` plus type/index tags). Cleanup operates strictly on these
+  `dizzy:run=<id>` plus type/index tags). Cleanup operates strictly on these
   tags, so it never touches resources the tool did not create. Tagging address
   scopes is best-effort — some Neutron releases return 404 for it — so a tag
   failure there is logged and tolerated (and left out of the metrics); those
   resources are instead reclaimed at cleanup from the run record, by id.
-- **Naming**: deterministic names like `ostester-<id>-net-0001` for easy
+- **Naming**: deterministic names like `dizzy-<id>-net-0001` for easy
   identification in Horizon / the CLI.
 - **Progress output**: long-running commands are not silent between their start
   and their final summary. `apply`, `chaos`, and `cleanup` log a line per

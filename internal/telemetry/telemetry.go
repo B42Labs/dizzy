@@ -159,30 +159,30 @@ func NewWithProvider(mp metric.MeterProvider) (*Telemetry, error) {
 	var err error
 	t := &Telemetry{}
 
-	if t.operationDuration, err = m.Float64Histogram("openstack_tester.operation.duration",
+	if t.operationDuration, err = m.Float64Histogram("dizzy.operation.duration",
 		metric.WithDescription("Duration of a single OpenStack API operation."),
 		metric.WithUnit("s"), callBoundaries); err != nil {
 		return nil, fmt.Errorf("creating operation.duration instrument: %w", err)
 	}
-	if t.operationErrors, err = m.Int64Counter("openstack_tester.operation.errors",
+	if t.operationErrors, err = m.Int64Counter("dizzy.operation.errors",
 		metric.WithDescription("Failed OpenStack API operations by error kind.")); err != nil {
 		return nil, fmt.Errorf("creating operation.errors instrument: %w", err)
 	}
-	if t.timeToReady, err = m.Float64Histogram("openstack_tester.resource.time_to_ready",
+	if t.timeToReady, err = m.Float64Histogram("dizzy.resource.time_to_ready",
 		metric.WithDescription("Time from create returning to a resource reaching its expected status."),
 		metric.WithUnit("s"), callBoundaries); err != nil {
 		return nil, fmt.Errorf("creating resource.time_to_ready instrument: %w", err)
 	}
-	if t.iterationDuration, err = m.Float64Histogram("openstack_tester.iteration.duration",
+	if t.iterationDuration, err = m.Float64Histogram("dizzy.iteration.duration",
 		metric.WithDescription("Wall-clock duration of one monitor iteration or one-shot run."),
 		metric.WithUnit("s"), iterBoundaries); err != nil {
 		return nil, fmt.Errorf("creating iteration.duration instrument: %w", err)
 	}
-	if t.iterationOps, err = m.Int64Counter("openstack_tester.iteration.operations",
+	if t.iterationOps, err = m.Int64Counter("dizzy.iteration.operations",
 		metric.WithDescription("OpenStack operations attempted, succeeded, and failed within an iteration.")); err != nil {
 		return nil, fmt.Errorf("creating iteration.operations instrument: %w", err)
 	}
-	if t.iterations, err = m.Int64Counter("openstack_tester.iterations",
+	if t.iterations, err = m.Int64Counter("dizzy.iterations",
 		metric.WithDescription("Completed iterations by outcome.")); err != nil {
 		return nil, fmt.Errorf("creating iterations instrument: %w", err)
 	}

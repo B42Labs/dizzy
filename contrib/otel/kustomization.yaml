@@ -24,7 +24,7 @@ resources:
 
 configMapGenerator:
   - name: grafana-dashboards
-    namespace: ostester-otel
+    namespace: dizzy-otel
     files:
       - dashboards/overview.json
       - dashboards/api-operations.json

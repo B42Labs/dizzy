@@ -1,6 +1,6 @@
 # kind cluster for the local OTEL smoke stack (see README §9).
 #
-# A single-node cluster named "ostester-otel" whose control-plane node maps two
+# A single-node cluster named "dizzy-otel" whose control-plane node maps two
 # host ports to node NodePorts: host 8428 to NodePort 30428 (VictoriaMetrics)
 # and host 3000 to NodePort 30300 (Grafana). The host binary and the browser
 # reach VictoriaMetrics at plain http://localhost:8428 and Grafana at
@@ -17,7 +17,7 @@
 ---
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
-name: ostester-otel
+name: dizzy-otel
 nodes:
   - role: control-plane
     extraPortMappings:
