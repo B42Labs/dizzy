@@ -1,7 +1,7 @@
 // Package neutron wraps the gophercloud v2 networking calls used to apply a
 // plan against a real cloud. It is the ports-and-adapters seam to OpenStack:
-// every created resource is given a deterministic ostester-<id>-<logical> name
-// and tagged with ostester:run=<id> so a run can be identified and, later,
+// every created resource is given a deterministic dizzy-<id>-<logical> name
+// and tagged with dizzy:run=<id> so a run can be identified and, later,
 // cleaned up by tag. Each call is timed through a metrics.Collector, and
 // status-bearing resources can be polled until ready.
 package neutron
@@ -35,7 +35,7 @@ const (
 var ErrQuota = errors.New("neutron: quota exceeded")
 
 // Kind names a Phase 1 Neutron resource type. It doubles as the metrics
-// "type" label and the tag value written under ostester:type. It is an alias
+// "type" label and the tag value written under dizzy:type. It is an alias
 // for the shared resource.Kind so the neutron package API stays
 // source-compatible after the identity type moved to internal/resource.
 type Kind = resource.Kind
@@ -86,13 +86,13 @@ func (c *Client) SetTelemetry(t *telemetry.Telemetry) {
 
 // resourceName builds the deterministic cloud name for a logical plan name.
 func resourceName(runID, logical string) string {
-	return "ostester-" + runID + "-" + logical
+	return "dizzy-" + runID + "-" + logical
 }
 
 // runTags returns the tags applied to every created resource of the given kind:
 // the run identifier and the resource type.
 func runTags(runID string, kind Kind) []string {
-	return []string{"ostester:run=" + runID, "ostester:type=" + string(kind)}
+	return []string{"dizzy:run=" + runID, "dizzy:type=" + string(kind)}
 }
 
 // tagCollection maps a Kind to the Neutron tag-extension resource collection

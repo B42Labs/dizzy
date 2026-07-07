@@ -87,10 +87,10 @@ func (f *fakeCleaner) Delete(_ context.Context, r resource.Resource) error {
 // with the user holding one project-scoped grant.
 func seedRun() *fakeCleaner {
 	f := newFakeCleaner()
-	f.domains = []resource.Resource{{Kind: keystone.KindDomain, ID: "d1", Name: "ostester-run0-dom-0001"}}
-	f.roles = []resource.Resource{{Kind: keystone.KindRole, ID: "r1", Name: "ostester-run0-role-0001"}}
-	f.projects = []resource.Resource{{Kind: keystone.KindProject, ID: "p1", Name: "ostester-run0-proj-0001"}}
-	f.users = []resource.Resource{{Kind: keystone.KindUser, ID: "u1", Name: "ostester-run0-user-0001"}}
+	f.domains = []resource.Resource{{Kind: keystone.KindDomain, ID: "d1", Name: "dizzy-run0-dom-0001"}}
+	f.roles = []resource.Resource{{Kind: keystone.KindRole, ID: "r1", Name: "dizzy-run0-role-0001"}}
+	f.projects = []resource.Resource{{Kind: keystone.KindProject, ID: "p1", Name: "dizzy-run0-proj-0001"}}
+	f.users = []resource.Resource{{Kind: keystone.KindUser, ID: "u1", Name: "dizzy-run0-user-0001"}}
 	f.userAssignments["u1"] = []resource.Resource{{Kind: keystone.KindAssignment, ID: "u1:project:p1:r1"}}
 	return f
 }
@@ -162,10 +162,10 @@ func TestCleanupUnionsRecordedAndDedups(t *testing.T) {
 	f := newFakeCleaner()
 	// Discovery finds only the user u1; the record additionally holds project p2
 	// (missed by discovery) and u1 again (a duplicate to dedup).
-	f.users = []resource.Resource{{Kind: keystone.KindUser, ID: "u1", Name: "ostester-run0-user-0001"}}
+	f.users = []resource.Resource{{Kind: keystone.KindUser, ID: "u1", Name: "dizzy-run0-user-0001"}}
 	recorded := []resource.Resource{
-		{Kind: keystone.KindProject, ID: "p2", Name: "ostester-run0-proj-0002"},
-		{Kind: keystone.KindUser, ID: "u1", Name: "ostester-run0-user-0001"},
+		{Kind: keystone.KindProject, ID: "p2", Name: "dizzy-run0-proj-0002"},
+		{Kind: keystone.KindUser, ID: "u1", Name: "dizzy-run0-user-0001"},
 	}
 
 	deleted, err := Cleanup(context.Background(), f, "run0", recorded, time.Minute)
@@ -184,7 +184,7 @@ func TestCleanupUnionsRecordedAndDedups(t *testing.T) {
 }
 
 // TestCleanupNeverDeletesUnprefixedRoots locks the domain-manager reused-root
-// acceptance criterion: a reused domain and role (carrying no ostester- prefix)
+// acceptance criterion: a reused domain and role (carrying no dizzy- prefix)
 // are never disabled or deleted, even when they appear in the record.
 func TestCleanupNeverDeletesUnprefixedRoots(t *testing.T) {
 	f := newFakeCleaner()
@@ -209,7 +209,7 @@ func TestCleanupNeverDeletesUnprefixedRoots(t *testing.T) {
 // is deleted (Keystone refuses to delete an enabled domain).
 func TestCleanupDisablesDomainBeforeDelete(t *testing.T) {
 	f := newFakeCleaner()
-	f.domains = []resource.Resource{{Kind: keystone.KindDomain, ID: "d1", Name: "ostester-run0-dom-0001"}}
+	f.domains = []resource.Resource{{Kind: keystone.KindDomain, ID: "d1", Name: "dizzy-run0-dom-0001"}}
 
 	if _, err := Cleanup(context.Background(), f, "run0", nil, time.Minute); err != nil {
 		t.Fatalf("Cleanup: %v", err)

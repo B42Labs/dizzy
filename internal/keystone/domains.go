@@ -54,7 +54,7 @@ func (c *Client) DisableDomain(ctx context.Context, r resource.Resource) error {
 }
 
 // ListDomainsByPrefix returns the domains whose name carries this run's
-// ostester-<runID>- prefix, the discovery step cleanup deletes from. A 403
+// dizzy-<runID>- prefix, the discovery step cleanup deletes from. A 403
 // returns (nil, nil) with a warning: a domain manager may not list domains, so
 // discovery fails open, mirroring the quota pre-check's 403 policy — the run's
 // created-list is the fallback handle, and a domain manager creates no domains
@@ -63,7 +63,7 @@ func (c *Client) ListDomainsByPrefix(ctx context.Context, runID string) ([]resou
 	return c.listDomains(ctx, runPrefix(runID))
 }
 
-// ListDomainsByAnyRun returns every domain carrying the ostester- name prefix,
+// ListDomainsByAnyRun returns every domain carrying the dizzy- name prefix,
 // regardless of run id — the pre-flight sweep's handle for reclaiming a previous
 // crashed iteration's domains.
 func (c *Client) ListDomainsByAnyRun(ctx context.Context) ([]resource.Resource, error) {

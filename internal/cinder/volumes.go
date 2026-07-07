@@ -70,7 +70,7 @@ func (c *Client) ExtendVolume(ctx context.Context, r resource.Resource, newSizeG
 }
 
 // ListVolumesByMetadata returns the volumes carrying this run's
-// ostester:run=<runID> metadata, the discovery step metadata-based cleanup
+// dizzy:run=<runID> metadata, the discovery step metadata-based cleanup
 // deletes from.
 func (c *Client) ListVolumesByMetadata(ctx context.Context, runID string) ([]resource.Resource, error) {
 	return c.listVolumesByMetadata(ctx, map[string]string{metaRun: runID})

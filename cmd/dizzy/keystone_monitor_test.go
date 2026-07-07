@@ -70,8 +70,8 @@ func TestKeystoneOrphanCleanerListsAnyRunByPrefix(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"users":[
-			{"id":"u-a","name":"ostester-runA-user-0001"},
-			{"id":"u-b","name":"ostester-runB-user-0001"},
+			{"id":"u-a","name":"dizzy-runA-user-0001"},
+			{"id":"u-b","name":"dizzy-runB-user-0001"},
 			{"id":"u-foreign","name":"admin"}
 		]}`)
 	}))

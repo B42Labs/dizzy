@@ -157,7 +157,7 @@ func TestWriteHTMLInventoryCapped(t *testing.T) {
 		rec.Created[i] = neutron.Resource{
 			Kind:    neutron.KindPort,
 			Logical: "port-" + strconv.Itoa(i),
-			Name:    "ostester-port-" + strconv.Itoa(i),
+			Name:    "dizzy-port-" + strconv.Itoa(i),
 			ID:      "port-id-" + strconv.Itoa(i),
 		}
 	}

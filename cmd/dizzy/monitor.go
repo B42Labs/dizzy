@@ -353,8 +353,8 @@ func writeIterationRecord(rec *run.Record) {
 }
 
 // orphanCleaner adapts a Neutron client to the executor.Cleaner seam for the
-// pre-flight sweep, discovering leftovers by the ostester:type tag (any tester
-// run) instead of one run's ostester:run tag. It is the second real
+// pre-flight sweep, discovering leftovers by the dizzy:type tag (any tester
+// run) instead of one run's dizzy:run tag. It is the second real
 // implementation of Cleaner — the one that proves the seam — so the sweep reuses
 // executor.Cleanup's exact reverse-dependency ordering unchanged. Address scopes
 // cannot be discovered by tag and so are not reclaimed here, the same limitation

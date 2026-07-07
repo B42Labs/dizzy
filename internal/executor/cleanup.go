@@ -21,7 +21,7 @@ type Cleaner interface {
 
 // Cleanup deletes every resource a run created in reverse dependency order,
 // returning the number deleted. Tag-discoverable kinds are found by the run's
-// ostester:run=<id> tag, so it never touches resources the tool did not create;
+// dizzy:run=<id> tag, so it never touches resources the tool did not create;
 // address scopes, which Neutron may not let us tag (and which gophercloud cannot
 // filter by tag), are reclaimed instead from recorded — the run record's created
 // list — by id. recorded is nil when cleanup runs from a bare run id (--run-id),

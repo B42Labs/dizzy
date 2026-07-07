@@ -42,14 +42,14 @@ var _ Cleaner = (*keystone.Client)(nil)
 // no-op; each mutating op is bounded by opTimeout. The first non-404 error stops
 // the run and is returned with the count deleted so far.
 //
-// Roles and domains are additionally guarded by the ostester- name prefix
+// Roles and domains are additionally guarded by the dizzy- name prefix
 // (HasNamePrefix): in domain-manager mode the run shares a pre-existing domain
 // and reuses pre-existing roles that carry no prefix and must never be deleted —
 // they are absent from both the listing and the record, and this guard is the
 // final backstop.
 //
 // An empty runID is refused: prefix discovery would degenerate to the bare
-// ostester- prefix and match every tester run in scope, so the
+// dizzy- prefix and match every tester run in scope, so the
 // "never touches resources the tool did not create" invariant depends on a
 // non-empty run id.
 func Cleanup(ctx context.Context, c Cleaner, runID string, recorded []resource.Resource, opTimeout time.Duration) (int, error) {
@@ -100,7 +100,7 @@ func Cleanup(ctx context.Context, c Cleaner, runID string, recorded []resource.R
 		return deleted, err
 	}
 
-	// Delete the roles — admin-created only. A reused role carries no ostester-
+	// Delete the roles — admin-created only. A reused role carries no dizzy-
 	// prefix, so ownedOnly drops it even if it somehow reached the record.
 	discoveredRoles, err := c.ListRolesByPrefix(ctx, runID)
 	if err != nil {
@@ -177,7 +177,7 @@ func bounded(ctx context.Context, opTimeout time.Duration, fn func(context.Conte
 	return fn(ctx)
 }
 
-// ownedOnly keeps only resources whose name carries the ostester- prefix — the
+// ownedOnly keeps only resources whose name carries the dizzy- prefix — the
 // reused-root protection for domain-manager mode, where a shared domain and
 // reused roles must never be deleted.
 func ownedOnly(resources []resource.Resource) []resource.Resource {

@@ -122,7 +122,7 @@ func TestTimedRecordsOperationTelemetry(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut && r.URL.Path == "/networks/net-id-1/tags" {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"tags":["ostester:run=run0","ostester:type=network"]}`)
+			_, _ = io.WriteString(w, `{"tags":["dizzy:run=run0","dizzy:type=network"]}`)
 			return
 		}
 		t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
@@ -140,17 +140,17 @@ func TestTimedRecordsOperationTelemetry(t *testing.T) {
 		t.Fatalf("createTagged: %v", err)
 	}
 
-	if !hasHistoPoint(t, reader, "openstack_tester.operation.duration",
+	if !hasHistoPoint(t, reader, "dizzy.operation.duration",
 		map[string]string{"kind": "network", "operation": "create", "outcome": "success"}) {
 		t.Error("create was not recorded as {kind=network, operation=create, outcome=success}")
 	}
-	if !hasHistoPoint(t, reader, "openstack_tester.operation.duration",
+	if !hasHistoPoint(t, reader, "dizzy.operation.duration",
 		map[string]string{"kind": "network", "operation": "tag", "outcome": "success"}) {
 		t.Error("tag was not recorded as {kind=network, operation=tag, outcome=success}")
 	}
 	// An all-success flow must not create the operation.errors series at all.
-	if hasMetric(t, reader, "openstack_tester.operation.errors") {
-		t.Error("an all-success flow created an openstack_tester.operation.errors series")
+	if hasMetric(t, reader, "dizzy.operation.errors") {
+		t.Error("an all-success flow created an dizzy.operation.errors series")
 	}
 }
 
@@ -178,14 +178,14 @@ func TestTimedRecordsErrorOutcome(t *testing.T) {
 		t.Fatal("expected an error when tagging keeps failing")
 	}
 
-	if !hasHistoPoint(t, reader, "openstack_tester.operation.duration",
+	if !hasHistoPoint(t, reader, "dizzy.operation.duration",
 		map[string]string{"kind": "network", "operation": "tag", "outcome": "error"}) {
 		t.Error("a failing tag PUT was not recorded with outcome=error")
 	}
 	// The same failure reaches operation.errors with the exact error.kind the
 	// classifier derives from the gophercloud 500 — parity with the report's
 	// Errors table, end to end.
-	if !hasSumPoint(t, reader, "openstack_tester.operation.errors",
+	if !hasSumPoint(t, reader, "dizzy.operation.errors",
 		map[string]string{"kind": "network", "operation": "tag", "error.kind": "http_500"}) {
 		t.Error("a failing tag PUT was not counted as {kind=network, operation=tag, error.kind=http_500}")
 	}
@@ -211,7 +211,7 @@ func TestWaitForReadyRecordsTimeToReady(t *testing.T) {
 		if err := c.WaitForReady(context.Background(), Resource{Kind: KindNetwork, ID: "n1"}); err != nil {
 			t.Fatalf("WaitForReady: %v", err)
 		}
-		if !hasHistoPoint(t, reader, "openstack_tester.resource.time_to_ready",
+		if !hasHistoPoint(t, reader, "dizzy.resource.time_to_ready",
 			map[string]string{"kind": "network", "outcome": "success"}) {
 			t.Error("a resource reaching ACTIVE was not recorded as time_to_ready outcome=success")
 		}
@@ -224,7 +224,7 @@ func TestWaitForReadyRecordsTimeToReady(t *testing.T) {
 		if err := c.WaitForReady(ctx, Resource{Kind: KindNetwork, ID: "n1"}); err == nil {
 			t.Fatal("expected WaitForReady to return the context error")
 		}
-		if !hasHistoPoint(t, reader, "openstack_tester.resource.time_to_ready",
+		if !hasHistoPoint(t, reader, "dizzy.resource.time_to_ready",
 			map[string]string{"kind": "network", "outcome": "timeout"}) {
 			t.Error("a cancelled readiness wait was not recorded as time_to_ready outcome=timeout")
 		}

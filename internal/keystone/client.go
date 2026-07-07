@@ -1,9 +1,9 @@
 // Package keystone wraps the gophercloud v2 identity (Keystone v3) calls used to
 // apply a Keystone plan against a real cloud. It is the ports-and-adapters seam
 // to OpenStack: every created resource is given a deterministic
-// ostester-<id>-<logical> name so a run can be identified and, later, cleaned up
-// by that name prefix. Projects additionally carry ostester:run=<id> /
-// ostester:type=project tags for a server-side filter, since projects are the
+// dizzy-<id>-<logical> name so a run can be identified and, later, cleaned up
+// by that name prefix. Projects additionally carry dizzy:run=<id> /
+// dizzy:type=project tags for a server-side filter, since projects are the
 // only identity kind that supports tags. Each call is timed through a
 // metrics.Collector and, when enabled, mirrored into OTEL. Unlike Neutron ports
 // and Cinder volumes, Keystone creates and deletes are synchronous — the
@@ -43,15 +43,15 @@ const (
 // resources are named namePrefix + runID + "-" + logical, so the run prefix
 // uniquely identifies one run while namePrefix alone matches any tester run (the
 // handle the monitor pre-flight sweep reclaims by).
-const namePrefix = "ostester-"
+const namePrefix = "dizzy-"
 
 // Project tag keys binding a created project to a tester run and its kind.
 // Keystone project tags are plain strings, so the key=value shape mirrors
 // Neutron's tags; Keystone forbids only "/" and "," in tags, and neither of
 // these values contains either.
 const (
-	tagRun  = "ostester:run="
-	tagType = "ostester:type="
+	tagRun  = "dizzy:run="
+	tagType = "dizzy:type="
 )
 
 // ErrForbidden is the sentinel a create/assign/issue wrapper wraps when Keystone
@@ -94,7 +94,7 @@ func runPrefix(runID string) string {
 	return namePrefix + runID + "-"
 }
 
-// HasNamePrefix reports whether name carries the ostester- prefix every resource
+// HasNamePrefix reports whether name carries the dizzy- prefix every resource
 // this tool creates. Cleanup uses it as a belt-and-suspenders guard so a reused
 // domain or role (which carries no prefix) is never disabled or deleted in
 // domain-manager mode.

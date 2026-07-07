@@ -18,7 +18,7 @@ import (
 
 // newKeystoneCleanupCmd builds "keystone cleanup", which deletes every domain,
 // role, project, user, and role assignment a run created, identified strictly by
-// the run's ostester-<id>- name prefix (projects also by tag), in reverse
+// the run's dizzy-<id>- name prefix (projects also by tag), in reverse
 // dependency order. It is idempotent: a second run deletes nothing. The run is
 // identified either by its record (--run) or directly by id (--run-id); exactly
 // one is required.

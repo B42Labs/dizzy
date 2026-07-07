@@ -39,7 +39,7 @@ func (c *Client) CreateProject(ctx context.Context, p keystoneplan.Project, doma
 	return resource.Resource{Kind: KindProject, Logical: p.Name, Name: name, ID: id}, nil
 }
 
-// ListProjectsByTag returns the projects carrying this run's ostester:run=<id>
+// ListProjectsByTag returns the projects carrying this run's dizzy:run=<id>
 // tag, the discovery step cleanup deletes from. Projects are the only identity
 // kind that supports tags, so this is a server-side filter (rechecked
 // client-side).
@@ -47,7 +47,7 @@ func (c *Client) ListProjectsByTag(ctx context.Context, runID string) ([]resourc
 	return c.listProjects(ctx, tagRun+runID)
 }
 
-// ListProjectsByType returns the projects carrying the ostester:type=project
+// ListProjectsByType returns the projects carrying the dizzy:type=project
 // tag, matching any tester run — the pre-flight sweep's handle for reclaiming a
 // previous crashed iteration's projects whose run id is no longer known.
 func (c *Client) ListProjectsByType(ctx context.Context) ([]resource.Resource, error) {

@@ -13,7 +13,7 @@ import (
 )
 
 // TestListByTagSendsTagQuery confirms ListByTag filters server-side with the
-// run's ostester:run tag and parses the returned resources.
+// run's dizzy:run tag and parses the returned resources.
 func TestListByTagSendsTagQuery(t *testing.T) {
 	var gotTag string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -22,7 +22,7 @@ func TestListByTagSendsTagQuery(t *testing.T) {
 		}
 		gotTag = r.URL.Query().Get("tags")
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"networks":[{"id":"n1","name":"ostester-run0-net-0001"}]}`)
+		_, _ = io.WriteString(w, `{"networks":[{"id":"n1","name":"dizzy-run0-net-0001"}]}`)
 	}))
 	defer ts.Close()
 
@@ -31,8 +31,8 @@ func TestListByTagSendsTagQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListByTag: %v", err)
 	}
-	if gotTag != "ostester:run=run0" {
-		t.Errorf("tags query = %q, want %q", gotTag, "ostester:run=run0")
+	if gotTag != "dizzy:run=run0" {
+		t.Errorf("tags query = %q, want %q", gotTag, "dizzy:run=run0")
 	}
 	if len(got) != 1 || got[0].ID != "n1" || got[0].Kind != KindNetwork {
 		t.Errorf("ListByTag = %+v, want one network n1", got)
@@ -40,7 +40,7 @@ func TestListByTagSendsTagQuery(t *testing.T) {
 }
 
 // TestListByTypeTagSendsTypeQuery confirms ListByTypeTag filters server-side on
-// the ostester:type tag — the pre-flight sweep's "any tester run" discovery —
+// the dizzy:type tag — the pre-flight sweep's "any tester run" discovery —
 // and parses the returned resources.
 func TestListByTypeTagSendsTypeQuery(t *testing.T) {
 	var gotTag string
@@ -50,7 +50,7 @@ func TestListByTypeTagSendsTypeQuery(t *testing.T) {
 		}
 		gotTag = r.URL.Query().Get("tags")
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"networks":[{"id":"n1","name":"ostester-old-net-0001"}]}`)
+		_, _ = io.WriteString(w, `{"networks":[{"id":"n1","name":"dizzy-old-net-0001"}]}`)
 	}))
 	defer ts.Close()
 
@@ -59,8 +59,8 @@ func TestListByTypeTagSendsTypeQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListByTypeTag: %v", err)
 	}
-	if gotTag != "ostester:type=network" {
-		t.Errorf("tags query = %q, want %q", gotTag, "ostester:type=network")
+	if gotTag != "dizzy:type=network" {
+		t.Errorf("tags query = %q, want %q", gotTag, "dizzy:type=network")
 	}
 	if len(got) != 1 || got[0].ID != "n1" || got[0].Kind != KindNetwork {
 		t.Errorf("ListByTypeTag = %+v, want one network n1", got)

@@ -168,12 +168,12 @@ func (c *Client) ListAssignmentsForUser(ctx context.Context, userID string) ([]r
 }
 
 // ListRolesByPrefix returns the roles whose name carries this run's
-// ostester-<runID>- prefix. Like domains it fails open on a 403.
+// dizzy-<runID>- prefix. Like domains it fails open on a 403.
 func (c *Client) ListRolesByPrefix(ctx context.Context, runID string) ([]resource.Resource, error) {
 	return c.listRoles(ctx, runPrefix(runID))
 }
 
-// ListRolesByAnyRun returns every role carrying the ostester- name prefix,
+// ListRolesByAnyRun returns every role carrying the dizzy- name prefix,
 // regardless of run id — the pre-flight sweep's handle.
 func (c *Client) ListRolesByAnyRun(ctx context.Context) ([]resource.Resource, error) {
 	return c.listRoles(ctx, namePrefix)

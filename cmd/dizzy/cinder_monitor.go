@@ -162,7 +162,7 @@ func cinderMonitorRunOnce(opts *globalOptions, p *cinderplan.Plan, tel *telemetr
 		res := runIteration(ctx, iterationDeps{
 			preflight: func(ctx context.Context) (int, error) {
 				// The fresh run id satisfies Cleanup's non-empty guard; the orphan
-				// adapter ignores it and discovers by the ostester:type metadata.
+				// adapter ignores it and discovers by the dizzy:type metadata.
 				return cinderexec.Cleanup(ctx, cinderTimeoutCleaner{cinderOrphanCleaner{client}, opts.timeout}, runID, nil, opts.timeout)
 			},
 			apply: func(ctx context.Context) ([]resource.Resource, error) {
@@ -216,8 +216,8 @@ func cinderMonitorRunOnce(opts *globalOptions, p *cinderplan.Plan, tel *telemetr
 }
 
 // cinderOrphanCleaner adapts a Cinder client to the cinderexec.Cleaner seam for
-// the pre-flight sweep, discovering leftovers by the ostester:type metadata (any
-// tester run) instead of one run's ostester:run metadata. It is the metadata
+// the pre-flight sweep, discovering leftovers by the dizzy:type metadata (any
+// tester run) instead of one run's dizzy:run metadata. It is the metadata
 // analog of Neutron's orphanCleaner, so the sweep reuses cinderexec.Cleanup's
 // exact snapshots-before-volumes ordering unchanged. Delete and WaitForGone
 // promote from the embedded client.

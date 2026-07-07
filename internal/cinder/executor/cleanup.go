@@ -11,7 +11,7 @@ import (
 )
 
 // Cleaner is the metadata-scoped teardown surface Cleanup drives: discover a
-// run's volumes and snapshots by their ostester:run metadata, delete a
+// run's volumes and snapshots by their dizzy:run metadata, delete a
 // resource, and wait for a resource to be gone. Like Cinder it is the single
 // ports-and-adapters seam to the cloud; *cinder.Client satisfies it in
 // production and a fake satisfies it in tests.
@@ -25,7 +25,7 @@ type Cleaner interface {
 // Cleanup deletes every resource a run created in reverse dependency order —
 // snapshots first, then the volumes they were taken from, since Cinder rejects
 // deleting a volume whose snapshots still exist — returning the number deleted.
-// Each kind is discovered by the run's ostester:run=<id> metadata and unioned
+// Each kind is discovered by the run's dizzy:run=<id> metadata and unioned
 // (deduplicated by id) with the run record's created list as a belt-and-
 // suspenders handle, so it never touches resources the tool did not create and
 // still reclaims a resource whose metadata list missed it. Snapshot deletion is
