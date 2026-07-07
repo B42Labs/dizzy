@@ -41,13 +41,13 @@ func (c *Client) CreateUser(ctx context.Context, u keystoneplan.User, domainID, 
 }
 
 // ListUsersByPrefix returns the users whose name carries this run's
-// ostester-<runID>- prefix, the discovery step cleanup deletes from. Like
+// dizzy-<runID>- prefix, the discovery step cleanup deletes from. Like
 // domains it fails open on a 403.
 func (c *Client) ListUsersByPrefix(ctx context.Context, runID string) ([]resource.Resource, error) {
 	return c.listUsers(ctx, runPrefix(runID))
 }
 
-// ListUsersByAnyRun returns every user carrying the ostester- name prefix,
+// ListUsersByAnyRun returns every user carrying the dizzy- name prefix,
 // regardless of run id — the pre-flight sweep's handle.
 func (c *Client) ListUsersByAnyRun(ctx context.Context) ([]resource.Resource, error) {
 	return c.listUsers(ctx, namePrefix)

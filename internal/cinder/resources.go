@@ -34,8 +34,8 @@ func (c *Client) status(ctx context.Context, r resource.Resource) (string, error
 }
 
 // ListByTypeMetadata returns the resources of kind carrying the
-// ostester:type=<kind> metadata, matching every tester run rather than one run's
-// ostester:run metadata. It is the discovery step for the monitor loop's
+// dizzy:type=<kind> metadata, matching every tester run rather than one run's
+// dizzy:run metadata. It is the discovery step for the monitor loop's
 // pre-flight orphan sweep, which must reclaim leftovers from a previous crashed
 // or interrupted iteration whose run id it no longer holds. The type value is a
 // fixed non-empty constant, so the empty-metadata hazard the run-id guard in

@@ -18,12 +18,12 @@ func respErr(status int, body string) error {
 // TestResourceNameAndTags checks that names and tags are deterministic and that
 // names stay collision-free across kinds and indices.
 func TestResourceNameAndTags(t *testing.T) {
-	if got := resourceName("abcd1234", "net-0001"); got != "ostester-abcd1234-net-0001" {
+	if got := resourceName("abcd1234", "net-0001"); got != "dizzy-abcd1234-net-0001" {
 		t.Errorf("resourceName = %q", got)
 	}
 
 	tags := runTags("abcd1234", KindNetwork)
-	want := []string{"ostester:run=abcd1234", "ostester:type=network"}
+	want := []string{"dizzy:run=abcd1234", "dizzy:type=network"}
 	if len(tags) != len(want) {
 		t.Fatalf("runTags = %v, want %v", tags, want)
 	}

@@ -39,7 +39,7 @@ func (c *Client) CreateSnapshot(ctx context.Context, s cinderplan.Snapshot, volu
 }
 
 // ListSnapshotsByMetadata returns the snapshots carrying this run's
-// ostester:run=<runID> metadata. Selection is keyed exclusively on the run
+// dizzy:run=<runID> metadata. Selection is keyed exclusively on the run
 // metadata, so it never includes snapshots the tool did not create.
 func (c *Client) ListSnapshotsByMetadata(ctx context.Context, runID string) ([]resource.Resource, error) {
 	return c.listSnapshotsByMetadata(ctx, map[string]string{metaRun: runID})

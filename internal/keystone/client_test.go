@@ -36,7 +36,7 @@ func testClient(ts *httptest.Server) (*Client, *metrics.Collector) {
 }
 
 func TestResourceNameAndProjectTags(t *testing.T) {
-	if got := resourceName("abcd1234", "proj-0001"); got != "ostester-abcd1234-proj-0001" {
+	if got := resourceName("abcd1234", "proj-0001"); got != "dizzy-abcd1234-proj-0001" {
 		t.Errorf("resourceName = %q", got)
 	}
 
@@ -48,7 +48,7 @@ func TestResourceNameAndProjectTags(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		_, _ = io.WriteString(w, `{"project":{"id":"pid1","name":"ostester-run0-proj-0001"}}`)
+		_, _ = io.WriteString(w, `{"project":{"id":"pid1","name":"dizzy-run0-proj-0001"}}`)
 	}))
 	defer ts.Close()
 
@@ -57,13 +57,13 @@ func TestResourceNameAndProjectTags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateProject: %v", err)
 	}
-	if res.ID != "pid1" || res.Name != "ostester-run0-proj-0001" {
+	if res.ID != "pid1" || res.Name != "dizzy-run0-proj-0001" {
 		t.Errorf("resource = %+v, want id pid1 and the prefixed name", res)
 	}
 
 	project, _ := body["project"].(map[string]any)
 	tags, _ := project["tags"].([]any)
-	want := map[string]bool{"ostester:run=run0": false, "ostester:type=project": false}
+	want := map[string]bool{"dizzy:run=run0": false, "dizzy:type=project": false}
 	for _, tg := range tags {
 		if s, ok := tg.(string); ok {
 			if _, exists := want[s]; exists {
@@ -158,8 +158,8 @@ func TestListUsersByPrefixClientSideFilter(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"users":[
-			{"id":"u-mine","name":"ostester-run0-user-0001"},
-			{"id":"u-theirs","name":"ostester-run9-user-0001"},
+			{"id":"u-mine","name":"dizzy-run0-user-0001"},
+			{"id":"u-theirs","name":"dizzy-run9-user-0001"},
 			{"id":"u-foreign","name":"admin"}
 		]}`)
 	}))
@@ -305,7 +305,7 @@ func TestIssueTokenRecordsOperationAndReadiness(t *testing.T) {
 	ident, _ := auth["identity"].(map[string]any)
 	pw, _ := ident["password"].(map[string]any)
 	user, _ := pw["user"].(map[string]any)
-	if name, _ := user["name"].(string); name != "ostester-run0-user-0001" {
+	if name, _ := user["name"].(string); name != "dizzy-run0-user-0001" {
 		t.Errorf("auth username = %q, want the prefixed user name", name)
 	}
 	scope, _ := auth["scope"].(map[string]any)
@@ -325,7 +325,7 @@ func TestDisableDomainRecordsUpdate(t *testing.T) {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"domain":{"id":"did1","name":"ostester-run0-dom-0001","enabled":false}}`)
+		_, _ = io.WriteString(w, `{"domain":{"id":"did1","name":"dizzy-run0-dom-0001","enabled":false}}`)
 	}))
 	defer ts.Close()
 

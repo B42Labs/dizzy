@@ -109,7 +109,7 @@ func TestCinderTimeoutCleanerBoundsWedgedOperation(t *testing.T) {
 }
 
 // TestCinderOrphanCleanerListsAnyRunByType confirms the sweep adapter ignores the
-// run id it is handed and discovers this tool's volumes by the ostester:type
+// run id it is handed and discovers this tool's volumes by the dizzy:type
 // metadata across every run — the crash-recovery contract, since the pre-flight
 // sweep runs with a brand-new run id but must reclaim leftovers tagged with a
 // previous, now-unknown one.
@@ -117,7 +117,7 @@ func TestCinderOrphanCleanerListsAnyRunByType(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"volumes":[
-			{"id":"v-foreign","name":"ostester-run9-vol-0001","metadata":{"ostester:run":"run9","ostester:type":"volume"}},
+			{"id":"v-foreign","name":"dizzy-run9-vol-0001","metadata":{"dizzy:run":"run9","dizzy:type":"volume"}},
 			{"id":"v-untagged","name":"untagged","metadata":{}}
 		]}`)
 	}))

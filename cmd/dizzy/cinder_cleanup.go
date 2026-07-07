@@ -16,7 +16,7 @@ import (
 )
 
 // newCinderCleanupCmd builds "cinder cleanup", which deletes every volume and
-// snapshot a run created, identified strictly by the run's ostester:run=<id>
+// snapshot a run created, identified strictly by the run's dizzy:run=<id>
 // metadata, snapshots before volumes. It is idempotent: a second run deletes
 // nothing. The run is identified either by its record (--run) or directly by id
 // (--run-id); exactly one is required.

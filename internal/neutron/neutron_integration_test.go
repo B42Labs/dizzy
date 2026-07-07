@@ -62,7 +62,7 @@ func TestWrappers_Integration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("listing tags on %s %s: %v", collection, id, err)
 		}
-		if !slices.Contains(tags, "ostester:run="+runID) {
+		if !slices.Contains(tags, "dizzy:run="+runID) {
 			t.Errorf("%s %s missing run tag; tags=%v", collection, id, tags)
 		}
 	}

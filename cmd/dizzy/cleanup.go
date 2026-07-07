@@ -19,7 +19,7 @@ import (
 )
 
 // newCleanupCmd builds "neutron cleanup", which deletes every resource a run
-// created, identified strictly by the run's ostester:run=<id> tag, in reverse
+// created, identified strictly by the run's dizzy:run=<id> tag, in reverse
 // dependency order. It is idempotent: a second run deletes nothing. The run is
 // identified either by its record (--run) or directly by id (--run-id); exactly
 // one is required.

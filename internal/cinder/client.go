@@ -1,7 +1,7 @@
 // Package cinder wraps the gophercloud v2 block-storage calls used to apply a
 // Cinder plan against a real cloud. It is the ports-and-adapters seam to
-// OpenStack: every created resource is given a deterministic ostester-<id>-
-// <logical> name and metadata ostester:run=<id> / ostester:type=<kind> so a run
+// OpenStack: every created resource is given a deterministic dizzy-<id>-
+// <logical> name and metadata dizzy:run=<id> / dizzy:type=<kind> so a run
 // can be identified and, later, cleaned up by that metadata. Each call is timed
 // through a metrics.Collector, and status-bearing resources can be polled until
 // ready. Unlike Neutron there is no separate tag step: the metadata rides in the
@@ -23,7 +23,7 @@ import (
 )
 
 // Cinder resource kinds. They double as the metrics "type" label and the
-// metadata value written under ostester:type.
+// metadata value written under dizzy:type.
 const (
 	KindVolume   resource.Kind = "volume"
 	KindSnapshot resource.Kind = "snapshot"
@@ -38,10 +38,10 @@ const (
 )
 
 // Metadata keys binding a created resource to a tester run and its kind. They
-// mirror Neutron's ostester:run / ostester:type tags.
+// mirror Neutron's dizzy:run / dizzy:type tags.
 const (
-	metaRun  = "ostester:run"
-	metaType = "ostester:type"
+	metaRun  = "dizzy:run"
+	metaType = "dizzy:type"
 )
 
 // ErrQuota is the sentinel a create/extend wrapper wraps when Cinder rejects the
@@ -74,7 +74,7 @@ func (c *Client) SetTelemetry(t *telemetry.Telemetry) {
 
 // resourceName builds the deterministic cloud name for a logical plan name.
 func resourceName(runID, logical string) string {
-	return "ostester-" + runID + "-" + logical
+	return "dizzy-" + runID + "-" + logical
 }
 
 // runMetadata returns the metadata stamped on every created resource of the

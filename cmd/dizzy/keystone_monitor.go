@@ -106,7 +106,7 @@ func newKeystoneMonitorCmd(opts *globalOptions) *cobra.Command {
 	flags.IntVar(&cfg.iterations, "iterations", 0, "stop after this many iterations (0 = run forever)")
 	flags.DurationVar(&cfg.errorWait, "error-wait", 0, "extra pause after a failed iteration before the next starts (0 = off)")
 	flags.BoolVar(&keepRunRecords, "keep-run-records", false, "write a run-<id>.json per iteration (off by default: in monitor mode they accumulate unboundedly)")
-	flags.BoolVar(&reclaimOrphans, "reclaim-orphans", false, "before each iteration, delete leftover ostester- identity resources across ALL tester runs cloud-wide (off by default); only safe when no other tester process targets this cloud, since with an admin token it deletes a concurrent run's in-flight users, roles, and whole domains")
+	flags.BoolVar(&reclaimOrphans, "reclaim-orphans", false, "before each iteration, delete leftover dizzy- identity resources across ALL tester runs cloud-wide (off by default); only safe when no other tester process targets this cloud, since with an admin token it deletes a concurrent run's in-flight users, roles, and whole domains")
 	priv.register(flags)
 	// MarkFlagRequired only fails for an unknown flag; scenario was just added.
 	_ = cmd.MarkFlagRequired("scenario")
@@ -190,12 +190,12 @@ func keystoneMonitorRunOnce(opts *globalOptions, p *keystoneplan.Plan, tel *tele
 }
 
 // keystonePreflight builds one iteration's pre-flight sweep. The sweep reclaims
-// tester leftovers across every run cloud-wide — by the any-run ostester- name
-// prefix and the ostester:type=project tag — so it is opt-in via --reclaim-orphans
+// tester leftovers across every run cloud-wide — by the any-run dizzy- name
+// prefix and the dizzy:type=project tag — so it is opt-in via --reclaim-orphans
 // and off by default: with an admin token those listings are unscoped, so an
 // unconditional sweep would delete a concurrent tester run's in-flight identity
 // resources (users and roles are cloud-global, and disabling then deleting an
-// ostester- domain cascades away its remaining contents). Off, it is a no-op that
+// dizzy- domain cascades away its remaining contents). Off, it is a no-op that
 // issues no identity calls, so a monitor loop reclaims only its own iterations —
 // each iteration's own run-scoped cleanup still runs regardless.
 func keystonePreflight(client *keystone.Client, opTimeout time.Duration, runID string, reclaimOrphans bool) func(ctx context.Context) (int, error) {
@@ -211,7 +211,7 @@ func keystonePreflight(client *keystone.Client, opTimeout time.Duration, runID s
 
 // keystoneOrphanCleaner adapts a Keystone client to the keystoneexec.Cleaner
 // seam for the pre-flight sweep, discovering leftovers across every tester run
-// (by the any-run name prefix, and by the ostester:type=project tag for
+// (by the any-run name prefix, and by the dizzy:type=project tag for
 // projects) instead of one run's prefix. It is the identity analog of Cinder's
 // orphanCleaner, so the sweep reuses keystoneexec.Cleanup's exact reverse-order
 // teardown unchanged. ListAssignmentsForUser, DisableDomain, and Delete promote

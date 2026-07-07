@@ -5,7 +5,7 @@
 package resource
 
 // Kind names a resource type. It doubles as the metrics "type" label and the
-// tag/metadata value written under ostester:type.
+// tag/metadata value written under dizzy:type.
 type Kind string
 
 // Resource is the cloud identity of a created resource. Logical is the plan's

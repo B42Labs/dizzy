@@ -136,10 +136,10 @@ func TestFinishKeystoneChurnTearsDownOnInterrupt(t *testing.T) {
 			c := &recordingKeystoneCleaner{}
 			// Reverse dependency order: assignment, user, project, role, domain.
 			created := []resource.Resource{
-				{Kind: keystone.KindDomain, ID: "d1", Name: "ostester-run1234-dom-0001"},
-				{Kind: keystone.KindRole, ID: "r1", Name: "ostester-run1234-role-0001"},
-				{Kind: keystone.KindProject, ID: "p1", Name: "ostester-run1234-proj-0001"},
-				{Kind: keystone.KindUser, ID: "u1", Name: "ostester-run1234-user-0001"},
+				{Kind: keystone.KindDomain, ID: "d1", Name: "dizzy-run1234-dom-0001"},
+				{Kind: keystone.KindRole, ID: "r1", Name: "dizzy-run1234-role-0001"},
+				{Kind: keystone.KindProject, ID: "p1", Name: "dizzy-run1234-proj-0001"},
+				{Kind: keystone.KindUser, ID: "u1", Name: "dizzy-run1234-user-0001"},
 				{Kind: keystone.KindAssignment, ID: "u1:project:p1:r1"},
 			}
 			cmd := &cobra.Command{}

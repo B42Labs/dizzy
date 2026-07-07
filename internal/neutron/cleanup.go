@@ -15,26 +15,26 @@ import (
 )
 
 // ListByTag returns the resources of kind carrying this run's
-// ostester:run=<runID> tag, the discovery step tag-based cleanup deletes from.
+// dizzy:run=<runID> tag, the discovery step tag-based cleanup deletes from.
 // It supports the tag-discoverable kinds (networks, subnets, routers, security
 // groups, subnet pools, ports); other kinds return an error. The filter is
 // applied server-side, so the result never includes resources the tool did not
 // create. Returned Resources carry the kind, cloud name, and id needed to delete
 // them.
 func (c *Client) ListByTag(ctx context.Context, kind Kind, runID string) ([]Resource, error) {
-	return c.listByTagValue(ctx, kind, "ostester:run="+runID)
+	return c.listByTagValue(ctx, kind, "dizzy:run="+runID)
 }
 
 // ListByTypeTag returns the resources of kind carrying the type tag
-// ostester:type=<kind>, matching every tester run rather than one run's
-// ostester:run tag. It is the discovery step for the monitor loop's pre-flight
+// dizzy:type=<kind>, matching every tester run rather than one run's
+// dizzy:run tag. It is the discovery step for the monitor loop's pre-flight
 // orphan sweep, which must reclaim leftovers from a previous crashed or
 // interrupted iteration whose run id it no longer holds. Neutron tag filtering
 // is exact-match with no prefix support, so the type tag is the only way to
 // find "any tester-created resource of this kind". It covers the same
 // tag-discoverable kinds as ListByTag; other kinds return an error.
 func (c *Client) ListByTypeTag(ctx context.Context, kind Kind) ([]Resource, error) {
-	return c.listByTagValue(ctx, kind, "ostester:type="+string(kind))
+	return c.listByTagValue(ctx, kind, "dizzy:type="+string(kind))
 }
 
 // listByTagValue is the shared timed body behind ListByTag and ListByTypeTag: it

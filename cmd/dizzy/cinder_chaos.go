@@ -307,7 +307,7 @@ func finishCinderChurn(ctx context.Context, cmd *cobra.Command, c cinderexec.Cle
 }
 
 // cinderLeakCheck counts the volumes and snapshots still carrying the run's
-// ostester:run metadata after teardown. It takes the cinderexec.Cleaner seam so
+// dizzy:run metadata after teardown. It takes the cinderexec.Cleaner seam so
 // the listing shares the teardown's per-op timeout bound.
 func cinderLeakCheck(ctx context.Context, c cinderexec.Cleaner, runID string) (int, error) {
 	vols, err := c.ListVolumesByMetadata(ctx, runID)

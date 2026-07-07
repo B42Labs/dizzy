@@ -21,8 +21,8 @@ func sampleRecord() *Record {
 		StartedAt:  time.Date(2026, 6, 24, 10, 0, 0, 0, time.UTC),
 		FinishedAt: time.Date(2026, 6, 24, 10, 1, 30, 0, time.UTC),
 		Created: []neutron.Resource{
-			{Kind: neutron.KindNetwork, Logical: "net-0001", Name: "ostester-abcd1234-net-0001", ID: "net-id-1"},
-			{Kind: neutron.KindSubnet, Logical: "subnet-0001", Name: "ostester-abcd1234-subnet-0001", ID: "sub-id-1"},
+			{Kind: neutron.KindNetwork, Logical: "net-0001", Name: "dizzy-abcd1234-net-0001", ID: "net-id-1"},
+			{Kind: neutron.KindSubnet, Logical: "subnet-0001", Name: "dizzy-abcd1234-subnet-0001", ID: "sub-id-1"},
 		},
 		Error: "applying plan (run abcd1234): creating port \"port-0001\": boom",
 		Metrics: metrics.Aggregate{
@@ -132,7 +132,7 @@ func TestLegacyRecordWithoutServiceLoads(t *testing.T) {
   "startedAt": "2026-06-24T10:00:00Z",
   "finishedAt": "2026-06-24T10:00:05Z",
   "created": [
-    {"kind": "network", "logical": "net-0001", "name": "ostester-legacy01-net-0001", "id": "n1"}
+    {"kind": "network", "logical": "net-0001", "name": "dizzy-legacy01-net-0001", "id": "n1"}
   ],
   "metrics": {"wall": 5000000000, "overall": {"type": "", "attempted": 1, "succeeded": 1, "failed": 0, "throughput": 0.2, "latency": {"min": 0, "mean": 0, "median": 0, "p90": 0, "p95": 0, "p99": 0, "max": 0}}, "byType": null, "errors": null, "readiness": null}
 }` + "\n"

@@ -529,9 +529,9 @@ possible follow-up).
   broaden coverage at the cost of that comparability; if you want it, run
   several monitors with different `--seed` values.
 - **Self-healing pre-flight sweep.** Before each iteration the loop deletes
-  leftover `ostester`-tagged resources so a previous crashed or interrupted
+  leftover `dizzy`-tagged resources so a previous crashed or interrupted
   iteration cannot accumulate. Because Neutron tag filtering is exact-match, the
-  sweep matches the `ostester:type=<kind>` tag and therefore reclaims **any**
+  sweep matches the `dizzy:type=<kind>` tag and therefore reclaims **any**
   tester-created resource in the project, not only `monitor`'s own. **Do not run
   `monitor` concurrently with another `apply`/`chaos`/`monitor` run in the same
   project** — the sweep would tear the other run down mid-flight. Address scopes
@@ -900,7 +900,7 @@ pinning to the ceiling: each action's create probability is
 the neutral bias at equilibrium and `target_fill` pulls the population toward its
 level. By default a churn run tears its resources down at the end **or when
 interrupted**: the run record is written first, then teardown (by tag for
-Neutron, by `ostester:run` metadata with snapshots deleted before their volumes
+Neutron, by `dizzy:run` metadata with snapshots deleted before their volumes
 for Cinder) plus a leak check, all on a `context.WithoutCancel` so the first
 signal triggers the teardown rather than killing it. `--no-cleanup` is the single
 opt-out — it leaves everything in place for an explicit `cleanup --run <id>`, so
@@ -1136,8 +1136,8 @@ HTTP 413, which the executor's fast-fail handles as a backstop.
 ### Identification and cleanup
 
 Cinder has no Neutron-style tag API, so run identity lives in **volume/snapshot
-metadata**: every resource is created with `ostester:run=<id>` and
-`ostester:type=<kind>`, plus the same deterministic `ostester-<runid>-<logical>`
+metadata**: every resource is created with `dizzy:run=<id>` and
+`dizzy:type=<kind>`, plus the same deterministic `dizzy-<runid>-<logical>`
 name. `cleanup` discovers a run's resources by that metadata, with the run
 record's created list as a belt-and-suspenders fallback, and deletes in reverse
 dependency order — **snapshots first, then volumes** (a volume with snapshots
@@ -1158,8 +1158,8 @@ pre-checked once at startup, so a misconfiguration fails fast before the loop
 begins.
 
 - **Self-healing pre-flight sweep.** Before each iteration the loop reclaims
-  leftover `ostester`-metadata resources so a previous crashed or interrupted
-  iteration cannot accumulate. Discovery is by the `ostester:type=<kind>`
+  leftover `dizzy`-metadata resources so a previous crashed or interrupted
+  iteration cannot accumulate. Discovery is by the `dizzy:type=<kind>`
   **metadata** (the metadata analog of Neutron's type tag), so it reclaims
   **any** tester-created volume/snapshot in the project, snapshots before
   volumes. **Do not run `cinder monitor` concurrently with another
@@ -1345,11 +1345,11 @@ leaves them for an explicit `keystone cleanup --run-id <id>`.
 
 Keystone has **no uniform tag API** — only **projects** support tags. So run
 identity lives primarily in the deterministic name prefix
-`ostester-<runid>-<logical>` (names are unique within their scope, a reliable
-handle), with projects additionally tagged `ostester:run=<id>` /
-`ostester:type=project` for a server-side filter. Discovery for cleanup:
+`dizzy-<runid>-<logical>` (names are unique within their scope, a reliable
+handle), with projects additionally tagged `dizzy:run=<id>` /
+`dizzy:type=project` for a server-side filter. Discovery for cleanup:
 projects by tag (falling back to the name prefix); domains, users, and roles by
-the `ostester-<runid>-` **name prefix** (client-side, the metadata analog Cinder
+the `dizzy-<runid>-` **name prefix** (client-side, the metadata analog Cinder
 uses); plus the run record's created-list as a belt-and-suspenders handle.
 
 Teardown is reverse dependency order, idempotent (a 404 is success), and **never
@@ -1377,7 +1377,7 @@ admin mode the domains and roles are recreated per iteration and torn down again
 in domain-manager mode the startup resolution is reused). Each iteration always
 cleans up its own run-scoped resources; the cross-run **pre-flight orphan sweep**
 is opt-in via `--reclaim-orphans` and **off by default**. When enabled it
-reclaims leftover `ostester-<...>`-named identity resources across every tester
+reclaims leftover `dizzy-<...>`-named identity resources across every tester
 run — and because an admin token lists cloud-wide (unlike the project-scoped
 other services), it is only safe when **no other tester process targets this
 cloud**: it would delete a concurrent run's in-flight users, roles, and whole

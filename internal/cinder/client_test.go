@@ -85,8 +85,8 @@ func TestListVolumesByMetadataClientSideBackstop(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"volumes":[
-			{"id":"v-mine","name":"ostester-run0-vol-0001","metadata":{"ostester:run":"run0"}},
-			{"id":"v-theirs","name":"another-run","metadata":{"ostester:run":"run9"}},
+			{"id":"v-mine","name":"dizzy-run0-vol-0001","metadata":{"dizzy:run":"run0"}},
+			{"id":"v-theirs","name":"another-run","metadata":{"dizzy:run":"run9"}},
 			{"id":"v-untagged","name":"untagged","metadata":{}}
 		]}`)
 	}))
@@ -109,8 +109,8 @@ func TestListSnapshotsByMetadataFiltersClientSide(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"snapshots":[
-			{"id":"s-mine","name":"ostester-run0-snap-0001","metadata":{"ostester:run":"run0"}},
-			{"id":"s-theirs","name":"another-run","metadata":{"ostester:run":"run9"}}
+			{"id":"s-mine","name":"dizzy-run0-snap-0001","metadata":{"dizzy:run":"run0"}},
+			{"id":"s-theirs","name":"another-run","metadata":{"dizzy:run":"run9"}}
 		]}`)
 	}))
 	defer ts.Close()
@@ -134,10 +134,10 @@ func TestListByTypeMetadataVolumesAcrossRuns(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"volumes":[
-			{"id":"v-run0","name":"ostester-run0-vol-0001","metadata":{"ostester:run":"run0","ostester:type":"volume"}},
-			{"id":"v-run9","name":"ostester-run9-vol-0001","metadata":{"ostester:run":"run9","ostester:type":"volume"}},
+			{"id":"v-run0","name":"dizzy-run0-vol-0001","metadata":{"dizzy:run":"run0","dizzy:type":"volume"}},
+			{"id":"v-run9","name":"dizzy-run9-vol-0001","metadata":{"dizzy:run":"run9","dizzy:type":"volume"}},
 			{"id":"v-untagged","name":"untagged","metadata":{}},
-			{"id":"v-othertype","name":"ostester-run0-snap","metadata":{"ostester:type":"snapshot"}}
+			{"id":"v-othertype","name":"dizzy-run0-snap","metadata":{"dizzy:type":"snapshot"}}
 		]}`)
 	}))
 	defer ts.Close()
@@ -163,8 +163,8 @@ func TestListByTypeMetadataSnapshotsFiltersClientSide(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"snapshots":[
-			{"id":"s-run0","name":"ostester-run0-snap-0001","metadata":{"ostester:run":"run0","ostester:type":"snapshot"}},
-			{"id":"s-run9","name":"ostester-run9-snap-0001","metadata":{"ostester:run":"run9","ostester:type":"snapshot"}},
+			{"id":"s-run0","name":"dizzy-run0-snap-0001","metadata":{"dizzy:run":"run0","dizzy:type":"snapshot"}},
+			{"id":"s-run9","name":"dizzy-run9-snap-0001","metadata":{"dizzy:run":"run9","dizzy:type":"snapshot"}},
 			{"id":"s-foreign","name":"someone-elses","metadata":{}}
 		]}`)
 	}))
@@ -192,7 +192,7 @@ func TestListByTypeMetadataUnsupportedKind(t *testing.T) {
 // TestResourceNameAndMetadata checks names and metadata are deterministic and
 // exact.
 func TestResourceNameAndMetadata(t *testing.T) {
-	if got := resourceName("abcd1234", "vol-0001"); got != "ostester-abcd1234-vol-0001" {
+	if got := resourceName("abcd1234", "vol-0001"); got != "dizzy-abcd1234-vol-0001" {
 		t.Errorf("resourceName = %q", got)
 	}
 

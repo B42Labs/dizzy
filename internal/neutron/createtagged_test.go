@@ -88,7 +88,7 @@ func TestCreateTaggedLogsOrphanNameOnCreateError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the create error to propagate")
 	}
-	if logged := buf.String(); !strings.Contains(logged, "ostester-run0-net-0001") {
+	if logged := buf.String(); !strings.Contains(logged, "dizzy-run0-net-0001") {
 		t.Errorf("create-error warning did not include the deterministic name; log=%q", logged)
 	}
 }
