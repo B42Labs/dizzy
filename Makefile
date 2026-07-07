@@ -202,13 +202,13 @@ otel-up:
 	@for tool in docker kind kubectl curl; do \
 		command -v $$tool >/dev/null 2>&1 || { echo "error: $$tool not found in PATH (required for the local OTEL stack)"; exit 1; }; \
 	done
-	@kind get clusters 2>/dev/null | grep -qx ostester-otel \
+	@kind get clusters 2>/dev/null | grep -qx dizzy-otel \
 		|| kind create cluster --config contrib/otel/kind.yaml
-	@docker port ostester-otel-control-plane 30300/tcp >/dev/null 2>&1 \
-		|| { echo "error: the existing ostester-otel cluster predates Grafana (no host port 3000 mapping); kind cannot add it to a running cluster — run 'make otel-down && make otel-up' to recreate it"; exit 1; }
-	@kubectl --context kind-ostester-otel apply -k contrib/otel
-	@kubectl --context kind-ostester-otel -n ostester-otel rollout status deployment/victoria-metrics --timeout=180s
-	@kubectl --context kind-ostester-otel -n ostester-otel rollout status deployment/grafana --timeout=180s
+	@docker port dizzy-otel-control-plane 30300/tcp >/dev/null 2>&1 \
+		|| { echo "error: the existing dizzy-otel cluster predates Grafana (no host port 3000 mapping); kind cannot add it to a running cluster — run 'make otel-down && make otel-up' to recreate it"; exit 1; }
+	@kubectl --context kind-dizzy-otel apply -k contrib/otel
+	@kubectl --context kind-dizzy-otel -n dizzy-otel rollout status deployment/victoria-metrics --timeout=180s
+	@kubectl --context kind-dizzy-otel -n dizzy-otel rollout status deployment/grafana --timeout=180s
 	@echo "Waiting for VictoriaMetrics on http://localhost:8428/health ..."
 	@for i in $$(seq 1 30); do \
 		curl -fsS http://localhost:8428/health >/dev/null 2>&1 && { echo "VictoriaMetrics is up: http://localhost:8428/vmui"; break; }; \
@@ -225,10 +225,10 @@ otel-up:
 ## otel-down: Delete the kind cluster and all stored metrics.
 otel-down:
 	@command -v kind >/dev/null 2>&1 || { echo "error: kind not found in PATH"; exit 1; }
-	kind delete cluster --name ostester-otel
+	kind delete cluster --name dizzy-otel
 
 ## otel-verify: Check the metric families in VictoriaMetrics and Grafana health.
-# openstack_tester_operation_errors_total is deliberately not a required family:
+# dizzy_operation_errors_total is deliberately not a required family:
 # it only exists once operations have failed, so a healthy run's steady state is
 # its absence, not a missing-metric failure.
 otel-verify:
@@ -237,11 +237,11 @@ otel-verify:
 		|| { echo "error: cannot reach VictoriaMetrics on http://localhost:8428 (run 'make otel-up' first)"; exit 1; }; \
 	rc=0; \
 	for fam in \
-		openstack_tester_operation_duration_seconds \
-		openstack_tester_resource_time_to_ready_seconds \
-		openstack_tester_iteration_duration_seconds \
-		openstack_tester_iteration_operations_total \
-		openstack_tester_iterations_total; do \
+		dizzy_operation_duration_seconds \
+		dizzy_resource_time_to_ready_seconds \
+		dizzy_iteration_duration_seconds \
+		dizzy_iteration_operations_total \
+		dizzy_iterations_total; do \
 		if printf '%s' "$$names" | grep -q "\"$$fam"; then \
 			echo "ok:      $$fam"; \
 		else \
@@ -265,13 +265,13 @@ otel-verify:
 
 ## otel-ui: Open VMUI with pre-filled queries showing live data.
 otel-ui:
-	@url='http://localhost:8428/vmui/#/?g0.expr=histogram_quantile(0.95,%20sum(rate(openstack_tester_operation_duration_seconds_bucket%7Boperation%3D%22create%22%7D%5B15m%5D))%20by%20(kind,%20le))&g1.expr=sum(rate(openstack_tester_iterations_total%5B15m%5D))%20by%20(outcome)'; \
+	@url='http://localhost:8428/vmui/#/?g0.expr=histogram_quantile(0.95,%20sum(rate(dizzy_operation_duration_seconds_bucket%7Boperation%3D%22create%22%7D%5B15m%5D))%20by%20(kind,%20le))&g1.expr=sum(rate(dizzy_iterations_total%5B15m%5D))%20by%20(outcome)'; \
 	echo "Opening VMUI: $$url"; \
 	open "$$url" 2>/dev/null || xdg-open "$$url" 2>/dev/null || echo "open the URL above in your browser"
 
 ## otel-grafana: Open the provisioned Grafana overview dashboard.
 otel-grafana:
-	@url='http://localhost:3000/d/ostester-overview'; \
+	@url='http://localhost:3000/d/dizzy-overview'; \
 	echo "Opening Grafana: $$url"; \
 	open "$$url" 2>/dev/null || xdg-open "$$url" 2>/dev/null || echo "open the URL above in your browser"
 

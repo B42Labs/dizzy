@@ -55,7 +55,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "victoriametrics" },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (kind, le) (rate(openstack_tester_resource_time_to_ready_seconds_bucket{cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (kind, le) (rate(dizzy_resource_time_to_ready_seconds_bucket{cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__rate_interval])))",
           "legendFormat": "{{kind}} p50",
           "range": true,
           "refId": "A"
@@ -63,7 +63,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "victoriametrics" },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (kind, le) (rate(openstack_tester_resource_time_to_ready_seconds_bucket{cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (kind, le) (rate(dizzy_resource_time_to_ready_seconds_bucket{cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__rate_interval])))",
           "legendFormat": "{{kind}} p95 (est.)",
           "range": true,
           "refId": "B"
@@ -110,7 +110,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "victoriametrics" },
           "editorMode": "code",
-          "expr": "sum by (kind) (increase(openstack_tester_resource_time_to_ready_seconds_count{outcome=\"success\", cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__range])) / sum by (kind) (increase(openstack_tester_resource_time_to_ready_seconds_count{cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__range]))",
+          "expr": "sum by (kind) (increase(dizzy_resource_time_to_ready_seconds_count{outcome=\"success\", cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__range])) / sum by (kind) (increase(dizzy_resource_time_to_ready_seconds_count{cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__range]))",
           "instant": true,
           "legendFormat": "{{kind}}",
           "range": false,
@@ -155,7 +155,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "victoriametrics" },
           "editorMode": "code",
-          "expr": "sum by (le) (increase(openstack_tester_resource_time_to_ready_seconds_bucket{cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__rate_interval]))",
+          "expr": "sum by (le) (increase(dizzy_resource_time_to_ready_seconds_bucket{cloud=~\"$cloud\", scenario=~\"$scenario\"}[$__rate_interval]))",
           "format": "heatmap",
           "legendFormat": "{{le}}",
           "range": true,
@@ -174,14 +174,14 @@
       {
         "current": {},
         "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-        "definition": "label_values(openstack_tester_resource_time_to_ready_seconds_count, cloud)",
+        "definition": "label_values(dizzy_resource_time_to_ready_seconds_count, cloud)",
         "includeAll": true,
         "allValue": ".*",
         "multi": true,
         "name": "cloud",
         "options": [],
         "query": {
-          "query": "label_values(openstack_tester_resource_time_to_ready_seconds_count, cloud)",
+          "query": "label_values(dizzy_resource_time_to_ready_seconds_count, cloud)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,
@@ -192,14 +192,14 @@
       {
         "current": {},
         "datasource": { "type": "prometheus", "uid": "victoriametrics" },
-        "definition": "label_values(openstack_tester_resource_time_to_ready_seconds_count{cloud=~\"$cloud\"}, scenario)",
+        "definition": "label_values(dizzy_resource_time_to_ready_seconds_count{cloud=~\"$cloud\"}, scenario)",
         "includeAll": true,
         "allValue": ".*",
         "multi": true,
         "name": "scenario",
         "options": [],
         "query": {
-          "query": "label_values(openstack_tester_resource_time_to_ready_seconds_count{cloud=~\"$cloud\"}, scenario)",
+          "query": "label_values(dizzy_resource_time_to_ready_seconds_count{cloud=~\"$cloud\"}, scenario)",
           "refId": "PrometheusVariableQueryEditor-VariableQuery"
         },
         "refresh": 2,
@@ -213,7 +213,7 @@
   "timepicker": {},
   "timezone": "",
   "title": "Resource readiness",
-  "uid": "ostester-time-to-ready",
+  "uid": "dizzy-time-to-ready",
   "version": 1,
   "weekStart": ""
 }

@@ -133,9 +133,9 @@ func TestInstrumentsMatchDocumentedSchema(t *testing.T) {
 	// The six documented instruments must all be present, with the seconds unit
 	// on the three histograms.
 	histograms := []string{
-		"openstack_tester.operation.duration",
-		"openstack_tester.resource.time_to_ready",
-		"openstack_tester.iteration.duration",
+		"dizzy.operation.duration",
+		"dizzy.resource.time_to_ready",
+		"dizzy.iteration.duration",
 	}
 	for _, name := range histograms {
 		m, ok := metrics[name]
@@ -147,9 +147,9 @@ func TestInstrumentsMatchDocumentedSchema(t *testing.T) {
 		}
 	}
 	for _, name := range []string{
-		"openstack_tester.operation.errors",
-		"openstack_tester.iteration.operations",
-		"openstack_tester.iterations",
+		"dizzy.operation.errors",
+		"dizzy.iteration.operations",
+		"dizzy.iterations",
 	} {
 		if _, ok := metrics[name]; !ok {
 			t.Fatalf("counter %s not emitted", name)
@@ -157,17 +157,17 @@ func TestInstrumentsMatchDocumentedSchema(t *testing.T) {
 	}
 
 	// operation.duration carries exactly kind/operation/outcome.
-	if _, ok := histoCount(t, metrics["openstack_tester.operation.duration"],
+	if _, ok := histoCount(t, metrics["dizzy.operation.duration"],
 		map[string]string{"kind": "network", "operation": "create", "outcome": "success"}); !ok {
 		t.Error("operation.duration missing the documented {kind,operation,outcome} attribute set")
 	}
 	// operation.errors carries exactly kind/operation/error.kind, incremented once.
-	if got, ok := sumValue(t, metrics["openstack_tester.operation.errors"],
+	if got, ok := sumValue(t, metrics["dizzy.operation.errors"],
 		map[string]string{"kind": "port", "operation": "delete", "error.kind": "quota"}); !ok || got != 1 {
 		t.Errorf("operation.errors{kind=port,operation=delete,error.kind=quota} = %d (present=%v), want 1", got, ok)
 	}
 	// time_to_ready carries exactly kind/outcome.
-	if _, ok := histoCount(t, metrics["openstack_tester.resource.time_to_ready"],
+	if _, ok := histoCount(t, metrics["dizzy.resource.time_to_ready"],
 		map[string]string{"kind": "network", "outcome": "success"}); !ok {
 		t.Error("resource.time_to_ready missing the documented {kind,outcome} attribute set")
 	}
@@ -188,7 +188,7 @@ func TestRecordOperationOutcomeMapping(t *testing.T) {
 			tel, reader := newTestTelemetry(t)
 			tel.RecordOperation(context.Background(), "port", "delete", 10*time.Millisecond, tc.errKind)
 
-			m := collectByName(t, reader)["openstack_tester.operation.duration"]
+			m := collectByName(t, reader)["dizzy.operation.duration"]
 			if _, ok := histoCount(t, m, map[string]string{
 				"kind": "port", "operation": "delete", "outcome": tc.outcome,
 			}); !ok {
@@ -204,8 +204,8 @@ func TestRecordOperationErrorsCounter(t *testing.T) {
 		tel, reader := newTestTelemetry(t)
 		tel.RecordOperation(context.Background(), "network", "create", 10*time.Millisecond, "")
 
-		if _, ok := collectByName(t, reader)["openstack_tester.operation.errors"]; ok {
-			t.Error("a successful operation created an openstack_tester.operation.errors series")
+		if _, ok := collectByName(t, reader)["dizzy.operation.errors"]; ok {
+			t.Error("a successful operation created an dizzy.operation.errors series")
 		}
 	})
 
@@ -222,7 +222,7 @@ func TestRecordOperationErrorsCounter(t *testing.T) {
 			tel, reader := newTestTelemetry(t)
 			tel.RecordOperation(context.Background(), "port", "delete", 10*time.Millisecond, tc.errKind)
 
-			m := collectByName(t, reader)["openstack_tester.operation.errors"]
+			m := collectByName(t, reader)["dizzy.operation.errors"]
 			if got, ok := sumValue(t, m, map[string]string{
 				"kind": "port", "operation": "delete", "error.kind": tc.errKind,
 			}); !ok || got != 1 {
@@ -237,7 +237,7 @@ func TestRecordTimeToReadyOutcome(t *testing.T) {
 	// A readiness deadline that elapsed records the timeout outcome.
 	tel.RecordTimeToReady(context.Background(), "router", time.Second, false)
 
-	m := collectByName(t, reader)["openstack_tester.resource.time_to_ready"]
+	m := collectByName(t, reader)["dizzy.resource.time_to_ready"]
 	if _, ok := histoCount(t, m, map[string]string{"kind": "router", "outcome": "timeout"}); !ok {
 		t.Error("ok=false did not map to the timeout outcome")
 	}
@@ -253,17 +253,17 @@ func TestRecordIterationCountsAndDuration(t *testing.T) {
 	metrics := collectByName(t, reader)
 
 	// The duration histogram and the iterations counter share the outcome value.
-	if _, ok := histoCount(t, metrics["openstack_tester.iteration.duration"],
+	if _, ok := histoCount(t, metrics["dizzy.iteration.duration"],
 		map[string]string{"outcome": "failure"}); !ok {
 		t.Error("iteration.duration missing the failure-outcome data point")
 	}
-	if got, ok := sumValue(t, metrics["openstack_tester.iterations"],
+	if got, ok := sumValue(t, metrics["dizzy.iterations"],
 		map[string]string{"outcome": "failure"}); !ok || got != 1 {
 		t.Errorf("iterations{outcome=failure} = %d (present=%v), want 1", got, ok)
 	}
 
 	// iteration.operations splits by result with the supplied counts.
-	ops := metrics["openstack_tester.iteration.operations"]
+	ops := metrics["dizzy.iteration.operations"]
 	for result, want := range map[string]int64{"attempted": 20, "succeeded": 17, "failed": 3} {
 		if got, ok := sumValue(t, ops, map[string]string{"result": result}); !ok || got != want {
 			t.Errorf("iteration.operations{result=%s} = %d (present=%v), want %d", result, got, ok, want)
