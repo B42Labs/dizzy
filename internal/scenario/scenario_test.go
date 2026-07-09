@@ -6,7 +6,8 @@ import (
 	"time"
 )
 
-// mediumScenario returns the README §6 example values, a known-valid scenario
+// mediumScenario returns the documented medium-profile example values (see
+// docs/reference/scenario-schema.md), a known-valid scenario
 // that tests mutate to provoke individual validation failures.
 func mediumScenario() Scenario {
 	return Scenario{

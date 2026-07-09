@@ -28,9 +28,9 @@ TESTBED_CMD ?= apply
 # --otel` against the testbed, pushing OTLP metrics into it; `make otel-ui`
 # opens VMUI, `make otel-grafana` opens the Grafana overview dashboard,
 # `make otel-verify` checks the stored schema and Grafana health, `make
-# otel-down` tears it all down. See README §9. Override the monitor cadence and
-# count (MONITOR_INTERVAL=0, the default, runs iterations back-to-back; set a
-# duration like 5m for a paced run):
+# otel-down` tears it all down. See docs/how-to/export-to-otel.md. Override the
+# monitor cadence and count (MONITOR_INTERVAL=0, the default, runs iterations
+# back-to-back; set a duration like 5m for a paced run):
 #   make testbed-monitor MONITOR_INTERVAL=5m MONITOR_ITERATIONS=1
 MONITOR_INTERVAL   ?= 0
 MONITOR_ITERATIONS ?= 0
