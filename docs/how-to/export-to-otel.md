@@ -69,13 +69,13 @@ single-node [VictoriaMetrics](https://victoriametrics.com/), which ingests
 OTLP/HTTP directly — no collector hop — plus a fully provisioned Grafana.
 
 **Prerequisites:** `docker`, `kind`, `kubectl`, and `curl` on the host, plus
-testbed reachability with `contrib/clouds.yaml`.
+OSISM testbed reachability with `contrib/devstack-osism-clouds.yaml`.
 
 ```console
-$ make otel-up          # kind + VictoriaMetrics (:8428) + Grafana (:3000)
-$ make testbed-monitor  # neutron monitor --otel against the testbed
-$ make otel-grafana     # open the provisioned overview dashboard
-$ make otel-ui          # or VMUI, for ad-hoc queries
+$ make otel-up                 # kind + VictoriaMetrics (:8428) + Grafana (:3000)
+$ make devstack-osism-monitor  # neutron monitor --otel against the OSISM testbed
+$ make otel-grafana            # open the provisioned overview dashboard
+$ make otel-ui                 # or VMUI, for ad-hoc queries
 ```
 
 Both host ports bind to `127.0.0.1` only. Grafana runs with **anonymous
@@ -84,9 +84,9 @@ read-only access** and must not be exposed beyond loopback.
 Override the cadence, scenario, or service:
 
 ```console
-$ make testbed-monitor MONITOR_INTERVAL=5m MONITOR_ITERATIONS=1
-$ make testbed-monitor SERVICE=cinder
-$ make testbed-monitor SCENARIO=scenarios/neutron/medium.yaml ARGS="--error-wait 2m"
+$ make devstack-osism-monitor MONITOR_INTERVAL=5m MONITOR_ITERATIONS=1
+$ make devstack-osism-monitor DEVSTACK_OSISM_SERVICE=cinder
+$ make devstack-osism-monitor DEVSTACK_OSISM_SCENARIO=scenarios/neutron/medium.yaml ARGS="--error-wait 2m"
 ```
 
 With the defaults (`MONITOR_INTERVAL=0`, `MONITOR_ITERATIONS=0`) iterations run
@@ -115,7 +115,7 @@ once operations have failed, so a healthy run's steady state is its absence.
 
 ## The endpoint variable that bites
 
-`make testbed-monitor` sets `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` to
+`make devstack-osism-monitor` sets `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` to
 `http://localhost:8428/opentelemetry/v1/metrics` — the full URL, path included.
 
 The generic `OTEL_EXPORTER_OTLP_ENDPOINT` would get `/v1/metrics` appended and

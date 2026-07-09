@@ -81,7 +81,7 @@ matches what you are doing right now.
 - [Monitor a cloud continuously](docs/how-to/monitor-a-cloud.md)
 - [Run a churn soak with `chaos`](docs/how-to/run-a-soak.md)
 - [Export metrics to OpenTelemetry](docs/how-to/export-to-otel.md)
-- [Run against a Cobalt Core dev stack](docs/how-to/run-against-c5c3.md)
+- [Run against a Cobalt Core dev stack](docs/how-to/run-against-devstack-c5c3.md)
 - [Deal with the quota pre-check](docs/how-to/raise-quotas.md)
 
 **Reference** — dry, complete, look-it-up material.
@@ -125,7 +125,9 @@ $ make fmt       # gofmt
 $ make help      # every target
 ```
 
-`make testbed` runs a scenario against the OSISM testbed defined in
-`contrib/clouds.yaml`, cleaning up afterwards. `make otel-up` boots a local
+`make devstack-osism` runs a scenario against the OSISM testbed defined in
+`contrib/devstack-osism-clouds.yaml`, cleaning up afterwards; `make devstack-c5c3`
+does the same against a local [Cobalt Core dev
+stack](docs/how-to/run-against-devstack-c5c3.md). `make otel-up` boots a local
 kind + VictoriaMetrics + Grafana stack for exercising `--otel` end to end; see
 [Export metrics to OpenTelemetry](docs/how-to/export-to-otel.md).

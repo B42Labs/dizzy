@@ -8,7 +8,7 @@ clouds:
       auth_url: https://api.testbed.osism.xyz:5000/v3
       project_domain_name: test
       user_domain_name: test
-    cacert: contrib/testbed.pem
+    cacert: contrib/devstack-osism.pem
     identity_api_version: 3
   admin:
     auth:
@@ -18,5 +18,5 @@ clouds:
       auth_url: https://api.testbed.osism.xyz:5000/v3
       project_domain_name: default
       user_domain_name: default
-    cacert: contrib/testbed.pem
+    cacert: contrib/devstack-osism.pem
     identity_api_version: 3
