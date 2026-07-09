@@ -7,8 +7,9 @@
 # http://localhost:3000 through these mappings.
 #
 # Keep the cluster name, the host ports, and the container ports in sync with
-# the Makefile targets (otel-up/down/verify/ui/grafana, testbed-monitor) and
-# with the NodePorts in victoria-metrics.yaml (30428) and grafana.yaml (30300).
+# the Makefile targets (otel-up/down/verify/ui/grafana, devstack-osism-monitor)
+# and with the NodePorts in victoria-metrics.yaml (30428) and grafana.yaml
+# (30300).
 #
 # kind cannot add port mappings to a running cluster, so a cluster created
 # before the Grafana mapping was added has no host port 3000. otel-up guards

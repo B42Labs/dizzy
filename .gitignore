@@ -5,8 +5,8 @@
 *.test
 *.out
 
-# Generated c5c3 dev-stack clouds.yaml (holds the live admin password)
-/contrib/c5c3-clouds.yaml
+# Generated devstack-c5c3 clouds.yaml (holds the live admin password)
+/contrib/devstack-c5c3-clouds.yaml
 
 # Editor / OS files
 *.swp

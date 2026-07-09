@@ -115,8 +115,8 @@ To run against the OSISM testbed, exporting into the local OTEL stack:
 
 ```console
 $ make otel-up
-$ make testbed-monitor
-$ make testbed-monitor MONITOR_INTERVAL=5m MONITOR_ITERATIONS=1
-$ make testbed-monitor SERVICE=cinder
-$ make testbed-monitor SCENARIO=scenarios/neutron/medium.yaml ARGS="--error-wait 2m"
+$ make devstack-osism-monitor
+$ make devstack-osism-monitor MONITOR_INTERVAL=5m MONITOR_ITERATIONS=1
+$ make devstack-osism-monitor DEVSTACK_OSISM_SERVICE=cinder
+$ make devstack-osism-monitor DEVSTACK_OSISM_SCENARIO=scenarios/neutron/medium.yaml ARGS="--error-wait 2m"
 ```
