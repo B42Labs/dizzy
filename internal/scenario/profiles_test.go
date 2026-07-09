@@ -71,12 +71,12 @@ func TestProfilesShipRunnableChaosBlock(t *testing.T) {
 	}
 }
 
-// TestMediumProfileMatchesReadmeExample asserts the shipped medium profile is
-// the README §6 example, by comparing its spatial envelope to the in-package
-// fixture that the README-example parse test also pins. The chaos block (which
-// the fixture omits) is checked separately so `neutron chaos` runs the profile
-// without flags.
-func TestMediumProfileMatchesReadmeExample(t *testing.T) {
+// TestMediumProfileMatchesDocumentedExample asserts the shipped medium profile
+// is the example in docs/reference/scenario-schema.md, by comparing its spatial
+// envelope to the in-package fixture that the documented-example parse test also
+// pins. The chaos block (which the fixture omits) is checked separately so
+// `neutron chaos` runs the profile without flags.
+func TestMediumProfileMatchesDocumentedExample(t *testing.T) {
 	got := readProfile(t, "medium")
 	assertChaos(t, "medium", got.Chaos, Chaos{
 		Duration:   Duration(30 * time.Minute),

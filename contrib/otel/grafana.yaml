@@ -1,4 +1,4 @@
-# Grafana for the local OTEL smoke stack (see README §9).
+# Grafana for the local OTEL smoke stack (see docs/how-to/export-to-otel.md).
 #
 # Plain manifests, no Helm: two provisioning ConfigMaps, a single-replica
 # Deployment, and a NodePort Service. Grafana is fully provisioned from files —
