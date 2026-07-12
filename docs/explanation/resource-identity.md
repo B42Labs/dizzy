@@ -12,7 +12,7 @@ offer one mechanism that works everywhere. That inconsistency is not an
 implementation detail you can ignore; it determines what cleanup can reach when
 the run record is lost.
 
-## Three mechanisms
+## The mechanisms
 
 **Neutron has a real tag API.** Every resource is created and then tagged
 `dizzy:run=<id>` and `dizzy:type=<kind>`. Cleanup lists by tag, server-side, and
@@ -28,7 +28,16 @@ identity lives primarily in the deterministic **name prefix**
 unique within their scope. Projects are additionally tagged, so they at least get
 a server-side filter.
 
-All three converge on the same deterministic naming: a resource with logical name
+**Nova uses both, split by who provides the resource.** Servers and the data
+volumes dizzy attaches carry the same two keys as **metadata** — the Cinder
+mechanism — while the companion networks, subnets, and ports carry them as
+Neutron **tags**. Nova's server-list API cannot filter on metadata server-side,
+so server discovery lists the project's servers and filters client-side on the
+metadata dizzy itself wrote. A **boot-from-volume root volume** is Nova-created
+with delete-on-termination and carries no dizzy identity of its own; it dies with
+its server, so cleanup reaches it through the server delete.
+
+All four converge on the same deterministic naming: a resource with logical name
 `net-0001` in run `a1b2c3d4` is called `dizzy-a1b2c3d4-net-0001` on the cloud.
 That is what makes it findable in Horizon, in `openstack network list`, and by
 prefix scan.
@@ -83,8 +92,9 @@ That makes the sweep self-healing and makes concurrent runs unsafe:
 > **Do not run `monitor` alongside another `dizzy` process in the same project.**
 > The sweep would tear the other run's resources down mid-flight.
 
-Neutron and Cinder sweep unconditionally. Keystone does not: because an admin
-token lists **cloud-wide** rather than within one project, a Keystone sweep would
+Neutron, Cinder, and Nova sweep unconditionally — all three are project-scoped.
+Keystone does not: because an admin token lists **cloud-wide** rather than
+within one project, a Keystone sweep would
 reach across the entire cloud, deleting a concurrent run's in-flight users, roles,
 and whole domains. It is therefore opt-in via `--reclaim-orphans`, off by
 default, and safe only when no other `dizzy` process targets that cloud at all.

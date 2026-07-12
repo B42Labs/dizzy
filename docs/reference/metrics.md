@@ -61,12 +61,12 @@ These identify one installation across time.
 | `service.version` | The build version |
 | `cloud` | The `--os-cloud` name |
 | `scenario` | The scenario name |
-| `service` | `neutron`, `cinder`, or `keystone` |
+| `service` | `neutron`, `cinder`, `keystone`, or `nova` |
 
 `service` is a bespoke attribute, deliberately distinct from the semantic
 `service.name`. It keeps the iteration-level series — which carry no `kind` — 
-apart when a Neutron, a Cinder, and a Keystone monitor feed the same backend. It
-mirrors the run record's `service` field.
+apart when a Neutron, a Cinder, a Keystone, and a Nova monitor feed the same
+backend. It mirrors the run record's `service` field.
 
 ### Instruments
 
@@ -79,7 +79,7 @@ mirrors the run record's `service` field.
 | `dizzy.iteration.operations` | counter | | `result` |
 | `dizzy.iterations` | counter | | `outcome` |
 
-All three services share this schema; no service adds an instrument.
+All four services share this schema; no service adds an instrument.
 
 ### Attribute values
 
@@ -87,8 +87,8 @@ Every value set is bounded.
 
 | Attribute | Values |
 |---|---|
-| `kind` | **neutron:** `address-scope`, `subnet-pool`, `network`, `subnet`, `router`, `router-interface`, `security-group`, `security-group-rule`, `port`, `floating-ip` — **cinder:** `volume`, `snapshot` — **keystone:** `domain`, `project`, `user`, `role`, `role_assignment`, `token` |
-| `operation` | `create`, `delete`, `get`, `list`, `tag`, `detach`, `extend` (cinder resize), `update` (keystone domain disable-before-delete) |
+| `kind` | **neutron:** `address-scope`, `subnet-pool`, `network`, `subnet`, `router`, `router-interface`, `security-group`, `security-group-rule`, `port`, `floating-ip` — **cinder:** `volume`, `snapshot` — **keystone:** `domain`, `project`, `user`, `role`, `role_assignment`, `token` — **nova:** `server`, `network`, `subnet`, `port`, `volume` |
+| `operation` | `create`, `delete`, `get`, `list`, `tag`, `attach`, `detach`, `extend` (cinder resize), `update` (keystone domain disable-before-delete), `stop`, `start`, `reboot`, `resize`, `confirm-resize`, `live-migrate` (nova server lifecycle) |
 | `outcome` | `success`, `error`, `timeout` for an operation; `success`, `timeout` for time-to-ready; `success`, `failure` for an iteration |
 | `result` | `attempted`, `succeeded`, `failed` |
 | `error.kind` | `quota`, `timeout`, `canceled`, `other`, `http_<status>` for the statuses the service returns, `http_other` for the rest |

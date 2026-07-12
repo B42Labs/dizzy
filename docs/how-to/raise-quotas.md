@@ -1,8 +1,8 @@
 # Deal with the quota pre-check
 
-`neutron apply` and `cinder apply` compare the expanded plan against your
-project's quotas **before creating anything**, and abort with an itemized message
-if the quotas are too low:
+`neutron apply`, `cinder apply`, and `nova apply` compare the expanded plan
+against your project's quotas **before creating anything**, and abort with an
+itemized message if the quotas are too low:
 
 ```
 error: plan exceeds project quota; raise these quotas before applying:
@@ -86,12 +86,20 @@ For Cinder, `gigabytes` is the sum of the volumes' *final* sizes after any
 planned resize, plus the snapshot sizes at their source volume's final size,
 since both count against the same shared quota.
 
+For Nova, the pre-check counts **instances**, **cores**, and **RAM** computed
+from the resolved boot flavor — a resized server counts, per dimension, the
+larger of its boot and resize flavor, since it holds both across the resize. It
+covers **only** the compute quotas: the Cinder gigabytes the companion (and
+boot-from-volume root) volumes consume and the Neutron port/network quotas the
+companion networks and ports consume are *not* pre-checked. The executor's quota
+fast-fail is the backstop there.
+
 ## When the pre-check cannot run
 
 If the project cannot read its own quota, the pre-check **fails open**: it logs a
 warning and proceeds. The executor's quota fast-fail is the backstop — the first
-over-quota response from the API (HTTP 409 for Neutron, HTTP 413 for Cinder)
-stops the run immediately rather than retrying.
+over-quota response from the API (HTTP 409 for Neutron, HTTP 413 for Cinder,
+HTTP 403 for Nova) stops the run immediately rather than retrying.
 
 The pre-check exists to give a good error message early, not to be a second
 authorization system. It must never refuse work the cloud would have allowed.
