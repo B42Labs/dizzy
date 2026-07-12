@@ -1,0 +1,36 @@
+name: large
+seed: 7654321                   # deterministic; same seed => same plan
+
+image: cirros
+flavor: m1.tiny
+resize_flavor: m1.small
+
+resources:
+  servers: 20
+  networks: 4
+
+distribution:
+  networks_per_server:    { min: 1, max: 3 }
+  volumes_per_server:     { min: 0, max: 3 }
+  ports_per_server:       { min: 0, max: 2 }
+  attached_volume_gib:    { min: 1, max: 8 }
+  root_volume_gib:        { min: 2, max: 8 }
+  boot_from_volume_ratio: 0.5
+  user_data_ratio:        0.5
+  stop_start_ratio:       0.5
+  stop_start_hard_ratio:  0.5
+  resized_ratio:          0.4
+  live_migrated_ratio:    0.3
+  deleted_ratio:          0.3
+  volume_detach_ratio:    0.5
+  port_detach_ratio:      0.5
+
+chaos:
+  duration: 1h
+  interval: { min: 200ms, max: 3s }
+  parallel: { max: 8 }
+  churn_ratio: 0.5
+  target_fill: 0.8
+  lifecycle_ratio: 0.3
+
+# Needs raised quotas; guarded by the apply compute quota pre-check.
