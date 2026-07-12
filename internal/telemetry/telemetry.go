@@ -10,8 +10,9 @@
 // and reports.
 //
 // The exported resource additionally carries bounded identifying attributes —
-// cloud, scenario, and service (neutron | cinder) — set from Config, so a single
-// backend can hold several installations and both service monitors at once.
+// cloud, scenario, and service (neutron | cinder | keystone | nova) — set from
+// Config, so a single backend can hold several installations and every service
+// monitor at once.
 //
 // Cardinality rule: metric attributes carry only bounded, low-cardinality
 // labels (kind, operation, outcome, result, error.kind). error.kind is the
@@ -46,10 +47,10 @@ const meterName = "github.com/B42Labs/dizzy"
 // Config carries the enablement flag and the identifying attributes that
 // distinguish one installation across time in the backend. Cloud is the
 // --os-cloud name, Scenario is the plan's scenario name, and Service names the
-// OpenStack service the run exercises (neutron or cinder, matching
-// run.Record.Service); each is omitted from the resource when empty. Service
-// keeps the iteration-level series — which carry no kind — distinguishable when
-// a neutron and a cinder monitor feed the same backend.
+// OpenStack service the run exercises (neutron, cinder, keystone, or nova,
+// matching run.Record.Service); each is omitted from the resource when empty.
+// Service keeps the iteration-level series — which carry no kind —
+// distinguishable when several service monitors feed the same backend.
 type Config struct {
 	Enabled  bool
 	Cloud    string
@@ -114,8 +115,8 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 // buildResource assembles the OTEL resource that tags every exported series with
 // the run's identity: the fixed service.name/service.version plus the
 // bespoke cloud, scenario, and service attributes, each appended only when
-// non-empty. service (neutron | cinder) is deliberately distinct from the
-// semconv service.name (which stays dizzy) and mirrors
+// non-empty. service (neutron | cinder | keystone | nova) is deliberately
+// distinct from the semconv service.name (which stays dizzy) and mirrors
 // run.Record.Service, so the iteration-level series stay per-service.
 func buildResource(cfg Config) (*resource.Resource, error) {
 	attrs := []attribute.KeyValue{

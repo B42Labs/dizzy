@@ -23,10 +23,10 @@ import (
 // the run failed partway, empty otherwise.
 type Record struct {
 	RunID string `json:"runID"`
-	// Service names the OpenStack service the run exercised (neutron or
-	// cinder). It is omitempty and read as "neutron" when absent, so run records
-	// written before Cinder support (which carry no service field) still load and
-	// report unchanged.
+	// Service names the OpenStack service the run exercised (neutron, cinder,
+	// keystone, or nova). It is omitempty and read as "neutron" when absent, so
+	// run records written before Cinder support (which carry no service field)
+	// still load and report unchanged.
 	Service    string              `json:"service,omitempty"`
 	Scenario   string              `json:"scenario"`
 	Seed       int64               `json:"seed"`
