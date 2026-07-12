@@ -26,6 +26,8 @@ func newNovaCmd(opts *globalOptions) *cobra.Command {
 	cmd.AddCommand(
 		newNovaGenerateCmd(opts),
 		newNovaApplyCmd(opts),
+		newNovaChaosCmd(opts),
+		newNovaMonitorCmd(opts),
 		newNovaStatusCmd(opts),
 		newReportCmd(opts),
 		newNovaCleanupCmd(opts),
