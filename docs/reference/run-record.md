@@ -13,7 +13,7 @@ unboundedly.
 | Field | Type | Notes |
 |---|---|---|
 | `runID` | string | The run id; also the tag/metadata/name-prefix value |
-| `service` | string | `neutron`, `cinder`, or `keystone`. Omitted on older records |
+| `service` | string | `neutron`, `cinder`, `keystone`, or `nova`. Omitted on older records |
 | `scenario` | string | Scenario name |
 | `seed` | int | The seed the plan was expanded from |
 | `startedAt` | timestamp | RFC 3339 |
@@ -31,7 +31,7 @@ is the same whichever service produced it.
 
 | Field | Type | Notes |
 |---|---|---|
-| `kind` | string | Resource type, e.g. `network`, `volume`, `domain` |
+| `kind` | string | Resource type, e.g. `network`, `volume`, `domain`, `server` |
 | `logical` | string | The plan's reference name, e.g. `net-0001` |
 | `name` | string | The applied cloud name, e.g. `dizzy-a1b2c3d4-net-0001` |
 | `id` | string | The service's UUID |
@@ -81,7 +81,7 @@ Present only on a run record written by `chaos`.
 |---|---|---|
 | `creates` | int | Create operations issued |
 | `deletes` | int | Delete operations issued |
-| `mutates` | int | Cinder extends or Keystone token issues; omitted when zero |
+| `mutates` | int | Cinder extends, Keystone token issues, or Nova server lifecycle mutations; omitted when zero |
 | `cycles` | int | Completed create→delete cycles |
 | `popMin` | int | Minimum live population over the run |
 | `popMax` | int | Maximum live population |

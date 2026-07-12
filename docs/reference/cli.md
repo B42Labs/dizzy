@@ -1,7 +1,8 @@
 # CLI reference
 
 A single binary, `dizzy`, with one command namespace per OpenStack service:
-`neutron`, `cinder`, and `keystone`. Each namespace offers the same verbs.
+`neutron`, `cinder`, `keystone`, and `nova`. Each namespace offers the same
+verbs.
 
 | Verb | Touches the API | Purpose |
 |---|---|---|
@@ -99,12 +100,23 @@ Namespace-specific flags:
 | `--domain <name>` | `keystone` | In-scope domain for domain-manager mode (default: the token's domain; ignored in admin mode) |
 | `--roles <csv>` | `keystone` | Existing roles to reuse in domain-manager mode (default `member,reader`; ignored in admin mode) |
 
-`neutron apply` and `cinder apply` run a read-only **quota pre-check** against
-the expanded plan and abort with an itemized message before creating anything if
-the quotas are insufficient. `keystone apply` runs a read-only **privilege
-pre-check** instead, since Keystone has no default per-resource quotas. See
-[Deal with the quota pre-check](../how-to/raise-quotas.md) and
-[Keystone's privilege model](../explanation/privilege-model.md).
+`neutron apply`, `cinder apply`, and `nova apply` run a read-only **quota
+pre-check** against the expanded plan and abort with an itemized message before
+creating anything if the quotas are insufficient. `keystone apply` runs a
+read-only **privilege pre-check** instead, since Keystone has no default
+per-resource quotas. See [Deal with the quota pre-check](../how-to/raise-quotas.md)
+and [Keystone's privilege model](../explanation/privilege-model.md).
+
+`nova apply` takes no service-specific flags: the boot image, flavor, and resize
+flavor are named in the scenario (`image`, `flavor`, `resize_flavor`) and
+resolved to cloud ids at apply time — dizzy uploads no image and creates no
+flavor. A name that does not exist fails with an actionable list of the
+available images or flavors. Its compute quota pre-check counts instances,
+cores, and RAM (see [raise-quotas](../how-to/raise-quotas.md)). If the plan
+schedules any live migration, `nova apply` also runs a **fail-open
+live-migration pre-check**: it needs the admin role and at least two usable
+compute hosts, and when either is missing it skips live migration for the run
+with a warning and continues — a missing admin capability never aborts a run.
 
 **On interrupt.** SIGINT/SIGTERM writes the run record first, then tears the
 partial topology down in reverse dependency order, logs the deletion count, and
@@ -120,8 +132,8 @@ so the live population never exceeds the scenario's counts and only planned
 resources are ever created. See [The churn engine](../explanation/churn-engine.md).
 
 Every flag can instead be set in a `chaos:` block in the scenario YAML; flags
-override the block. All three built-in profiles ship such a block, so `chaos`
-runs them with no extra flags.
+override the block. Every built-in profile ships such a block, so `chaos` runs
+them with no extra flags.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -141,6 +153,7 @@ Namespace-specific:
 | `--volume-type <name>` | `cinder` | cloud default | As for `apply` |
 | `--resize-ratio <float>` | `cinder` | `0.3` | Probability per churn step of extending a live, not-yet-resized volume to its planned target; `0` disables |
 | `--token-ratio <float>` | `keystone` | `0.3` | Probability per churn step of issuing a token as a live, assigned user; `0` disables |
+| `--lifecycle-ratio <float>` | `nova` | `0.3` | Probability per churn step of mutating a live server (stop/start, resize, or live-migrate); `0` disables |
 | `--privilege`, `--domain`, `--roles` | `keystone` | | As for `apply` |
 
 By default a churn run tears its resources down at the end **or when
@@ -183,8 +196,8 @@ across iterations. To broaden coverage, run several monitors with different
 `--seed` values.
 
 > **Do not run `monitor` concurrently with another `dizzy` run in the same
-> project.** For `neutron` and `cinder` the pre-flight sweep is always on and
-> reclaims any tester-created resource in the project, so it would tear a
+> project.** For `neutron`, `cinder`, and `nova` the pre-flight sweep is always
+> on and reclaims any tester-created resource in the project, so it would tear a
 > concurrent run down mid-flight. For `keystone` the equivalent sweep is opt-in
 > via `--reclaim-orphans`, and because an admin token lists cloud-wide it is only
 > safe when no other `dizzy` process targets the cloud at all.
@@ -204,7 +217,7 @@ Re-queries the current state of a run's resources from the API.
 ## `report`
 
 Renders metrics from a run record. Never touches the API. The same command
-builder backs all three namespaces, so `dizzy cinder report` and
+builder backs all four namespaces, so `dizzy cinder report` and
 `dizzy neutron report` are the same code.
 
 | Flag | Default | Description |
@@ -242,6 +255,12 @@ Discovery differs per service, and so does what `--run-id` alone can reach:
   domains, users, and roles by the `dizzy-<runid>-` name prefix. Role
   assignments are best reclaimed *with* a record, which is their authoritative
   handle.
+- **nova** — servers and data volumes are found by their `dizzy:run=<id>`
+  metadata; the companion networks, subnets, and ports by the `dizzy:run=<id>`
+  tag. Servers are deleted first (so their attachments release), then ports,
+  volumes, and networks (a network delete cascades its subnet). A
+  boot-from-volume root volume carries no dizzy identity — it is delete-on-
+  termination, so it dies with its server.
 
 See [Resource identity and cleanup](../explanation/resource-identity.md).
 

@@ -4,13 +4,14 @@ A scenario-driven load and consistency tester for OpenStack control planes.
 
 `dizzy` builds large, randomized but **reproducible** workloads through the
 OpenStack APIs, records how long every operation takes and which states the
-resources reach, and cleans up after itself. It covers three services today:
+resources reach, and cleans up after itself. It covers four services today:
 
 | Namespace | Service | What it exercises |
 |---|---|---|
 | `dizzy neutron` | Networking | Address scopes, subnet pools, networks, subnets, routers, router interfaces, security groups + rules, ports, floating IPs |
 | `dizzy cinder` | Block storage | Volume create, extend (resize), snapshot |
 | `dizzy keystone` | Identity | Domains, roles, projects, users, role assignments, scoped token issue |
+| `dizzy nova` | Compute | Server boot (image / volume), stop/start (soft / hard), resize + confirm, live migration, volume & port attach/detach, multi-network, user data |
 
 Every namespace offers the same five verbs — `generate`, `apply`, `chaos`,
 `monitor`, `cleanup` — plus `status` and `report`. A scenario expands
@@ -19,7 +20,7 @@ re-query, report on, and tear down by tag.
 
 It is **not** a correctness suite like Tempest. It measures latency, error
 rates, and state convergence under load. The two are complementary. It creates
-no VMs (no Nova) and no load balancers (no Octavia).
+no load balancers (no Octavia).
 
 ## Installation
 
@@ -58,7 +59,7 @@ $ dizzy neutron report --run run-<id>.json                     # see the timings
 $ dizzy neutron cleanup --run run-<id>.json                    # tear it down
 ```
 
-`--scenario` takes a filesystem path, and the nine built-in profiles live under
+`--scenario` takes a filesystem path, and the twelve built-in profiles live under
 `scenarios/` in this repository — so clone it even if you installed a release
 binary. The `small` profile fits Neutron's default per-project quotas and runs
 against a fresh project with nothing raised.
@@ -103,8 +104,9 @@ matches what you are doing right now.
 
 - `dizzy` operates only within the project of the selected `clouds.yaml` entry.
 - Every resource it creates carries a run identifier — a Neutron tag, Cinder
-  metadata, or a Keystone name prefix. `cleanup` deletes strictly on that
-  identifier, so it never touches resources the tool did not create.
+  metadata, a Keystone name prefix, or (for Nova) server and volume metadata.
+  `cleanup` deletes strictly on that identifier, so it never touches resources
+  the tool did not create.
 - `apply --dry-run` previews a plan without making a single API call.
 - There are no destructive defaults; the cloud and project are always explicit.
 
