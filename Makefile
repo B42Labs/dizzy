@@ -83,7 +83,7 @@ install:
 run: build
 	./$(BINARY) $(ARGS)
 
-## devstack-osism: Run the small scenario (DEVSTACK_OSISM_SERVICE=neutron|cinder|keystone|nova) against the OSISM testbed, then clean up.
+## devstack-osism: Run the small scenario (DEVSTACK_OSISM_SERVICE=neutron|cinder|keystone|nova|glance) against the OSISM testbed, then clean up.
 devstack-osism: build
 	@test -f "$(DEVSTACK_OSISM_CLOUDS_FILE)" || { echo "error: clouds file $(DEVSTACK_OSISM_CLOUDS_FILE) not found"; exit 1; }
 	@test -f "$(DEVSTACK_OSISM_CACERT)"      || { echo "error: CA cert $(DEVSTACK_OSISM_CACERT) not found (clouds.yaml 'cacert')"; exit 1; }
@@ -277,7 +277,7 @@ otel-grafana:
 	echo "Opening Grafana: $$url"; \
 	open "$$url" 2>/dev/null || xdg-open "$$url" 2>/dev/null || echo "open the URL above in your browser"
 
-## devstack-osism-monitor: Run monitor --otel (DEVSTACK_OSISM_SERVICE=neutron|cinder|keystone|nova) against the OSISM testbed, exporting to VictoriaMetrics.
+## devstack-osism-monitor: Run monitor --otel (DEVSTACK_OSISM_SERVICE=neutron|cinder|keystone|nova|glance) against the OSISM testbed, exporting to VictoriaMetrics.
 # monitor applies and cleans up each iteration's resources itself, so this target
 # runs no post-run cleanup: unlike `devstack-osism`, scanning run-*.json in the
 # shared working directory would tear down the resources of a concurrent

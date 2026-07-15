@@ -4,7 +4,7 @@ A scenario-driven load and consistency tester for OpenStack control planes.
 
 `dizzy` builds large, randomized but **reproducible** workloads through the
 OpenStack APIs, records how long every operation takes and which states the
-resources reach, and cleans up after itself. It covers four services today:
+resources reach, and cleans up after itself. It covers five services today:
 
 | Namespace | Service | What it exercises |
 |---|---|---|
@@ -12,6 +12,7 @@ resources reach, and cleans up after itself. It covers four services today:
 | `dizzy cinder` | Block storage | Volume create, extend (resize), snapshot |
 | `dizzy keystone` | Identity | Domains, roles, projects, users, role assignments, scoped token issue |
 | `dizzy nova` | Compute | Server boot (image / volume), stop/start (soft / hard), resize + confirm, live migration, volume & port attach/detach, multi-network, user data |
+| `dizzy glance` | Image | Image create + synthetic data upload, metadata/property churn, visibility transitions (private / shared / community / public), member add/accept/remove, deactivate/reactivate, delete |
 
 Every namespace offers the same five verbs — `generate`, `apply`, `chaos`,
 `monitor`, `cleanup` — plus `status` and `report`. A scenario expands
@@ -59,7 +60,7 @@ $ dizzy neutron report --run run-<id>.json                     # see the timings
 $ dizzy neutron cleanup --run run-<id>.json                    # tear it down
 ```
 
-`--scenario` takes a filesystem path, and the twelve built-in profiles live under
+`--scenario` takes a filesystem path, and the fifteen built-in profiles live under
 `scenarios/` in this repository — so clone it even if you installed a release
 binary. The `small` profile fits Neutron's default per-project quotas and runs
 against a fresh project with nothing raised.
@@ -104,9 +105,9 @@ matches what you are doing right now.
 
 - `dizzy` operates only within the project of the selected `clouds.yaml` entry.
 - Every resource it creates carries a run identifier — a Neutron tag, Cinder
-  metadata, a Keystone name prefix, or (for Nova) server and volume metadata.
-  `cleanup` deletes strictly on that identifier, so it never touches resources
-  the tool did not create.
+  metadata, a Keystone name prefix, (for Nova) server and volume metadata, or
+  (for Glance) an image tag. `cleanup` deletes strictly on that identifier, so it
+  never touches resources the tool did not create.
 - `apply --dry-run` previews a plan without making a single API call.
 - There are no destructive defaults; the cloud and project are always explicit.
 

@@ -1,8 +1,8 @@
 # CLI reference
 
 A single binary, `dizzy`, with one command namespace per OpenStack service:
-`neutron`, `cinder`, `keystone`, and `nova`. Each namespace offers the same
-verbs.
+`neutron`, `cinder`, `keystone`, `nova`, and `glance`. Each namespace offers the
+same verbs.
 
 | Verb | Touches the API | Purpose |
 |---|---|---|
@@ -104,7 +104,10 @@ Namespace-specific flags:
 pre-check** against the expanded plan and abort with an itemized message before
 creating anything if the quotas are insufficient. `keystone apply` runs a
 read-only **privilege pre-check** instead, since Keystone has no default
-per-resource quotas. See [Deal with the quota pre-check](../how-to/raise-quotas.md)
+per-resource quotas. `glance apply` runs **no** pre-check: Glance exposes no
+project-quota API (its image count and size caps are deployment config), so an
+over-limit request surfaces as a fast-failed 413 during the run rather than being
+caught up front. See [Deal with the quota pre-check](../how-to/raise-quotas.md)
 and [Keystone's privilege model](../explanation/privilege-model.md).
 
 `nova apply` takes no service-specific flags: the boot image, flavor, and resize
@@ -117,6 +120,15 @@ schedules any live migration, `nova apply` also runs a **fail-open
 live-migration pre-check**: it needs the admin role and at least two usable
 compute hosts, and when either is missing it skips live migration for the run
 with a warning and continues — a missing admin capability never aborts a run.
+
+`glance apply` takes no service-specific flags: every image is created by dizzy
+with a synthetic, generated data payload of a configurable size, so a run
+references no pre-existing image (`resources.images` and
+`distribution.image_size_mib` shape it). Image import through web-download and
+multi-store placement are out of scope: every image enters through the direct
+data-upload path into the cloud's default store. A payload larger than the
+default `--timeout` allows may need `--timeout` raised, since each upload is one
+operation bounded by it.
 
 **On interrupt.** SIGINT/SIGTERM writes the run record first, then tears the
 partial topology down in reverse dependency order, logs the deletion count, and
@@ -154,6 +166,7 @@ Namespace-specific:
 | `--resize-ratio <float>` | `cinder` | `0.3` | Probability per churn step of extending a live, not-yet-resized volume to its planned target; `0` disables |
 | `--token-ratio <float>` | `keystone` | `0.3` | Probability per churn step of issuing a token as a live, assigned user; `0` disables |
 | `--lifecycle-ratio <float>` | `nova` | `0.3` | Probability per churn step of mutating a live server (stop/start, resize, or live-migrate); `0` disables |
+| `--lifecycle-ratio <float>` | `glance` | `0.3` | Probability per churn step of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, or metadata churn); `0` disables |
 | `--privilege`, `--domain`, `--roles` | `keystone` | | As for `apply` |
 
 By default a churn run tears its resources down at the end **or when
@@ -196,9 +209,9 @@ across iterations. To broaden coverage, run several monitors with different
 `--seed` values.
 
 > **Do not run `monitor` concurrently with another `dizzy` run in the same
-> project.** For `neutron`, `cinder`, and `nova` the pre-flight sweep is always
-> on and reclaims any tester-created resource in the project, so it would tear a
-> concurrent run down mid-flight. For `keystone` the equivalent sweep is opt-in
+> project.** For `neutron`, `cinder`, `nova`, and `glance` the pre-flight sweep is
+> always on and reclaims any tester-created resource in the project, so it would
+> tear a concurrent run down mid-flight. For `keystone` the equivalent sweep is opt-in
 > via `--reclaim-orphans`, and because an admin token lists cloud-wide it is only
 > safe when no other `dizzy` process targets the cloud at all.
 
@@ -217,7 +230,7 @@ Re-queries the current state of a run's resources from the API.
 ## `report`
 
 Renders metrics from a run record. Never touches the API. The same command
-builder backs all four namespaces, so `dizzy cinder report` and
+builder backs all five namespaces, so `dizzy cinder report` and
 `dizzy neutron report` are the same code.
 
 | Flag | Default | Description |
@@ -261,6 +274,10 @@ Discovery differs per service, and so does what `--run-id` alone can reach:
   volumes, and networks (a network delete cascades its subnet). A
   boot-from-volume root volume carries no dizzy identity — it is delete-on-
   termination, so it dies with its server.
+- **glance** — images are found by the `dizzy:run=<id>` Glance image tag, filtered
+  server-side by the list API's `tag` parameter, with the run record's created
+  list as a fallback. Images are a single kind with no ordering, so a bare
+  `--run-id` reaches everything the run created.
 
 See [Resource identity and cleanup](../explanation/resource-identity.md).
 

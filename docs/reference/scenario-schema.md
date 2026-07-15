@@ -292,6 +292,70 @@ runs against a fresh project without raising any compute quota. `medium` and
 `large` need raised quotas. The companion Cinder and Neutron consumption is not
 pre-checked — see [Deal with the quota pre-check](../how-to/raise-quotas.md).
 
+## Glance
+
+```yaml
+name: small
+seed: 42
+
+resources:
+  images: 5
+
+distribution:
+  image_size_mib:        { min: 1, max: 8 }   # synthetic upload payload per image, in MiB
+  metadata_update_ratio: 0.5                  # fraction whose custom properties are churned
+  shared_ratio:          0.5                  # fraction transitioned to shared visibility
+  member_accept_ratio:   0.5                  # of the shared images, fraction whose membership is accepted
+  member_remove_ratio:   0.5                  # of the shared images, fraction whose membership is later removed
+  community_ratio:       0.25                 # fraction transitioned to community visibility
+  public_ratio:          0.0                  # fraction transitioned to public visibility (admin-only; see below)
+  deactivate_ratio:      0.34                 # fraction driven through a deactivate/reactivate cycle
+  deleted_ratio:         0.34                 # fraction deleted during the run
+```
+
+Every image is created by dizzy with a **synthetic, generated data payload** of
+`image_size_mib` mebibytes, uploaded through the direct data path — so a run
+references no pre-existing image, and the byte volume it pushes is a scenario
+parameter rather than an accident of the cloud. Image import through
+web-download and multi-store placement are out of scope: every image lands in the
+cloud's default store. `image_size_mib.max` is the byte-volume knob; because each
+upload is one operation bounded by `--timeout`, a large payload may need
+`--timeout` raised.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `resources.images` | int | Images to create |
+| `distribution.image_size_mib` | range | Synthetic upload payload size drawn per image, in MiB; `min >= 1` when `images > 0` |
+| `distribution.metadata_update_ratio` | ratio | Fraction whose custom properties are churned (an add pass then a replace/remove pass) |
+| `distribution.shared_ratio` | ratio | Fraction transitioned to shared visibility, with the run's own project added as a member (a self-share, so the accept stays authorized) |
+| `distribution.member_accept_ratio` | ratio | Of the shared images, fraction whose membership is accepted; only consulted for a shared image |
+| `distribution.member_remove_ratio` | ratio | Of the shared images, fraction whose membership is later removed; only consulted for a shared image |
+| `distribution.community_ratio` | ratio | Fraction transitioned to community visibility |
+| `distribution.public_ratio` | ratio | Fraction transitioned to public visibility; `publicize_image` is admin-only on most clouds, so the shipped profiles keep this at `0` |
+| `distribution.deactivate_ratio` | ratio | Fraction driven through a deactivate/reactivate cycle |
+| `distribution.deleted_ratio` | ratio | Fraction deleted during the run |
+
+Every lifecycle decision — the visibility transitions, the member operations, and
+the deactivate cycle — lives **in the plan**, not in a choice made at apply time,
+so the same scenario and seed drive the same operations. The upload payload bytes
+are likewise derived from the seed, so a run pushes byte-identical data every
+time.
+
+### Profiles
+
+Expanded counts at each profile's shipped seed:
+
+| Profile | Images | Upload total | Shared | Community | Deactivations | Deletes | Chaos duration |
+|---|---|---|---|---|---|---|---|
+| `small` | 5 | 20 MiB | 3 | 3 | 2 | 2 | 5m |
+| `medium` | 20 | 406 MiB | 11 | 6 | 10 | 8 | 30m |
+| `large` | 50 | 2007 MiB | 29 | 12 | 24 | 23 | 1h |
+
+All three profiles keep `public_ratio` at `0`, since `publicize_image` is
+admin-only on most clouds; raise it only against a cloud that grants the policy.
+Glance exposes no project-quota API, so none of the profiles is pre-checked — an
+over-limit request surfaces as a fast-failed 413.
+
 ## The `chaos:` block
 
 Optional, and read only by the `chaos` command. It adds a temporal frame to the
@@ -317,7 +381,8 @@ chaos:                                # the block shipped by scenarios/neutron/m
 | `resize_ratio` | ratio | cinder | Probability per step of extending a live volume to its planned target |
 | `token_ratio` | ratio | keystone | Probability per step of issuing a token as a live, assigned user |
 | `lifecycle_ratio` | ratio | nova | Probability per step of mutating a live server (stop/start, resize, or live-migrate) |
+| `lifecycle_ratio` | ratio | glance | Probability per step of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, or metadata churn) |
 
-All twelve built-in profiles carry a `chaos:` block, so `chaos` runs any of them
+All fifteen built-in profiles carry a `chaos:` block, so `chaos` runs any of them
 with no flags at all. See [The churn engine](../explanation/churn-engine.md) for
 what `churn_ratio` and `target_fill` actually control.

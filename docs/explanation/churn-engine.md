@@ -82,12 +82,15 @@ This is why the churn engine can safely pick any live node as a delete candidate
 
 Create and delete change the population. Some interesting operations don't.
 
-Cinder's **extend**, Keystone's **token issue**, and Nova's **server lifecycle**
-are modeled as *mutations*: with probability `resize_ratio` (or `token_ratio`, or
-`lifecycle_ratio`), a churn step mutates an existing resource instead of changing
-the population. A volume is extended to its plan's target; a user with a live
-project assignment authenticates for a scoped token; a live server is
-stop/started, resized-and-confirmed, or live-migrated, in that fixed precedence.
+Cinder's **extend**, Keystone's **token issue**, Nova's **server lifecycle**, and
+Glance's **image lifecycle** are modeled as *mutations*: with probability
+`resize_ratio` (or `token_ratio`, or `lifecycle_ratio`), a churn step mutates an
+existing resource instead of changing the population. A volume is extended to its
+plan's target; a user with a live project assignment authenticates for a scoped
+token; a live server is stop/started, resized-and-confirmed, or live-migrated, in
+that fixed precedence; a live image is metadata-churned, shared with a member
+added/accepted/removed, deactivated-and-reactivated, and flipped to community and
+public visibility, in that fixed precedence.
 
 Because mutations leave the population untouched, the controller's economics
 above are unaffected. They still count against the per-tick fan-out, since they
@@ -95,8 +98,8 @@ are API calls like any other.
 
 Each resource *instance* is mutated at most once per lifetime — a volume is
 extended to its planned target and not further, a grant issues one token, a
-server runs its planned lifecycle once — and is re-armed when it is deleted and
-recreated. For Cinder this is what keeps a
+server runs its planned lifecycle once, an image runs its planned lifecycle once
+— and is re-armed when it is deleted and recreated. For Cinder this is what keeps a
 week-long soak's gigabyte consumption inside the envelope that the quota
 pre-check validated (the sum of planned final sizes), rather than growing without
 bound.

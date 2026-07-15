@@ -5,8 +5,8 @@
 regressions, and error-rate changes become visible as trends instead of being
 buried in per-run JSON files.
 
-Available in every namespace: `neutron monitor`, `cinder monitor`, and
-`keystone monitor`.
+Available in every namespace: `neutron monitor`, `cinder monitor`,
+`keystone monitor`, `nova monitor`, and `glance monitor`.
 
 > **One `dizzy` per project.** The pre-flight sweep reclaims any `dizzy`-tagged
 > resource it finds, so a concurrent `apply` or `chaos` in the same project would

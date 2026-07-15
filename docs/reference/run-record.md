@@ -13,7 +13,7 @@ unboundedly.
 | Field | Type | Notes |
 |---|---|---|
 | `runID` | string | The run id; also the tag/metadata/name-prefix value |
-| `service` | string | `neutron`, `cinder`, `keystone`, or `nova`. Omitted on older records |
+| `service` | string | `neutron`, `cinder`, `keystone`, `nova`, or `glance`. Omitted on older records |
 | `scenario` | string | Scenario name |
 | `seed` | int | The seed the plan was expanded from |
 | `startedAt` | timestamp | RFC 3339 |

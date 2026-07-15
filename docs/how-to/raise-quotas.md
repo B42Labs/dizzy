@@ -4,6 +4,11 @@
 against your project's quotas **before creating anything**, and abort with an
 itemized message if the quotas are too low:
 
+> `glance apply` runs **no** quota pre-check. Glance exposes no project-quota API
+> to compare a plan against — its image count and per-image size caps are
+> deployment configuration, not a per-project quota — so an over-limit request
+> surfaces only during the run, as a fast-failed 413.
+
 ```
 error: plan exceeds project quota; raise these quotas before applying:
 networks need 100, quota 10; subnets need 200, quota 10; routers need 20, quota 10
