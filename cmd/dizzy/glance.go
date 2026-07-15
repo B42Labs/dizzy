@@ -23,6 +23,8 @@ func newGlanceCmd(opts *globalOptions) *cobra.Command {
 	cmd.AddCommand(
 		newGlanceGenerateCmd(opts),
 		newGlanceApplyCmd(opts),
+		newGlanceChaosCmd(opts),
+		newGlanceMonitorCmd(opts),
 		newGlanceStatusCmd(opts),
 		newReportCmd(opts),
 		newGlanceCleanupCmd(opts),

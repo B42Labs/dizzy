@@ -12,36 +12,27 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/B42Labs/dizzy/internal/chaos"
-	"github.com/B42Labs/dizzy/internal/chaos/novagraph"
+	"github.com/B42Labs/dizzy/internal/chaos/glancegraph"
 	"github.com/B42Labs/dizzy/internal/config"
+	"github.com/B42Labs/dizzy/internal/glance"
+	glanceexec "github.com/B42Labs/dizzy/internal/glance/executor"
+	glancescenario "github.com/B42Labs/dizzy/internal/glance/scenario"
 	"github.com/B42Labs/dizzy/internal/metrics"
-	"github.com/B42Labs/dizzy/internal/nova"
-	novaexec "github.com/B42Labs/dizzy/internal/nova/executor"
-	novascenario "github.com/B42Labs/dizzy/internal/nova/scenario"
 	"github.com/B42Labs/dizzy/internal/resource"
 	"github.com/B42Labs/dizzy/internal/run"
 	"github.com/B42Labs/dizzy/internal/telemetry"
 )
 
-// defaultChaosLifecycleRatio is the built-in per-step probability of mutating a
-// live instance, used when neither the scenario chaos block nor the
-// --lifecycle-ratio flag supplies one. It backs both the nova chaos command (a
-// server stop/start, resize, or live migration) and the glance chaos command (an
-// image deactivate/reactivate, visibility flip, member add/remove, or metadata
-// churn). The temporal defaults it joins live in chaos.go, shared with the other
-// chaos commands.
-const defaultChaosLifecycleRatio = 0.3
-
-// newNovaChaosCmd builds "nova chaos": a random churn/soak run that, for a
-// configured duration, continuously creates and deletes servers (and their
-// companion networks, volumes, and ports) and occasionally drives a live server
-// through its planned lifecycle, bounded by the scenario as the spatial
-// envelope. It authenticates, resolves image/flavors and runs the pre-checks,
-// runs the churn, records the run, and — whether it completed or was
-// interrupted, unless --no-cleanup — tears the resources down by identity and
-// reports any leak. It mirrors "cinder chaos" with the compute-specific
+// newGlanceChaosCmd builds "glance chaos": a random churn/soak run that, for a
+// configured duration, continuously creates and deletes images (each with its
+// synthetic uploaded payload) and occasionally drives a live image through its
+// planned lifecycle — a deactivate/reactivate cycle, visibility flips, member
+// add/accept/remove, and metadata churn — bounded by the scenario as the spatial
+// envelope. It authenticates, runs the churn, records the run, and — whether it
+// completed or was interrupted, unless --no-cleanup — tears the images down by
+// identity and reports any leak. It mirrors "nova chaos" with the image-specific
 // --lifecycle-ratio.
-func newNovaChaosCmd(opts *globalOptions) *cobra.Command {
+func newGlanceChaosCmd(opts *globalOptions) *cobra.Command {
 	var (
 		scenarioPath   string
 		sets           []string
@@ -52,15 +43,18 @@ func newNovaChaosCmd(opts *globalOptions) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "chaos",
-		Short: "Run continuous randomized server churn within a scenario envelope",
+		Short: "Run continuous randomized image churn within a scenario envelope",
+		Long: "Run continuous randomized image churn within a scenario envelope.\n\n" +
+			"Run only one dizzy process per project: a concurrent monitor's always-on pre-flight sweep reclaims " +
+			"every dizzy-tagged image in the project, so this run's images would be torn down mid-flight.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			s, p, err := buildNovaPlanFromFlags(cmd, opts, scenarioPath, sets)
+			s, p, err := buildGlancePlanFromFlags(cmd, opts, scenarioPath, sets)
 			if err != nil {
 				return err
 			}
 
-			cfg := mergeNovaChaosConfig(cmd, opts, s, f, lifecycleRatio)
-			cfg.Classify = novagraph.Classify
+			cfg := mergeGlanceChaosConfig(cmd, opts, s, f, lifecycleRatio)
+			cfg.Classify = glancegraph.Classify
 			if err := cfg.Validate(); err != nil {
 				return err
 			}
@@ -78,7 +72,7 @@ func newNovaChaosCmd(opts *globalOptions) *cobra.Command {
 			}()
 
 			tel, err := telemetry.Setup(ctx, telemetry.Config{
-				Enabled: opts.otel, Cloud: opts.cloudName(), Scenario: p.Scenario, Service: "nova",
+				Enabled: opts.otel, Cloud: opts.cloudName(), Scenario: p.Scenario, Service: "glance",
 			})
 			if err != nil {
 				return fmt.Errorf("setting up telemetry: %w", err)
@@ -90,23 +84,16 @@ func newNovaChaosCmd(opts *globalOptions) *cobra.Command {
 				return err
 			}
 
-			cs, err := config.NewComputeStack(ctx, opts.osCloud)
+			gc, err := config.NewImageClient(ctx, opts.osCloud)
 			if err != nil {
-				return fmt.Errorf("creating compute clients: %w", err)
-			}
-
-			// The envelope is the population's worst case, so image/flavors and the
-			// pre-checks are resolved against the full plan exactly as apply does.
-			resolved, err := resolveNovaRefs(ctx, cs, p)
-			if err != nil {
-				return err
+				return fmt.Errorf("creating image client: %w", err)
 			}
 
 			collector := metrics.NewCollector()
-			client := nova.New(cs.Compute, cs.Network, cs.BlockStorage, runID, collector)
+			client := glance.New(gc, runID, collector)
 			client.SetTelemetry(tel)
 
-			nodes, err := novagraph.Build(p, client, resolved, opts.timeout)
+			nodes, err := glancegraph.Build(p, client, p.Seed, opts.timeout)
 			if err != nil {
 				return fmt.Errorf("building churn graph: %w", err)
 			}
@@ -138,7 +125,7 @@ func newNovaChaosCmd(opts *globalOptions) *cobra.Command {
 
 			rec := &run.Record{
 				RunID:      runID,
-				Service:    "nova",
+				Service:    "glance",
 				Scenario:   p.Scenario,
 				Seed:       p.Seed,
 				StartedAt:  start,
@@ -154,36 +141,36 @@ func newNovaChaosCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("writing output: %w", err)
 			}
 
-			return finishNovaChurn(ctx, cmd, client, runID, recordPath, result.Created, ctx.Err() != nil, noCleanup, opts.timeout)
+			return finishGlanceChurn(ctx, cmd, client, runID, recordPath, result.Created, ctx.Err() != nil, noCleanup, opts.concurrency, opts.timeout)
 		},
 	}
 
 	flags := cmd.Flags()
 	flags.StringVar(&scenarioPath, "scenario", "", "path to the scenario YAML file (required)")
-	flags.StringArrayVar(&sets, "set", nil, "override a scenario value, e.g. --set resources.servers=20 (repeatable)")
+	flags.StringArrayVar(&sets, "set", nil, "override a scenario value, e.g. --set resources.images=20 (repeatable)")
 	flags.DurationVar(&f.duration, "duration", 0, "total wall-clock runtime of the churn (required via flag or the scenario chaos block)")
 	flags.DurationVar(&f.minInterval, "min-interval", defaultChaosMinInterval, "minimum random delay between scheduled actions")
 	flags.DurationVar(&f.maxInterval, "max-interval", defaultChaosMaxInterval, "maximum random delay between scheduled actions")
 	flags.IntVar(&f.maxParallel, "max-parallel", 0, "maximum concurrent in-flight churn operations (default: --concurrency)")
 	flags.Float64Var(&f.churnRatio, "churn-ratio", defaultChaosChurnRatio, "create bias at steady state, between 0 and 1")
 	flags.Float64Var(&f.targetFill, "target-fill", defaultChaosTargetFill, "fraction of the envelope to keep populated on average, between 0 and 1")
-	flags.Float64Var(&lifecycleRatio, "lifecycle-ratio", defaultChaosLifecycleRatio, "probability per churn step of mutating a live server (stop/start, resize, or live-migrate), between 0 and 1")
-	flags.BoolVar(&noCleanup, "no-cleanup", false, "leave the servers and their companions in place — at the end of the run or on interrupt — instead of tearing them down by identity")
+	flags.Float64Var(&lifecycleRatio, "lifecycle-ratio", defaultChaosLifecycleRatio, "probability per churn step of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, or metadata churn), between 0 and 1")
+	flags.BoolVar(&noCleanup, "no-cleanup", false, "leave the images in place — at the end of the run or on interrupt — instead of tearing them down by identity")
 	// MarkFlagRequired only fails for an unknown flag; "scenario" was just added.
 	_ = cmd.MarkFlagRequired("scenario")
 
 	return cmd
 }
 
-// mergeNovaChaosConfig builds the churn config from three layers, lowest
+// mergeGlanceChaosConfig builds the churn config from three layers, lowest
 // precedence first: built-in defaults, the scenario's chaos block (each non-zero
 // field), and the dedicated flags (each one explicitly set). A zero field in the
 // chaos block falls back to the default; to set a field to zero use the flag —
 // except lifecycle_ratio, a pointer whose explicit 0 disables mutations while an
 // omitted key falls back to the default. The lifecycle ratio maps onto the
-// engine's mutate probability (chaos.Config.ResizeRatio). It is the compute
-// counterpart of mergeCinderChaosConfig.
-func mergeNovaChaosConfig(cmd *cobra.Command, opts *globalOptions, s novascenario.Scenario, f chaosFlags, lifecycleRatio float64) chaos.Config {
+// engine's mutate probability (chaos.Config.ResizeRatio). It is the image
+// counterpart of mergeNovaChaosConfig.
+func mergeGlanceChaosConfig(cmd *cobra.Command, opts *globalOptions, s glancescenario.Scenario, f chaosFlags, lifecycleRatio float64) chaos.Config {
 	cfg := chaos.Config{
 		MinInterval: defaultChaosMinInterval,
 		MaxInterval: defaultChaosMaxInterval,
@@ -242,13 +229,13 @@ func mergeNovaChaosConfig(cmd *cobra.Command, opts *globalOptions, s novascenari
 	return cfg
 }
 
-// finishNovaChurn applies the teardown policy. Unless --no-cleanup is set, the
-// run — whether it completed or was interrupted — tears the servers and their
-// companions down by identity (each operation bounded by opTimeout) and runs a
-// leak check; teardown and the leak check run on a context.WithoutCancel of ctx
-// so a first-signal interrupt does not kill the teardown it triggered. With
-// --no-cleanup the resources are left in place and the cleanup hint is printed.
-func finishNovaChurn(ctx context.Context, cmd *cobra.Command, c novaexec.Cleaner, runID, recordPath string, created []resource.Resource, interrupted, noCleanup bool, opTimeout time.Duration) error {
+// finishGlanceChurn applies the teardown policy. Unless --no-cleanup is set, the
+// run — whether it completed or was interrupted — tears the images down by
+// identity (each operation bounded by opTimeout) and runs a leak check; teardown
+// and the leak check run on a context.WithoutCancel of ctx so a first-signal
+// interrupt does not kill the teardown it triggered. With --no-cleanup the images
+// are left in place and the cleanup hint is printed.
+func finishGlanceChurn(ctx context.Context, cmd *cobra.Command, c glanceexec.Cleaner, runID, recordPath string, created []resource.Resource, interrupted, noCleanup bool, concurrency int, opTimeout time.Duration) error {
 	out := cmd.OutOrStdout()
 	if noCleanup {
 		reason := "churn complete"
@@ -259,14 +246,14 @@ func finishNovaChurn(ctx context.Context, cmd *cobra.Command, c novaexec.Cleaner
 		if recordPath != "" {
 			hint = "--run " + recordPath
 		}
-		_, err := fmt.Fprintf(out, "%s; resources left in place — reclaim with: nova cleanup %s\n", reason, hint)
+		_, err := fmt.Fprintf(out, "%s; resources left in place — reclaim with: glance cleanup %s\n", reason, hint)
 		return err
 	}
 
 	tctx := context.WithoutCancel(ctx)
-	cleaner := novaTimeoutCleaner{c, opTimeout}
+	cleaner := glanceTimeoutCleaner{c, opTimeout}
 
-	deleted, cleanupErr := novaexec.Cleanup(tctx, cleaner, runID, created, opTimeout)
+	deleted, cleanupErr := glanceexec.Cleanup(tctx, cleaner, runID, created, concurrency, opTimeout)
 	if _, err := fmt.Fprintf(out, "deleted %d resource(s) for run %s\n", deleted, runID); err != nil {
 		return fmt.Errorf("writing output: %w", err)
 	}
@@ -274,37 +261,27 @@ func finishNovaChurn(ctx context.Context, cmd *cobra.Command, c novaexec.Cleaner
 		return fmt.Errorf("tearing down run %s: %w", runID, cleanupErr)
 	}
 
-	leaked, err := novaLeakCheck(tctx, cleaner, runID)
+	leaked, err := glanceLeakCheck(tctx, cleaner, runID)
 	if err != nil {
 		return err
 	}
 	if leaked > 0 {
-		_, err = fmt.Fprintf(out, "leak check: %d run-tagged resource(s) still present after teardown\n", leaked)
+		_, err = fmt.Fprintf(out, "leak check: %d run-tagged image(s) still present after teardown\n", leaked)
 	} else {
-		_, err = fmt.Fprintf(out, "leak check: no run-tagged resources remain\n")
+		_, err = fmt.Fprintf(out, "leak check: no run-tagged images remain\n")
 	}
 	return err
 }
 
-// novaLeakCheck counts the resources still carrying the run's identity after
-// teardown, across every kind. It takes the novaexec.Cleaner seam so the listing
-// shares the teardown's per-op timeout bound.
-func novaLeakCheck(ctx context.Context, c novaexec.Cleaner, runID string) (int, error) {
-	servers, err := c.ListServersByMetadata(ctx, runID)
+// glanceLeakCheck counts the images still carrying the run's identity tag after
+// teardown. It takes the glanceexec.Cleaner seam so the listing shares the
+// teardown's per-op timeout bound. On a deployment configured with delayed_delete
+// a just-deleted image lingers in pending_delete while still tag-listed, so it
+// can be counted here even though teardown treated it as gone.
+func glanceLeakCheck(ctx context.Context, c glanceexec.Cleaner, runID string) (int, error) {
+	found, err := c.ListImagesByTag(ctx, runID)
 	if err != nil {
-		return 0, fmt.Errorf("leak check listing servers: %w", err)
+		return 0, fmt.Errorf("leak check listing images: %w", err)
 	}
-	volumes, err := c.ListVolumesByMetadata(ctx, runID)
-	if err != nil {
-		return len(servers), fmt.Errorf("leak check listing volumes: %w", err)
-	}
-	total := len(servers) + len(volumes)
-	for _, kind := range []resource.Kind{nova.KindPort, nova.KindNetwork, nova.KindSubnet} {
-		found, err := c.ListByTag(ctx, kind, runID)
-		if err != nil {
-			return total, fmt.Errorf("leak check listing %s: %w", kind, err)
-		}
-		total += len(found)
-	}
-	return total, nil
+	return len(found), nil
 }
