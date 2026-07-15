@@ -54,10 +54,17 @@ func TestPayloadSeedVariesPerLogicalName(t *testing.T) {
 	if PayloadSeed(42, "img-0001") == PayloadSeed(42, "img-0002") {
 		t.Error("payloadSeed collided for two distinct logical names")
 	}
-	if PayloadSeed(42, "img-0001") != PayloadSeed(42, "img-0001") {
-		t.Error("payloadSeed is not stable for the same plan seed and name")
-	}
 	if PayloadSeed(42, "img-0001") == PayloadSeed(43, "img-0001") {
 		t.Error("payloadSeed did not vary with the plan seed")
+	}
+}
+
+// TestPayloadSeedIsStable asserts the same (plan seed, logical name) pair always
+// derives the same seed, so a scenario's uploads are byte-identical run to run.
+func TestPayloadSeedIsStable(t *testing.T) {
+	const seed, name = 42, "img-0001"
+	first := PayloadSeed(seed, name)
+	if second := PayloadSeed(seed, name); first != second {
+		t.Errorf("payloadSeed unstable: %d != %d", first, second)
 	}
 }
