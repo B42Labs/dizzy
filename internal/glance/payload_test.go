@@ -51,13 +51,13 @@ func TestPayloadReaderExactLength(t *testing.T) {
 // seed derive distinct payload seeds, so two images never share a payload, while
 // the same (seed, name) pair is stable.
 func TestPayloadSeedVariesPerLogicalName(t *testing.T) {
-	if payloadSeed(42, "img-0001") == payloadSeed(42, "img-0002") {
+	if PayloadSeed(42, "img-0001") == PayloadSeed(42, "img-0002") {
 		t.Error("payloadSeed collided for two distinct logical names")
 	}
-	if payloadSeed(42, "img-0001") != payloadSeed(42, "img-0001") {
+	if PayloadSeed(42, "img-0001") != PayloadSeed(42, "img-0001") {
 		t.Error("payloadSeed is not stable for the same plan seed and name")
 	}
-	if payloadSeed(42, "img-0001") == payloadSeed(43, "img-0001") {
+	if PayloadSeed(42, "img-0001") == PayloadSeed(43, "img-0001") {
 		t.Error("payloadSeed did not vary with the plan seed")
 	}
 }

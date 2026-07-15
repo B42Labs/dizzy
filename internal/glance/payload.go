@@ -16,11 +16,13 @@ func payloadReader(seed, n int64) io.Reader {
 	return io.LimitReader(rand.New(rand.NewSource(seed)), n)
 }
 
-// payloadSeed derives the per-image payload seed from the plan seed and the
+// PayloadSeed derives the per-image payload seed from the plan seed and the
 // image's logical name, so two images in one plan get distinct payloads while the
 // whole plan stays reproducible from its single seed. It XORs the plan seed with
-// the FNV-64a hash of the logical name.
-func payloadSeed(planSeed int64, logical string) int64 {
+// the FNV-64a hash of the logical name. It is exported so the apply executor and
+// the chaos graph derive the same seed the client uploads with, keeping a
+// scenario's synthetic payloads byte-identical across both paths.
+func PayloadSeed(planSeed int64, logical string) int64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(logical))
 	return planSeed ^ int64(h.Sum64())
