@@ -37,7 +37,14 @@ metadata dizzy itself wrote. A **boot-from-volume root volume** is Nova-created
 with delete-on-termination and carries no dizzy identity of its own; it dies with
 its server, so cleanup reaches it through the server delete.
 
-All four converge on the same deterministic naming: a resource with logical name
+**Glance has first-class image tags.** Images carry the same two keys —
+`dizzy:run=<id>` and `dizzy:type=image` — as Glance image tags, set atomically at
+create via the create call rather than a follow-up tag request, and the image
+list API filters on a tag server-side. Discovery is therefore a single tag query,
+the cleanest of the five: images are one kind with no dependency ordering, so a
+bare `--run-id` reclaims everything the run created.
+
+All five converge on the same deterministic naming: a resource with logical name
 `net-0001` in run `a1b2c3d4` is called `dizzy-a1b2c3d4-net-0001` on the cloud.
 That is what makes it findable in Horizon, in `openstack network list`, and by
 prefix scan.
@@ -92,8 +99,8 @@ That makes the sweep self-healing and makes concurrent runs unsafe:
 > **Do not run `monitor` alongside another `dizzy` process in the same project.**
 > The sweep would tear the other run's resources down mid-flight.
 
-Neutron, Cinder, and Nova sweep unconditionally — all three are project-scoped.
-Keystone does not: because an admin token lists **cloud-wide** rather than
+Neutron, Cinder, Nova, and Glance sweep unconditionally — all four are
+project-scoped. Keystone does not: because an admin token lists **cloud-wide** rather than
 within one project, a Keystone sweep would
 reach across the entire cloud, deleting a concurrent run's in-flight users, roles,
 and whole domains. It is therefore opt-in via `--reclaim-orphans`, off by

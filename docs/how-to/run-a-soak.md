@@ -11,13 +11,14 @@ For what the knobs actually control, see
 
 ## Run a built-in profile
 
-All twelve profiles ship a `chaos:` block, so they run with no flags at all:
+All fifteen profiles ship a `chaos:` block, so they run with no flags at all:
 
 ```console
 $ dizzy neutron chaos --scenario scenarios/neutron/small.yaml    # 5m
 $ dizzy cinder chaos  --scenario scenarios/cinder/small.yaml     # 5m
 $ dizzy keystone chaos --scenario scenarios/keystone/small.yaml  # 5m
 $ dizzy nova chaos --scenario scenarios/nova/small.yaml          # 5m
+$ dizzy glance chaos --scenario scenarios/glance/small.yaml      # 5m
 ```
 
 The topology is torn down at the end of the run, followed by a leak check.
