@@ -1,0 +1,33 @@
+name: small
+seed: 42                        # deterministic; same seed => same plan
+
+# dizzy uploads a synthetic, generated payload for every image, so a run
+# references no pre-existing image. image_size_mib is the byte-volume knob:
+# raise distribution.image_size_mib.max to push more bytes through the service
+# (each upload is one operation bounded by --timeout, so large payloads may need
+# --timeout raised).
+resources:
+  images: 5
+
+distribution:
+  image_size_mib:        { min: 1, max: 8 }   # synthetic upload payload per image (total stays <= 40 MiB)
+  metadata_update_ratio: 0.5                  # fraction whose custom properties are churned
+  shared_ratio:          0.5                  # fraction transitioned to shared visibility
+  member_accept_ratio:   0.5                  # of the shared images, the fraction whose membership is accepted
+  member_remove_ratio:   0.5                  # of the shared images, the fraction whose membership is later removed
+  community_ratio:       0.25                 # fraction transitioned to community visibility
+  public_ratio:          0.0                  # publicize_image is admin-only on most clouds; keep 0 unless the cloud allows it
+  deactivate_ratio:      0.34                 # fraction driven through a deactivate/reactivate cycle
+  deleted_ratio:         0.34                 # fraction deleted during the run
+
+chaos:                                 # `glance chaos --scenario scenarios/glance/small.yaml` runs as-is
+  duration: 5m                         # total runtime; the only hard stop besides Ctrl-C
+  interval: { min: 200ms, max: 3s }    # random delay drawn per churn tick
+  parallel: { max: 4 }                 # per-tick fan-out, drawn in [1, max]; capped by --concurrency
+  churn_ratio: 0.5                     # create bias at steady state (0..1)
+  target_fill: 0.8                     # fraction of the envelope kept populated (0..1)
+  lifecycle_ratio: 0.3                 # probability per tick of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, metadata churn)
+
+# Glance exposes no project-quota API (its caps — image count and size — are
+# deployment config), so `glance apply` runs no quota pre-check: an over-limit
+# request surfaces as a fast-failed 413.

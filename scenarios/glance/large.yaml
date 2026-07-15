@@ -1,0 +1,30 @@
+name: large
+seed: 42                        # deterministic; same seed => same plan
+
+# The heaviest built-in image population, with the largest synthetic payloads.
+# Each upload is one operation bounded by --timeout; raise it when pushing large
+# payloads (image_size_mib.max) against a slow store.
+resources:
+  images: 50
+
+distribution:
+  image_size_mib:        { min: 16, max: 64 }
+  metadata_update_ratio: 0.5
+  shared_ratio:          0.5
+  member_accept_ratio:   0.5
+  member_remove_ratio:   0.5
+  community_ratio:       0.25
+  public_ratio:          0.0                  # publicize_image is admin-only on most clouds
+  deactivate_ratio:      0.34
+  deleted_ratio:         0.34
+
+chaos:                                 # `glance chaos --scenario scenarios/glance/large.yaml` runs as-is
+  duration: 1h
+  interval: { min: 200ms, max: 3s }
+  parallel: { max: 4 }
+  churn_ratio: 0.5
+  target_fill: 0.8
+  lifecycle_ratio: 0.3
+
+# Glance exposes no project-quota API, so `glance apply` runs no quota pre-check;
+# an over-limit request surfaces as a fast-failed 413.

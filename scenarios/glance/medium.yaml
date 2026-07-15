@@ -1,0 +1,31 @@
+name: medium
+seed: 42                        # deterministic; same seed => same plan
+
+# A larger image population with bigger payloads than small. dizzy uploads a
+# synthetic payload per image; raising image_size_mib.max raises the byte volume
+# pushed through the service (and may need --timeout raised, since each upload is
+# one operation bounded by it).
+resources:
+  images: 20
+
+distribution:
+  image_size_mib:        { min: 8, max: 32 }
+  metadata_update_ratio: 0.5
+  shared_ratio:          0.5
+  member_accept_ratio:   0.5
+  member_remove_ratio:   0.5
+  community_ratio:       0.25
+  public_ratio:          0.0                  # publicize_image is admin-only on most clouds
+  deactivate_ratio:      0.34
+  deleted_ratio:         0.34
+
+chaos:                                 # `glance chaos --scenario scenarios/glance/medium.yaml` runs as-is
+  duration: 30m
+  interval: { min: 200ms, max: 3s }
+  parallel: { max: 4 }
+  churn_ratio: 0.5
+  target_fill: 0.8
+  lifecycle_ratio: 0.3
+
+# Glance exposes no project-quota API, so `glance apply` runs no quota pre-check;
+# an over-limit request surfaces as a fast-failed 413.
