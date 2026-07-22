@@ -5,8 +5,8 @@ Releases are cut by pushing a `v*` tag; the
 publishes the binaries.
 
 Each release ships raw binaries for **linux/amd64**, **linux/arm64**, and
-**darwin/arm64**, plus a `checksums.txt`, a cosign signature (`.sig`) and
-certificate (`.pem`) for every file, and SPDX and CycloneDX SBOMs.
+**darwin/arm64**, plus a `checksums.txt`, a cosign signature bundle (`.bundle`)
+for every file, and SPDX and CycloneDX SBOMs.
 
 ## Install a binary
 
@@ -29,12 +29,11 @@ On macOS, `sha256sum` is `shasum -a 256 -c -`.
 ## Verify the cosign signature
 
 The binaries are signed keyless via Sigstore, with GitHub Actions as the OIDC
-identity. Download `$ASSET.sig` and `$ASSET.pem` alongside the binary:
+identity. Download `$ASSET.bundle` alongside the binary:
 
 ```sh
 cosign verify-blob \
-  --certificate $ASSET.pem \
-  --signature $ASSET.sig \
+  --bundle $ASSET.bundle \
   --certificate-identity-regexp 'https://github.com/B42Labs/dizzy/.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   $ASSET

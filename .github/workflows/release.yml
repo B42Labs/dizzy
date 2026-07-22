@@ -104,16 +104,16 @@ jobs:
         run: |
           for file in dizzy-* checksums.txt; do
             cosign sign-blob --yes \
-              --output-signature "${file}.sig" \
-              --output-certificate "${file}.pem" \
+              --new-bundle-format \
+              --bundle "${file}.bundle" \
               "$file"
           done
 
       - name: Generate SBOMs
         run: |
           for bin in dist/dizzy-*; do
-            # skip signature and certificate files
-            case "$bin" in *.sig|*.pem) continue ;; esac
+            # skip cosign signature bundles
+            case "$bin" in *.bundle) continue ;; esac
             name=$(basename "$bin")
             syft "$bin" --output spdx-json="dist/${name}.spdx.json"
             syft "$bin" --output cyclonedx-json="dist/${name}.cdx.json"

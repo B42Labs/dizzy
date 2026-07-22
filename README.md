@@ -27,7 +27,7 @@ no load balancers (no Octavia).
 
 Pre-built binaries for **linux/amd64**, **linux/arm64**, and **darwin/arm64**
 are published on the [releases page](https://github.com/B42Labs/dizzy/releases),
-alongside a `checksums.txt`, a cosign signature and certificate per file, and
+alongside a `checksums.txt`, a cosign signature bundle per file, and
 SPDX/CycloneDX SBOMs.
 
 ```sh
