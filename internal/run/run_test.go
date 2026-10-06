@@ -1,9 +1,13 @@
 package run
 
 import (
+	"bytes"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -150,5 +154,126 @@ func TestLegacyRecordWithoutServiceLoads(t *testing.T) {
 	}
 	if len(rec.Created) != 1 || rec.Created[0].ID != "n1" {
 		t.Errorf("legacy record Created = %+v, want the one recorded network", rec.Created)
+	}
+}
+
+// TestRecordIncompleteAndBucketWidthRoundTrip confirms a checkpoint's incomplete
+// marker and an unbounded run's bucket width survive a write/load round trip.
+func TestRecordIncompleteAndBucketWidthRoundTrip(t *testing.T) {
+	rec := sampleRecord()
+	rec.RunID = "ckpt0001"
+	rec.Incomplete = true
+	rec.Chaos = &ChaosStats{Creates: 3, BucketWidth: time.Hour}
+
+	path, err := Write(t.TempDir(), rec)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !loaded.Incomplete || loaded.Chaos == nil || loaded.Chaos.BucketWidth != time.Hour {
+		t.Errorf("loaded incomplete/bucketWidth = %v/%+v, want true/1h", loaded.Incomplete, loaded.Chaos)
+	}
+}
+
+// TestRecordOmitsIncompleteAndBucketWidth confirms a final record of a bounded
+// run carries neither key, so its shape is unchanged.
+func TestRecordOmitsIncompleteAndBucketWidth(t *testing.T) {
+	rec := sampleRecord()
+	rec.Chaos = &ChaosStats{Creates: 3}
+
+	path, err := Write(t.TempDir(), rec)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading record: %v", err)
+	}
+	for _, key := range []string{`"incomplete"`, `"bucketWidth"`} {
+		if bytes.Contains(data, []byte(key)) {
+			t.Errorf("record carries %s although it is unset:\n%s", key, data)
+		}
+	}
+}
+
+// TestLegacyChaosRecordLoadsComplete confirms a chaos record written before the
+// incomplete marker and the bucket width existed loads as a complete record of
+// a bounded run.
+func TestLegacyChaosRecordLoadsComplete(t *testing.T) {
+	legacy := `{
+  "runID": "legacy02",
+  "scenario": "small",
+  "seed": 1,
+  "startedAt": "2026-06-24T10:00:00Z",
+  "finishedAt": "2026-06-24T10:10:00Z",
+  "created": null,
+  "metrics": {"wall": 600000000000, "overall": {"type": "", "attempted": 0, "succeeded": 0, "failed": 0, "throughput": 0, "latency": {"min": 0, "mean": 0, "median": 0, "p90": 0, "p95": 0, "p99": 0, "max": 0}}, "byType": null, "errors": null, "readiness": null},
+  "chaos": {"creates": 4, "deletes": 2, "cycles": 2, "popMin": 0, "popMax": 3, "popMean": 1.5, "targetFill": 0.8}
+}` + "\n"
+	path := filepath.Join(t.TempDir(), "run-legacy02.json")
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatalf("writing legacy record: %v", err)
+	}
+
+	rec, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load of a legacy chaos record: %v", err)
+	}
+	if rec.Incomplete {
+		t.Error("legacy record loaded as incomplete, want complete")
+	}
+	if rec.Chaos == nil || rec.Chaos.BucketWidth != 0 || rec.Chaos.Creates != 4 {
+		t.Errorf("legacy chaos stats = %+v, want creates 4 and bucket width 0", rec.Chaos)
+	}
+}
+
+// TestWriteToMissingDirFails confirms a write into a directory that does not
+// exist fails with the wrapped path error and leaves nothing behind.
+func TestWriteToMissingDirFails(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "missing")
+	_, err := Write(dir, sampleRecord())
+	if err == nil {
+		t.Fatal("Write into a missing directory: expected an error, got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "writing run record to") {
+		t.Errorf("error %q does not start with %q", err.Error(), "writing run record to")
+	}
+	var pathErr *fs.PathError
+	if !errors.As(err, &pathErr) {
+		t.Errorf("error %q does not wrap an *fs.PathError", err.Error())
+	}
+	if _, statErr := os.Stat(dir); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("Write left %s behind (stat: %v)", dir, statErr)
+	}
+}
+
+// TestWriteTwiceKeepsLatest confirms rewriting a record for the same run id,
+// as a chaos checkpoint does, replaces it and leaves no temp file behind.
+func TestWriteTwiceKeepsLatest(t *testing.T) {
+	dir := t.TempDir()
+	first := sampleRecord()
+	first.Incomplete = true
+	if _, err := Write(dir, first); err != nil {
+		t.Fatalf("first Write: %v", err)
+	}
+	second := sampleRecord()
+	second.FinishedAt = first.FinishedAt.Add(time.Minute)
+	path, err := Write(dir, second)
+	if err != nil {
+		t.Fatalf("second Write: %v", err)
+	}
+
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !reflect.DeepEqual(second, loaded) {
+		t.Errorf("Load returned %+v, want the second record %+v", loaded, second)
+	}
+	if _, err := os.Stat(path + ".tmp"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("temp file %s.tmp remains after the write (stat: %v)", path, err)
 	}
 }

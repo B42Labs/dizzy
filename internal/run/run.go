@@ -2,7 +2,9 @@
 // metrics. A record (run-<id>.json) captures the created resource IDs, the run's
 // provenance and timing, the aggregated metrics, and any apply error, so a run
 // can be reported on, re-checked (status), or cleaned up (cleanup) after the
-// process that produced it has exited.
+// process that produced it has exited. A chaos run also rewrites its record
+// periodically while it runs, marked incomplete, so a killed process or a lost
+// node still leaves a recent record.
 package run
 
 import (
@@ -42,6 +44,10 @@ type Record struct {
 	// Chaos holds the churn-specific statistics of a soak/chaos run. It is nil
 	// for an apply run, so an apply record's shape is unchanged.
 	Chaos *ChaosStats `json:"chaos,omitempty"`
+	// Incomplete marks a checkpoint a chaos run wrote while it was still
+	// running: the run was still going or was killed before its final record.
+	// FinishedAt is then the checkpoint time. The final write omits the key.
+	Incomplete bool `json:"incomplete,omitempty"`
 }
 
 // ChaosStats holds the churn-specific statistics of a soak/chaos run, persisted
@@ -63,11 +69,15 @@ type ChaosStats struct {
 	PopMean    float64       `json:"popMean"`
 	TargetFill float64       `json:"targetFill"`
 	Buckets    []ChaosBucket `json:"buckets,omitempty"`
+	// BucketWidth is the fixed width of every time bucket of an unbounded run
+	// (--duration 0). It is omitempty and 0 for a bounded run, whose ten
+	// buckets divide its duration equally.
+	BucketWidth time.Duration `json:"bucketWidth,omitempty"`
 }
 
-// ChaosBucket is one equal-width time slice of a churn run: the operations whose
-// decision offset fell within it, summarized so latency and error degradation
-// over time is visible rather than only an aggregate.
+// ChaosBucket is one time slice of a churn run: the operations whose decision
+// offset fell within it, summarized so latency and error degradation over time
+// is visible rather than only an aggregate.
 type ChaosBucket struct {
 	Start  time.Duration        `json:"start"`
 	Stats  metrics.Stats        `json:"stats"`
@@ -75,8 +85,10 @@ type ChaosBucket struct {
 }
 
 // Write marshals r as indented JSON and writes it to dir as run-<id>.json,
-// returning the path written. It writes to a temp file and renames so a kill
-// mid-write never leaves a truncated record, mirroring the generate command.
+// returning the path written. It writes to a temp file, syncs it to disk and
+// renames it over the record, so a kill or a node loss mid-write leaves the
+// previous record or the new one, never a truncated one. Writing the same run
+// id again replaces the record, which is how a chaos run checkpoints.
 func Write(dir string, r *Record) (string, error) {
 	data, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
@@ -86,13 +98,32 @@ func Write(dir string, r *Record) (string, error) {
 
 	path := filepath.Join(dir, "run-"+r.RunID+".json")
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := writeSynced(tmp, data); err != nil {
 		return "", fmt.Errorf("writing run record to %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		return "", fmt.Errorf("finalizing run record %s: %w", path, err)
 	}
 	return path, nil
+}
+
+// writeSynced writes data to path and syncs the file before closing it, so the
+// rename that follows cannot publish a record whose data is not yet on disk.
+// The first error of the write, the sync and the close is returned.
+func writeSynced(path string, data []byte) (err error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}()
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // Load reads and decodes the run record at path.
