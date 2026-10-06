@@ -458,6 +458,46 @@ func TestLongLivedSkipsMigrationsWithoutVerdict(t *testing.T) {
 	}
 }
 
+// TestLongLivedUnmarkedServerNeverColdMigrates confirms a kept server the plan
+// does not mark for cold migration never cold-migrates, even when the run
+// enabled it, and draws from the same operations, in the same order, as a
+// marked server under a verdict that disabled cold migration.
+func TestLongLivedUnmarkedServerNeverColdMigrates(t *testing.T) {
+	opsOf := func(s novaplan.Server, r novaexec.Resolved) []string {
+		f := newFakeNova()
+		mutate := keptGraph(t, keptServer(s), f, r)
+		for i := 0; i < 30; i++ {
+			if err := mutate("srv-0001"); err != nil {
+				t.Fatalf("mutation %d: %v", i, err)
+			}
+		}
+		return logOf(f, f.opsBySrv, "srv-0001")
+	}
+
+	unmarked := novaplan.Server{StopStart: novaplan.StopStartSoft, Resize: true, LiveMigrate: true}
+	got := opsOf(unmarked, resolvedAll())
+	count := make(map[string]int)
+	for _, op := range got {
+		count[op]++
+	}
+	if count["cold-migrate"] != 0 {
+		t.Errorf("an unmarked server cold-migrated %d times in %v", count["cold-migrate"], got)
+	}
+	for _, op := range []string{"stop-start", "resize", "live-migrate"} {
+		if count[op] == 0 {
+			t.Errorf("30 mutations drew no %s: %v", op, got)
+		}
+	}
+
+	marked := unmarked
+	marked.ColdMigrate = true
+	noCold := resolvedAll()
+	noCold.ColdMigration = false
+	if want := opsOf(marked, noCold); !reflect.DeepEqual(got, want) {
+		t.Errorf("operations = %v, want those of a marked server without the cold verdict %v", got, want)
+	}
+}
+
 // TestLongLivedColdMigrateErrorSurfaces confirms a failed cold migration comes
 // back from the mutation unchanged and the server's next mutation runs.
 func TestLongLivedColdMigrateErrorSurfaces(t *testing.T) {
