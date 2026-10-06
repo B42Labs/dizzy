@@ -1,9 +1,10 @@
 // Package chaos runs a random churn/soak load against an OpenStack service.
 // Instead of building a topology once and stopping, it keeps creating and
 // deleting resources at random, seeded intervals and parallelism for a
-// configured duration, using a scenario plan as the spatial envelope: the live
-// population never exceeds the plan's resource set, and only planned resources
-// whose parents exist are ever created. It also draws an optional mutate action
+// configured duration, or until its context is cancelled in an unbounded run,
+// using a scenario plan as the spatial envelope: the live population never
+// exceeds the plan's resource set, and only planned resources whose parents
+// exist are ever created. It also draws an optional mutate action
 // — an in-place change of a live instance (e.g. a volume extend) that is neither
 // a create nor a delete, bounded to at most once per instance lifetime. The
 // schedule of decisions is deterministic for a given seed and config, while the
@@ -29,9 +30,14 @@ import (
 	"github.com/B42Labs/dizzy/internal/resource"
 )
 
-// bucketCount is the number of equal-width time buckets the run's duration is
-// divided into for the time-series latency/error report.
+// bucketCount is the number of equal-width time buckets a bounded run's
+// duration is divided into for the time-series latency/error report.
 const bucketCount = 10
+
+// minBucketWidth is the narrowest time bucket a run may ask for. It keeps the
+// series of an unbounded run, which gains one bucket per width, at no more
+// than 1,440 buckets per day.
+const minBucketWidth = time.Minute
 
 // maxParallelCeiling and maxIntervalCeiling bound the churn knobs from above so
 // that valid-but-absurd operator input cannot push the scheduler into runaway
@@ -55,6 +61,11 @@ const (
 // match the metrics report, and when nil a minimal default labels only
 // canceled/timeout/other. Per-operation retry and timeout are the builder's
 // concern, captured inside the node closures.
+//
+// Unbounded selects a run without an end: it keeps going until its context is
+// cancelled, Duration must be 0, and its time series is sliced into buckets of
+// BucketWidth instead of into bucketCount equal parts of Duration. A bounded
+// run ignores BucketWidth.
 type Config struct {
 	Duration    time.Duration
 	MinInterval time.Duration
@@ -65,14 +76,26 @@ type Config struct {
 	ResizeRatio float64
 	Concurrency int
 	Classify    func(error) string
+	Unbounded   bool
+	BucketWidth time.Duration
 }
 
 // Validate checks the merged config (defaults, YAML block, and flag overrides
 // combined) for consistency. Unlike the scenario block, it requires a positive
-// duration, since by now a flag has had its chance to supply one.
+// duration for a bounded run, since by now a flag has had its chance to supply
+// one; an unbounded run instead requires a duration of 0 and a bucket width.
 func (c Config) Validate() error {
-	if c.Duration <= 0 {
+	if c.Unbounded && c.Duration != 0 {
+		return fmt.Errorf("chaos duration must be 0 for an unbounded run, got %s", c.Duration)
+	}
+	if !c.Unbounded && c.Duration <= 0 {
 		return fmt.Errorf("chaos duration must be set and positive, got %s", c.Duration)
+	}
+	if c.Unbounded && c.BucketWidth == 0 {
+		return errors.New("chaos bucket-width must be set for an unbounded run")
+	}
+	if c.BucketWidth != 0 && c.BucketWidth < minBucketWidth {
+		return fmt.Errorf("chaos bucket-width must be at least %s, got %s", minBucketWidth, c.BucketWidth)
 	}
 	if c.MinInterval <= 0 {
 		return fmt.Errorf("chaos min-interval must be positive, got %s", c.MinInterval)
@@ -104,19 +127,22 @@ func (c Config) Validate() error {
 // Result is the outcome of a churn run: the deterministic decision log, the
 // resources still live at the end (for the run record and cleanup), churn
 // counters, the population series summary, and per-time-bucket latency/error
-// statistics.
+// statistics. An unbounded run keeps no decision log, so its Decisions is nil,
+// and its BucketWidth is the width of its buckets; a bounded run's BucketWidth
+// is 0.
 type Result struct {
-	Decisions  []Decision
-	Created    []resource.Resource
-	Creates    int
-	Deletes    int
-	Mutates    int
-	Cycles     int
-	PopMin     int
-	PopMax     int
-	PopMean    float64
-	TargetFill float64
-	Buckets    []Bucket
+	Decisions   []Decision
+	Created     []resource.Resource
+	Creates     int
+	Deletes     int
+	Mutates     int
+	Cycles      int
+	PopMin      int
+	PopMax      int
+	PopMean     float64
+	TargetFill  float64
+	Buckets     []Bucket
+	BucketWidth time.Duration
 }
 
 // Decision is one scheduled action in the run's deterministic schedule. Action
@@ -129,7 +155,9 @@ type Decision struct {
 }
 
 // Bucket summarizes the operations whose decision offset fell in one time slice
-// of the run, so latency/error degradation over time is visible.
+// of the run, so latency/error degradation over time is visible. The last
+// bucket of an unbounded run may be partial; its throughput still divides by
+// the full width.
 type Bucket struct {
 	Start  time.Duration
 	Stats  metrics.Stats
@@ -169,7 +197,9 @@ type Node struct {
 // drawing every decision from seed. nodes come from a per-service builder, each
 // carrying create/delete closures that capture their cloud client. It returns
 // when cfg.Duration elapses on clk or ctx is cancelled, after letting in-flight
-// operations drain. A non-nil error means the config was rejected before any
+// operations drain; an unbounded run returns only on cancellation, which is its
+// normal end, so it lets the cloud calls already in flight finish rather than
+// cutting them off. A non-nil error means the config was rejected before any
 // work started; operation-level failures are tolerated and reported in the
 // result.
 func Run(ctx context.Context, nodes []Node, seed int64, cfg Config, clk Clock) (*Result, error) {
@@ -234,9 +264,12 @@ type slot struct {
 // results accumulates operation outcomes, one slot per time bucket, and the
 // completed-cycle count from the concurrent operation tasks. A bounded run has
 // bucketCount slots of Duration/bucketCount from the start, and an offset past
-// the last slot lands in it. advance seals a slot once the scheduler's offset
-// has moved past it and none of its operations is in flight: offsets only
-// grow, so a sealed slot receives nothing more and its raw data is released.
+// the last slot lands in it. An unbounded run has slots of BucketWidth, which
+// advance appends as the scheduler's offset reaches them, so a bucket without
+// operations is still present. advance seals a slot once the scheduler's
+// offset has moved past it and none of its operations is in flight: offsets
+// only grow, so a sealed slot receives nothing more and its raw data is
+// released.
 type results struct {
 	mu     sync.Mutex // guards slots, open and cycles
 	width  time.Duration
@@ -248,6 +281,9 @@ type results struct {
 
 // newResults builds the bucket slots for cfg.
 func newResults(cfg Config) *results {
+	if cfg.Unbounded {
+		return &results{width: cfg.BucketWidth}
+	}
 	width := cfg.Duration / bucketCount
 	if width <= 0 {
 		width = 1 // a sub-bucketCount duration: collapse to unit-width buckets
@@ -268,13 +304,17 @@ func (r *results) index(offset time.Duration) int {
 }
 
 // advance moves the series to the scheduler's current offset. The scheduler
-// calls it once per tick, before the tick's operations start. It seals every
-// slot below the current one whose operations have all finished: sealing
-// computes the slot's Bucket and releases its raw latencies and error tally.
+// calls it once per tick, before the tick's operations start. It appends the
+// slots up to the current one and seals every slot below the current one
+// whose operations have all finished: sealing computes the slot's Bucket and
+// releases its raw latencies and error tally.
 func (r *results) advance(offset time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	cur := r.index(offset)
+	for len(r.slots) <= cur {
+		r.slots = append(r.slots, slot{})
+	}
 	for i := r.open; i < cur; i++ {
 		if s := &r.slots[i]; !s.sealed && s.inFlight == 0 {
 			s.bucket = r.bucket(i)
@@ -364,9 +404,9 @@ func (r *results) bucket(i int) Bucket {
 }
 
 // engine drives one churn run. The fields above the divider are immutable after
-// construction; states/present/decisions/population are owned by the single
-// scheduler goroutine; res/sem/wg are the synchronization shared with the
-// operation tasks.
+// construction; states/present/decisions/counters/population are owned by the
+// single scheduler goroutine; res/sem/wg are the synchronization shared with
+// the operation tasks. decisions is only appended to in a bounded run.
 type engine struct {
 	nodes    []Node
 	parents  [][]int
@@ -384,6 +424,9 @@ type engine struct {
 	states     []nodeState
 	present    int
 	decisions  []Decision
+	creates    int
+	deletes    int
+	mutates    int
 	popMin     int
 	popMax     int
 	popSum     int
@@ -445,13 +488,13 @@ func newEngine(nodes []Node, seed int64, cfg Config, clk Clock) *engine {
 }
 
 // run is the single-threaded scheduler loop: until the duration elapses (or the
-// context is cancelled), it sleeps a random delay then dispatches a random
-// fan-out of decisions, each transitioning the logical inventory and launching a
-// bounded, retrying cloud operation. After the loop it lets in-flight work drain
-// and assembles the result.
+// context is cancelled, the only end of an unbounded run), it sleeps a random
+// delay then dispatches a random fan-out of decisions, each transitioning the
+// logical inventory and launching a bounded, retrying cloud operation. After
+// the loop it lets in-flight work drain and assembles the result.
 func (e *engine) run(ctx context.Context) *Result {
 	start := e.clk.Now()
-	for e.clk.Now().Sub(start) < e.cfg.Duration {
+	for e.cfg.Unbounded || e.clk.Now().Sub(start) < e.cfg.Duration {
 		if ctx.Err() != nil {
 			break
 		}
@@ -466,7 +509,7 @@ func (e *engine) run(ctx context.Context) *Result {
 		}
 	}
 	e.wg.Wait()
-	return e.result()
+	return e.assemble(e.decisions)
 }
 
 // drawDelay draws the inter-tick delay uniformly from [MinInterval, MaxInterval].
@@ -490,7 +533,7 @@ func (e *engine) step(ctx context.Context, offset time.Duration) {
 		if cands := e.mutateCandidates(); len(cands) > 0 {
 			idx := cands[e.rng.Intn(len(cands))]
 			nd := e.nodes[idx]
-			e.decisions = append(e.decisions, Decision{Offset: offset, Action: "mutate", Kind: nd.Kind, Key: nd.Key})
+			e.record(Decision{Offset: offset, Action: "mutate", Kind: nd.Kind, Key: nd.Key})
 			slog.Info("churn mutate", "kind", nd.Kind, "key", nd.Key, "offset", offset.Round(time.Millisecond))
 			e.dispatchMutate(ctx, idx, offset)
 			e.samplePopulation()
@@ -506,7 +549,7 @@ func (e *engine) step(ctx context.Context, offset time.Duration) {
 	var idx int
 	switch {
 	case len(creates) == 0 && len(deletes) == 0:
-		e.decisions = append(e.decisions, Decision{Offset: offset, Action: "noop"})
+		e.record(Decision{Offset: offset, Action: "noop"})
 		e.samplePopulation()
 		return
 	case len(deletes) == 0:
@@ -520,7 +563,7 @@ func (e *engine) step(ctx context.Context, offset time.Duration) {
 	}
 
 	nd := e.nodes[idx]
-	e.decisions = append(e.decisions, Decision{Offset: offset, Action: action, Kind: nd.Kind, Key: nd.Key})
+	e.record(Decision{Offset: offset, Action: action, Kind: nd.Kind, Key: nd.Key})
 	// Announce each scheduled action so a churn run shows what it is doing
 	// instead of going silent until its final report. Logged at info (per
 	// action); silence it with --log-level warn. No-ops are not logged.
@@ -531,6 +574,23 @@ func (e *engine) step(ctx context.Context, offset time.Duration) {
 		e.dispatchDelete(ctx, idx, offset)
 	}
 	e.samplePopulation()
+}
+
+// record counts decision d and, in a bounded run, appends it to the decision
+// log. An unbounded run keeps no log, so its memory does not grow with every
+// decision.
+func (e *engine) record(d Decision) {
+	switch d.Action {
+	case "create":
+		e.creates++
+	case "delete":
+		e.deletes++
+	case "mutate":
+		e.mutates++
+	}
+	if !e.cfg.Unbounded {
+		e.decisions = append(e.decisions, d)
+	}
 }
 
 // pCreate is the controller's create probability: the churn ratio plus the gap
@@ -657,7 +717,7 @@ func (e *engine) dispatchCreate(ctx context.Context, idx int, offset time.Durati
 		// error) must stay deletable and in the run record, while a create that
 		// yielded nothing publishes a zero resource. failed skips its doomed
 		// children regardless of whether an id was produced.
-		res, err := nd.Create(ctx, ids)
+		res, err := nd.Create(e.opContext(ctx), ids)
 		newOp.res = res
 		newOp.failed = err != nil
 		e.res.add(outcome{offset: offset, latency: time.Since(t0), success: err == nil, errKind: e.classify(err)})
@@ -704,7 +764,7 @@ func (e *engine) dispatchDelete(ctx context.Context, idx int, offset time.Durati
 		// delete closure owns retry and already-gone (404) tolerance.
 		newOp.deleteFailed = true
 		t0 := time.Now()
-		err := nd.Delete(ctx, ids, res)
+		err := nd.Delete(e.opContext(ctx), ids, res)
 		newOp.deleteFailed = err != nil
 		e.res.add(outcome{offset: offset, latency: time.Since(t0), success: err == nil, errKind: e.classify(err)})
 		if err == nil {
@@ -748,7 +808,7 @@ func (e *engine) dispatchMutate(ctx context.Context, idx int, offset time.Durati
 		}
 		ids := resolveIDs(parentKeys, parentOps)
 		t0 := time.Now()
-		err := nd.Mutate(ctx, ids, res)
+		err := nd.Mutate(e.opContext(ctx), ids, res)
 		e.res.add(outcome{offset: offset, latency: time.Since(t0), success: err == nil, errKind: e.classify(err)})
 	})
 }
@@ -815,10 +875,23 @@ func (e *engine) launch(ctx context.Context, o *op, offset time.Duration, work f
 	}()
 }
 
+// opContext returns the context an admitted operation's cloud call runs on.
+// ctx still gates scheduling, the pending pool and await. In an unbounded run
+// its cancellation is the normal end, so a call already in flight finishes
+// within its own op timeout instead of being cut off mid-create, which would
+// leave an untagged resource behind and count a failure that is not one. A
+// bounded run's cancellation is an interruption and cuts the call short.
+func (e *engine) opContext(ctx context.Context) context.Context {
+	if e.cfg.Unbounded {
+		return context.WithoutCancel(ctx)
+	}
+	return ctx
+}
+
 // await blocks until every dependency operation has finished, then takes the
-// node's family gate (if any) and a concurrency slot. It returns false if the
-// context is cancelled first, in which case nothing was acquired and the
-// operation must not run. Acquiring the slot only after dependencies are
+// node's family gate (if any) and a concurrency slot. It returns false once the
+// context is cancelled, even if all else is ready, in which case nothing is held
+// and the operation must not run. Acquiring the slot only after dependencies are
 // satisfied keeps a blocked dependent from holding a slot its dependency needs,
 // so the bounded pool cannot deadlock. Taking the gate before the slot keeps an
 // op parked behind a busy family from occupying a slot: only the family's running
@@ -840,6 +913,13 @@ func (e *engine) await(ctx context.Context, deps []*op, gate chan struct{}) bool
 	}
 	select {
 	case e.sem <- struct{}{}:
+		// select picks at random among ready cases, so the slot may win over a
+		// cancelled context. Admitting the op then would start, in an unbounded
+		// run, a cloud call that ignores the stop.
+		if ctx.Err() != nil {
+			e.release(gate)
+			return false
+		}
 		return true
 	case <-ctx.Done():
 		if gate != nil {
@@ -859,24 +939,23 @@ func (e *engine) release(gate chan struct{}) {
 	}
 }
 
-// result assembles the run summary after all operations have drained.
-func (e *engine) result() *Result {
+// assemble builds a Result carrying decisions from the engine's counters,
+// population summary, buckets and live resources. It runs on the scheduler
+// goroutine.
+func (e *engine) assemble(decisions []Decision) *Result {
 	r := &Result{
-		Decisions:  e.decisions,
+		Decisions:  decisions,
 		Created:    e.liveResources(),
+		Creates:    e.creates,
+		Deletes:    e.deletes,
+		Mutates:    e.mutates,
 		TargetFill: e.cfg.TargetFill,
 		PopMin:     e.popMin,
 		PopMax:     e.popMax,
+		Buckets:    e.res.buckets(),
 	}
-	for _, d := range e.decisions {
-		switch d.Action {
-		case "create":
-			r.Creates++
-		case "delete":
-			r.Deletes++
-		case "mutate":
-			r.Mutates++
-		}
+	if e.cfg.Unbounded {
+		r.BucketWidth = e.cfg.BucketWidth
 	}
 	if e.popSamples > 0 {
 		r.PopMean = float64(e.popSum) / float64(e.popSamples)
@@ -885,7 +964,6 @@ func (e *engine) result() *Result {
 	e.res.mu.Lock()
 	r.Cycles = e.res.cycles
 	e.res.mu.Unlock()
-	r.Buckets = e.res.buckets()
 	return r
 }
 
