@@ -13,11 +13,13 @@ resources reach, and cleans up after itself. It covers five services today:
 | `dizzy keystone` | Identity | Domains, roles, projects, users, role assignments, scoped token issue |
 | `dizzy nova` | Compute | Server boot (image / volume), stop/start (soft / hard), resize + confirm, live migration, volume & port attach/detach, multi-network, user data |
 | `dizzy glance` | Image | Image create + synthetic data upload, metadata/property churn, visibility transitions (private / shared / community / public), member add/accept/remove, deactivate/reactivate, delete |
+| `dizzy mix` | Combined | Several workload personas side by side, each in its own project, in one churn run; today the CI persona (short-lived servers on one network each, with data volumes) |
 
-Every namespace offers the same five verbs — `generate`, `apply`, `chaos`,
-`monitor`, `cleanup` — plus `status` and `report`. A scenario expands
+Every service namespace offers the same five verbs — `generate`, `apply`,
+`chaos`, `monitor`, `cleanup` — plus `status` and `report`. A scenario expands
 deterministically into a plan; applying that plan produces a run record you can
-re-query, report on, and tear down by tag.
+re-query, report on, and tear down by tag. `dizzy mix` offers `generate`,
+`chaos`, `status`, `report` and `cleanup`.
 
 It is **not** a correctness suite like Tempest. It measures latency, error
 rates, and state convergence under load. The two are complementary. It creates
@@ -62,7 +64,7 @@ $ dizzy neutron report --run run-<id>.json                     # see the timings
 $ dizzy neutron cleanup --run run-<id>.json                    # tear it down
 ```
 
-`--scenario` takes a filesystem path, and the fifteen built-in profiles live under
+`--scenario` takes a filesystem path, and the eighteen built-in profiles live under
 `scenarios/` in this repository — so clone it even if you installed a release
 binary; the container image carries them under `/usr/share/dizzy/scenarios`. The
 `small` profile fits Neutron's default per-project quotas and runs against a
@@ -102,11 +104,13 @@ matches what you are doing right now.
 - [Determinism and reproducibility](docs/explanation/determinism.md)
 - [The churn engine](docs/explanation/churn-engine.md)
 - [Resource identity and cleanup](docs/explanation/resource-identity.md)
+- [Combined runs](docs/explanation/combined-runs.md)
 - [Keystone's privilege model](docs/explanation/privilege-model.md)
 
 ## Safety
 
-- `dizzy` operates only within the project of the selected `clouds.yaml` entry.
+- `dizzy` operates only within the project of the selected `clouds.yaml` entry,
+  or, for `dizzy mix`, of the entry each persona names.
 - Every resource it creates carries a run identifier — a Neutron tag, Cinder
   metadata, a Keystone name prefix, (for Nova) server and volume metadata, or
   (for Glance) an image tag. `cleanup` deletes strictly on that identifier, so it
