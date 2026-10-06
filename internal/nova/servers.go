@@ -16,20 +16,25 @@ import (
 )
 
 // BootSpec carries the cloud ids resolved at apply time for a server boot: the
-// image and flavor (referenced by name in the scenario) and the network ids the
-// server is wired into.
+// image and flavor (referenced by name in the scenario), the network ids the
+// server is wired into, and the id of the server group it boots into, empty
+// for a server without one.
 type BootSpec struct {
 	ImageID    string
 	FlavorID   string
 	NetworkIDs []string
+	GroupID    string
 }
 
 // CreateServer boots a server with the deterministic name and run metadata. It
 // boots directly from the image, or — when s.BootFromVolume — from a
 // dizzy-created root volume of s.RootVolumeGiB that is deleted on termination
 // (so cleanup reaches it through the server delete). When s.UserData is set a
-// deterministic cloud-config naming the logical server is injected at boot. A
-// quota rejection is wrapped with ErrQuota so the executor fails fast.
+// deterministic cloud-config naming the logical server is injected at boot.
+// When boot.GroupID is set the request carries the scheduler hint that boots
+// the server into that server group; gophercloud rejects a group id that is
+// not a UUID before it sends the request. A quota rejection is wrapped with
+// ErrQuota so the executor fails fast.
 func (c *Client) CreateServer(ctx context.Context, s novaplan.Server, boot BootSpec) (resource.Resource, error) {
 	name := resourceName(c.runID, s.Name)
 
@@ -59,10 +64,16 @@ func (c *Client) CreateServer(ctx context.Context, s novaplan.Server, boot BootS
 	if s.UserData {
 		opts.UserData = userData(s.Name)
 	}
+	// An untyped nil keeps the request of a server without a group free of a
+	// scheduler hint.
+	var hints servers.SchedulerHintOptsBuilder
+	if boot.GroupID != "" {
+		hints = servers.SchedulerHintOpts{Group: boot.GroupID}
+	}
 
 	var id string
 	err := c.timed(ctx, string(KindServer), "create", func(ctx context.Context) error {
-		created, err := servers.Create(ctx, c.compute, opts, nil).Extract()
+		created, err := servers.Create(ctx, c.compute, opts, hints).Extract()
 		if err != nil {
 			return err
 		}
