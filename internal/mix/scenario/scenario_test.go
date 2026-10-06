@@ -507,6 +507,13 @@ func TestSet(t *testing.T) {
 		{"personas.legacy.networks", "2", func(s Scenario) bool { return s.Personas.Legacy.Networks == 2 }},
 		{"personas.legacy.resize_flavor", "m1.medium", func(s Scenario) bool { return s.Personas.Legacy.ResizeFlavor == "m1.medium" }},
 		{"personas.legacy.resize_flavor", "", func(s Scenario) bool { return s.Personas.Legacy.ResizeFlavor == "" }},
+		{"personas.legacy.cold_migration", "false", func(s Scenario) bool { return !s.Personas.Legacy.ColdMigrates() }},
+		{"personas.legacy.cold_migration", "true", func(s Scenario) bool {
+			return s.Personas.Legacy.ColdMigration != nil && s.Personas.Legacy.ColdMigrates()
+		}},
+		{"personas.legacy.cold_migration", " 1 ", func(s Scenario) bool {
+			return s.Personas.Legacy.ColdMigration != nil && s.Personas.Legacy.ColdMigrates()
+		}},
 		{"personas.legacy.volumes_per_server.min", "1", func(s Scenario) bool { return s.Personas.Legacy.VolumesPerServer.Min == 1 }},
 		{"personas.legacy.volumes_per_server.max", "3", func(s Scenario) bool { return s.Personas.Legacy.VolumesPerServer.Max == 3 }},
 		{"personas.legacy.volume_gib.min", "2", func(s Scenario) bool { return s.Personas.Legacy.VolumeGiB.Min == 2 }},
@@ -554,6 +561,26 @@ func TestSet(t *testing.T) {
 			}
 		})
 	}
+
+	// Set assigns a new pointer, so a copy of a scenario that turns cold
+	// migration off leaves the original on.
+	t.Run("personas.legacy.cold_migration on a copy", func(t *testing.T) {
+		t.Parallel()
+		s := smallScenario()
+		if err := s.Set("personas.legacy.cold_migration", "true"); err != nil {
+			t.Fatalf("Set(true) = %v", err)
+		}
+		a := s
+		if err := a.Set("personas.legacy.cold_migration", "false"); err != nil {
+			t.Fatalf("Set(false) on the copy = %v", err)
+		}
+		if a.Personas.Legacy.ColdMigrates() {
+			t.Error("the copy still cold-migrates after Set(false)")
+		}
+		if !s.Personas.Legacy.ColdMigrates() {
+			t.Error("Set(false) on a copy turned cold migration off in the original")
+		}
+	})
 }
 
 func TestSetErrors(t *testing.T) {
@@ -570,13 +597,15 @@ func TestSetErrors(t *testing.T) {
 		{"personas.legacy.networks", "two", `override personas.legacy.networks: "two" is not an integer`},
 		{"personas.gardener.nope", "1", `unknown override key "personas.gardener.nope"`},
 		{"personas.gardener.clusters", "x", `override personas.gardener.clusters: "x" is not an integer`},
+		{"personas.legacy.cold_migration", "", `override personas.legacy.cold_migration: "" is not a boolean`},
+		{"personas.legacy.cold_migration", "maybe", `override personas.legacy.cold_migration: "maybe" is not a boolean`},
 		{"lanes.cinder.enabled", "maybe", `override lanes.cinder.enabled: "maybe" is not a boolean`},
 		{"lanes.swift.enabled", "true", `unknown override key "lanes.swift.enabled"`},
 		{"lanes.glance.volume_type", "ssd", `unknown override key "lanes.glance.volume_type"`},
 		{"enabled", "true", `unknown override key "enabled"`},
 	}
 	for _, tc := range tests {
-		t.Run(tc.key, func(t *testing.T) {
+		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
 			t.Parallel()
 			s := smallScenario()
 			if err := s.Set(tc.key, tc.value); err == nil || err.Error() != tc.want {
