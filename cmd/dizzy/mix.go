@@ -260,6 +260,17 @@ func mixPersonaCloud(s mixscenario.Scenario, name string) (string, error) {
 	}
 }
 
+// logColdMigrationOff logs, at info level and with the message of the
+// migration pre-check, that the scenario turned cold migration off for the
+// persona name. It logs nothing for a persona other than legacy, or when the
+// legacy block leaves cold migration on.
+func logColdMigrationOff(s mixscenario.Scenario, name string) {
+	if name != "legacy" || s.Personas.Legacy.ColdMigrates() {
+		return
+	}
+	slog.Info(coldMigrationDisabledMsg, "reason", "personas.legacy.cold_migration is false")
+}
+
 // planLaneInputs returns the lane input of every persona of p, under the cloud
 // the scenario names for it and the lane identity "<runID>-<persona>", which is
 // built here only. It sets no persona, so the inputs bind cleanup-only lanes;

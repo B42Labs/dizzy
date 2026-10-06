@@ -100,6 +100,7 @@ func newMixChaosCmd(opts *globalOptions) *cobra.Command {
 				if err != nil {
 					return err
 				}
+				logColdMigrationOff(s, in.name)
 				lanes = append(lanes, l)
 			}
 			for i, in := range planServiceLaneInputs(s, runID, overall) {
