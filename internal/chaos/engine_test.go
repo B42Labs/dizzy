@@ -997,7 +997,7 @@ func TestLiveResourcesKeepsInstanceUntilDeleteConfirms(t *testing.T) {
 			e.res.advance(0)
 			e.dispatchCreate(ctx, 0, 0)
 			<-e.states[0].create.done
-			e.dispatchDelete(ctx, 0, 0)
+			e.dispatchDelete(ctx, 0, 0, nil)
 			<-started
 			if tc.recreate {
 				e.dispatchCreate(ctx, 0, 0) // waits for the delete in flight
@@ -1039,7 +1039,7 @@ func TestDeleteCancelledBeforeItRunsKeepsResource(t *testing.T) {
 	<-e.states[0].create.done
 
 	gate <- struct{}{} // another op of the family holds the gate
-	e.dispatchDelete(ctx, 0, 0)
+	e.dispatchDelete(ctx, 0, 0, nil)
 	cancel()
 	e.wg.Wait()
 
@@ -1272,5 +1272,456 @@ func TestRunUnboundedPinnedRepeat(t *testing.T) {
 	defer f.mu.Unlock()
 	if f.deletes != 0 {
 		t.Errorf("%d deletes reached the cloud, want 0", f.deletes)
+	}
+}
+
+// rollFake is an in-process backend for the rolling-set tests. Every closure
+// sleeps delay while it is in flight. Per set, it tracks the roots that are
+// down in the cloud, from the start of a root's delete until its next create
+// returns, and the most of them at once. It flags a root delete that starts
+// while the root's child is still in the cloud and a child create that starts
+// while its root is not, and records whether closures of two different sets
+// were in flight together.
+type rollFake struct {
+	mu        sync.Mutex
+	delay     time.Duration
+	nextID    int
+	set       map[string]string // the Roll value of each rolling key
+	child     map[string]string // the child key of each root that has one
+	root      map[string]string // the root key of each child
+	alive     map[string]bool   // created and not yet deleted in the cloud
+	down      map[string]map[string]bool
+	maxDown   int
+	inFlight  map[string]int
+	overlap   bool
+	violation bool
+	deletes   map[string]int
+}
+
+func newRollFake(delay time.Duration) *rollFake {
+	return &rollFake{
+		delay: delay, set: map[string]string{}, child: map[string]string{}, root: map[string]string{},
+		alive: map[string]bool{}, down: map[string]map[string]bool{}, inFlight: map[string]int{}, deletes: map[string]int{},
+	}
+}
+
+// begin counts a closure of key's set as in flight and notes an overlap with
+// another set. The caller holds mu.
+func (f *rollFake) begin(key string) {
+	s := f.set[key]
+	if s == "" {
+		return
+	}
+	for other, n := range f.inFlight {
+		if other != s && n > 0 {
+			f.overlap = true
+		}
+	}
+	f.inFlight[s]++
+}
+
+// end counts a closure of key's set as finished. The caller holds mu.
+func (f *rollFake) end(key string) {
+	if s := f.set[key]; s != "" {
+		f.inFlight[s]--
+	}
+}
+
+func (f *rollFake) create(key, kind string) (resource.Resource, error) {
+	f.mu.Lock()
+	if r := f.root[key]; r != "" && !f.alive[r] {
+		f.violation = true
+	}
+	f.begin(key)
+	f.mu.Unlock()
+	time.Sleep(f.delay)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.end(key)
+	f.nextID++
+	f.alive[key] = true
+	delete(f.down[f.set[key]], key)
+	return resource.Resource{Kind: resource.Kind(kind), Logical: key, ID: fmt.Sprintf("id-%d", f.nextID)}, nil
+}
+
+func (f *rollFake) delete(res resource.Resource) error {
+	key := res.Logical
+	f.mu.Lock()
+	if c := f.child[key]; c != "" && f.alive[c] {
+		f.violation = true
+	}
+	if s := f.set[key]; s != "" && f.root[key] == "" {
+		if f.down[s] == nil {
+			f.down[s] = map[string]bool{}
+		}
+		f.down[s][key] = true
+		f.maxDown = max(f.maxDown, len(f.down[s]))
+	}
+	f.begin(key)
+	f.mu.Unlock()
+	time.Sleep(f.delay)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.end(key)
+	f.alive[key] = false
+	f.deletes[key]++
+	return nil
+}
+
+// rollingNodes builds sets rolling sets backed by f, each under its own pinned
+// parent net-<s>: roots srv-<s>-<r> carrying the Roll value set-<s> and, with
+// withChild, one rolling child vol-<s>-<r> per root.
+func rollingNodes(f *rollFake, sets, roots int, withChild bool) []Node {
+	node := func(key, kind string, parents ...string) Node {
+		return Node{
+			Key: key, Kind: resource.Kind(kind), Parents: parents,
+			Create: func(context.Context, map[string]string) (resource.Resource, error) {
+				return f.create(key, kind)
+			},
+			Delete: func(_ context.Context, _ map[string]string, res resource.Resource) error {
+				return f.delete(res)
+			},
+		}
+	}
+	var nodes []Node
+	for s := 0; s < sets; s++ {
+		net := fmt.Sprintf("net-%d", s)
+		parent := node(net, "network")
+		parent.Pinned = true
+		nodes = append(nodes, parent)
+		roll := fmt.Sprintf("set-%d", s)
+		for r := 0; r < roots; r++ {
+			srv := fmt.Sprintf("srv-%d-%d", s, r)
+			root := node(srv, "server", net)
+			root.Roll = roll
+			f.set[srv] = roll
+			nodes = append(nodes, root)
+			if withChild {
+				vol := fmt.Sprintf("vol-%d-%d", s, r)
+				child := node(vol, "volume", srv)
+				child.Roll = roll
+				f.set[vol], f.child[srv], f.root[vol] = roll, vol, srv
+				nodes = append(nodes, child)
+			}
+		}
+	}
+	return nodes
+}
+
+// TestRunRollingCreatesAllThenRolls confirms a graph of two pinned parents and
+// two rolling sets of three roots with one child each is created in full
+// before anything else, and is then only deleted and created.
+func TestRunRollingCreatesAllThenRolls(t *testing.T) {
+	r, err := Run(context.Background(), rollingNodes(newRollFake(0), 2, 3, true), 7, validConfig(), newFakeClock())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	const total = 14
+	if len(r.Decisions) <= total {
+		t.Fatalf("the run made %d decisions, want more than %d", len(r.Decisions), total)
+	}
+	keys := map[string]bool{}
+	for i, d := range r.Decisions[:total] {
+		if d.Action != "create" {
+			t.Errorf("decision %d = %s %s, want a create", i, d.Action, d.Key)
+		}
+		keys[d.Key] = true
+	}
+	if len(keys) != total {
+		t.Errorf("the first %d decisions created %d distinct nodes, want %d", total, len(keys), total)
+	}
+	got := countActions(&Result{Decisions: r.Decisions[total:]})
+	if got["delete"] == 0 || got["create"]+got["delete"] != len(r.Decisions)-total {
+		t.Errorf("decisions after the first %d = %v, want only deletes and creates, some deletes", total, got)
+	}
+}
+
+// TestRunRollingDecisionOrder confirms every roll deletes the child directly
+// before its root at the same offset, that a child is never deleted without
+// its root directly after it, and that the next two decisions of the set
+// create the root and then the child.
+func TestRunRollingDecisionOrder(t *testing.T) {
+	nodes := rollingNodes(newRollFake(0), 2, 3, true)
+	roll := map[string]string{}
+	for _, nd := range nodes {
+		roll[nd.Key] = nd.Roll
+	}
+	r, err := Run(context.Background(), nodes, 7, validConfig(), newFakeClock())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	rolls := 0
+	for i, d := range r.Decisions {
+		if d.Action != "delete" {
+			continue
+		}
+		if strings.HasPrefix(d.Key, "vol-") {
+			root := Decision{Offset: d.Offset, Action: "delete", Kind: "server", Key: "srv-" + strings.TrimPrefix(d.Key, "vol-")}
+			if i+1 == len(r.Decisions) || r.Decisions[i+1] != root {
+				t.Errorf("decision %d deletes %s, but the one after it is not %v", i, d.Key, root)
+			}
+			continue
+		}
+		if !strings.HasPrefix(d.Key, "srv-") {
+			continue
+		}
+		rolls++
+		child := "vol-" + strings.TrimPrefix(d.Key, "srv-")
+		want := Decision{Offset: d.Offset, Action: "delete", Kind: "volume", Key: child}
+		if i == 0 || r.Decisions[i-1] != want {
+			t.Errorf("decision %d deletes %s, but the one before it is not %v", i, d.Key, want)
+		}
+		var next []string
+		for _, n := range r.Decisions[i+1:] {
+			if len(next) == 2 {
+				break
+			}
+			if roll[n.Key] == roll[d.Key] {
+				next = append(next, n.Action+" "+n.Key)
+			}
+		}
+		// A roll at the very end of the run is followed by fewer decisions.
+		wantNext := []string{"create " + d.Key, "create " + child}[:len(next)]
+		if !reflect.DeepEqual(next, wantNext) {
+			t.Errorf("after the roll of %s at decision %d the set decided %v, want %v", d.Key, i, next, wantNext)
+		}
+	}
+	if rolls == 0 {
+		t.Fatal("the run rolled nothing; the test exercises nothing")
+	}
+}
+
+// TestRunRollingOneRootDownPerSet confirms that, with slow cloud calls and
+// several operations in flight, no set has more than one root down in the
+// cloud at once, two sets replace concurrently, and no root is deleted before
+// its child nor a child created before its root.
+func TestRunRollingOneRootDownPerSet(t *testing.T) {
+	f := newRollFake(50 * time.Millisecond)
+	cfg := validConfig()
+	cfg.Duration = 600 * time.Millisecond
+	cfg.MaxParallel, cfg.Concurrency = 4, 4
+	r, err := Run(context.Background(), rollingNodes(f, 2, 3, true), 7, cfg, newFakeClock())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if r.Deletes == 0 {
+		t.Fatal("the run deleted nothing; the test exercises nothing")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.maxDown > 1 {
+		t.Errorf("a set had %d roots down at once, want at most 1", f.maxDown)
+	}
+	if !f.overlap {
+		t.Error("the closures of two sets were never in flight together")
+	}
+	if f.violation {
+		t.Error("a root delete started before its child's delete returned, or a child create before its root's create")
+	}
+}
+
+// TestDeleteCandidatesRolling confirms only the roots of a whole rolling set
+// are delete candidates, never a childless node of the set nor a pinned
+// parent, and that a set with one node down offers none.
+func TestDeleteCandidatesRolling(t *testing.T) {
+	nodes := rollingNodes(newRollFake(0), 1, 2, true) // net-0, srv-0-0, vol-0-0, srv-0-1, vol-0-1
+	e := newEngine(nodes, 7, validConfig(), newFakeClock())
+	for i := range e.states {
+		e.states[i].present = true
+	}
+	keys := func() []string {
+		var out []string
+		for _, i := range e.deleteCandidates() {
+			out = append(out, e.nodes[i].Key)
+		}
+		return out
+	}
+	if got, want := keys(), []string{"srv-0-0", "srv-0-1"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("whole set: candidates = %v, want only the roots %v", got, want)
+	}
+	e.states[4].present = false // vol-0-1 down: the set is not whole
+	if got := keys(); len(got) != 0 {
+		t.Errorf("broken set: candidates = %v, want none", got)
+	}
+}
+
+// TestRollDeletesSharedDescendantOnce confirms a roll over a root with two
+// children that share a grandchild deletes the grandchild first and once, the
+// children in index order, and the root last.
+func TestRollDeletesSharedDescendantOnce(t *testing.T) {
+	var mu sync.Mutex
+	deletes := map[string]int{}
+	node := func(key string, parents ...string) Node {
+		return Node{
+			Key: key, Kind: "server", Parents: parents, Roll: "s",
+			Create: func(context.Context, map[string]string) (resource.Resource, error) {
+				return resource.Resource{Kind: "server", Logical: key, ID: "id-" + key}, nil
+			},
+			Delete: func(context.Context, map[string]string, resource.Resource) error {
+				mu.Lock()
+				deletes[key]++
+				mu.Unlock()
+				return nil
+			},
+		}
+	}
+	nodes := []Node{node("root"), node("c1", "root"), node("c2", "root"), node("gc", "c1", "c2")}
+	e := newEngine(nodes, 7, validConfig(), newFakeClock())
+	ctx := context.Background()
+	e.res.advance(0)
+	for i := 0; i < 5; i++ { // four creates of the set, then its roll
+		e.step(ctx, 0)
+	}
+	e.wg.Wait()
+	var got []string
+	for _, d := range e.decisions {
+		if d.Action == "delete" {
+			got = append(got, d.Key)
+		}
+	}
+	if want := []string{"gc", "c1", "c2", "root"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("roll deleted %v, want %v", got, want)
+	}
+	if want := map[string]int{"gc": 1, "c1": 1, "c2": 1, "root": 1}; !reflect.DeepEqual(deletes, want) {
+		t.Errorf("cloud deletes = %v, want one of each node", deletes)
+	}
+}
+
+// TestRunRollingKeepsPinnedParents confirms the pinned parents of rolling sets
+// are never deleted, while the sets are, and that the run creates more often
+// than it deletes.
+func TestRunRollingKeepsPinnedParents(t *testing.T) {
+	f := newRollFake(0)
+	r, err := Run(context.Background(), rollingNodes(f, 2, 3, true), 7, validConfig(), newFakeClock())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, d := range r.Decisions {
+		if d.Action == "delete" && strings.HasPrefix(d.Key, "net-") {
+			t.Errorf("decision at %s deletes the pinned parent %s", d.Offset, d.Key)
+		}
+	}
+	if r.Deletes == 0 || r.Creates <= r.Deletes {
+		t.Errorf("creates=%d deletes=%d, want deletes above 0 and creates above deletes", r.Creates, r.Deletes)
+	}
+}
+
+// TestRunRollingDeterministicSchedule confirms two runs of a rolling graph
+// with the same seed and config draw the same schedule, and a run with
+// another seed a different one.
+func TestRunRollingDeterministicSchedule(t *testing.T) {
+	run := func(seed int64) []Decision {
+		t.Helper()
+		r, err := Run(context.Background(), rollingNodes(newRollFake(0), 2, 3, true), seed, validConfig(), newFakeClock())
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		return r.Decisions
+	}
+	first := run(7)
+	if !reflect.DeepEqual(first, run(7)) {
+		t.Error("the schedules of a rolling graph differ for the same seed/config")
+	}
+	if reflect.DeepEqual(first, run(8)) {
+		t.Error("the schedules of a rolling graph are equal for two seeds")
+	}
+}
+
+// singleRollingRoot is one parentless rolling root, the degenerate set.
+func singleRollingRoot(create func() (resource.Resource, error), del func() error) Node {
+	return Node{
+		Key: "srv-0", Kind: resource.Kind("server"), Roll: "set-0",
+		Create: func(context.Context, map[string]string) (resource.Resource, error) { return create() },
+		Delete: func(context.Context, map[string]string, resource.Resource) error { return del() },
+	}
+}
+
+// stepThrice runs three steps of e at offset 0 and waits for their operations:
+// a create, a roll and the create that follows it.
+func stepThrice(t *testing.T, e *engine) {
+	t.Helper()
+	ctx := context.Background()
+	e.res.advance(0)
+	for i := 0; i < 3; i++ {
+		e.step(ctx, 0)
+	}
+	e.wg.Wait()
+	var got []string
+	for _, d := range e.decisions {
+		got = append(got, d.Action)
+	}
+	if want := []string{"create", "delete", "create"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("decisions = %v, want %v", got, want)
+	}
+}
+
+// TestRollRepairsFailedCreate confirms a rolling root whose create failed is
+// rolled without a cloud delete, since it has no cloud id, and created again.
+func TestRollRepairsFailedCreate(t *testing.T) {
+	creates, deletes := 0, 0 // the node's ops run one after another
+	node := singleRollingRoot(func() (resource.Resource, error) {
+		creates++
+		if creates == 1 {
+			return resource.Resource{}, errors.New("simulated create failure")
+		}
+		return resource.Resource{Kind: "server", Logical: "srv-0", ID: "id-2"}, nil
+	}, func() error {
+		deletes++
+		return nil
+	})
+	e := newEngine([]Node{node}, 7, validConfig(), newFakeClock())
+	stepThrice(t, e)
+	if deletes != 0 {
+		t.Errorf("the delete closure ran %d times for a root without a cloud id, want 0", deletes)
+	}
+	if got := liveIDs(e); !reflect.DeepEqual(got, []string{"id-2"}) {
+		t.Errorf("Created = %v, want [id-2]", got)
+	}
+}
+
+// TestRollRecreatesAfterFailedDelete confirms a rolling root whose delete
+// failed is created again, and that the instance whose delete failed stays in
+// the run record next to its successor.
+func TestRollRecreatesAfterFailedDelete(t *testing.T) {
+	creates := 0
+	node := singleRollingRoot(func() (resource.Resource, error) {
+		creates++
+		return resource.Resource{Kind: "server", Logical: "srv-0", ID: fmt.Sprintf("id-%d", creates)}, nil
+	}, func() error {
+		return errors.New("simulated delete failure")
+	})
+	e := newEngine([]Node{node}, 7, validConfig(), newFakeClock())
+	stepThrice(t, e)
+	if got := liveIDs(e); !reflect.DeepEqual(got, []string{"id-1", "id-2"}) {
+		t.Errorf("Created = %v, want [id-1 id-2]", got)
+	}
+}
+
+// TestRunRollingDegenerateSet confirms a set of one root without a child
+// rolls.
+func TestRunRollingDegenerateSet(t *testing.T) {
+	f := newRollFake(0)
+	r, err := Run(context.Background(), rollingNodes(f, 1, 1, false), 7, validConfig(), newFakeClock())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r.Deletes == 0 || f.deletes["srv-0-0"] == 0 {
+		t.Errorf("deletes=%d cloud deletes of the root=%d, want both above 0", r.Deletes, f.deletes["srv-0-0"])
+	}
+}
+
+// TestRunUnboundedRolling confirms an unbounded run over rolling sets keeps no
+// decision log and rolls.
+func TestRunUnboundedRolling(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r, err := Run(ctx, rollingNodes(newRollFake(0), 2, 3, true), 7, unboundedConfig(), newCancelClock(time.Hour, cancel))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if r.Decisions != nil || r.Deletes == 0 {
+		t.Errorf("decisions=%d deletes=%d, want nil and above 0", len(r.Decisions), r.Deletes)
 	}
 }
