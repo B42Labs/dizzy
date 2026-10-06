@@ -98,6 +98,28 @@ Domain-manager mode is therefore best-effort on those releases, with the
 executor's 403 fast-fail as the backstop. `--privilege admin` with a cloud admin
 is the path that always works.
 
+## In a combined run
+
+`mix chaos` can run the Keystone churn as a background lane next to its
+personas. The lane runs the same privilege pre-check with the same three tiers,
+but takes its settings from the scenario's lane block instead of flags:
+`lanes.keystone.privilege`, `lanes.keystone.domain` and `lanes.keystone.roles`
+stand for `--privilege`, `--domain` and `--roles`, an empty privilege means
+`auto`, and empty roles mean `member,reader`. The pre-check's own messages
+still name the flags; in a combined run they mean the lane keys.
+
+A failing pre-check ends the combined run before anything exists, with an
+error that starts with `lane "keystone": `, because a lane the operator
+switched on either runs or stops the run. The bundled mix profiles leave the
+lane off and point it at Keystone's `small` profile, the only one a domain
+manager can run, since it plans a single domain.
+
+The scaffold is created later than in `keystone chaos`: only once every
+persona and every lane of the run has passed its pre-checks, so a lane whose
+pre-check fails after the Keystone lane's leaves no domain behind. In
+domain-manager mode that step creates nothing and binds the in-scope domain
+and the reused roles.
+
 ## Teardown under a shared domain
 
 Domain-manager mode makes teardown genuinely delicate. The run lives inside a

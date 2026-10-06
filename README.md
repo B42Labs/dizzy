@@ -13,7 +13,7 @@ resources reach, and cleans up after itself. It covers five services today:
 | `dizzy keystone` | Identity | Domains, roles, projects, users, role assignments, scoped token issue |
 | `dizzy nova` | Compute | Server boot (image / volume), stop/start (soft / hard), resize + confirm, live migration, volume & port attach/detach, multi-network, user data |
 | `dizzy glance` | Image | Image create + synthetic data upload, metadata/property churn, visibility transitions (private / shared / community / public), member add/accept/remove, deactivate/reactivate, delete |
-| `dizzy mix` | Combined | Several workload personas side by side, each in its own project, in one churn run: the CI persona (short-lived servers on one network each, with data volumes), the Gardener persona (Kubernetes-style clusters of workers in anti-affinity server groups, each worker with a data volume, replaced one at a time) and the Legacy persona (long-lived servers that are stopped and started, resized, live- and cold-migrated, and have their volumes and ports detached and re-attached until teardown) |
+| `dizzy mix` | Combined | Several workload personas side by side, each in its own project, in one churn run: the CI persona (short-lived servers on one network each, with data volumes), the Gardener persona (Kubernetes-style clusters of workers in anti-affinity server groups, each worker with a data volume, replaced one at a time) and the Legacy persona (long-lived servers that are stopped and started, resized, live- and cold-migrated, and have their volumes and ports detached and re-attached until teardown), plus optional background lanes that run the Cinder, Glance, Keystone or Neutron churn next to them |
 
 Every service namespace offers the same five verbs — `generate`, `apply`,
 `chaos`, `monitor`, `cleanup` — plus `status` and `report`. A scenario expands
@@ -110,7 +110,7 @@ matches what you are doing right now.
 ## Safety
 
 - `dizzy` operates only within the project of the selected `clouds.yaml` entry,
-  or, for `dizzy mix`, of the entry each persona names.
+  or, for `dizzy mix`, of the entry each persona and lane names.
 - Every resource it creates carries a run identifier — a Neutron tag, Cinder
   metadata, a Keystone name prefix, (for Nova) server and volume metadata, or
   (for Glance) an image tag. `cleanup` deletes strictly on that identifier, so it
