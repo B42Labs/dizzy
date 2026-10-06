@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"reflect"
 	"testing"
 	"time"
 )
@@ -139,4 +140,96 @@ func TestAggregateEmpty(t *testing.T) {
 	if agg.Summary() == "" {
 		t.Error("Summary returned empty string")
 	}
+}
+
+// TestAggregateExactMinMeanMax confirms the histogram-backed aggregate keeps
+// min, mean and max exact (only the percentiles are estimates), using the
+// samples of TestAggregate.
+func TestAggregateExactMinMeanMax(t *testing.T) {
+	c := NewCollector()
+	c.Record(Sample{Type: "network", Duration: ms(10), Success: true})
+	c.Record(Sample{Type: "network", Duration: ms(30), Success: true})
+	c.Record(Sample{Type: "network", Duration: ms(20), Success: false, ErrKind: "http_503"})
+	c.Record(Sample{Type: "subnet", Duration: ms(40), Success: true})
+	c.Record(Sample{Type: "subnet", Duration: ms(5), Success: false, ErrKind: "quota"})
+
+	agg := c.Aggregate(2 * time.Second)
+	if len(agg.ByType) == 0 || agg.ByType[0].Type != "network" {
+		t.Fatalf("by-type groups = %+v, want network first", agg.ByType)
+	}
+	lat := agg.ByType[0].Latency
+	if lat.Min != ms(10) || lat.Mean != ms(20) || lat.Max != ms(30) {
+		t.Errorf("network min/mean/max = %s/%s/%s, want 10ms/20ms/30ms", lat.Min, lat.Mean, lat.Max)
+	}
+}
+
+// TestAggregateEmptyHasNilGroups confirms an empty collector aggregates to a
+// zero overall group and nil (not empty) slices, so its JSON keeps the null
+// values records have always carried, and that its snapshot is all zeros.
+func TestAggregateEmptyHasNilGroups(t *testing.T) {
+	c := NewCollector()
+	agg := c.Aggregate(time.Second)
+	if agg.Overall != (Stats{}) {
+		t.Errorf("empty overall = %+v, want zero", agg.Overall)
+	}
+	if agg.ByType != nil || agg.Errors != nil || agg.Readiness != nil {
+		t.Errorf("empty aggregate groups = %#v / %#v / %#v, want nil", agg.ByType, agg.Errors, agg.Readiness)
+	}
+	if a, s, f := c.Snapshot(); a != 0 || s != 0 || f != 0 {
+		t.Errorf("empty snapshot = (%d,%d,%d), want (0,0,0)", a, s, f)
+	}
+}
+
+// TestCollectorStateIsBounded confirms the collector's memory does not grow
+// with the number of samples: a million samples of one type and a million
+// readiness records leave one group each, and no type the collector is built
+// from holds a slice that could grow per sample.
+func TestCollectorStateIsBounded(t *testing.T) {
+	c := NewCollector()
+	for i := 0; i < 1_000_000; i++ {
+		c.Record(Sample{Type: "network", Duration: time.Duration(i) * time.Microsecond, Success: i%2 == 0})
+		c.RecordReadiness(Readiness{Type: "network", Duration: time.Duration(i) * time.Microsecond, OK: true})
+	}
+	if len(c.byType) != 1 || len(c.readiness) != 1 {
+		t.Errorf("groups = %d type / %d readiness, want 1 / 1", len(c.byType), len(c.readiness))
+	}
+	if a, _, _ := c.Snapshot(); a != 1_000_000 {
+		t.Errorf("snapshot attempted = %d, want 1000000", a)
+	}
+	if path := slicePath(reflect.TypeOf(Collector{}), "Collector", map[reflect.Type]bool{}); path != "" {
+		t.Errorf("collector state holds a slice at %s", path)
+	}
+}
+
+// slicePath walks the types of package metrics reachable from typ (through
+// fields, pointers and map keys and values) and returns the path to the first
+// slice it finds, or "" when there is none. Types from other packages, such as
+// sync.Mutex, are not entered.
+func slicePath(typ reflect.Type, path string, seen map[reflect.Type]bool) string {
+	if seen[typ] {
+		return ""
+	}
+	seen[typ] = true
+	switch typ.Kind() {
+	case reflect.Slice, reflect.Array:
+		return path
+	case reflect.Pointer:
+		return slicePath(typ.Elem(), path, seen)
+	case reflect.Map:
+		if p := slicePath(typ.Key(), path+"[key]", seen); p != "" {
+			return p
+		}
+		return slicePath(typ.Elem(), path+"[value]", seen)
+	case reflect.Struct:
+		if typ.PkgPath() != reflect.TypeOf(Collector{}).PkgPath() {
+			return ""
+		}
+		for i := 0; i < typ.NumField(); i++ {
+			f := typ.Field(i)
+			if p := slicePath(f.Type, path+"."+f.Name, seen); p != "" {
+				return p
+			}
+		}
+	}
+	return ""
 }

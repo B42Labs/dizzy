@@ -4,6 +4,12 @@
 // collector is safe for use by the concurrent workers of the executor; the
 // aggregation it produces is pure data so callers can render or persist it
 // however they need.
+//
+// The collector keeps no sample: it adds each one to fixed-size counters and
+// a log-bucket histogram per group, so its memory does not grow with the
+// length of a run. Its min, mean and max are exact, and its percentiles are
+// estimates within 1%. ComputeLatency, which works on a slice of durations,
+// stays exact.
 package metrics
 
 import (
@@ -34,101 +40,100 @@ type Readiness struct {
 	OK       bool
 }
 
-// Collector accumulates samples and readiness records from concurrent workers.
-// Its zero value is not usable; construct it with NewCollector.
+// Collector accumulates samples and readiness records from concurrent workers
+// into fixed-size per-group state, so its memory does not grow with the number
+// of samples. Its zero value is not usable; construct it with NewCollector.
 type Collector struct {
-	mu        sync.Mutex
-	samples   []Sample
-	readiness []Readiness
+	mu        sync.Mutex // guards overall, byType, errors and readiness
+	overall   group
+	byType    map[string]*group
+	errors    map[string]int
+	readiness map[string]*group
+}
+
+// group accumulates the records of one stats group: the overall group, the
+// samples of one type, or the time-to-ready records of one type.
+type group struct {
+	attempted int
+	succeeded int
+	latency   histogram
 }
 
 // NewCollector returns an empty Collector ready for concurrent use.
 func NewCollector() *Collector {
-	return &Collector{}
+	return &Collector{
+		byType:    make(map[string]*group),
+		errors:    make(map[string]int),
+		readiness: make(map[string]*group),
+	}
 }
 
-// Record appends one API-call sample.
+// Record adds one API-call sample to the overall group, to its type's group,
+// and, when it carries an ErrKind, to the error tally.
 func (c *Collector) Record(s Sample) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.samples = append(c.samples, s)
+	c.overall.add(s.Success, s.Duration)
+	g, ok := c.byType[s.Type]
+	if !ok {
+		g = &group{}
+		c.byType[s.Type] = g
+	}
+	g.add(s.Success, s.Duration)
+	if s.ErrKind != "" {
+		c.errors[s.ErrKind]++
+	}
 }
 
-// RecordReadiness appends one time-to-ready record.
+// RecordReadiness adds one time-to-ready record to its type's group.
 func (c *Collector) RecordReadiness(r Readiness) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.readiness = append(c.readiness, r)
+	g, ok := c.readiness[r.Type]
+	if !ok {
+		g = &group{}
+		c.readiness[r.Type] = g
+	}
+	g.add(r.OK, r.Duration)
 }
 
 // Snapshot returns the live counts accumulated so far: the total number of
 // recorded API-call samples, how many succeeded, and how many failed. It is
-// cheap (a single pass, no percentile math) and safe for concurrent use, so a
-// progress heartbeat can poll it on its own goroutine while the executor's
-// workers keep recording into the collector.
+// cheap (it reads three counters, no percentile math) and safe for concurrent
+// use, so a progress heartbeat can poll it on its own goroutine while the
+// executor's workers keep recording into the collector.
 func (c *Collector) Snapshot() (attempted, succeeded, failed int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	attempted = len(c.samples)
-	for _, s := range c.samples {
-		if s.Success {
-			succeeded++
-		}
-	}
-	return attempted, succeeded, attempted - succeeded
+	return c.overall.attempted, c.overall.succeeded, c.overall.attempted - c.overall.succeeded
 }
 
 // Aggregate summarizes every recorded sample over the supplied wall-clock
 // duration: overall and per-type counts, latency percentiles, and throughput,
-// plus an error breakdown by kind and per-type time-to-ready statistics.
+// plus an error breakdown by kind and per-type time-to-ready statistics. The
+// percentiles are estimates within 1%; min, mean and max are exact. It may be
+// called while workers still record, for example to checkpoint a running run.
 func (c *Collector) Aggregate(wall time.Duration) Aggregate {
 	c.mu.Lock()
-	samples := make([]Sample, len(c.samples))
-	copy(samples, c.samples)
-	readiness := make([]Readiness, len(c.readiness))
-	copy(readiness, c.readiness)
-	c.mu.Unlock()
+	defer c.mu.Unlock()
 
 	agg := Aggregate{
 		Wall:    wall,
-		Overall: computeStats("", samples, wall),
+		Overall: c.overall.stats("", wall),
 	}
 
-	byType := make(map[string][]Sample)
-	for _, s := range samples {
-		byType[s.Type] = append(byType[s.Type], s)
-	}
-	for typ, group := range byType {
-		agg.ByType = append(agg.ByType, computeStats(typ, group, wall))
+	for typ, g := range c.byType {
+		agg.ByType = append(agg.ByType, g.stats(typ, wall))
 	}
 	sort.Slice(agg.ByType, func(i, j int) bool { return agg.ByType[i].Type < agg.ByType[j].Type })
 
-	errCounts := make(map[string]int)
-	for _, s := range samples {
-		if s.ErrKind != "" {
-			errCounts[s.ErrKind]++
-		}
-	}
-	for kind, count := range errCounts {
+	for kind, count := range c.errors {
 		agg.Errors = append(agg.Errors, ErrorCount{Kind: kind, Count: count})
 	}
 	sort.Slice(agg.Errors, func(i, j int) bool { return agg.Errors[i].Kind < agg.Errors[j].Kind })
 
-	readyByType := make(map[string][]Readiness)
-	for _, r := range readiness {
-		readyByType[r.Type] = append(readyByType[r.Type], r)
-	}
-	for typ, group := range readyByType {
-		stats := ReadinessStats{Type: typ, Count: len(group)}
-		durs := make([]time.Duration, 0, len(group))
-		for _, r := range group {
-			if r.OK {
-				stats.OK++
-			}
-			durs = append(durs, r.Duration)
-		}
-		stats.Latency = ComputeLatency(durs)
-		agg.Readiness = append(agg.Readiness, stats)
+	for typ, g := range c.readiness {
+		agg.Readiness = append(agg.Readiness, ReadinessStats{Type: typ, Count: g.attempted, OK: g.succeeded, Latency: g.latency.latency()})
 	}
 	sort.Slice(agg.Readiness, func(i, j int) bool { return agg.Readiness[i].Type < agg.Readiness[j].Type })
 
@@ -181,29 +186,35 @@ type ReadinessStats struct {
 	Latency Latency `json:"latency"`
 }
 
-// computeStats builds a Stats for one labeled group of samples over the given
-// wall-clock duration.
-func computeStats(typ string, samples []Sample, wall time.Duration) Stats {
-	stats := Stats{Type: typ, Attempted: len(samples)}
-	durs := make([]time.Duration, 0, len(samples))
-	for _, s := range samples {
-		if s.Success {
-			stats.Succeeded++
-		}
-		durs = append(durs, s.Duration)
+// add counts one record in the group: whether it succeeded, and its duration.
+func (g *group) add(ok bool, d time.Duration) {
+	g.attempted++
+	if ok {
+		g.succeeded++
 	}
-	stats.Failed = stats.Attempted - stats.Succeeded
-	stats.Latency = ComputeLatency(durs)
+	g.latency.add(d)
+}
+
+// stats builds the group's Stats under the given type label over the given
+// wall-clock duration.
+func (g *group) stats(typ string, wall time.Duration) Stats {
+	stats := Stats{
+		Type:      typ,
+		Attempted: g.attempted,
+		Succeeded: g.succeeded,
+		Failed:    g.attempted - g.succeeded,
+		Latency:   g.latency.latency(),
+	}
 	if wall > 0 {
 		stats.Throughput = float64(stats.Succeeded) / wall.Seconds()
 	}
 	return stats
 }
 
-// ComputeLatency returns the latency distribution of the supplied durations,
-// the same computation Aggregate applies per group. It is exported so the chaos
-// churn engine can summarize each time bucket's latency without re-implementing
-// the percentile math. The zero Latency is returned for an empty input.
+// ComputeLatency returns the exact latency distribution of the supplied
+// durations, with nearest-rank percentiles. It is exported so the chaos churn
+// engine can summarize each time bucket's latency without re-implementing the
+// percentile math. The zero Latency is returned for an empty input.
 func ComputeLatency(durs []time.Duration) Latency {
 	if len(durs) == 0 {
 		return Latency{}
