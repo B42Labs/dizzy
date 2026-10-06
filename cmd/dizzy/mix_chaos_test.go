@@ -166,6 +166,47 @@ func parseMix(t *testing.T, data string, sets ...string) mixscenario.Scenario {
 	return s
 }
 
+// TestLogColdMigrationOff confirms the one info line of a scenario that turned
+// cold migration off is logged for the legacy persona alone, and that nothing
+// is logged while the legacy block leaves cold migration on. The subtests swap
+// the default logger, so they do not run in parallel.
+func TestLogColdMigrationOff(t *testing.T) {
+	const off = "personas.legacy.cold_migration=false"
+	tests := []struct {
+		name    string
+		persona string
+		sets    []string
+		want    string
+	}{
+		{"legacy, off", "legacy", []string{off}, `level=INFO msg="cold migration disabled for this run" reason="personas.legacy.cold_migration is false"`},
+		{"legacy, absent", "legacy", nil, ""},
+		{"legacy, on", "legacy", []string{"personas.legacy.cold_migration=true"}, ""},
+		{"ci, off", "ci", []string{off}, ""},
+		{"gardener, off", "gardener", []string{off}, ""},
+		{"no name, off", "", []string{off}, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{
+				ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+					if a.Key == slog.TimeKey {
+						return slog.Attr{}
+					}
+					return a
+				},
+			})))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			logColdMigrationOff(parseMix(t, sampleMixScenarioYAML, tc.sets...), tc.persona)
+			if got := strings.TrimSpace(logs.String()); got != tc.want {
+				t.Errorf("logs = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestMergeMixChaosConfig(t *testing.T) {
 	t.Run("persona values", func(t *testing.T) {
 		s, err := mixscenario.Parse([]byte(mixChaosScenarioYAML))

@@ -78,6 +78,10 @@ func resolveNovaRefs(ctx context.Context, cs *config.ComputeStack, p *novaplan.P
 	return resolved, nil
 }
 
+// coldMigrationDisabledMsg is the message every path that turns cold migration
+// off for a run logs, so one grep finds them all.
+const coldMigrationDisabledMsg = "cold migration disabled for this run"
+
 // setMigrationVerdict applies the migration pre-check's verdict to resolved for
 // each migration kind p schedules. It enables the kind and logs that at info
 // level when ok is set, and otherwise leaves it disabled and logs a warning
@@ -97,7 +101,7 @@ func setMigrationVerdict(resolved *novaexec.Resolved, p *novaplan.Plan, ok bool,
 		if ok {
 			slog.Info("cold migration enabled for this run")
 		} else {
-			slog.Warn("cold migration disabled for this run", "reason", reason)
+			slog.Warn(coldMigrationDisabledMsg, "reason", reason)
 		}
 	}
 }
