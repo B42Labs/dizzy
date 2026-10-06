@@ -101,6 +101,7 @@ func buildMixLane(ctx context.Context, opts *globalOptions, in mixLaneInput) (_ 
 	client := nova.New(cs.Compute, cs.Network, cs.BlockStorage, in.runID, collector)
 	client.SetTelemetry(tel)
 	cleaner := novaTimeoutCleaner{client, opts.timeout}
+	groups := serverGroupTimeoutCleaner{client, opts.timeout}
 	projectID, _ := nova.ProjectID(cs.Compute)
 	// Discovery is project-scoped, so in another project it finds nothing and
 	// the recorded ids are 404s that count as deleted: refuse instead.
@@ -118,10 +119,10 @@ func buildMixLane(ctx context.Context, opts *globalOptions, in mixLaneInput) (_ 
 		Collector: collector,
 		Telemetry: tel,
 		Cleanup: func(ctx context.Context, recorded []resource.Resource) (int, error) {
-			return novaexec.Cleanup(ctx, cleaner, in.runID, recorded, opts.timeout)
+			return laneCleanup(ctx, cleaner, groups, in.runID, recorded, opts.timeout)
 		},
 		Leaked: func(ctx context.Context) (int, error) {
-			return novaLeakCheck(ctx, cleaner, in.runID)
+			return laneLeaked(ctx, cleaner, groups, in.runID)
 		},
 		Observe: client.Observe,
 	}
@@ -141,10 +142,60 @@ func buildMixLane(ctx context.Context, opts *globalOptions, in mixLaneInput) (_ 
 	return l, nil
 }
 
-// buildPersonaNodes builds the churn graph of a persona's lane: the long-lived
-// graph, whose nodes stay until teardown and are mutated repeatedly, for a
-// long-lived persona, and the graph nova chaos churns otherwise.
+// laneCleanup tears down one lane under its identity: it runs novaexec.Cleanup
+// and then deletes the lane's server groups, even when that failed, since Nova
+// deletes a group whatever its members and a group left behind holds a unit of
+// the server_groups quota. It returns the sum of both counts and both errors
+// joined.
+func laneCleanup(ctx context.Context, c novaexec.Cleaner, g novaexec.ServerGroupCleaner, runID string, recorded []resource.Resource, opTimeout time.Duration) (int, error) {
+	deleted, err := novaexec.Cleanup(ctx, c, runID, recorded, opTimeout)
+	groups, gerr := novaexec.CleanupServerGroups(ctx, g, runID, recorded)
+	return deleted + groups, errors.Join(err, gerr)
+}
+
+// laneLeaked counts what is left of one lane after teardown: the resources
+// novaLeakCheck finds by the lane identity and the server groups found by its
+// name prefix. A failing novaLeakCheck is returned unchanged.
+func laneLeaked(ctx context.Context, c novaexec.Cleaner, g novaexec.ServerGroupCleaner, runID string) (int, error) {
+	leaked, err := novaLeakCheck(ctx, c, runID)
+	if err != nil {
+		return leaked, err
+	}
+	groups, err := g.ListServerGroupsByName(ctx, runID)
+	if err != nil {
+		return leaked, fmt.Errorf("leak check listing server groups: %w", err)
+	}
+	return leaked + len(groups), nil
+}
+
+// serverGroupTimeoutCleaner bounds every call of a novaexec.ServerGroupCleaner
+// by opTimeout, as novaTimeoutCleaner bounds the calls of Cleanup.
+type serverGroupTimeoutCleaner struct {
+	inner     novaexec.ServerGroupCleaner
+	opTimeout time.Duration
+}
+
+func (t serverGroupTimeoutCleaner) ListServerGroupsByName(ctx context.Context, runID string) ([]resource.Resource, error) {
+	ctx, cancel := context.WithTimeout(ctx, t.opTimeout)
+	defer cancel()
+	return t.inner.ListServerGroupsByName(ctx, runID)
+}
+
+func (t serverGroupTimeoutCleaner) Delete(ctx context.Context, r resource.Resource) error {
+	ctx, cancel := context.WithTimeout(ctx, t.opTimeout)
+	defer cancel()
+	return t.inner.Delete(ctx, r)
+}
+
+// buildPersonaNodes builds the churn graph of a persona's lane: the rolling
+// graph, whose clusters stay whole and replace their workers one at a time, for
+// a rolling persona, the long-lived graph, whose nodes stay until teardown and
+// are mutated repeatedly, for a long-lived persona, and the graph nova chaos
+// churns otherwise.
 func buildPersonaNodes(ps *mixplan.Persona, c novagraph.Nova, r novaexec.Resolved, opTimeout time.Duration) ([]chaos.Node, error) {
+	if ps.Rolling {
+		return novagraph.BuildRolling(ps.Nova, c, r, opTimeout)
+	}
 	if ps.LongLived {
 		return novagraph.BuildLongLived(ps.Nova, c, r, opTimeout)
 	}
@@ -180,6 +231,8 @@ func mixPersonaCloud(s mixscenario.Scenario, name string) (string, error) {
 	switch name {
 	case "ci":
 		return s.Personas.CI.Cloud, nil
+	case "gardener":
+		return s.Personas.Gardener.Cloud, nil
 	case "legacy":
 		return s.Personas.Legacy.Cloud, nil
 	default:
