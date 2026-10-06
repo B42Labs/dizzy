@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servergroups"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/networks"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/ports"
@@ -18,7 +19,8 @@ import (
 // status fetches a resource and returns its status without recording a sample.
 // The readiness polls go through this so their repeated gets do not flood the
 // per-call latency stats; the time-to-ready record stands in for them instead.
-// Subnets report no status, so an existing subnet returns ("", nil).
+// Subnets and server groups report no status, so an existing one returns
+// ("", nil).
 func (c *Client) status(ctx context.Context, r resource.Resource) (string, error) {
 	switch r.Kind {
 	case KindServer:
@@ -47,6 +49,9 @@ func (c *Client) status(ctx context.Context, r resource.Resource) (string, error
 		return p.Status, nil
 	case KindSubnet:
 		_, err := subnets.Get(ctx, c.network, r.ID).Extract()
+		return "", err
+	case KindServerGroup:
+		_, err := servergroups.Get(ctx, c.compute, r.ID).Extract()
 		return "", err
 	default:
 		return "", fmt.Errorf("status not supported for kind %q", r.Kind)
@@ -78,8 +83,9 @@ func (c *Client) Observe(ctx context.Context, r resource.Resource) (status strin
 }
 
 // Delete removes a resource, recording the call. Servers, volumes, ports,
-// subnets, and networks are deleted by id; a 404 surfaces to the caller, which
-// treats an already-gone resource as success to keep cleanup idempotent.
+// subnets, networks, and server groups are deleted by id; a 404 surfaces to the
+// caller, which treats an already-gone resource as success to keep cleanup
+// idempotent.
 func (c *Client) Delete(ctx context.Context, r resource.Resource) error {
 	return c.timed(ctx, string(r.Kind), "delete", func(ctx context.Context) error {
 		switch r.Kind {
@@ -93,6 +99,8 @@ func (c *Client) Delete(ctx context.Context, r resource.Resource) error {
 			return subnets.Delete(ctx, c.network, r.ID).ExtractErr()
 		case KindNetwork:
 			return networks.Delete(ctx, c.network, r.ID).ExtractErr()
+		case KindServerGroup:
+			return servergroups.Delete(ctx, c.compute, r.ID).ExtractErr()
 		default:
 			return fmt.Errorf("delete not supported for kind %q", r.Kind)
 		}
@@ -131,13 +139,13 @@ func terminalState(kind resource.Kind, status string) bool {
 }
 
 // WaitForReady polls a created resource until it reaches its ready state,
-// recording one Readiness sample. A subnet reports no status, so it returns nil
-// immediately. It returns a terminal error when the resource reaches a terminal
-// failure state (a server ERROR, a volume error_*), and ctx.Err() if ctx is
-// cancelled or its deadline elapses first; the caller decides whether a
-// readiness deadline is fatal.
+// recording one Readiness sample. A subnet or a server group reports no status,
+// so it returns nil immediately. It returns a terminal error when the resource
+// reaches a terminal failure state (a server ERROR, a volume error_*), and
+// ctx.Err() if ctx is cancelled or its deadline elapses first; the caller
+// decides whether a readiness deadline is fatal.
 func (c *Client) WaitForReady(ctx context.Context, r resource.Resource) error {
-	if r.Kind == KindSubnet {
+	if r.Kind == KindSubnet || r.Kind == KindServerGroup {
 		return nil
 	}
 	return c.pollStatus(ctx, r,

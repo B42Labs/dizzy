@@ -29,12 +29,15 @@ import (
 // Nova resource kinds. They double as the metrics "type" label and the
 // tag/metadata value written under dizzy:type. Servers and volumes carry the
 // identity as metadata; networks, subnets, and ports carry it as Neutron tags.
+// Server groups carry neither metadata nor tags, so they are found by their
+// dizzy-<id>- name prefix.
 const (
-	KindServer  resource.Kind = "server"
-	KindNetwork resource.Kind = "network"
-	KindSubnet  resource.Kind = "subnet"
-	KindPort    resource.Kind = "port"
-	KindVolume  resource.Kind = "volume"
+	KindServer      resource.Kind = "server"
+	KindNetwork     resource.Kind = "network"
+	KindSubnet      resource.Kind = "subnet"
+	KindPort        resource.Kind = "port"
+	KindVolume      resource.Kind = "volume"
+	KindServerGroup resource.Kind = "server_group"
 )
 
 // Compute server status strings the readiness polls branch on. A server is
