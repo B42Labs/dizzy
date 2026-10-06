@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +45,31 @@ func smallScenario() Scenario {
 			Parallel: novascenario.Parallel{Max: 4},
 		},
 	}
+}
+
+// legacyBlock is the legacy block of the shipped small profile.
+func legacyBlock() Legacy {
+	return Legacy{
+		Share:            0.2,
+		Networks:         1,
+		ResizeFlavor:     "m1.small",
+		VolumesPerServer: novascenario.Range{Min: 1, Max: 2},
+		VolumeGiB:        novascenario.Range{Min: 1, Max: 2},
+		PortsPerServer:   novascenario.Range{Min: 0, Max: 1},
+		Interval: novascenario.Interval{
+			Min: novascenario.Duration(10 * time.Second),
+			Max: novascenario.Duration(time.Minute),
+		},
+	}
+}
+
+// twoPersonaScenario is smallScenario with the CI persona at share 0.8 and the
+// legacy block at share 0.2.
+func twoPersonaScenario() Scenario {
+	s := smallScenario()
+	s.Personas.CI.Share = 0.8
+	s.Personas.Legacy = legacyBlock()
+	return s
 }
 
 // marshal encodes v as the indented JSON mix generate writes.
@@ -202,5 +228,122 @@ func TestPersonaSeed(t *testing.T) {
 	}
 	if PersonaSeed(42, "ci") == PersonaSeed(42, "legacy") {
 		t.Error("PersonaSeed gives ci and legacy the same seed")
+	}
+}
+
+// TestGenerateTwoPersonas confirms the server envelope divides 5 to 1 between
+// the CI and the Legacy persona, in canonical order, and that only the Legacy
+// persona is long-lived.
+func TestGenerateTwoPersonas(t *testing.T) {
+	p, err := twoPersonaScenario().Generate()
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	type entry struct {
+		name      string
+		servers   int
+		share     float64
+		longLived bool
+	}
+	var got []entry
+	for _, ps := range p.Personas {
+		got = append(got, entry{ps.Name, len(ps.Nova.Servers), ps.Share, ps.LongLived})
+	}
+	want := []entry{{"ci", 5, 0.8, false}, {"legacy", 1, 0.2, true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("personas = %+v, want %+v", got, want)
+	}
+	if legacy := p.Personas[1]; legacy.Seed != PersonaSeed(42, "legacy") || legacy.Nova.Scenario != "small/legacy" || legacy.Nova.ResizeFlavor != "m1.small" {
+		t.Errorf("legacy provenance = %d %s %q, want PersonaSeed(42, legacy), small/legacy and m1.small", legacy.Seed, legacy.Nova.Scenario, legacy.Nova.ResizeFlavor)
+	}
+}
+
+// TestLegacyPersonaShape confirms a Legacy server carries every operation the
+// persona exercises, on one network, and that every Legacy volume and port is
+// detached and re-attached.
+func TestLegacyPersonaShape(t *testing.T) {
+	s := twoPersonaScenario()
+	s.Resources.Servers = 40
+	p, err := s.Generate()
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	np := p.Personas[1].Nova
+	for _, srv := range np.Servers {
+		if srv.StopStart != "soft" || !srv.Resize || !srv.LiveMigrate || !srv.ColdMigrate || len(srv.Networks) != 1 {
+			t.Errorf("server %+v, want soft stop/start, resize, live and cold migration and one network", srv)
+		}
+		if srv.Delete || srv.BootFromVolume || srv.UserData {
+			t.Errorf("server %+v carries an operation the Legacy persona does not use", srv)
+		}
+	}
+	if len(np.Volumes) == 0 || len(np.Ports) == 0 {
+		t.Fatalf("eight servers drew %d volumes and %d ports, want some of each", len(np.Volumes), len(np.Ports))
+	}
+	for _, v := range np.Volumes {
+		if !v.Detach {
+			t.Errorf("volume %+v is not detached", v)
+		}
+	}
+	for _, pt := range np.Ports {
+		if !pt.Detach {
+			t.Errorf("port %+v is not detached", pt)
+		}
+	}
+}
+
+// TestLegacyWithoutResizeFlavor confirms an empty resize flavor turns resize
+// off, and that zero volume and port ranges give empty lists.
+func TestLegacyWithoutResizeFlavor(t *testing.T) {
+	s := twoPersonaScenario()
+	s.Personas.Legacy.ResizeFlavor = ""
+	s.Personas.Legacy.VolumesPerServer = novascenario.Range{}
+	s.Personas.Legacy.PortsPerServer = novascenario.Range{}
+	p, err := s.Generate()
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	np := p.Personas[1].Nova
+	for _, srv := range np.Servers {
+		if srv.Resize || !srv.ColdMigrate {
+			t.Errorf("server %+v, want no resize and a cold migration", srv)
+		}
+	}
+	data := string(marshal(t, np))
+	if strings.Contains(data, `"resizeFlavor"`) || !strings.Contains(data, `"volumes": []`) || !strings.Contains(data, `"ports": []`) {
+		t.Errorf("legacy compute plan = %s, want no resizeFlavor and empty volumes and ports", data)
+	}
+}
+
+// TestGenerateLegacyOnly confirms a scenario whose CI share is 0 gives the
+// Legacy persona every server.
+func TestGenerateLegacyOnly(t *testing.T) {
+	s := twoPersonaScenario()
+	s.Personas.CI.Share = 0
+	s.Personas.Legacy.Share = 1
+	p, err := s.Generate()
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	if len(p.Personas) != 1 || p.Personas[0].Name != "legacy" || p.Personas[0].Servers != 6 || p.Personas[0].Share != 1 {
+		t.Errorf("personas = %+v, want legacy alone with 6 servers and share 1", p.Personas)
+	}
+}
+
+// TestCIPlanJSONUnchangedKeys confirms the CI persona's entry carries neither
+// longLived nor coldMigrate, so its plan JSON keeps its bytes, while the
+// Legacy entry carries both.
+func TestCIPlanJSONUnchangedKeys(t *testing.T) {
+	p, err := twoPersonaScenario().Generate()
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	for _, ps := range p.Personas {
+		data := string(marshal(t, ps))
+		want := ps.Name == "legacy"
+		if strings.Contains(data, `"longLived"`) != want || strings.Contains(data, `"coldMigrate"`) != want {
+			t.Errorf("persona %s JSON has longLived=%v coldMigrate=%v, want both %v",
+				ps.Name, strings.Contains(data, `"longLived"`), strings.Contains(data, `"coldMigrate"`), want)
+		}
 	}
 }

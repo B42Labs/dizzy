@@ -11,12 +11,76 @@ import (
 )
 
 func TestParseRejectsUnknownKey(t *testing.T) {
-	_, err := Parse([]byte("name: x\npersonas:\n  legacy:\n    share: 1\n"))
-	if err == nil {
-		t.Fatal("Parse accepted the unknown key personas.legacy")
+	for key, data := range map[string]string{
+		"personas.nope":        "name: x\npersonas:\n  nope:\n    share: 1\n",
+		"personas.legacy.nope": "name: x\npersonas:\n  legacy:\n    nope: 1\n",
+	} {
+		t.Run(key, func(t *testing.T) {
+			t.Parallel()
+			_, err := Parse([]byte(data))
+			if err == nil {
+				t.Fatalf("Parse accepted the unknown key %s", key)
+			}
+			if !strings.HasPrefix(err.Error(), "parsing scenario:") {
+				t.Errorf("error %q does not start with %q", err, "parsing scenario:")
+			}
+		})
 	}
-	if !strings.HasPrefix(err.Error(), "parsing scenario:") {
-		t.Errorf("error %q does not start with %q", err, "parsing scenario:")
+}
+
+// TestParseLegacyBlock confirms every key of the legacy block decodes into its
+// field.
+func TestParseLegacyBlock(t *testing.T) {
+	s, err := Parse([]byte(`
+personas:
+  legacy:
+    share: 0.2
+    cloud: tenant-legacy
+    networks: 3
+    resize_flavor: m1.small
+    volumes_per_server: { min: 1, max: 2 }
+    volume_gib: { min: 3, max: 4 }
+    ports_per_server: { min: 0, max: 5 }
+    interval: { min: 10s, max: 1m }
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	want := Legacy{
+		Share: 0.2, Cloud: "tenant-legacy", Networks: 3, ResizeFlavor: "m1.small",
+		VolumesPerServer: novascenario.Range{Min: 1, Max: 2},
+		VolumeGiB:        novascenario.Range{Min: 3, Max: 4},
+		PortsPerServer:   novascenario.Range{Min: 0, Max: 5},
+		Interval:         novascenario.Interval{Min: novascenario.Duration(10 * time.Second), Max: novascenario.Duration(time.Minute)},
+	}
+	if s.Personas.Legacy != want {
+		t.Errorf("personas.legacy = %+v, want %+v", s.Personas.Legacy, want)
+	}
+}
+
+// TestParseWithoutLegacy confirms a scenario without a legacy block has a zero
+// Legacy and generates a plan with the CI persona alone.
+func TestParseWithoutLegacy(t *testing.T) {
+	s, err := Parse([]byte(`
+name: ci-only
+image: cirros
+flavor: m1.tiny
+resources: { servers: 3 }
+personas:
+  ci: { share: 1, networks: 1 }
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if s.Personas.Legacy != (Legacy{}) {
+		t.Errorf("personas.legacy = %+v, want the zero block", s.Personas.Legacy)
+	}
+	p, err := s.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if len(p.Personas) != 1 || p.Personas[0].Name != "ci" || p.Personas[0].Servers != 3 {
+		t.Errorf("personas = %+v, want ci with 3 servers alone", p.Personas)
 	}
 }
 
@@ -50,7 +114,10 @@ func TestValidate(t *testing.T) {
 		{"negative share", func(s *Scenario) { s.Personas.CI.Share = -1 }, "personas.ci.share must be a finite number of at least 0, got -1"},
 		{"NaN share", func(s *Scenario) { s.Personas.CI.Share = math.NaN() }, "personas.ci.share must be a finite number of at least 0, got NaN"},
 		{"infinite share", func(s *Scenario) { s.Personas.CI.Share = math.Inf(1) }, "personas.ci.share must be a finite number of at least 0, got +Inf"},
-		{"zero share", func(s *Scenario) { s.Personas.CI.Share = 0 }, "at least one persona must have a share above 0"},
+		{"zero shares", func(s *Scenario) { s.Personas.CI.Share = 0; s.Personas.Legacy.Share = 0 }, "at least one persona must have a share above 0"},
+		{"negative legacy share", func(s *Scenario) { s.Personas.Legacy.Share = -1 }, "personas.legacy.share must be a finite number of at least 0, got -1"},
+		{"NaN legacy share", func(s *Scenario) { s.Personas.Legacy.Share = math.NaN() }, "personas.legacy.share must be a finite number of at least 0, got NaN"},
+		{"legacy alone", func(s *Scenario) { s.Personas.CI.Share = 0; s.Personas.Legacy = legacyBlock() }, ""},
 		{"negative interval", func(s *Scenario) { s.Personas.CI.Interval.Min = d(-time.Second) }, "personas.ci.interval.min must not be negative, got -1s"},
 		{"inverted interval", func(s *Scenario) { s.Personas.CI.Interval.Min = d(2 * time.Second) }, "personas.ci.interval.min (2s) must not exceed personas.ci.interval.max (1s)"},
 		{"churn ratio above 1", func(s *Scenario) { s.Personas.CI.ChurnRatio = 1.5 }, "personas.ci.churn_ratio must be between 0 and 1, got 1.5"},
@@ -59,6 +126,10 @@ func TestValidate(t *testing.T) {
 		{"negative target fill", func(s *Scenario) { s.Personas.CI.TargetFill = -0.1 }, "personas.ci.target_fill must be between 0 and 1, got -0.1"},
 		{"target fill above 1", func(s *Scenario) { s.Personas.CI.TargetFill = 1.5 }, "personas.ci.target_fill must be between 0 and 1, got 1.5"},
 		{"NaN target fill", func(s *Scenario) { s.Personas.CI.TargetFill = math.NaN() }, "personas.ci.target_fill must be between 0 and 1, got NaN"},
+		{"negative legacy interval", func(s *Scenario) { s.Personas.Legacy.Interval.Min = d(-time.Second) }, "personas.legacy.interval.min must not be negative, got -1s"},
+		{"inverted legacy interval", func(s *Scenario) {
+			s.Personas.Legacy.Interval = novascenario.Interval{Min: d(2 * time.Second), Max: d(time.Second)}
+		}, "personas.legacy.interval.min (2s) must not exceed personas.legacy.interval.max (1s)"},
 		{"negative duration", func(s *Scenario) { s.Chaos.Duration = d(-time.Minute) }, "chaos.duration must not be negative, got -1m0s"},
 		{"negative bucket width", func(s *Scenario) { s.Chaos.BucketWidth = d(-time.Minute) }, "chaos.bucket_width must not be negative, got -1m0s"},
 		{"negative parallel", func(s *Scenario) { s.Chaos.Parallel.Max = -1 }, "chaos.parallel.max must not be negative, got -1"},
@@ -68,6 +139,11 @@ func TestValidate(t *testing.T) {
 		{"no networks", func(s *Scenario) { s.Personas.CI.Networks = 0 }, "personas.ci: distribution.networks_per_server.max (1) must not exceed resources.networks (0)"},
 		{"no image", func(s *Scenario) { s.Image = "" }, "personas.ci: image must be set when resources.servers > 0"},
 		{"no networks without servers", func(s *Scenario) { s.Personas.CI.Networks = 0; s.Resources.Servers = 0 }, ""},
+		{"legacy resize flavor equals flavor", func(s *Scenario) { s.Personas.Legacy = legacyBlock(); s.Personas.Legacy.ResizeFlavor = "m1.tiny" },
+			`personas.legacy: resize_flavor ("m1.tiny") must differ from flavor ("m1.tiny")`},
+		{"legacy without networks", func(s *Scenario) { s.Personas.Legacy = legacyBlock(); s.Personas.Legacy.Networks = 0 },
+			"personas.legacy: distribution.networks_per_server.max (1) must not exceed resources.networks (0)"},
+		{"inactive legacy block", func(s *Scenario) { s.Personas.Legacy = Legacy{Networks: 0, ResizeFlavor: "m1.tiny"} }, ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -111,6 +187,23 @@ func TestSet(t *testing.T) {
 		}},
 		{"personas.ci.churn_ratio", "0.25", func(s Scenario) bool { return s.Personas.CI.ChurnRatio == 0.25 }},
 		{"personas.ci.target_fill", "0.9", func(s Scenario) bool { return s.Personas.CI.TargetFill == 0.9 }},
+		{"personas.legacy.share", "0.3", func(s Scenario) bool { return s.Personas.Legacy.Share == 0.3 }},
+		{"personas.legacy.cloud", "tenant-legacy", func(s Scenario) bool { return s.Personas.Legacy.Cloud == "tenant-legacy" }},
+		{"personas.legacy.networks", "2", func(s Scenario) bool { return s.Personas.Legacy.Networks == 2 }},
+		{"personas.legacy.resize_flavor", "m1.medium", func(s Scenario) bool { return s.Personas.Legacy.ResizeFlavor == "m1.medium" }},
+		{"personas.legacy.resize_flavor", "", func(s Scenario) bool { return s.Personas.Legacy.ResizeFlavor == "" }},
+		{"personas.legacy.volumes_per_server.min", "1", func(s Scenario) bool { return s.Personas.Legacy.VolumesPerServer.Min == 1 }},
+		{"personas.legacy.volumes_per_server.max", "3", func(s Scenario) bool { return s.Personas.Legacy.VolumesPerServer.Max == 3 }},
+		{"personas.legacy.volume_gib.min", "2", func(s Scenario) bool { return s.Personas.Legacy.VolumeGiB.Min == 2 }},
+		{"personas.legacy.volume_gib.max", "4", func(s Scenario) bool { return s.Personas.Legacy.VolumeGiB.Max == 4 }},
+		{"personas.legacy.ports_per_server.min", "1", func(s Scenario) bool { return s.Personas.Legacy.PortsPerServer.Min == 1 }},
+		{"personas.legacy.ports_per_server.max", "2", func(s Scenario) bool { return s.Personas.Legacy.PortsPerServer.Max == 2 }},
+		{"personas.legacy.interval.min", "5s", func(s Scenario) bool {
+			return s.Personas.Legacy.Interval.Min == novascenario.Duration(5*time.Second)
+		}},
+		{"personas.legacy.interval.max", "2m", func(s Scenario) bool {
+			return s.Personas.Legacy.Interval.Max == novascenario.Duration(2*time.Minute)
+		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
@@ -136,6 +229,9 @@ func TestSetErrors(t *testing.T) {
 		{"seed", "1.5", `override seed: "1.5" is not an integer`},
 		{"personas.ci.share", "half", `override personas.ci.share: "half" is not a number`},
 		{"personas.ci.interval.min", "5", `override personas.ci.interval.min: "5" is not a duration`},
+		{"personas.legacy.nope", "1", `unknown override key "personas.legacy.nope"`},
+		{"personas.legacy.interval.min", "x", `override personas.legacy.interval.min: "x" is not a duration`},
+		{"personas.legacy.networks", "two", `override personas.legacy.networks: "two" is not an integer`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.key, func(t *testing.T) {
@@ -153,6 +249,7 @@ func FuzzParse(f *testing.F) {
 	f.Add([]byte("name: small\nresources: { servers: 6 }\npersonas:\n  ci: { share: 1, networks: 2 }\n"))
 	f.Add([]byte("name: x\npersonas:\n  ci: { share: .nan }\n"))
 	f.Add([]byte("chaos: { duration: 1m, parallel: { max: 4 } }\nservices: [a, a]\n"))
+	f.Add([]byte("name: x\nresources: { servers: 2 }\npersonas:\n  legacy: { share: 1, networks: 1, resize_flavor: m1.small, ports_per_server: { min: 0, max: 1 } }\n"))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		s, err := Parse(data)
 		if err != nil {
