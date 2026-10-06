@@ -26,7 +26,8 @@ import (
 type Record struct {
 	RunID string `json:"runID"`
 	// Service names the OpenStack service the run exercised (neutron, cinder,
-	// keystone, nova, or glance). It is omitempty and read as "neutron" when
+	// keystone, nova, or glance), or mix for a combined run of several
+	// workload personas. It is omitempty and read as "neutron" when
 	// absent, so run records written before Cinder support (which carry no service
 	// field) still load and report unchanged.
 	Service    string              `json:"service,omitempty"`
@@ -42,8 +43,15 @@ type Record struct {
 	// cinder run that used the cloud's default type.
 	VolumeType string `json:"volumeType,omitempty"`
 	// Chaos holds the churn-specific statistics of a soak/chaos run. It is nil
-	// for an apply run, so an apply record's shape is unchanged.
+	// for an apply run, so an apply record's shape is unchanged. It is also nil
+	// for a mix run, whose churn statistics are per persona.
 	Chaos *ChaosStats `json:"chaos,omitempty"`
+	// Services lists the opt-in services a mix run bound to its personas. It is
+	// omitted when empty.
+	Services []string `json:"services,omitempty"`
+	// Personas holds one entry per workload persona of a mix run, in the order
+	// the run ran them. It is omitted for every other run.
+	Personas []PersonaStats `json:"personas,omitempty"`
 	// Incomplete marks a checkpoint a chaos run wrote while it was still
 	// running: the run was still going or was killed before its final record.
 	// FinishedAt is then the checkpoint time. The final write omits the key.
@@ -73,6 +81,26 @@ type ChaosStats struct {
 	// (--duration 0). It is omitempty and 0 for a bounded run, whose ten
 	// buckets divide its duration equally.
 	BucketWidth time.Duration `json:"bucketWidth,omitempty"`
+}
+
+// PersonaStats is one workload persona of a mix run. RunID is the identity its
+// resources carry, the run id suffixed with the persona name. Cloud is the
+// clouds.yaml entry the scenario named for it, empty when the persona used the
+// --os-cloud fallback, and ProjectID the project it authenticated against,
+// empty when unknown. Share is the persona's normalized share of the server
+// envelope and Servers its part of it. Metrics and Chaos are the persona's own
+// aggregate and churn statistics; Chaos is nil in a checkpoint written before
+// the persona's engine produced a snapshot.
+type PersonaStats struct {
+	Name      string            `json:"name"`
+	RunID     string            `json:"runID"`
+	Cloud     string            `json:"cloud,omitempty"`
+	ProjectID string            `json:"projectID,omitempty"`
+	Share     float64           `json:"share"`
+	Servers   int               `json:"servers"`
+	Seed      int64             `json:"seed"`
+	Metrics   metrics.Aggregate `json:"metrics"`
+	Chaos     *ChaosStats       `json:"chaos,omitempty"`
 }
 
 // ChaosBucket is one time slice of a churn run: the operations whose decision
