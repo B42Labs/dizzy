@@ -114,6 +114,30 @@ func TestBuildResourceAttributes(t *testing.T) {
 			t.Error("service attribute present despite an empty Config.Service")
 		}
 	})
+
+	t.Run("persona present for a mix run", func(t *testing.T) {
+		res, err := buildResource(Config{Cloud: "tenant-ci", Scenario: "small", Service: "mix", Persona: "ci"})
+		if err != nil {
+			t.Fatalf("buildResource: %v", err)
+		}
+		set := res.Set()
+		for k, want := range map[string]string{"service": "mix", "persona": "ci"} {
+			got, ok := set.Value(attribute.Key(k))
+			if !ok || got.AsString() != want {
+				t.Errorf("resource attribute %q = %q (present=%v), want %q", k, got.AsString(), ok, want)
+			}
+		}
+	})
+
+	t.Run("empty persona is omitted", func(t *testing.T) {
+		res, err := buildResource(Config{Cloud: "test", Scenario: "small", Service: "nova"})
+		if err != nil {
+			t.Fatalf("buildResource: %v", err)
+		}
+		if _, ok := res.Set().Value(attribute.Key("persona")); ok {
+			t.Error("persona attribute present despite an empty Config.Persona")
+		}
+	})
 }
 
 func TestInstrumentsMatchDocumentedSchema(t *testing.T) {
