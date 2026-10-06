@@ -1,0 +1,77 @@
+{
+  "scenario": "small",
+  "seed": 42,
+  "services": [],
+  "personas": [
+    {
+      "name": "ci",
+      "share": 1,
+      "servers": 6,
+      "seed": 622155389148472395,
+      "nova": {
+        "scenario": "small/ci",
+        "seed": 622155389148472395,
+        "image": "cirros",
+        "flavor": "m1.tiny",
+        "networks": [
+          {
+            "name": "net-0001",
+            "subnet": "sub-0001",
+            "cidr": "10.0.1.0/24"
+          },
+          {
+            "name": "net-0002",
+            "subnet": "sub-0002",
+            "cidr": "10.0.2.0/24"
+          }
+        ],
+        "servers": [
+          {
+            "name": "srv-0001",
+            "networks": [
+              "net-0002"
+            ]
+          },
+          {
+            "name": "srv-0002",
+            "networks": [
+              "net-0001"
+            ]
+          },
+          {
+            "name": "srv-0003",
+            "networks": [
+              "net-0001"
+            ]
+          },
+          {
+            "name": "srv-0004",
+            "networks": [
+              "net-0002"
+            ]
+          },
+          {
+            "name": "srv-0005",
+            "networks": [
+              "net-0002"
+            ]
+          },
+          {
+            "name": "srv-0006",
+            "networks": [
+              "net-0001"
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "vol-0001",
+            "sizeGiB": 2,
+            "server": "srv-0001"
+          }
+        ],
+        "ports": []
+      }
+    }
+  ]
+}
