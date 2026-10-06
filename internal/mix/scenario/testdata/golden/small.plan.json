@@ -5,8 +5,8 @@
   "personas": [
     {
       "name": "ci",
-      "share": 1,
-      "servers": 6,
+      "share": 0.8,
+      "servers": 5,
       "seed": 622155389148472395,
       "nova": {
         "scenario": "small/ci",
@@ -55,12 +55,6 @@
             "networks": [
               "net-0002"
             ]
-          },
-          {
-            "name": "srv-0006",
-            "networks": [
-              "net-0001"
-            ]
           }
         ],
         "volumes": [
@@ -68,6 +62,54 @@
             "name": "vol-0001",
             "sizeGiB": 2,
             "server": "srv-0001"
+          }
+        ],
+        "ports": []
+      }
+    },
+    {
+      "name": "legacy",
+      "share": 0.2,
+      "servers": 1,
+      "seed": -2394854468723704588,
+      "longLived": true,
+      "nova": {
+        "scenario": "small/legacy",
+        "seed": -2394854468723704588,
+        "image": "cirros",
+        "flavor": "m1.tiny",
+        "resizeFlavor": "m1.small",
+        "networks": [
+          {
+            "name": "net-0001",
+            "subnet": "sub-0001",
+            "cidr": "10.0.1.0/24"
+          }
+        ],
+        "servers": [
+          {
+            "name": "srv-0001",
+            "networks": [
+              "net-0001"
+            ],
+            "stopStart": "soft",
+            "resize": true,
+            "liveMigrate": true,
+            "coldMigrate": true
+          }
+        ],
+        "volumes": [
+          {
+            "name": "vol-0001",
+            "sizeGiB": 1,
+            "server": "srv-0001",
+            "detach": true
+          },
+          {
+            "name": "vol-0002",
+            "sizeGiB": 1,
+            "server": "srv-0001",
+            "detach": true
           }
         ],
         "ports": []

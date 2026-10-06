@@ -18,8 +18,9 @@ import (
 
 var update = flag.Bool("update", false, "update golden files")
 
-// smallScenario equals the shipped small profile: six servers, all for the CI
-// persona, on two networks. It backs the golden test.
+// smallScenario equals the shipped small profile: six servers, five for the CI
+// persona on two networks and one for the Legacy persona on one. It backs the
+// golden test.
 func smallScenario() Scenario {
 	return Scenario{
 		Name:      "small",
@@ -28,18 +29,21 @@ func smallScenario() Scenario {
 		Flavor:    "m1.tiny",
 		Services:  []string{},
 		Resources: Resources{Servers: 6},
-		Personas: Personas{CI: CI{
-			Share:            1,
-			Networks:         2,
-			VolumesPerServer: novascenario.Range{Min: 0, Max: 1},
-			VolumeGiB:        novascenario.Range{Min: 1, Max: 2},
-			Interval: novascenario.Interval{
-				Min: novascenario.Duration(100 * time.Millisecond),
-				Max: novascenario.Duration(time.Second),
+		Personas: Personas{
+			CI: CI{
+				Share:            0.8,
+				Networks:         2,
+				VolumesPerServer: novascenario.Range{Min: 0, Max: 1},
+				VolumeGiB:        novascenario.Range{Min: 1, Max: 2},
+				Interval: novascenario.Interval{
+					Min: novascenario.Duration(100 * time.Millisecond),
+					Max: novascenario.Duration(time.Second),
+				},
+				ChurnRatio: 0.5,
+				TargetFill: 0.6,
 			},
-			ChurnRatio: 0.5,
-			TargetFill: 0.6,
-		}},
+			Legacy: legacyBlock(),
+		},
 		Chaos: &Chaos{
 			Duration: novascenario.Duration(5 * time.Minute),
 			Parallel: novascenario.Parallel{Max: 4},
@@ -61,15 +65,6 @@ func legacyBlock() Legacy {
 			Max: novascenario.Duration(time.Minute),
 		},
 	}
-}
-
-// twoPersonaScenario is smallScenario with the CI persona at share 0.8 and the
-// legacy block at share 0.2.
-func twoPersonaScenario() Scenario {
-	s := smallScenario()
-	s.Personas.CI.Share = 0.8
-	s.Personas.Legacy = legacyBlock()
-	return s
 }
 
 // marshal encodes v as the indented JSON mix generate writes.
@@ -136,31 +131,46 @@ func TestGenerateGolden(t *testing.T) {
 	}
 }
 
-// TestGenerateSmallPlanShape confirms the small scenario gives the CI persona
-// every server and the whole share, under its derived seed.
+// TestGenerateSmallPlanShape confirms the small scenario divides its servers 5
+// to 1 between the CI and the Legacy persona, in canonical order, each under
+// its derived seed, and that only the Legacy persona is long-lived.
 func TestGenerateSmallPlanShape(t *testing.T) {
 	p, err := smallScenario().Generate()
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
-	if p.Scenario != "small" || p.Seed != 42 || len(p.Personas) != 1 {
-		t.Fatalf("plan = %s/%d with %d personas, want small/42 with 1", p.Scenario, p.Seed, len(p.Personas))
+	if p.Scenario != "small" || p.Seed != 42 {
+		t.Fatalf("plan = %s/%d, want small/42", p.Scenario, p.Seed)
 	}
-	ci := p.Personas[0]
-	if ci.Name != "ci" || ci.Servers != 6 || ci.Share != 1 || ci.Seed != PersonaSeed(42, "ci") {
-		t.Errorf("persona = %+v, want ci with 6 servers, share 1 and seed PersonaSeed(42, ci)", ci)
+	type entry struct {
+		name      string
+		servers   int
+		planned   int
+		share     float64
+		longLived bool
 	}
-	if ci.Nova.Scenario != "small/ci" || ci.Nova.Seed != ci.Seed || ci.Nova.Image != "cirros" || ci.Nova.Flavor != "m1.tiny" {
-		t.Errorf("compute plan provenance = %s/%d %s/%s, want small/ci with the persona seed, cirros and m1.tiny",
-			ci.Nova.Scenario, ci.Nova.Seed, ci.Nova.Image, ci.Nova.Flavor)
+	var got []entry
+	for _, ps := range p.Personas {
+		got = append(got, entry{ps.Name, ps.Servers, len(ps.Nova.Servers), ps.Share, ps.LongLived})
 	}
-	for i, srv := range ci.Nova.Servers {
-		if want := fmt.Sprintf("srv-%04d", i+1); srv.Name != want {
-			t.Errorf("server %d = %q, want %q", i, srv.Name, want)
+	want := []entry{{"ci", 5, 5, 0.8, false}, {"legacy", 1, 1, 0.2, true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("personas = %+v, want %+v", got, want)
+	}
+	for _, ps := range p.Personas {
+		if ps.Seed != PersonaSeed(42, ps.Name) || ps.Nova.Scenario != "small/"+ps.Name || ps.Nova.Seed != ps.Seed ||
+			ps.Nova.Image != "cirros" || ps.Nova.Flavor != "m1.tiny" {
+			t.Errorf("%s compute plan provenance = %s/%d %s/%s, want small/%s with the persona seed, cirros and m1.tiny",
+				ps.Name, ps.Nova.Scenario, ps.Nova.Seed, ps.Nova.Image, ps.Nova.Flavor, ps.Name)
+		}
+		for i, srv := range ps.Nova.Servers {
+			if want := fmt.Sprintf("srv-%04d", i+1); srv.Name != want {
+				t.Errorf("%s server %d = %q, want %q", ps.Name, i, srv.Name, want)
+			}
 		}
 	}
-	if len(ci.Nova.Servers) != 6 || len(ci.Nova.Networks) != 2 {
-		t.Errorf("compute plan has %d servers and %d networks, want 6 and 2", len(ci.Nova.Servers), len(ci.Nova.Networks))
+	if ci, legacy := p.Personas[0].Nova, p.Personas[1].Nova; len(ci.Networks) != 2 || len(legacy.Networks) != 1 || legacy.ResizeFlavor != "m1.small" {
+		t.Errorf("networks ci/legacy = %d/%d, legacy resize flavor %q, want 2/1 and m1.small", len(ci.Networks), len(legacy.Networks), legacy.ResizeFlavor)
 	}
 }
 
@@ -231,38 +241,11 @@ func TestPersonaSeed(t *testing.T) {
 	}
 }
 
-// TestGenerateTwoPersonas confirms the server envelope divides 5 to 1 between
-// the CI and the Legacy persona, in canonical order, and that only the Legacy
-// persona is long-lived.
-func TestGenerateTwoPersonas(t *testing.T) {
-	p, err := twoPersonaScenario().Generate()
-	if err != nil {
-		t.Fatalf("Generate(): %v", err)
-	}
-	type entry struct {
-		name      string
-		servers   int
-		share     float64
-		longLived bool
-	}
-	var got []entry
-	for _, ps := range p.Personas {
-		got = append(got, entry{ps.Name, len(ps.Nova.Servers), ps.Share, ps.LongLived})
-	}
-	want := []entry{{"ci", 5, 0.8, false}, {"legacy", 1, 0.2, true}}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("personas = %+v, want %+v", got, want)
-	}
-	if legacy := p.Personas[1]; legacy.Seed != PersonaSeed(42, "legacy") || legacy.Nova.Scenario != "small/legacy" || legacy.Nova.ResizeFlavor != "m1.small" {
-		t.Errorf("legacy provenance = %d %s %q, want PersonaSeed(42, legacy), small/legacy and m1.small", legacy.Seed, legacy.Nova.Scenario, legacy.Nova.ResizeFlavor)
-	}
-}
-
 // TestLegacyPersonaShape confirms a Legacy server carries every operation the
 // persona exercises, on one network, and that every Legacy volume and port is
 // detached and re-attached.
 func TestLegacyPersonaShape(t *testing.T) {
-	s := twoPersonaScenario()
+	s := smallScenario()
 	s.Resources.Servers = 40
 	p, err := s.Generate()
 	if err != nil {
@@ -295,7 +278,7 @@ func TestLegacyPersonaShape(t *testing.T) {
 // TestLegacyWithoutResizeFlavor confirms an empty resize flavor turns resize
 // off, and that zero volume and port ranges give empty lists.
 func TestLegacyWithoutResizeFlavor(t *testing.T) {
-	s := twoPersonaScenario()
+	s := smallScenario()
 	s.Personas.Legacy.ResizeFlavor = ""
 	s.Personas.Legacy.VolumesPerServer = novascenario.Range{}
 	s.Personas.Legacy.PortsPerServer = novascenario.Range{}
@@ -318,7 +301,7 @@ func TestLegacyWithoutResizeFlavor(t *testing.T) {
 // TestGenerateLegacyOnly confirms a scenario whose CI share is 0 gives the
 // Legacy persona every server.
 func TestGenerateLegacyOnly(t *testing.T) {
-	s := twoPersonaScenario()
+	s := smallScenario()
 	s.Personas.CI.Share = 0
 	s.Personas.Legacy.Share = 1
 	p, err := s.Generate()
@@ -334,7 +317,7 @@ func TestGenerateLegacyOnly(t *testing.T) {
 // longLived nor coldMigrate, so its plan JSON keeps its bytes, while the
 // Legacy entry carries both.
 func TestCIPlanJSONUnchangedKeys(t *testing.T) {
-	p, err := twoPersonaScenario().Generate()
+	p, err := smallScenario().Generate()
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
