@@ -2,8 +2,11 @@ package novagraph
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -43,6 +46,11 @@ type fakeNova struct {
 	opsBySrv     map[string][]string // server logical -> operations started, in call order
 	flavorsBySrv map[string][]string // server logical -> flavor ids ResizeServer was called with
 	attachLog    map[string][]string // volume or port logical -> attach, detach and detach-wait calls
+	createSrv    int
+	groupCreates map[string]int        // server group logical -> CreateServerGroup calls
+	groupID      map[string]string     // server group logical -> id of its live instance
+	deletesBy    map[resource.Kind]int // kind -> Delete calls
+	bootLog      []string              // "<server logical> ok|failed" per CreateServer call, in call order
 
 	// failNext queues, per method name, the errors its next calls return, one
 	// per call; a method with an empty queue succeeds.
@@ -53,8 +61,14 @@ type fakeNova struct {
 	attachAbsentSrv   bool // an attach referenced a server that is not live
 	familyBusy        map[string]bool
 	familyViolation   bool // two ops on one server's family overlapped
+	wrongGroupID      bool // a server was booted with another id than its group's
+	rollViolation     bool // a server was deleted while another server of its group was down
+	deletedWithVolume bool // a server was deleted while a volume was attached to it
 	opDelay           time.Duration
-	liveByLogicalName map[string]bool // logical -> a live instance exists
+	liveByLogicalName map[string]bool   // logical -> a live instance exists
+	groupOf           map[string]string // server logical -> its server group
+	down              map[string]bool   // server logical -> deleted and not yet booted again
+	volServer         map[string]string // volume id -> id of the server it was attached to
 }
 
 func newFakeNova() *fakeNova {
@@ -71,6 +85,12 @@ func newFakeNova() *fakeNova {
 		failNext:          map[string][]error{},
 		familyBusy:        map[string]bool{},
 		liveByLogicalName: map[string]bool{},
+		groupCreates:      map[string]int{},
+		groupID:           map[string]string{},
+		deletesBy:         map[resource.Kind]int{},
+		groupOf:           map[string]string{},
+		down:              map[string]bool{},
+		volServer:         map[string]string{},
 	}
 }
 
@@ -121,6 +141,14 @@ func (f *fakeNova) create(kind resource.Kind, logical, prefix string) resource.R
 	return resource.Resource{Kind: kind, Logical: logical, ID: id}
 }
 
+func (f *fakeNova) CreateServerGroup(_ context.Context, g novaplan.ServerGroup) (resource.Resource, error) {
+	res := f.create(nova.KindServerGroup, g.Name, "grp")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.groupCreates[g.Name]++
+	f.groupID[g.Name] = res.ID
+	return res, nil
+}
 func (f *fakeNova) CreateNetwork(_ context.Context, n novaplan.Network) (resource.Resource, error) {
 	return f.create(nova.KindNetwork, n.Name, "net"), nil
 }
@@ -131,8 +159,29 @@ func (f *fakeNova) CreateSubnet(_ context.Context, n novaplan.Network, _ string)
 }
 func (f *fakeNova) DeleteNetworkPorts(context.Context, string) (int, error) { return 0, nil }
 
-func (f *fakeNova) CreateServer(_ context.Context, s novaplan.Server, _ nova.BootSpec) (resource.Resource, error) {
-	return f.create(nova.KindServer, s.Name, "srv"), nil
+// CreateServer checks that a server with a group boots into its group's live
+// instance, and returns the error queued under "CreateServer" without
+// creating anything. A boot takes opDelay.
+func (f *fakeNova) CreateServer(_ context.Context, s novaplan.Server, boot nova.BootSpec) (resource.Resource, error) {
+	f.mu.Lock()
+	f.createSrv++
+	if s.Group != "" && boot.GroupID != f.groupID[s.Group] {
+		f.wrongGroupID = true
+	}
+	f.groupOf[s.Name] = s.Group
+	if err := f.injected("CreateServer"); err != nil {
+		f.bootLog = append(f.bootLog, s.Name+" failed")
+		f.mu.Unlock()
+		return resource.Resource{}, err
+	}
+	f.mu.Unlock()
+	time.Sleep(f.opDelay)
+	res := f.create(nova.KindServer, s.Name, "srv")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bootLog = append(f.bootLog, s.Name+" ok")
+	f.down[s.Name] = false
+	return res, nil
 }
 func (f *fakeNova) CreateVolume(_ context.Context, v novaplan.Volume) (resource.Resource, error) {
 	f.mu.Lock()
@@ -157,6 +206,7 @@ func (f *fakeNova) AttachVolume(_ context.Context, server, volume resource.Resou
 		return err
 	}
 	f.attachedVol[volume.ID] = true
+	f.volServer[volume.ID] = server.ID
 	return nil
 }
 func (f *fakeNova) DetachVolume(_ context.Context, server, volume resource.Resource) error {
@@ -253,10 +303,31 @@ func (f *fakeNova) ColdMigrateServer(_ context.Context, r resource.Resource) err
 	return f.injected("ColdMigrateServer")
 }
 
+// Delete flags a server delete while another server of its group is down or
+// while a volume is still attached to it. A server delete takes opDelay.
 func (f *fakeNova) Delete(_ context.Context, r resource.Resource) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.deletes++
+	f.deletesBy[r.Kind]++
+	if r.Kind == nova.KindServer {
+		if g := f.groupOf[r.Logical]; g != "" {
+			for other, down := range f.down {
+				if down && other != r.Logical && f.groupOf[other] == g {
+					f.rollViolation = true
+				}
+			}
+		}
+		for vol, attached := range f.attachedVol {
+			if attached && f.volServer[vol] == r.ID {
+				f.deletedWithVolume = true
+			}
+		}
+		f.down[r.Logical] = true
+		f.mu.Unlock()
+		time.Sleep(f.opDelay)
+		f.mu.Lock()
+	}
+	defer f.mu.Unlock()
 	delete(f.live, r.ID)
 	f.liveByLogicalName[r.Logical] = false
 	return nil
@@ -529,5 +600,121 @@ func TestRunLongLivedOperationsDeterministic(t *testing.T) {
 	}
 	if other := opsOf(8); reflect.DeepEqual(first, other) {
 		t.Errorf("seeds 7 and 8 gave every server the same operations: %v", first)
+	}
+}
+
+// rollingPlan is the plan of a Gardener persona: two clusters of three
+// workers, each cluster with its own network and soft-anti-affinity group, and
+// one data volume per worker.
+func rollingPlan() *novaplan.Plan {
+	p := &novaplan.Plan{
+		Scenario: "gardener", Seed: 7, Image: "cirros", Flavor: "m1.tiny",
+		Networks: []novaplan.Network{
+			{Name: "net-0001", Subnet: "sub-0001", CIDR: "10.0.1.0/24"},
+			{Name: "net-0002", Subnet: "sub-0002", CIDR: "10.0.2.0/24"},
+		},
+		ServerGroups: []novaplan.ServerGroup{
+			{Name: "grp-0001", Policy: novaplan.PolicySoftAntiAffinity},
+			{Name: "grp-0002", Policy: novaplan.PolicySoftAntiAffinity},
+		},
+	}
+	for i := 0; i < 6; i++ {
+		k := i%2 + 1
+		srv := fmt.Sprintf("srv-%04d", i+1)
+		p.Servers = append(p.Servers, novaplan.Server{
+			Name: srv, Networks: []string{fmt.Sprintf("net-%04d", k)}, Group: fmt.Sprintf("grp-%04d", k),
+		})
+		p.Volumes = append(p.Volumes, novaplan.Volume{Name: fmt.Sprintf("vol-%04d", i+1), SizeGiB: 1, Server: srv})
+	}
+	return p
+}
+
+// runRolling runs a churn of p's rolling graph on f.
+func runRolling(t *testing.T, p *novaplan.Plan, f *fakeNova) *chaos.Result {
+	t.Helper()
+	nodes, err := BuildRolling(p, f, resolvedAll(), time.Minute)
+	if err != nil {
+		t.Fatalf("BuildRolling: %v", err)
+	}
+	r, err := chaos.Run(context.Background(), nodes, p.Seed, novaCfg(), newFakeClock())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	return r
+}
+
+// TestRunBootsIntoGroup confirms a churn over a graph with a server group
+// boots every server with the id the cloud gave its group's live instance.
+func TestRunBootsIntoGroup(t *testing.T) {
+	f := newFakeNova()
+	p := churnPlan()
+	p.ServerGroups = []novaplan.ServerGroup{{Name: "grp-0001", Policy: novaplan.PolicyAntiAffinity}}
+	for i := range p.Servers {
+		p.Servers[i].Group = "grp-0001"
+	}
+	if _, err := chaos.Run(context.Background(), mustBuild(t, p, f), p.Seed, novaCfg(), newFakeClock()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.createSrv == 0 {
+		t.Fatal("no server was booted; the test exercises nothing")
+	}
+	if f.wrongGroupID {
+		t.Error("a server was booted with another id than its group's")
+	}
+}
+
+// TestRunRollingInvariants drives the rolling graph of two clusters and checks
+// that it replaces workers one at a time per group: no worker is deleted while
+// another worker of its group is down or while its volume is attached, the
+// per-server family never runs two operations at once, and the groups and
+// networks are created once and never deleted.
+func TestRunRollingInvariants(t *testing.T) {
+	f := newFakeNova()
+	f.opDelay = time.Millisecond // widen the serial window so a race would show
+	p := rollingPlan()
+	runRolling(t, p, f)
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.deletesBy[nova.KindServer] == 0 || f.deletesBy[nova.KindVolume] == 0 ||
+		f.createSrv <= len(p.Servers) || f.createVol <= len(p.Volumes) {
+		t.Fatalf("server deletes=%d volume deletes=%d server boots=%d volume creates=%d; the run replaced nothing",
+			f.deletesBy[nova.KindServer], f.deletesBy[nova.KindVolume], f.createSrv, f.createVol)
+	}
+	for flag, set := range map[string]bool{
+		"rollViolation": f.rollViolation, "deletedWithVolume": f.deletedWithVolume,
+		"familyViolation": f.familyViolation, "attachAbsentSrv": f.attachAbsentSrv, "wrongGroupID": f.wrongGroupID,
+	} {
+		if set {
+			t.Errorf("%s is set", flag)
+		}
+	}
+	if f.deletesBy[nova.KindServerGroup] != 0 || f.deletesBy[nova.KindNetwork] != 0 {
+		t.Errorf("server group deletes=%d network deletes=%d, want 0", f.deletesBy[nova.KindServerGroup], f.deletesBy[nova.KindNetwork])
+	}
+	for _, g := range p.ServerGroups {
+		if f.groupCreates[g.Name] != 1 {
+			t.Errorf("server group %s created %d times, want once", g.Name, f.groupCreates[g.Name])
+		}
+	}
+}
+
+// TestRunRollingRebootsFailedWorker confirms a worker whose boot failed is
+// booted again by a later roll.
+func TestRunRollingRebootsFailedWorker(t *testing.T) {
+	f := newFakeNova()
+	f.failNext["CreateServer"] = []error{errors.New("simulated boot failure")}
+	runRolling(t, rollingPlan(), f)
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.bootLog) == 0 || !strings.HasSuffix(f.bootLog[0], " failed") {
+		t.Fatalf("boot log = %v, want the first boot to fail", f.bootLog)
+	}
+	worker := strings.TrimSuffix(f.bootLog[0], " failed")
+	if !slices.Contains(f.bootLog[1:], worker+" ok") {
+		t.Errorf("boot log = %v, want %s booted again", f.bootLog, worker)
 	}
 }
