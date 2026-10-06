@@ -61,12 +61,12 @@ func TestSmallProfileMatchesFixture(t *testing.T) {
 // scenario schema reference documents for the three profiles.
 func TestProfilesMatchDocumentedSizes(t *testing.T) {
 	sizes := map[string]struct {
-		servers, networks, legacyNetworks int
-		duration                          time.Duration
+		servers, networks, clusters, legacyNetworks int
+		duration                                    time.Duration
 	}{
-		"small":  {6, 2, 1, 5 * time.Minute},
-		"medium": {20, 4, 2, 30 * time.Minute},
-		"large":  {60, 8, 2, time.Hour},
+		"small":  {6, 2, 1, 1, 5 * time.Minute},
+		"medium": {20, 4, 2, 2, 30 * time.Minute},
+		"large":  {60, 8, 3, 2, time.Hour},
 	}
 	for _, name := range profileNames {
 		t.Run(name, func(t *testing.T) {
@@ -83,7 +83,7 @@ func TestProfilesMatchDocumentedSizes(t *testing.T) {
 				t.Errorf("seed/image/flavor/services = %d/%s/%s/%#v, want 42/cirros/m1.tiny/[]", s.Seed, s.Image, s.Flavor, s.Services)
 			}
 			wantCI := CI{
-				Share: 0.8, Networks: want.networks,
+				Share: 0.5, Networks: want.networks,
 				VolumesPerServer: novascenario.Range{Min: 0, Max: 1},
 				VolumeGiB:        novascenario.Range{Min: 1, Max: 2},
 				Interval: novascenario.Interval{
@@ -94,6 +94,17 @@ func TestProfilesMatchDocumentedSizes(t *testing.T) {
 			}
 			if ci != wantCI {
 				t.Errorf("personas.ci = %+v, want %+v", ci, wantCI)
+			}
+			wantGardener := Gardener{
+				Share: 0.3, Clusters: want.clusters, Policy: "soft-anti-affinity",
+				VolumeGiB: novascenario.Range{Min: 1, Max: 2},
+				Interval: novascenario.Interval{
+					Min: novascenario.Duration(10 * time.Second),
+					Max: novascenario.Duration(time.Minute),
+				},
+			}
+			if s.Personas.Gardener != wantGardener {
+				t.Errorf("personas.gardener = %+v, want %+v", s.Personas.Gardener, wantGardener)
 			}
 			wantLegacy := Legacy{
 				Share: 0.2, Networks: want.legacyNetworks, ResizeFlavor: "m1.small",
@@ -112,10 +123,10 @@ func TestProfilesMatchDocumentedSizes(t *testing.T) {
 	}
 }
 
-// TestProfilesSplitServers locks how each profile divides its servers between
-// the CI and the Legacy persona.
+// TestProfilesSplitServers locks how each profile divides its servers among
+// the CI, the Gardener and the Legacy persona.
 func TestProfilesSplitServers(t *testing.T) {
-	split := map[string][2]int{"small": {5, 1}, "medium": {16, 4}, "large": {48, 12}}
+	split := map[string][3]int{"small": {3, 2, 1}, "medium": {10, 6, 4}, "large": {30, 18, 12}}
 	for _, name := range profileNames {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -123,28 +134,48 @@ func TestProfilesSplitServers(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Generate() = %v, want nil", err)
 			}
-			if len(p.Personas) != 2 || p.Personas[0].Name != "ci" || p.Personas[1].Name != "legacy" {
-				t.Fatalf("personas = %+v, want ci and legacy", p.Personas)
+			if len(p.Personas) != 3 || p.Personas[0].Name != "ci" || p.Personas[1].Name != "gardener" || p.Personas[2].Name != "legacy" {
+				t.Fatalf("personas = %+v, want ci, gardener and legacy", p.Personas)
 			}
-			if got := [2]int{len(p.Personas[0].Nova.Servers), len(p.Personas[1].Nova.Servers)}; got != split[name] {
-				t.Errorf("ci/legacy servers = %v, want %v", got, split[name])
+			var got [3]int
+			for i, ps := range p.Personas {
+				got[i] = len(ps.Nova.Servers)
+			}
+			if got != split[name] {
+				t.Errorf("ci/gardener/legacy servers = %v, want %v", got, split[name])
 			}
 		})
 	}
 }
 
 // TestSmallProfileFitsDefaultQuotas confirms the small profile stays within
-// Nova's common default quota of 10 instances.
+// Nova's common default quota of 10 instances and its default limits of 10
+// server groups and 10 members per group.
 func TestSmallProfileFitsDefaultQuotas(t *testing.T) {
 	p, err := readProfile(t, "small").Generate()
 	if err != nil {
 		t.Fatalf("Generate(small): %v", err)
 	}
-	var servers int
+	var servers, groups int
+	members := map[string]int{}
 	for _, ps := range p.Personas {
 		servers += len(ps.Nova.Servers)
+		groups += len(ps.Nova.ServerGroups)
+		for _, srv := range ps.Nova.Servers {
+			if srv.Group != "" {
+				members[ps.Name+"/"+srv.Group]++
+			}
+		}
 	}
 	if servers > 10 {
 		t.Errorf("small servers = %d, want <= 10 (default instance quota)", servers)
+	}
+	if groups == 0 || groups > 10 {
+		t.Errorf("small server groups = %d, want 1 to 10 (default server group quota)", groups)
+	}
+	for group, n := range members {
+		if n > 10 {
+			t.Errorf("server group %s has %d members, want <= 10 (default member quota)", group, n)
+		}
 	}
 }

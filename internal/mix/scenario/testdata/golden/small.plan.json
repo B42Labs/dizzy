@@ -5,8 +5,8 @@
   "personas": [
     {
       "name": "ci",
-      "share": 0.8,
-      "servers": 5,
+      "share": 0.5,
+      "servers": 3,
       "seed": 622155389148472395,
       "nova": {
         "scenario": "small/ci",
@@ -43,18 +43,6 @@
             "networks": [
               "net-0001"
             ]
-          },
-          {
-            "name": "srv-0004",
-            "networks": [
-              "net-0002"
-            ]
-          },
-          {
-            "name": "srv-0005",
-            "networks": [
-              "net-0002"
-            ]
           }
         ],
         "volumes": [
@@ -62,6 +50,61 @@
             "name": "vol-0001",
             "sizeGiB": 2,
             "server": "srv-0001"
+          }
+        ],
+        "ports": []
+      }
+    },
+    {
+      "name": "gardener",
+      "share": 0.3,
+      "servers": 2,
+      "seed": 6828651199476969225,
+      "rolling": true,
+      "nova": {
+        "scenario": "small/gardener",
+        "seed": 6828651199476969225,
+        "image": "cirros",
+        "flavor": "m1.tiny",
+        "networks": [
+          {
+            "name": "net-0001",
+            "subnet": "sub-0001",
+            "cidr": "10.0.1.0/24"
+          }
+        ],
+        "serverGroups": [
+          {
+            "name": "grp-0001",
+            "policy": "soft-anti-affinity"
+          }
+        ],
+        "servers": [
+          {
+            "name": "srv-0001",
+            "networks": [
+              "net-0001"
+            ],
+            "group": "grp-0001"
+          },
+          {
+            "name": "srv-0002",
+            "networks": [
+              "net-0001"
+            ],
+            "group": "grp-0001"
+          }
+        ],
+        "volumes": [
+          {
+            "name": "vol-0001",
+            "sizeGiB": 2,
+            "server": "srv-0001"
+          },
+          {
+            "name": "vol-0002",
+            "sizeGiB": 2,
+            "server": "srv-0002"
           }
         ],
         "ports": []

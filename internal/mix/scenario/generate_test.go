@@ -19,9 +19,9 @@ import (
 
 var update = flag.Bool("update", false, "update golden files")
 
-// smallScenario equals the shipped small profile: six servers, five for the CI
-// persona on two networks and one for the Legacy persona on one. It backs the
-// golden test.
+// smallScenario equals the shipped small profile: six servers, three for the
+// CI persona on two networks, two for the Gardener persona in one cluster and
+// one for the Legacy persona on one network. It backs the golden test.
 func smallScenario() Scenario {
 	return Scenario{
 		Name:      "small",
@@ -32,7 +32,7 @@ func smallScenario() Scenario {
 		Resources: Resources{Servers: 6},
 		Personas: Personas{
 			CI: CI{
-				Share:            0.8,
+				Share:            0.5,
 				Networks:         2,
 				VolumesPerServer: novascenario.Range{Min: 0, Max: 1},
 				VolumeGiB:        novascenario.Range{Min: 1, Max: 2},
@@ -43,7 +43,8 @@ func smallScenario() Scenario {
 				ChurnRatio: 0.5,
 				TargetFill: 0.6,
 			},
-			Legacy: legacyBlock(),
+			Gardener: gardenerBlock(),
+			Legacy:   legacyBlock(),
 		},
 		Chaos: &Chaos{
 			Duration: novascenario.Duration(5 * time.Minute),
@@ -80,15 +81,6 @@ func gardenerBlock() Gardener {
 			Max: novascenario.Duration(time.Minute),
 		},
 	}
-}
-
-// mixedScenario is smallScenario with the three personas at the shares 0.5,
-// 0.3 and 0.2, which give them 3, 2 and 1 servers.
-func mixedScenario() Scenario {
-	s := smallScenario()
-	s.Personas.CI.Share = 0.5
-	s.Personas.Gardener = gardenerBlock()
-	return s
 }
 
 // marshal encodes v as the indented JSON mix generate writes.
@@ -155,9 +147,10 @@ func TestGenerateGolden(t *testing.T) {
 	}
 }
 
-// TestGenerateSmallPlanShape confirms the small scenario divides its servers 5
-// to 1 between the CI and the Legacy persona, in canonical order, each under
-// its derived seed, and that only the Legacy persona is long-lived.
+// TestGenerateSmallPlanShape confirms the small scenario divides its servers
+// 3, 2 and 1 among the CI, the Gardener and the Legacy persona, in canonical
+// order, each under its derived seed, and that only the Gardener persona is
+// rolling and only the Legacy persona long-lived.
 func TestGenerateSmallPlanShape(t *testing.T) {
 	p, err := smallScenario().Generate()
 	if err != nil {
@@ -172,12 +165,13 @@ func TestGenerateSmallPlanShape(t *testing.T) {
 		planned   int
 		share     float64
 		longLived bool
+		rolling   bool
 	}
 	var got []entry
 	for _, ps := range p.Personas {
-		got = append(got, entry{ps.Name, ps.Servers, len(ps.Nova.Servers), ps.Share, ps.LongLived})
+		got = append(got, entry{ps.Name, ps.Servers, len(ps.Nova.Servers), ps.Share, ps.LongLived, ps.Rolling})
 	}
-	want := []entry{{"ci", 5, 5, 0.8, false}, {"legacy", 1, 1, 0.2, true}}
+	want := []entry{{"ci", 3, 3, 0.5, false, false}, {"gardener", 2, 2, 0.3, false, true}, {"legacy", 1, 1, 0.2, true, false}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("personas = %+v, want %+v", got, want)
 	}
@@ -193,8 +187,10 @@ func TestGenerateSmallPlanShape(t *testing.T) {
 			}
 		}
 	}
-	if ci, legacy := p.Personas[0].Nova, p.Personas[1].Nova; len(ci.Networks) != 2 || len(legacy.Networks) != 1 || legacy.ResizeFlavor != "m1.small" {
-		t.Errorf("networks ci/legacy = %d/%d, legacy resize flavor %q, want 2/1 and m1.small", len(ci.Networks), len(legacy.Networks), legacy.ResizeFlavor)
+	if ci, gardener, legacy := p.Personas[0].Nova, p.Personas[1].Nova, p.Personas[2].Nova; len(ci.Networks) != 2 || len(gardener.Networks) != 1 ||
+		len(legacy.Networks) != 1 || legacy.ResizeFlavor != "m1.small" {
+		t.Errorf("networks ci/gardener/legacy = %d/%d/%d, legacy resize flavor %q, want 2/1/1 and m1.small",
+			len(ci.Networks), len(gardener.Networks), len(legacy.Networks), legacy.ResizeFlavor)
 	}
 }
 
@@ -275,7 +271,7 @@ func TestLegacyPersonaShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
-	np := p.Personas[1].Nova
+	np := p.Personas[2].Nova
 	for _, srv := range np.Servers {
 		if srv.StopStart != "soft" || !srv.Resize || !srv.LiveMigrate || !srv.ColdMigrate || len(srv.Networks) != 1 {
 			t.Errorf("server %+v, want soft stop/start, resize, live and cold migration and one network", srv)
@@ -310,7 +306,7 @@ func TestLegacyWithoutResizeFlavor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
-	np := p.Personas[1].Nova
+	np := p.Personas[2].Nova
 	for _, srv := range np.Servers {
 		if srv.Resize || !srv.ColdMigrate {
 			t.Errorf("server %+v, want no resize and a cold migration", srv)
@@ -322,11 +318,11 @@ func TestLegacyWithoutResizeFlavor(t *testing.T) {
 	}
 }
 
-// TestGenerateLegacyOnly confirms a scenario whose CI share is 0 gives the
-// Legacy persona every server.
+// TestGenerateLegacyOnly confirms a scenario whose CI and Gardener shares are
+// 0 gives the Legacy persona every server.
 func TestGenerateLegacyOnly(t *testing.T) {
 	s := smallScenario()
-	s.Personas.CI.Share = 0
+	s.Personas.CI.Share, s.Personas.Gardener.Share = 0, 0
 	s.Personas.Legacy.Share = 1
 	p, err := s.Generate()
 	if err != nil {
@@ -342,7 +338,7 @@ func TestGenerateLegacyOnly(t *testing.T) {
 // Legacy entry carries both, and that only the Gardener entry carries the
 // rolling, serverGroups and group keys.
 func TestCIPlanJSONUnchangedKeys(t *testing.T) {
-	p, err := mixedScenario().Generate()
+	p, err := smallScenario().Generate()
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
@@ -362,12 +358,12 @@ func TestCIPlanJSONUnchangedKeys(t *testing.T) {
 	}
 }
 
-// TestGardenerPersonaShape confirms the Gardener persona of the mixed
+// TestGardenerPersonaShape confirms the Gardener persona of the small
 // scenario is one cluster: one network, one soft-anti-affinity group, and two
 // workers that each name both and have one data volume, with no port, and
 // that the persona is the only rolling one.
 func TestGardenerPersonaShape(t *testing.T) {
-	p, err := mixedScenario().Generate()
+	p, err := smallScenario().Generate()
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
@@ -411,7 +407,7 @@ func TestGardenerPersonaShape(t *testing.T) {
 // clusters round-robin, so cluster sizes differ by at most one, and that each
 // worker's network and group belong to the same cluster.
 func TestGardenerClustersRoundRobin(t *testing.T) {
-	s := mixedScenario()
+	s := smallScenario()
 	s.Resources.Servers = 7
 	s.Personas.CI.Share, s.Personas.Legacy.Share = 0, 0
 	s.Personas.Gardener.Clusters = 3
@@ -438,7 +434,7 @@ func TestGardenerClustersRoundRobin(t *testing.T) {
 // TestGenerateGardenerOnly confirms a scenario whose only share above 0 is the
 // Gardener persona's gives it every server.
 func TestGenerateGardenerOnly(t *testing.T) {
-	s := mixedScenario()
+	s := smallScenario()
 	s.Personas.CI.Share, s.Personas.Legacy.Share = 0, 0
 	p, err := s.Generate()
 	if err != nil {
@@ -453,7 +449,7 @@ func TestGenerateGardenerOnly(t *testing.T) {
 // no server is left out of the plan without an error, though its cluster
 // count exceeds its servers.
 func TestGenerateOneServerDropsGardener(t *testing.T) {
-	s := mixedScenario()
+	s := smallScenario()
 	s.Resources.Servers = 1
 	p, err := s.Generate()
 	if err != nil {
