@@ -23,8 +23,16 @@ var csvHeader = []string{
 // WriteTable renders the run's metrics as the compact human-readable summary,
 // the default report format. For a churn run it appends the churn-specific
 // summary and the per-time-bucket latency/error table after the standard
-// metrics; an apply run (Chaos nil) renders exactly as before.
+// metrics; an apply run (Chaos nil) renders exactly as before. An incomplete
+// record (a chaos checkpoint) starts with a line saying so and when it was
+// written, then a blank line, then the same output as a complete record.
 func WriteTable(w io.Writer, r *Record) error {
+	if r.Incomplete {
+		if _, err := fmt.Fprintf(w, "Run incomplete: checkpoint written at %s; the run was still going or was killed before its final record\n\n",
+			r.FinishedAt.UTC().Format(time.RFC3339)); err != nil {
+			return fmt.Errorf("writing table report: %w", err)
+		}
+	}
 	if _, err := io.WriteString(w, r.Metrics.Summary()); err != nil {
 		return fmt.Errorf("writing table report: %w", err)
 	}
@@ -85,15 +93,17 @@ func formatBucketErrors(errs []metrics.ErrorCount) string {
 
 // WriteJSON renders the run's metrics as indented JSON, the machine-readable
 // report format. A churn run additionally carries its chaos statistics under a
-// "chaos" key; an apply run (Chaos nil) marshals just the metrics aggregate, so
-// its JSON shape is unchanged.
+// "chaos" key, and "incomplete": true when the record is a mid-run checkpoint;
+// an apply run (Chaos nil) marshals just the metrics aggregate, so its JSON
+// shape is unchanged.
 func WriteJSON(w io.Writer, r *Record) error {
 	var payload any = r.Metrics
 	if r.Chaos != nil {
 		payload = struct {
-			Metrics metrics.Aggregate `json:"metrics"`
-			Chaos   *ChaosStats       `json:"chaos"`
-		}{Metrics: r.Metrics, Chaos: r.Chaos}
+			Metrics    metrics.Aggregate `json:"metrics"`
+			Chaos      *ChaosStats       `json:"chaos"`
+			Incomplete bool              `json:"incomplete,omitempty"`
+		}{Metrics: r.Metrics, Chaos: r.Chaos, Incomplete: r.Incomplete}
 	}
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {

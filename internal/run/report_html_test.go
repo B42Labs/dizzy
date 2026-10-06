@@ -198,3 +198,46 @@ func TestWriteHTMLApplyOmitsChaos(t *testing.T) {
 		t.Error("chaos report missing the chaos section")
 	}
 }
+
+// TestWriteHTMLIncompleteBanner confirms the banner is three-way: a checkpoint
+// shows the incomplete banner, a complete record the ok banner, and a failed
+// run the fail banner even when it is also incomplete.
+func TestWriteHTMLIncompleteBanner(t *testing.T) {
+	tests := []struct {
+		name       string
+		incomplete bool
+		err        string
+		want       []string
+		notWant    []string
+	}{
+		{"incomplete", true, "", []string{"banner warn", "Run incomplete", "checkpoint written at 2026-06-24T10:01:30Z"}, []string{"banner ok", "banner fail"}},
+		{"complete", false, "", []string{"banner ok"}, []string{"banner warn", "banner fail"}},
+		{"failed takes precedence", true, "boom", []string{"banner fail"}, []string{"banner warn", "banner ok"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rec := chaosRecord()
+			rec.Incomplete = tc.incomplete
+			rec.Error = tc.err
+
+			var buf bytes.Buffer
+			if err := WriteHTML(&buf, rec); err != nil {
+				t.Fatalf("WriteHTML: %v", err)
+			}
+			out := buf.String()
+			// The stylesheet spells the classes as ".banner.ok", so "banner ok"
+			// only matches a rendered banner.
+			for _, s := range tc.want {
+				if !strings.Contains(out, s) {
+					t.Errorf("report lacks %q", s)
+				}
+			}
+			for _, s := range tc.notWant {
+				if strings.Contains(out, s) {
+					t.Errorf("report unexpectedly has %q", s)
+				}
+			}
+		})
+	}
+}
