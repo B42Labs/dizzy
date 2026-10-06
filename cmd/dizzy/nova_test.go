@@ -346,6 +346,19 @@ func TestSetMigrationVerdict(t *testing.T) {
 			want:    novaexec.Resolved{ImageID: "img-1", FlavorID: "flv-1", LiveMigration: true, ColdMigration: true},
 			logs:    []string{`level=INFO msg="live migration enabled for this run"`, `level=INFO msg="cold migration enabled for this run"`},
 		},
+		{
+			name:    "live migration only, enabled",
+			servers: []novaplan.Server{server(true, false)},
+			ok:      true,
+			want:    novaexec.Resolved{ImageID: "img-1", FlavorID: "flv-1", LiveMigration: true},
+			logs:    []string{`level=INFO msg="live migration enabled for this run"`},
+		},
+		{
+			name:    "live migration only, disabled",
+			servers: []novaplan.Server{server(true, false)},
+			want:    base,
+			logs:    []string{`level=WARN msg="live migration disabled for this run" reason="credentials lack the admin role"`},
+		},
 		{name: "no migration, ok", servers: []novaplan.Server{server(false, false)}, ok: true, want: base},
 		{name: "no migration, not ok", servers: nil, want: base},
 	}
