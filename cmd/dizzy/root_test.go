@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -43,7 +45,7 @@ func TestMixSubcommandsRegistered(t *testing.T) {
 	if mix == nil {
 		t.Fatal("mix command not registered on root")
 	}
-	for _, name := range []string{"generate", "chaos", "report"} {
+	for _, name := range []string{"generate", "chaos", "status", "report", "cleanup"} {
 		if findSubcommand(mix, name) == nil {
 			t.Errorf("mix subcommand %q not registered", name)
 		}
@@ -51,6 +53,35 @@ func TestMixSubcommandsRegistered(t *testing.T) {
 	for _, name := range []string{"apply", "monitor"} {
 		if findSubcommand(mix, name) != nil {
 			t.Errorf("mix subcommand %q registered, want none", name)
+		}
+	}
+}
+
+// TestMixHelpListsSubcommands confirms dizzy mix --help lists the five
+// subcommands and neither apply nor monitor.
+func TestMixHelpListsSubcommands(t *testing.T) {
+	root := newRootCmd()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"mix", "--help"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("mix --help: %v", err)
+	}
+	listed := map[string]bool{}
+	for _, line := range strings.Split(out.String(), "\n") {
+		if fields := strings.Fields(line); len(fields) > 0 && strings.HasPrefix(line, "  ") {
+			listed[fields[0]] = true
+		}
+	}
+	for _, name := range []string{"generate", "chaos", "status", "report", "cleanup"} {
+		if !listed[name] {
+			t.Errorf("mix --help does not list %q:\n%s", name, out.String())
+		}
+	}
+	for _, name := range []string{"apply", "monitor"} {
+		if listed[name] {
+			t.Errorf("mix --help lists %q:\n%s", name, out.String())
 		}
 	}
 }

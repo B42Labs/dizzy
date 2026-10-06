@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -293,18 +292,8 @@ func finishMixChurn(ctx context.Context, cmd *cobra.Command, opts *globalOptions
 	}
 
 	tctx := context.WithoutCancel(ctx)
-	var errs []error
-	for _, l := range lanes {
-		deleted, err := l.Cleanup(tctx, resourcesOfPersona(created, l.Name))
-		if _, werr := fmt.Fprintf(out, "deleted %d resource(s) for run %s\n", deleted, l.RunID); werr != nil {
-			return fmt.Errorf("writing output: %w", werr)
-		}
-		if err != nil {
-			errs = append(errs, fmt.Errorf("tearing down persona %q (run %s): %w", l.Name, l.RunID, err))
-		}
-	}
-	if len(errs) > 0 {
-		return errors.Join(errs...)
+	if err := deleteLaneResources(tctx, out, lanes, created, "tearing down"); err != nil {
+		return err
 	}
 
 	var leaked int
