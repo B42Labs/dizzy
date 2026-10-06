@@ -8,7 +8,12 @@
 // — an in-place change of a live instance (e.g. a volume extend) that is neither
 // a create nor a delete, bounded to at most once per instance lifetime unless
 // the node is pinned. A pinned node is created before any other decision and
-// never deleted, so it lives until the caller's teardown. The schedule of
+// never deleted, so it lives until the caller's teardown. Nodes that share a
+// Roll value form a rolling set, which the engine keeps whole and replaces one
+// root at a time: once every node of the set is present, a delete of a root
+// takes the root and its subtree down in one step, and the following steps
+// create them again before any other decision. The cloud calls of one set run
+// one after another, while two sets replace concurrently. The schedule of
 // decisions is deterministic for a given seed and config, while the
 // concurrent cloud-call completion order is not. The engine is service-neutral:
 // per-service builders under subpackages (neutrongraph, cindergraph) turn a plan
@@ -203,6 +208,22 @@ type Bucket struct {
 // present: it is never created again, and its mutations are skipped without an
 // outcome.
 //
+// Roll, when non-empty, makes the node a member of the rolling set of nodes
+// that carry the same value. A root of a set is a rolling node none of whose
+// parents carries the same Roll value, and a set is whole when every node of it
+// is present. The engine creates an absent rolling node whose parents are
+// present before any other decision, as it does for a pinned node. It deletes a
+// rolling node only as part of a roll: once the set is whole, a root may be
+// drawn for a delete, whatever its dependents, and the engine then deletes the
+// root's present descendants, children before parents, and the root last, in
+// one step. Every delete of a roll waits for every earlier operation of the
+// set, so the replacements of one set reach the cloud strictly one after
+// another. A rolling node whose create failed stays present, so a later roll
+// deletes whatever the failed create left and creates the node again. The
+// builder guarantees that every descendant of a rolling node carries the same
+// Roll value and that none of them is pinned; a node is either pinned or
+// rolling, never both.
+//
 // Gate, when non-nil, serializes every operation of the nodes that share it: a
 // capacity-1 channel the engine acquires before granting a concurrency slot, so
 // at most one op per gate is ever in flight. A builder points a family of nodes
@@ -216,6 +237,7 @@ type Node struct {
 	Parents []string
 	Gate    chan struct{}
 	Pinned  bool
+	Roll    string
 	Create  func(ctx context.Context, ids map[string]string) (resource.Resource, error)
 	Delete  func(ctx context.Context, ids map[string]string, res resource.Resource) error
 	Mutate  func(ctx context.Context, ids map[string]string, res resource.Resource) error
@@ -476,7 +498,9 @@ type engine struct {
 	clk      Clock
 	rng      *rand.Rand
 	mutable  bool
-	pinned   bool
+	eager    bool
+	sets     map[string][]int
+	rollRoot []bool
 
 	sem     chan struct{}
 	pending chan struct{}
@@ -533,13 +557,29 @@ func newEngine(nodes []Node, seed int64, cfg Config, clk Clock) *engine {
 			break
 		}
 	}
-	// A graph is pinned when any node is pinned. Only a pinned graph looks for
-	// a pinned create on each step.
-	pinned := false
-	for _, nd := range nodes {
-		if nd.Pinned {
-			pinned = true
-			break
+	// A graph is eager when any node is pinned or rolling. Only an eager graph
+	// looks on each step for an eager create: the create of an absent pinned or
+	// rolling node whose parents are present, made before any other decision.
+	// The rolling sets index their node indices by Roll value, in index order,
+	// and mark the roots: the rolling nodes none of whose parents is in the same
+	// set.
+	eager := false
+	sets := make(map[string][]int)
+	rollRoot := make([]bool, len(nodes))
+	for i, nd := range nodes {
+		if nd.Pinned || nd.Roll != "" {
+			eager = true
+		}
+		if nd.Roll == "" {
+			continue
+		}
+		sets[nd.Roll] = append(sets[nd.Roll], i)
+		rollRoot[i] = true
+		for _, pi := range parents[i] {
+			if nodes[pi].Roll == nd.Roll {
+				rollRoot[i] = false
+				break
+			}
 		}
 	}
 
@@ -551,7 +591,9 @@ func newEngine(nodes []Node, seed int64, cfg Config, clk Clock) *engine {
 		clk:      clk,
 		rng:      rand.New(rand.NewSource(seed)),
 		mutable:  mutable,
-		pinned:   pinned,
+		eager:    eager,
+		sets:     sets,
+		rollRoot: rollRoot,
 		sem:      make(chan struct{}, limit),
 		pending:  make(chan struct{}, limit),
 		res:      newResults(cfg),
@@ -612,20 +654,23 @@ func (e *engine) drawDelay() time.Duration {
 	return e.cfg.MinInterval + time.Duration(e.rng.Int63n(span+1))
 }
 
-// step makes and dispatches one churn decision. When the graph has pinned nodes
-// it first creates one of the absent pinned nodes whose parents are present, if
-// any. When the graph is mutable it then draws, with probability ResizeRatio, a
-// mutation of a live node that is not yet mutated or is pinned; otherwise
-// it picks a create or a delete from the currently valid candidates, biased by
-// the controller. It transitions the logical inventory, records the decision,
-// and launches the operation. With no valid action it records a no-op.
+// step makes and dispatches one churn decision. When the graph has pinned or
+// rolling nodes it first creates one of the absent pinned or rolling nodes
+// whose parents are present, if any. When the graph is mutable it then draws,
+// with probability ResizeRatio, a mutation of a live node that is not yet
+// mutated or is pinned; otherwise it picks a create or a delete from the
+// currently valid candidates, biased by the controller. A delete of a rolling
+// root rolls its set. It transitions the logical inventory, records the
+// decision, and launches the operation. With no valid action it records a
+// no-op.
 //
-// The pinned create draws only from a non-empty candidate list and the mutate
-// draw is gated on mutable and ResizeRatio, so a graph without pinned or
-// mutable nodes never touches the RNG here, keeping the create/delete decision
-// schedule for such a graph byte-for-byte what it was before either existed.
+// The eager create draws only from a non-empty candidate list and the mutate
+// draw is gated on mutable and ResizeRatio, so a graph without pinned, rolling
+// or mutable nodes never touches the RNG here, keeping the create/delete
+// decision schedule for such a graph byte-for-byte what it was before any of
+// them existed.
 func (e *engine) step(ctx context.Context, offset time.Duration) {
-	if cands := e.pinnedCreateCandidates(); len(cands) > 0 {
+	if cands := e.eagerCreateCandidates(); len(cands) > 0 {
 		idx := cands[e.rng.Intn(len(cands))]
 		nd := e.nodes[idx]
 		e.record(Decision{Offset: offset, Action: "create", Kind: nd.Kind, Key: nd.Key})
@@ -669,6 +714,11 @@ func (e *engine) step(ctx context.Context, offset time.Duration) {
 	}
 
 	nd := e.nodes[idx]
+	if action == "delete" && nd.Roll != "" {
+		e.roll(ctx, idx, offset)
+		e.samplePopulation()
+		return
+	}
 	e.record(Decision{Offset: offset, Action: action, Kind: nd.Kind, Key: nd.Key})
 	// Announce each scheduled action so a churn run shows what it is doing
 	// instead of going silent until its final report. Logged at info (per
@@ -677,9 +727,41 @@ func (e *engine) step(ctx context.Context, offset time.Duration) {
 	if action == "create" {
 		e.dispatchCreate(ctx, idx, offset)
 	} else {
-		e.dispatchDelete(ctx, idx, offset)
+		e.dispatchDelete(ctx, idx, offset, nil)
 	}
 	e.samplePopulation()
+}
+
+// roll replaces the rolling root idx: it deletes the root's present
+// descendants depth-first in post-order, following children in index order
+// and each node once, and the root last, recording a delete decision at offset
+// for each. Every delete also waits for the last operation every node of the
+// set had before the roll, so the cloud sees the replacements of one set
+// strictly one after another. The following steps create the nodes again
+// through the eager create. roll draws nothing from the generator, so the
+// schedule depends only on the draw of the root.
+func (e *engine) roll(ctx context.Context, idx int, offset time.Duration) {
+	var extra []*op
+	for _, i := range e.sets[e.nodes[idx].Roll] {
+		if last := e.states[i].last; last != nil {
+			extra = append(extra, last)
+		}
+	}
+	// A visited node is absent once its delete is dispatched, so a node two
+	// paths reach is deleted once.
+	var visit func(i int)
+	visit = func(i int) {
+		for _, ci := range e.children[i] {
+			if e.states[ci].present {
+				visit(ci)
+			}
+		}
+		nd := e.nodes[i]
+		e.record(Decision{Offset: offset, Action: "delete", Kind: nd.Kind, Key: nd.Key})
+		slog.Info("churn delete", "kind", nd.Kind, "key", nd.Key, "offset", offset.Round(time.Millisecond))
+		e.dispatchDelete(ctx, i, offset, extra)
+	}
+	visit(idx)
 }
 
 // record counts decision d and, in a bounded run, appends it to the decision
@@ -738,29 +820,56 @@ func (e *engine) createCandidates() []int {
 	return out
 }
 
-// pinnedCreateCandidates returns the entries of createCandidates whose node is
-// pinned. A graph without pinned nodes has none, so it skips the scan.
-func (e *engine) pinnedCreateCandidates() []int {
-	if !e.pinned {
+// eagerCreateCandidates returns the entries of createCandidates whose node is
+// pinned or rolling. A graph without such nodes has none, so it skips the scan.
+func (e *engine) eagerCreateCandidates() []int {
+	if !e.eager {
 		return nil
 	}
 	var out []int
 	for _, i := range e.createCandidates() {
-		if e.nodes[i].Pinned {
+		if e.nodes[i].Pinned || e.nodes[i].Roll != "" {
 			out = append(out, i)
 		}
 	}
 	return out
 }
 
+// setWhole reports whether every node of the rolling set roll is present.
+func (e *engine) setWhole(roll string) bool {
+	for _, i := range e.sets[roll] {
+		if !e.states[i].present {
+			return false
+		}
+	}
+	return true
+}
+
 // deleteCandidates returns the indices of present, non-pinned nodes whose
 // dependents are all absent — the nodes that may be deleted without a
 // dependency violation. A parent of a present pinned node is never a candidate,
-// since that dependent stays present.
+// since that dependent stays present. A rolling node is a candidate exactly
+// when it is a root of a whole set, whatever its dependents, since a roll
+// deletes them with it.
 func (e *engine) deleteCandidates() []int {
+	// Every root of a set asks whether the set is whole, so each set is checked
+	// once up front rather than once per root.
+	var whole map[string]bool
+	if len(e.sets) > 0 {
+		whole = make(map[string]bool, len(e.sets))
+		for roll := range e.sets {
+			whole[roll] = e.setWhole(roll)
+		}
+	}
 	var out []int
 	for i := range e.nodes {
 		if !e.states[i].present || e.nodes[i].Pinned {
+			continue
+		}
+		if roll := e.nodes[i].Roll; roll != "" {
+			if e.rollRoot[i] && whole[roll] {
+				out = append(out, i)
+			}
 			continue
 		}
 		free := true
@@ -851,9 +960,11 @@ func (e *engine) dispatchCreate(ctx context.Context, idx int, offset time.Durati
 
 // dispatchDelete marks node idx absent and launches its delete. The delete waits
 // for the node's create (resource source), its parents' creates (cloud ids for a
-// router-interface removal), and the deletes of any former dependents (so a
-// parent is never deleted while a child's cloud delete is still in flight).
-func (e *engine) dispatchDelete(ctx context.Context, idx int, offset time.Duration) {
+// router-interface removal), the deletes of any former dependents (so a
+// parent is never deleted while a child's cloud delete is still in flight), and
+// the operations in extra, which a roll passes to order the replacements of
+// one set.
+func (e *engine) dispatchDelete(ctx context.Context, idx int, offset time.Duration, extra []*op) {
 	nd := e.nodes[idx]
 	st := &e.states[idx]
 	// Assume the resource survives until the delete confirms otherwise, so a
@@ -872,6 +983,7 @@ func (e *engine) dispatchDelete(ctx context.Context, idx int, offset time.Durati
 			deps = append(deps, cs.last)
 		}
 	}
+	deps = append(deps, extra...)
 
 	st.present = false
 	st.last = newOp
