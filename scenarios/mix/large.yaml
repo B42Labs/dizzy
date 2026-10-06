@@ -1,0 +1,30 @@
+name: large
+seed: 42                        # deterministic; same seed => same plan
+
+# image and flavor are referenced by name, are shared by every persona, and must
+# already exist on the target cloud: dizzy uploads no image and creates no
+# flavor. Override for a cloud that names them differently, e.g. --set image=ubuntu-22.04.
+image: cirros
+flavor: m1.tiny
+
+services: []                    # opt-in services bound to every persona; this build supports none
+
+resources:
+  servers: 60                   # the server envelope the personas divide by their shares
+
+personas:
+  ci:                                         # short-lived servers on one network each, no lifecycle operation
+    share: 1                                  # share of resources.servers
+    cloud: ""                                 # clouds.yaml entry of the persona's project; "" uses --os-cloud
+    networks: 8                               # networks the persona's servers are spread over
+    volumes_per_server: { min: 0, max: 1 }    # data volumes attached per server
+    volume_gib:         { min: 1, max: 2 }    # size drawn per data volume
+    interval:           { min: 100ms, max: 1s }  # random delay drawn per churn tick
+    churn_ratio: 0.5                          # create bias at steady state (0..1)
+    target_fill: 0.6                          # fraction of the persona's envelope kept populated (0..1)
+
+chaos:                                 # `mix chaos --scenario scenarios/mix/large.yaml` runs as-is
+  duration: 1h                         # total runtime; the only hard stop besides Ctrl-C
+  parallel: { max: 4 }                 # per-tick fan-out of each persona, drawn in [1, max]; capped by --concurrency
+
+# Needs raised quotas; guarded by the per-persona compute quota pre-check.

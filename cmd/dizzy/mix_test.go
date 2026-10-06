@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	mixplan "github.com/B42Labs/dizzy/internal/mix/plan"
+	"github.com/B42Labs/dizzy/scenarios"
 )
 
 // sampleMixScenarioYAML is a small but complete mix scenario used by the mix
@@ -123,5 +124,39 @@ func TestMixGenerateErrors(t *testing.T) {
 				t.Errorf("error = %q, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestMixGenerateSmallProfile runs mix generate on the shipped small profile
+// twice and checks the output is byte-identical and has the documented shape.
+func TestMixGenerateSmallProfile(t *testing.T) {
+	data, err := scenarios.Files.ReadFile("mix/small.yaml")
+	if err != nil {
+		t.Fatalf("reading shipped profile: %v", err)
+	}
+	path := writeScenario(t, string(data))
+
+	first, err := execRoot(t, "mix", "generate", "--scenario", path)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	second, err := execRoot(t, "mix", "generate", "--scenario", path)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if first != second {
+		t.Error("two runs of mix generate on the small profile differ")
+	}
+
+	p := decodeMixPlan(t, first)
+	if len(p.Personas) != 1 {
+		t.Fatalf("plan has %d personas, want 1", len(p.Personas))
+	}
+	ci := p.Personas[0]
+	if ci.Name != "ci" || ci.Servers != 6 || ci.Share != 1 || len(ci.Nova.Servers) != 6 {
+		t.Errorf("persona = %s with %d servers, share %v and %d planned, want ci, 6, 1, 6", ci.Name, ci.Servers, ci.Share, len(ci.Nova.Servers))
+	}
+	if ci.Nova.Servers[0].Name != "srv-0001" || ci.Nova.Servers[5].Name != "srv-0006" {
+		t.Errorf("servers run %s..%s, want srv-0001..srv-0006", ci.Nova.Servers[0].Name, ci.Nova.Servers[5].Name)
 	}
 }
