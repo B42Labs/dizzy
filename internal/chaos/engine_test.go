@@ -1050,3 +1050,227 @@ func TestDeleteCancelledBeforeItRunsKeepsResource(t *testing.T) {
 		t.Errorf("liveResources after the cancelled delete = %v, want [id-0]", got)
 	}
 }
+
+// pinnedNodes builds n independent, parentless, pinned and repeatable mutable
+// nodes backed by f, the shape of a long-lived graph.
+func pinnedNodes(f *mutFake, n int) []Node {
+	nodes := mutableNodes(f, n)
+	for i := range nodes {
+		nodes[i].Pinned = true
+	}
+	return nodes
+}
+
+// countActions counts the decisions of r per action.
+func countActions(r *Result) map[string]int {
+	n := make(map[string]int)
+	for _, d := range r.Decisions {
+		n[d.Action]++
+	}
+	return n
+}
+
+// TestRunPinnedNodesCreatedFirstAndKept confirms a graph of pinned nodes gets
+// one create per node as its first decisions and never a delete, so every
+// node stays live until the run ends.
+func TestRunPinnedNodesCreatedFirstAndKept(t *testing.T) {
+	for _, n := range []int{1, 4} {
+		t.Run(fmt.Sprintf("%d nodes", n), func(t *testing.T) {
+			nodes := mutableNodes(newMutFake(), n)
+			for i := range nodes {
+				nodes[i].Pinned = true
+			}
+			r, err := Run(context.Background(), nodes, 7, mutConfig(), newFakeClock())
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if len(r.Decisions) <= n {
+				t.Fatalf("the run made %d decisions, want more than %d", len(r.Decisions), n)
+			}
+			keys := make(map[string]bool)
+			for i, d := range r.Decisions[:n] {
+				if d.Action != "create" {
+					t.Errorf("decision %d = %s %s, want a create", i, d.Action, d.Key)
+				}
+				keys[d.Key] = true
+			}
+			if len(keys) != n {
+				t.Errorf("the first %d decisions created %d distinct nodes, want %d", n, len(keys), n)
+			}
+			if r.Deletes != 0 || r.PopMax != n || len(r.Created) != n {
+				t.Errorf("deletes=%d popMax=%d created=%d, want 0, %d and %d", r.Deletes, r.PopMax, len(r.Created), n, n)
+			}
+		})
+	}
+}
+
+// TestRunNeverDeletesPinnedInMixedGraph confirms a graph of pinned and plain
+// nodes deletes plain nodes but never a pinned one.
+func TestRunNeverDeletesPinnedInMixedGraph(t *testing.T) {
+	nodes := plainNodes(newMutFake(), 6)
+	pinned := map[string]bool{}
+	for i := range nodes[:3] {
+		nodes[i].Pinned = true
+		pinned[nodes[i].Key] = true
+	}
+	r, err := Run(context.Background(), nodes, 7, validConfig(), newFakeClock())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if r.Deletes == 0 {
+		t.Fatal("the run deleted nothing; the test exercises nothing")
+	}
+	for _, d := range r.Decisions {
+		if d.Action == "delete" && pinned[d.Key] {
+			t.Errorf("decision at %s deletes the pinned node %s", d.Offset, d.Key)
+		}
+	}
+}
+
+// TestRunKeepsParentOfPinnedNode confirms a plain parent of a pinned node is
+// never deleted: the pinned child is created right after the parent, and from
+// then on the parent has a present dependent.
+func TestRunKeepsParentOfPinnedNode(t *testing.T) {
+	nodes := plainNodes(newMutFake(), 3)
+	parent, child := nodes[0].Key, nodes[1].Key
+	nodes[1].Parents = []string{parent}
+	nodes[1].Pinned = true
+	r, err := Run(context.Background(), nodes, 7, validConfig(), newFakeClock())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if r.Deletes == 0 {
+		t.Fatal("the run deleted nothing; the test exercises nothing")
+	}
+	childCreated := false
+	for _, d := range r.Decisions {
+		if d.Action == "delete" && (d.Key == parent || d.Key == child) {
+			t.Errorf("decision at %s deletes %s, the pinned node or its parent", d.Offset, d.Key)
+		}
+		childCreated = childCreated || (d.Action == "create" && d.Key == child)
+	}
+	if !childCreated {
+		t.Error("the pinned child was never created")
+	}
+}
+
+// TestRunPinnedMutatesOneInstanceRepeatedly confirms a pinned node is mutated
+// more than once within one instance lifetime, where an unpinned node is
+// mutated at most once (TestRunMutateAtMostOncePerLifetime).
+func TestRunPinnedMutatesOneInstanceRepeatedly(t *testing.T) {
+	f := newMutFake()
+	nodes := mutableNodes(f, 1)
+	nodes[0].Pinned = true
+	cfg := mutConfig()
+	cfg.ResizeRatio = 0.8
+	if _, err := Run(context.Background(), nodes, 7, cfg, newFakeClock()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	most := 0
+	for _, n := range f.mutatesByID {
+		most = max(most, n)
+	}
+	if most < 2 {
+		t.Errorf("the most mutations of one cloud id = %d, want at least 2", most)
+	}
+}
+
+// TestRunPinnedRepeatDeterministicSchedule confirms two runs of a pinned,
+// repeatable graph with the same seed and config draw the same schedule.
+func TestRunPinnedRepeatDeterministicSchedule(t *testing.T) {
+	r1, err := Run(context.Background(), pinnedNodes(newMutFake(), 4), 7, mutConfig(), newFakeClock())
+	if err != nil {
+		t.Fatalf("Run #1: %v", err)
+	}
+	r2, err := Run(context.Background(), pinnedNodes(newMutFake(), 4), 7, mutConfig(), newFakeClock())
+	if err != nil {
+		t.Fatalf("Run #2: %v", err)
+	}
+	if r1.Mutates == 0 {
+		t.Fatal("no mutations were scheduled; the test exercises nothing")
+	}
+	if !reflect.DeepEqual(r1.Decisions, r2.Decisions) {
+		t.Error("the schedules of a pinned, repeatable graph differ for the same seed/config")
+	}
+}
+
+// TestRunZeroNodesOnlyNoops confirms an empty graph only ever records no-ops,
+// whatever the mutate probability.
+func TestRunZeroNodesOnlyNoops(t *testing.T) {
+	for _, ratio := range []float64{0, 0.5, 1} {
+		t.Run(fmt.Sprintf("resize ratio %v", ratio), func(t *testing.T) {
+			cfg := validConfig()
+			cfg.ResizeRatio = ratio
+			r, err := Run(context.Background(), []Node{}, 7, cfg, newFakeClock())
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if len(r.Decisions) == 0 {
+				t.Fatal("the run made no decisions")
+			}
+			if got := countActions(r); got["noop"] != len(r.Decisions) {
+				t.Errorf("decisions = %v, want only noops", got)
+			}
+		})
+	}
+}
+
+// TestRunPinnedFailedCreateIsNotRepaired confirms a pinned node whose create
+// failed is neither created again nor deleted, and that its mutations are
+// drawn but never reach the cloud.
+func TestRunPinnedFailedCreateIsNotRepaired(t *testing.T) {
+	f := newMutFake()
+	f.failCreate = true
+	cfg := mutConfig()
+	cfg.ResizeRatio = 0.9
+	r, err := Run(context.Background(), pinnedNodes(f, 1), 7, cfg, newFakeClock())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	got := countActions(r)
+	if got["create"] != 1 || got["delete"] != 0 || got["mutate"] == 0 {
+		t.Fatalf("decisions = %v, want one create, no delete and some mutates", got)
+	}
+	width := cfg.Duration / bucketCount
+	createBucket := int(r.Decisions[0].Offset / width)
+	for i, b := range r.Buckets {
+		want := metrics.Stats{}
+		if i == createBucket {
+			want = metrics.Stats{Attempted: 1, Failed: 1}
+		}
+		if b.Stats.Attempted != want.Attempted || b.Stats.Failed != want.Failed {
+			t.Errorf("bucket %d attempted/failed = %d/%d, want %d/%d", i, b.Stats.Attempted, b.Stats.Failed, want.Attempted, want.Failed)
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.mutates != 0 {
+		t.Errorf("%d mutations reached the cloud for a node whose create failed, want 0", f.mutates)
+	}
+}
+
+// TestRunUnboundedPinnedRepeat confirms an unbounded run over pinned,
+// repeatable nodes keeps no decision log, mutates and never deletes.
+func TestRunUnboundedPinnedRepeat(t *testing.T) {
+	f := newMutFake()
+	cfg := unboundedConfig()
+	cfg.ResizeRatio = 0.5
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r, err := Run(ctx, pinnedNodes(f, 4), 7, cfg, newCancelClock(time.Hour, cancel))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if r.Decisions != nil || r.Mutates == 0 || r.Deletes != 0 {
+		t.Errorf("decisions=%d mutates=%d deletes=%d, want nil, above 0 and 0", len(r.Decisions), r.Mutates, r.Deletes)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.deletes != 0 {
+		t.Errorf("%d deletes reached the cloud, want 0", f.deletes)
+	}
+}
