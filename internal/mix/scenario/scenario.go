@@ -1,9 +1,11 @@
 // Package scenario defines the YAML scenario format of a combined (mix) run:
 // the shared image and flavor, the server envelope, the opt-in services, one
-// block per workload persona, and the run-wide chaos settings. Generate expands
-// it into a mix plan by dividing the server envelope among the personas and
-// building each persona's compute scenario. The same scenario and seed always
-// yield a byte-identical plan. Mix gets its own schema so yaml.UnmarshalStrict
+// block per workload persona, one block per background lane, and the run-wide
+// chaos settings. Generate expands it into a mix plan by dividing the server
+// envelope among the personas and building each persona's compute scenario;
+// it also expands the scenario of every enabled lane, which
+// LoadLanes reads. The same scenario and seed always yield a byte-identical
+// plan. Mix gets its own schema so yaml.UnmarshalStrict
 // keeps failing loudly on a typo, and reuses the Nova package's range,
 // interval, parallel and duration types.
 package scenario
@@ -24,6 +26,7 @@ import (
 // name resources that must already exist on the target cloud and are shared by
 // every persona. Resources.Servers is the server envelope the personas divide
 // by their shares. Services lists the opt-in services bound to every persona.
+// Lanes switches on the single-service churns that run next to the personas.
 type Scenario struct {
 	Name      string    `yaml:"name"`
 	Seed      int64     `yaml:"seed"`
@@ -32,6 +35,7 @@ type Scenario struct {
 	Services  []string  `yaml:"services"`
 	Resources Resources `yaml:"resources"`
 	Personas  Personas  `yaml:"personas"`
+	Lanes     Lanes     `yaml:"lanes"`
 	Chaos     *Chaos    `yaml:"chaos,omitempty"`
 }
 
@@ -106,6 +110,56 @@ type Legacy struct {
 	Interval         novascenario.Interval `yaml:"interval"`
 }
 
+// Lanes holds one block per background lane: the churn of a single service
+// that the service's own chaos command runs, in a churn engine of its own next
+// to the personas. Every lane is off unless its block enables it.
+type Lanes struct {
+	Cinder   CinderLane   `yaml:"cinder"`
+	Glance   Lane         `yaml:"glance"`
+	Keystone KeystoneLane `yaml:"keystone"`
+	Neutron  NeutronLane  `yaml:"neutron"`
+}
+
+// Lane holds the keys every lane has. Enabled switches the lane on. Cloud is
+// the clouds.yaml entry the lane authenticates with, empty for the --os-cloud
+// fallback. An enabled lane names its scenario in exactly one way: Profile is
+// a bundled profile of the service (small, medium or large), and Scenario the
+// path of a scenario file of the service, relative to the working directory.
+type Lane struct {
+	Enabled  bool   `yaml:"enabled"`
+	Cloud    string `yaml:"cloud"`
+	Profile  string `yaml:"profile"`
+	Scenario string `yaml:"scenario"`
+}
+
+// CinderLane is the Cinder lane, volume and snapshot churn. VolumeType names
+// the volume type its volumes are created with, empty for the cloud's default
+// type.
+type CinderLane struct {
+	Lane       `yaml:",inline"`
+	VolumeType string `yaml:"volume_type"`
+}
+
+// KeystoneLane is the Keystone lane, project, user and role assignment churn.
+// Privilege selects the privilege tier, auto, admin or domain-manager, and
+// empty means auto. Domain and Roles bind the domain-manager tier: the
+// in-scope domain, empty for the domain the token is scoped to, and the
+// existing roles to reuse, comma-separated, empty for member,reader.
+type KeystoneLane struct {
+	Lane      `yaml:",inline"`
+	Privilege string `yaml:"privilege"`
+	Domain    string `yaml:"domain"`
+	Roles     string `yaml:"roles"`
+}
+
+// NeutronLane is the Neutron lane, network topology churn. ExternalNetwork
+// names the external network for gateways and floating IPs, empty to detect
+// the first one.
+type NeutronLane struct {
+	Lane            `yaml:",inline"`
+	ExternalNetwork string `yaml:"external_network"`
+}
+
 // Chaos holds the run-wide churn settings, applied to every persona's engine.
 // A zero field falls back to the command's default, and a flag overrides it.
 type Chaos struct {
@@ -130,9 +184,10 @@ func Parse(data []byte) (Scenario, error) {
 }
 
 // Validate checks the scenario for semantic consistency, returning an
-// actionable error that names the offending field. It then runs the
-// persona-specific checks of every persona with a share above 0, builds its
-// compute scenario and validates it too.
+// actionable error that names the offending field. It checks every enabled
+// lane, in canonical order. It then runs the persona-specific checks of every
+// persona with a share above 0, builds its compute scenario and validates it
+// too.
 func (s Scenario) Validate() error {
 	if s.Name == "" {
 		return fmt.Errorf("name must not be empty")
@@ -196,6 +251,10 @@ func (s Scenario) Validate() error {
 		seen[name] = true
 	}
 
+	if err := s.Lanes.validate(); err != nil {
+		return err
+	}
+
 	servers := Apportion(s.Resources.Servers, shares(personas))
 	for i, p := range personas {
 		if p.share == 0 {
@@ -227,9 +286,9 @@ func validateInterval(key string, iv novascenario.Interval) error {
 
 // Set applies a single dotted-key override of the form key=value, matching the
 // documented scenario fields. services takes a comma-separated list, and the
-// empty string clears it; the interval bounds take Go duration strings. It
-// returns an error for an unknown key or a value that does not parse to the
-// field's type.
+// empty string clears it; the interval bounds take Go duration strings, and
+// lanes.<name>.enabled a boolean. It returns an error for an unknown key or a
+// value that does not parse to the field's type.
 func (s *Scenario) Set(key, value string) error {
 	ci, gardener, legacy := &s.Personas.CI, &s.Personas.Gardener, &s.Personas.Legacy
 	switch key {
@@ -320,7 +379,7 @@ func (s *Scenario) Set(key, value string) error {
 	case "personas.legacy.interval.max":
 		return setDuration(&legacy.Interval.Max, key, value)
 	default:
-		return fmt.Errorf("unknown override key %q", key)
+		return s.Lanes.set(key, value)
 	}
 }
 
@@ -353,6 +412,17 @@ func setFloat(dst *float64, key, value string) error {
 		return fmt.Errorf("override %s: %q is not a number", key, value)
 	}
 	*dst = f
+	return nil
+}
+
+// setBool parses value as a boolean into dst, wrapping a parse failure with the
+// key.
+func setBool(dst *bool, key, value string) error {
+	b, err := strconv.ParseBool(strings.TrimSpace(value))
+	if err != nil {
+		return fmt.Errorf("override %s: %q is not a boolean", key, value)
+	}
+	*dst = b
 	return nil
 }
 
