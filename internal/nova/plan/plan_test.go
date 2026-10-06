@@ -1,6 +1,7 @@
 package plan
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -106,8 +107,8 @@ func TestCountHelpers(t *testing.T) {
 	p := &Plan{
 		Servers: []Server{
 			{Name: "a", Resize: true, LiveMigrate: true, Delete: true, StopStart: StopStartSoft, BootFromVolume: true, RootVolumeGiB: 1},
-			{Name: "b", StopStart: StopStartHard},
-			{Name: "c"},
+			{Name: "b", StopStart: StopStartHard, ColdMigrate: true},
+			{Name: "c", ColdMigrate: true},
 		},
 		Volumes: []Volume{{Name: "v1", Detach: true}, {Name: "v2"}},
 		Ports:   []Port{{Name: "p1"}, {Name: "p2", Detach: true}, {Name: "p3", Detach: true}},
@@ -117,6 +118,12 @@ func TestCountHelpers(t *testing.T) {
 	}
 	if got := p.LiveMigrations(); got != 1 {
 		t.Errorf("LiveMigrations() = %d, want 1", got)
+	}
+	if got := p.ColdMigrations(); got != 2 {
+		t.Errorf("ColdMigrations() = %d, want 2", got)
+	}
+	if got := (&Plan{}).ColdMigrations(); got != 0 {
+		t.Errorf("ColdMigrations() of a plan without servers = %d, want 0", got)
 	}
 	if got := p.Deletes(); got != 1 {
 		t.Errorf("Deletes() = %d, want 1", got)
@@ -143,5 +150,26 @@ func TestSummaryIsDeterministic(t *testing.T) {
 	}
 	if !strings.Contains(first, "cirros") || !strings.Contains(first, "m1.tiny") {
 		t.Errorf("Summary() = %q, want image and flavor named", first)
+	}
+}
+
+// TestServerColdMigrateOmittedWhenFalse confirms a server that is not
+// cold-migrated encodes without a coldMigrate key, so the plans of every
+// existing scenario keep their bytes.
+func TestServerColdMigrateOmittedWhenFalse(t *testing.T) {
+	for _, tc := range []struct {
+		server Server
+		want   bool
+	}{
+		{Server{Name: "srv-0001", Networks: []string{"net-0001"}}, false},
+		{Server{Name: "srv-0001", Networks: []string{"net-0001"}, ColdMigrate: true}, true},
+	} {
+		data, err := json.Marshal(tc.server)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if got := strings.Contains(string(data), `"coldMigrate"`); got != tc.want {
+			t.Errorf("JSON %s has a coldMigrate key = %v, want %v", data, got, tc.want)
+		}
 	}
 }

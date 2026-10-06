@@ -79,13 +79,15 @@ const (
 )
 
 // Resolved carries the by-name references resolved to cloud ids at apply time,
-// plus whether live migration is enabled for this run (the admin pre-check's
-// verdict). The executor threads these into the boot and resize operations.
+// plus whether live and cold migration are enabled for this run (the admin
+// pre-check's verdict). The executor threads these into the boot and resize
+// operations; only the long-lived churn graph reads ColdMigration.
 type Resolved struct {
 	ImageID        string
 	FlavorID       string
 	ResizeFlavorID string
 	LiveMigration  bool
+	ColdMigration  bool
 }
 
 // Result is the outcome of an apply: every resource that was created, in

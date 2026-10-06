@@ -7,7 +7,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/hypervisors"
 )
 
-func TestDecideLiveMigration(t *testing.T) {
+func TestDecideMigration(t *testing.T) {
 	up := func(n int) []hypervisors.Hypervisor {
 		hs := make([]hypervisors.Hypervisor, n)
 		for i := range hs {
@@ -72,9 +72,9 @@ func TestDecideLiveMigration(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ok, reason := decideLiveMigration(tc.roles, tc.rolesOK, tc.hosts)
+			ok, reason := decideMigration(tc.roles, tc.rolesOK, tc.hosts)
 			if ok != tc.wantOK {
-				t.Fatalf("decideLiveMigration() ok = %v, want %v (reason %q)", ok, tc.wantOK, reason)
+				t.Fatalf("decideMigration() ok = %v, want %v (reason %q)", ok, tc.wantOK, reason)
 			}
 			if tc.wantSub != "" && !strings.Contains(reason, tc.wantSub) {
 				t.Errorf("reason = %q, want it to mention %q", reason, tc.wantSub)

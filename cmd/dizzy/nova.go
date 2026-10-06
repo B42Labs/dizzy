@@ -37,12 +37,13 @@ func newNovaCmd(opts *globalOptions) *cobra.Command {
 }
 
 // resolveNovaRefs resolves the plan's by-name image and flavor references to
-// cloud ids, pre-checks the compute quota, and runs the live-migration admin
-// pre-check when the plan schedules any live migration. It is shared by apply,
-// chaos, and monitor. The image is resolved via Glance and the flavors via Nova;
-// the resize flavor is only resolved when the plan resizes anything. A false
-// live-migration verdict logs a warning and leaves live migration disabled for
-// the run rather than aborting it — the fail-open behavior the issue requires.
+// cloud ids, pre-checks the compute quota, and runs the migration admin
+// pre-check once when the plan schedules any live or cold migration. It is
+// shared by apply, chaos, monitor and mix chaos. The image is resolved via
+// Glance and the flavors via Nova; the resize flavor is only resolved when the
+// plan resizes anything. A false migration verdict logs a warning per migration
+// kind and leaves those migrations disabled for the run rather than aborting
+// it — the fail-open behavior the issue requires.
 func resolveNovaRefs(ctx context.Context, cs *config.ComputeStack, p *novaplan.Plan) (novaexec.Resolved, error) {
 	img, err := nova.FindImage(ctx, cs.Image, p.Image)
 	if err != nil {
@@ -69,16 +70,36 @@ func resolveNovaRefs(ctx context.Context, cs *config.ComputeStack, p *novaplan.P
 		return novaexec.Resolved{}, err
 	}
 
+	if p.LiveMigrations() > 0 || p.ColdMigrations() > 0 {
+		ok, reason := nova.PrecheckMigration(ctx, cs.Compute)
+		setMigrationVerdict(&resolved, p, ok, reason)
+	}
+
+	return resolved, nil
+}
+
+// setMigrationVerdict applies the migration pre-check's verdict to resolved for
+// each migration kind p schedules. It enables the kind and logs that at info
+// level when ok is set, and otherwise leaves it disabled and logs a warning
+// that carries reason. A kind the plan does not schedule stays untouched and
+// logs nothing.
+func setMigrationVerdict(resolved *novaexec.Resolved, p *novaplan.Plan, ok bool, reason string) {
 	if p.LiveMigrations() > 0 {
-		if ok, reason := nova.PrecheckLiveMigration(ctx, cs.Compute); ok {
-			resolved.LiveMigration = true
+		resolved.LiveMigration = ok
+		if ok {
 			slog.Info("live migration enabled for this run")
 		} else {
 			slog.Warn("live migration disabled for this run", "reason", reason)
 		}
 	}
-
-	return resolved, nil
+	if p.ColdMigrations() > 0 {
+		resolved.ColdMigration = ok
+		if ok {
+			slog.Info("cold migration enabled for this run")
+		} else {
+			slog.Warn("cold migration disabled for this run", "reason", reason)
+		}
+	}
 }
 
 // novaTimeoutCleaner wraps a novaexec.Cleaner so every cloud operation Cleanup
