@@ -294,8 +294,9 @@ func validateInterval(key string, iv novascenario.Interval) error {
 // Set applies a single dotted-key override of the form key=value, matching the
 // documented scenario fields. services takes a comma-separated list, and the
 // empty string clears it; the interval bounds take Go duration strings, and
-// lanes.<name>.enabled a boolean. It returns an error for an unknown key or a
-// value that does not parse to the field's type.
+// lanes.<name>.enabled and personas.legacy.cold_migration a boolean. It
+// returns an error for an unknown key or a value that does not parse to the
+// field's type.
 func (s *Scenario) Set(key, value string) error {
 	ci, gardener, legacy := &s.Personas.CI, &s.Personas.Gardener, &s.Personas.Legacy
 	switch key {
@@ -368,6 +369,13 @@ func (s *Scenario) Set(key, value string) error {
 		return setInt(&legacy.Networks, key, value)
 	case "personas.legacy.resize_flavor":
 		legacy.ResizeFlavor = value
+		return nil
+	case "personas.legacy.cold_migration":
+		var b bool
+		if err := setBool(&b, key, value); err != nil {
+			return err
+		}
+		legacy.ColdMigration = &b
 		return nil
 	case "personas.legacy.volumes_per_server.min":
 		return setInt(&legacy.VolumesPerServer.Min, key, value)

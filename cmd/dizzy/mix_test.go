@@ -127,6 +127,8 @@ func TestMixGenerateErrors(t *testing.T) {
 		{"missing file", []string{"mix", "generate", "--scenario", filepath.Join(t.TempDir(), "nope.yaml")}, "reading scenario:", true},
 		{"set without value", []string{"mix", "generate", "--scenario", valid, "--set", "nokey"}, `invalid --set "nokey": want key=value`, false},
 		{"unknown set key", []string{"mix", "generate", "--scenario", valid, "--set", "personas.ci.nope=1"}, `unknown override key "personas.ci.nope"`, false},
+		{"cold migration not a boolean", []string{"mix", "generate", "--scenario", valid, "--set", "personas.legacy.cold_migration=maybe"},
+			`override personas.legacy.cold_migration: "maybe" is not a boolean`, false},
 		{"unsupported service", []string{"mix", "generate", "--scenario", valid, "--set", "services=octavia"},
 			`opt-in service "octavia" is not supported by this build of dizzy (supported: none)`, false},
 		{"no server to divide", []string{"mix", "generate", "--scenario", valid, "--set", "resources.servers=0"},
