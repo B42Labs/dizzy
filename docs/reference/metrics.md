@@ -10,6 +10,11 @@ These measurements have two sinks. The in-memory collector is the source of
 truth for run records and `report`. With `--otel`, the same seam also feeds an
 OpenTelemetry exporter.
 
+The collector keeps no individual sample. It adds each one to counters and a
+fixed-size latency histogram per resource kind, so its memory does not grow with
+the length of a run. Min, mean and max stay exact; the median and the p90, p95
+and p99 percentiles are estimates within 1%.
+
 ## What `report` renders
 
 Per resource kind and overall:
@@ -23,7 +28,9 @@ Per resource kind and overall:
 A churn run adds create/delete/mutate counts, completed create→delete cycles, the
 live-population summary (min, mean, max, and the controller's target fill), and
 latency and error rate **bucketed over the run's duration** — so degradation over
-time is visible rather than averaged away. A run that ends with teardown also
+time is visible rather than averaged away. A bounded run has ten equal buckets; a
+run with `--duration 0` has one bucket per `--bucket-width`. Bucket percentiles
+are exact. A run that ends with teardown also
 performs a **leak check**, listing any resource still carrying the run tag after
 the topology should be gone.
 

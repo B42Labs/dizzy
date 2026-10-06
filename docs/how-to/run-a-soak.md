@@ -25,12 +25,40 @@ The topology is torn down at the end of the run, followed by a leak check.
 
 ## Set the duration
 
-`--duration` is the only hard stop besides Ctrl-C. A flag overrides the
-scenario's `chaos:` block:
+`--duration` sets when the run ends on its own; Ctrl-C ends it earlier. A flag
+overrides the scenario's `chaos:` block:
 
 ```console
 $ dizzy neutron chaos --scenario scenarios/neutron/medium.yaml --duration 2h
 ```
+
+## Run until stopped
+
+To keep a lab under load until you stop it, pass `--duration 0`:
+
+```console
+$ dizzy neutron chaos --scenario scenarios/neutron/small.yaml --duration 0
+```
+
+Stop it with Ctrl-C or SIGTERM. The run schedules nothing more. If operations
+are still in flight, it writes a checkpoint of its run record and lets them
+finish. `--timeout` bounds each attempt and each wait phase of an operation, so
+with retries one operation can take several timeouts. The run then writes its
+final record, tears the topology down and runs the leak check, as a bounded run
+does when its duration elapses, and exits 0. A second signal ends the process at
+once, without the final record or the teardown; clean up from the checkpoint
+with `cleanup --run`. Only the flag selects this mode: `duration: 0` in the
+`chaos:` block means unset.
+
+Such a run slices its time series into buckets of `--bucket-width`, one hour by
+default and at least one minute:
+
+```console
+$ dizzy neutron chaos --scenario scenarios/neutron/small.yaml --duration 0 --bucket-width 15m
+```
+
+The series keeps every bucket, so it is the one part of the run record that
+grows: about 0.6 kB per bucket, 24 buckets per day at the default width.
 
 ## Tune the churn
 
@@ -116,6 +144,18 @@ The HTML report renders the time buckets as a chart, which is the quickest way t
 see whether the control plane got slower as the run went on. Compare `popMean`
 against `targetFill` to confirm the controller held the population where you
 asked.
+
+The record on disk is current to the minute: a churn run rewrites it once a
+minute while it runs. `report` works on it at any time and marks a record
+written mid-run as incomplete. If the process is killed or its node is lost,
+reclaim what the last record lists:
+
+```console
+$ dizzy neutron cleanup --run run-<id>.json
+```
+
+Resources created in the last minute before a kill are not in that record;
+`cleanup --run-id <id>` finds the ones a tag or metadata identifies.
 
 ## Export live metrics instead
 

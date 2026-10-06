@@ -4,9 +4,12 @@
 the canonical artifact of a run: what was created, how long each call took, and
 what went wrong. `status`, `report`, and `cleanup` all consume it.
 
-`chaos` writes one too, with an extra `chaos` object. `monitor` writes one per
-iteration only with `--keep-run-records`, since in a long loop they accumulate
-unboundedly.
+`chaos` writes one too, with an extra `chaos` object. It rewrites the record
+once a minute while it runs, marked `incomplete`, and writes the final record
+when the run ends. A consumer must check `incomplete` before it treats a
+`chaos` record as final: dizzy releases that predate the key ignore it and read
+a checkpoint as a finished run. `monitor` writes one per iteration only with
+`--keep-run-records`, since in a long loop they accumulate unboundedly.
 
 ## Top level
 
@@ -23,6 +26,7 @@ unboundedly.
 | `metrics` | object | Aggregate metrics; see below |
 | `volumeType` | string | Cinder only; the resolved volume type, for provenance |
 | `chaos` | object | Churn runs only; see below |
+| `incomplete` | bool | `true` on a record `chaos` wrote while still running; `finishedAt` is then the checkpoint time and `metrics.wall` the time elapsed so far. Omitted on a final record |
 
 ## `created[]`
 
@@ -66,6 +70,11 @@ role assignments.
 `min`, `mean`, `median`, `p90`, `p95`, `p99`, `max` — all durations in
 nanoseconds, as Go encodes `time.Duration`.
 
+Under `metrics`, `median`, `p90`, `p95` and `p99` are estimates within 1% of the
+exact value, since the collector keeps a fixed-size histogram instead of every
+sample. `min`, `mean` and `max` are exact, and so is every value in
+`chaos.buckets[]`.
+
 ### Error kinds
 
 The `kind` in an `errors[]` entry is the service client's classification:
@@ -88,11 +97,17 @@ Present only on a run record written by `chaos`.
 | `popMean` | float | Mean live population |
 | `targetFill` | float | The controller's target, for comparison against `popMean` |
 | `buckets` | array | Time-sliced stats; see below |
+| `bucketWidth` | duration | Width of every bucket of a run with `--duration 0`, in nanoseconds. Omitted for a bounded run |
 
 ### `buckets[]`
 
 Latency and errors bucketed over the run's duration, so degradation over time is
 visible rather than averaged away. `report` renders these as a time series.
+
+A bounded run has ten buckets of equal width. A run with `--duration 0` has one
+bucket per `bucketWidth`, starting at offset 0, including buckets without
+operations; its last bucket may be partial, and its throughput still divides by
+the full width. A record written before the first tick has no buckets.
 
 | Field | Type | Notes |
 |---|---|---|
