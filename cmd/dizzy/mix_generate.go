@@ -95,7 +95,7 @@ func buildMixPlanFromFlags(cmd *cobra.Command, opts *globalOptions, scenarioPath
 		s.Seed = opts.seed
 	}
 
-	p, err := s.Generate()
+	p, err := s.Generate(mixscenario.LaneScenarios{})
 	if err != nil {
 		return mixscenario.Scenario{}, nil, err
 	}

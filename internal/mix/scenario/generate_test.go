@@ -94,11 +94,11 @@ func marshal(t *testing.T, v any) []byte {
 }
 
 func TestGenerateDeterministic(t *testing.T) {
-	p1, err := smallScenario().Generate()
+	p1, err := smallScenario().Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
-	p2, err := smallScenario().Generate()
+	p2, err := smallScenario().Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
@@ -109,12 +109,12 @@ func TestGenerateDeterministic(t *testing.T) {
 
 func TestGenerateSeedChangesPlan(t *testing.T) {
 	s := smallScenario()
-	p1, err := s.Generate()
+	p1, err := s.Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
 	s.Seed = 7
-	p2, err := s.Generate()
+	p2, err := s.Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
@@ -124,20 +124,27 @@ func TestGenerateSeedChangesPlan(t *testing.T) {
 }
 
 func TestGenerateGolden(t *testing.T) {
-	p, err := smallScenario().Generate()
+	p, err := smallScenario().Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
 	got := marshal(t, p)
+	if bytes.Contains(got, []byte(`"lanes"`)) {
+		t.Errorf("plan without an enabled lane has a lanes key:\n%s", got)
+	}
+	checkGolden(t, filepath.Join("testdata", "golden", "small.plan.json"), got)
+}
 
-	path := filepath.Join("testdata", "golden", "small.plan.json")
+// checkGolden compares got with the golden file at path, or writes it there
+// with -update.
+func checkGolden(t *testing.T, path string, got []byte) {
+	t.Helper()
 	if *update {
 		if err := os.WriteFile(path, got, 0o644); err != nil {
 			t.Fatalf("writing golden file: %v", err)
 		}
 		return
 	}
-
 	want, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("reading golden file (run with -update to create it): %v", err)
@@ -147,12 +154,121 @@ func TestGenerateGolden(t *testing.T) {
 	}
 }
 
+// TestGenerateWithLanesGolden confirms the small scenario with every lane on
+// the bundled small profile emits the four lanes in canonical order, each
+// under its derived seed, byte-identically on a second call.
+func TestGenerateWithLanesGolden(t *testing.T) {
+	s := smallScenario()
+	enableAllLanes(&s)
+	generate := func() []byte {
+		ls, err := s.LoadLanes(noRead(t))
+		if err != nil {
+			t.Fatalf("LoadLanes: %v", err)
+		}
+		p, err := s.Generate(ls)
+		if err != nil {
+			t.Fatalf("Generate: %v", err)
+		}
+		var names []string
+		for _, l := range p.Lanes {
+			names = append(names, l.Name)
+			if l.Seed != PersonaSeed(42, l.Name) || l.Scenario() != "small/"+l.Name {
+				t.Errorf("lane %s seed/scenario = %d/%s, want %d/small/%s", l.Name, l.Seed, l.Scenario(), PersonaSeed(42, l.Name), l.Name)
+			}
+		}
+		if want := []string{"cinder", "glance", "keystone", "neutron"}; !reflect.DeepEqual(names, want) {
+			t.Errorf("lanes = %v, want %v", names, want)
+		}
+		return marshal(t, p)
+	}
+	first := generate()
+	if second := generate(); !bytes.Equal(first, second) {
+		t.Error("the same scenario and lanes produced different plans")
+	}
+	checkGolden(t, filepath.Join("testdata", "golden", "small-lanes.plan.json"), first)
+}
+
+func TestGenerateEnabledLaneNotLoaded(t *testing.T) {
+	s := smallScenario()
+	s.Lanes.Cinder.Lane = Lane{Enabled: true, Profile: "small"}
+	_, err := s.Generate(LaneScenarios{})
+	if want := "lanes.cinder is enabled but its scenario was not loaded"; err == nil || err.Error() != want {
+		t.Errorf("Generate() = %v, want %q", err, want)
+	}
+}
+
+// loadLaneFile loads the scenarios of s with the lane named by lane switched
+// on, reading data as its scenario file.
+func loadLaneFile(t *testing.T, s Scenario, lane, data string) (Scenario, LaneScenarios) {
+	t.Helper()
+	if err := s.Set("lanes."+lane+".enabled", "true"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := s.Set("lanes."+lane+".scenario", lane+".yaml"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	var paths []string
+	ls, err := s.LoadLanes(fileRead(data, &paths))
+	if err != nil {
+		t.Fatalf("LoadLanes: %v", err)
+	}
+	return s, ls
+}
+
+// TestGenerateWithLanesEmptyPlan confirms a lane whose scenario plans nothing
+// to churn fails, under the emptiness rule of each service.
+func TestGenerateWithLanesEmptyPlan(t *testing.T) {
+	tests := []struct {
+		name, lane, data string
+	}{
+		{"empty cinder file", "cinder", ""},
+		{"no volumes", "cinder", "resources: { volumes: 0 }\n"},
+		{"empty glance file", "glance", ""},
+		{"keystone without projects and users", "keystone", "resources: { domains: 1, roles: 1 }\n"},
+		{"empty neutron file", "neutron", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, ls := loadLaneFile(t, smallScenario(), tc.lane, tc.data)
+			_, err := s.Generate(ls)
+			if want := "lanes." + tc.lane + ": the scenario plans no resources to churn"; err == nil || err.Error() != want {
+				t.Errorf("Generate = %v, want %q", err, want)
+			}
+		})
+	}
+}
+
+func TestGenerateWithLanesWrapsScenarioError(t *testing.T) {
+	s, ls := loadLaneFile(t, smallScenario(), "cinder", "resources: { volumes: -1 }\n")
+	_, err := s.Generate(ls)
+	if want := "lanes.cinder: invalid scenario: resources.volumes must not be negative, got -1"; err == nil || err.Error() != want {
+		t.Errorf("Generate = %v, want %q", err, want)
+	}
+}
+
+// TestGenerateWithLanesIgnoresDisabledPointer confirms the scenario of a
+// disabled lane is ignored, so the plan equals the one without lanes.
+func TestGenerateWithLanesIgnoresDisabledPointer(t *testing.T) {
+	_, ls := loadLaneFile(t, smallScenario(), "cinder", "resources: { volumes: 2 }\ndistribution: { volume_size_gib: { min: 1, max: 1 } }\n")
+	p, err := smallScenario().Generate(ls)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	want, err := smallScenario().Generate(LaneScenarios{})
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	if !bytes.Equal(marshal(t, p), marshal(t, want)) {
+		t.Errorf("plan with a disabled lane's scenario = %s, want the plan without lanes", marshal(t, p))
+	}
+}
+
 // TestGenerateSmallPlanShape confirms the small scenario divides its servers
 // 3, 2 and 1 among the CI, the Gardener and the Legacy persona, in canonical
 // order, each under its derived seed, and that only the Gardener persona is
 // rolling and only the Legacy persona long-lived.
 func TestGenerateSmallPlanShape(t *testing.T) {
-	p, err := smallScenario().Generate()
+	p, err := smallScenario().Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
@@ -200,7 +316,7 @@ func TestCIPersonaShape(t *testing.T) {
 	s := smallScenario()
 	s.Resources.Servers = 40
 	s.Personas.CI.VolumesPerServer.Max = 3
-	p, err := s.Generate()
+	p, err := s.Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
@@ -221,7 +337,7 @@ func TestCIPersonaShape(t *testing.T) {
 func TestGenerateZeroServers(t *testing.T) {
 	s := smallScenario()
 	s.Resources.Servers = 0
-	_, err := s.Generate()
+	_, err := s.Generate(LaneScenarios{})
 	if want := "generated plan failed validation: plan has no persona with at least one server"; err == nil || err.Error() != want {
 		t.Errorf("Generate() = %v, want %q", err, want)
 	}
@@ -230,7 +346,7 @@ func TestGenerateZeroServers(t *testing.T) {
 func TestGenerateInvalidScenario(t *testing.T) {
 	s := smallScenario()
 	s.Name = ""
-	_, err := s.Generate()
+	_, err := s.Generate(LaneScenarios{})
 	if err == nil || !strings.HasPrefix(err.Error(), "invalid scenario: ") {
 		t.Errorf("Generate() = %v, want an error starting with %q", err, "invalid scenario: ")
 	}
@@ -241,7 +357,7 @@ func TestGenerateInvalidScenario(t *testing.T) {
 func TestGenerateServicesNonNil(t *testing.T) {
 	s := smallScenario()
 	s.Services = nil
-	p, err := s.Generate()
+	p, err := s.Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
@@ -267,7 +383,7 @@ func TestPersonaSeed(t *testing.T) {
 func TestLegacyPersonaShape(t *testing.T) {
 	s := smallScenario()
 	s.Resources.Servers = 40
-	p, err := s.Generate()
+	p, err := s.Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
@@ -302,7 +418,7 @@ func TestLegacyWithoutResizeFlavor(t *testing.T) {
 	s.Personas.Legacy.ResizeFlavor = ""
 	s.Personas.Legacy.VolumesPerServer = novascenario.Range{}
 	s.Personas.Legacy.PortsPerServer = novascenario.Range{}
-	p, err := s.Generate()
+	p, err := s.Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
@@ -324,7 +440,7 @@ func TestGenerateLegacyOnly(t *testing.T) {
 	s := smallScenario()
 	s.Personas.CI.Share, s.Personas.Gardener.Share = 0, 0
 	s.Personas.Legacy.Share = 1
-	p, err := s.Generate()
+	p, err := s.Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
@@ -338,7 +454,7 @@ func TestGenerateLegacyOnly(t *testing.T) {
 // Legacy entry carries both, and that only the Gardener entry carries the
 // rolling, serverGroups and group keys.
 func TestCIPlanJSONUnchangedKeys(t *testing.T) {
-	p, err := smallScenario().Generate()
+	p, err := smallScenario().Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
@@ -363,7 +479,7 @@ func TestCIPlanJSONUnchangedKeys(t *testing.T) {
 // workers that each name both and have one data volume, with no port, and
 // that the persona is the only rolling one.
 func TestGardenerPersonaShape(t *testing.T) {
-	p, err := smallScenario().Generate()
+	p, err := smallScenario().Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
@@ -411,7 +527,7 @@ func TestGardenerClustersRoundRobin(t *testing.T) {
 	s.Resources.Servers = 7
 	s.Personas.CI.Share, s.Personas.Legacy.Share = 0, 0
 	s.Personas.Gardener.Clusters = 3
-	p, err := s.Generate()
+	p, err := s.Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
@@ -436,7 +552,7 @@ func TestGardenerClustersRoundRobin(t *testing.T) {
 func TestGenerateGardenerOnly(t *testing.T) {
 	s := smallScenario()
 	s.Personas.CI.Share, s.Personas.Legacy.Share = 0, 0
-	p, err := s.Generate()
+	p, err := s.Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
@@ -451,7 +567,7 @@ func TestGenerateGardenerOnly(t *testing.T) {
 func TestGenerateOneServerDropsGardener(t *testing.T) {
 	s := smallScenario()
 	s.Resources.Servers = 1
-	p, err := s.Generate()
+	p, err := s.Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}

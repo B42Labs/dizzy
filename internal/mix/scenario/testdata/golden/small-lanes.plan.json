@@ -1,0 +1,715 @@
+{
+  "scenario": "small",
+  "seed": 42,
+  "services": [],
+  "personas": [
+    {
+      "name": "ci",
+      "share": 0.5,
+      "servers": 3,
+      "seed": 622155389148472395,
+      "nova": {
+        "scenario": "small/ci",
+        "seed": 622155389148472395,
+        "image": "cirros",
+        "flavor": "m1.tiny",
+        "networks": [
+          {
+            "name": "net-0001",
+            "subnet": "sub-0001",
+            "cidr": "10.0.1.0/24"
+          },
+          {
+            "name": "net-0002",
+            "subnet": "sub-0002",
+            "cidr": "10.0.2.0/24"
+          }
+        ],
+        "servers": [
+          {
+            "name": "srv-0001",
+            "networks": [
+              "net-0002"
+            ]
+          },
+          {
+            "name": "srv-0002",
+            "networks": [
+              "net-0001"
+            ]
+          },
+          {
+            "name": "srv-0003",
+            "networks": [
+              "net-0001"
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "vol-0001",
+            "sizeGiB": 2,
+            "server": "srv-0001"
+          }
+        ],
+        "ports": []
+      }
+    },
+    {
+      "name": "gardener",
+      "share": 0.3,
+      "servers": 2,
+      "seed": 6828651199476969225,
+      "rolling": true,
+      "nova": {
+        "scenario": "small/gardener",
+        "seed": 6828651199476969225,
+        "image": "cirros",
+        "flavor": "m1.tiny",
+        "networks": [
+          {
+            "name": "net-0001",
+            "subnet": "sub-0001",
+            "cidr": "10.0.1.0/24"
+          }
+        ],
+        "serverGroups": [
+          {
+            "name": "grp-0001",
+            "policy": "soft-anti-affinity"
+          }
+        ],
+        "servers": [
+          {
+            "name": "srv-0001",
+            "networks": [
+              "net-0001"
+            ],
+            "group": "grp-0001"
+          },
+          {
+            "name": "srv-0002",
+            "networks": [
+              "net-0001"
+            ],
+            "group": "grp-0001"
+          }
+        ],
+        "volumes": [
+          {
+            "name": "vol-0001",
+            "sizeGiB": 2,
+            "server": "srv-0001"
+          },
+          {
+            "name": "vol-0002",
+            "sizeGiB": 2,
+            "server": "srv-0002"
+          }
+        ],
+        "ports": []
+      }
+    },
+    {
+      "name": "legacy",
+      "share": 0.2,
+      "servers": 1,
+      "seed": -2394854468723704588,
+      "longLived": true,
+      "nova": {
+        "scenario": "small/legacy",
+        "seed": -2394854468723704588,
+        "image": "cirros",
+        "flavor": "m1.tiny",
+        "resizeFlavor": "m1.small",
+        "networks": [
+          {
+            "name": "net-0001",
+            "subnet": "sub-0001",
+            "cidr": "10.0.1.0/24"
+          }
+        ],
+        "servers": [
+          {
+            "name": "srv-0001",
+            "networks": [
+              "net-0001"
+            ],
+            "stopStart": "soft",
+            "resize": true,
+            "liveMigrate": true,
+            "coldMigrate": true
+          }
+        ],
+        "volumes": [
+          {
+            "name": "vol-0001",
+            "sizeGiB": 1,
+            "server": "srv-0001",
+            "detach": true
+          },
+          {
+            "name": "vol-0002",
+            "sizeGiB": 1,
+            "server": "srv-0001",
+            "detach": true
+          }
+        ],
+        "ports": []
+      }
+    }
+  ],
+  "lanes": [
+    {
+      "name": "cinder",
+      "seed": 6205130622162677298,
+      "cinder": {
+        "scenario": "small/cinder",
+        "seed": 6205130622162677298,
+        "volumes": [
+          {
+            "name": "vol-0001",
+            "sizeGiB": 5
+          },
+          {
+            "name": "vol-0002",
+            "sizeGiB": 4
+          },
+          {
+            "name": "vol-0003",
+            "sizeGiB": 3
+          },
+          {
+            "name": "vol-0004",
+            "sizeGiB": 4,
+            "resizeToGiB": 6
+          },
+          {
+            "name": "vol-0005",
+            "sizeGiB": 1,
+            "resizeToGiB": 3
+          }
+        ],
+        "snapshots": [
+          {
+            "name": "snap-0001",
+            "volume": "vol-0001"
+          },
+          {
+            "name": "snap-0002",
+            "volume": "vol-0001"
+          },
+          {
+            "name": "snap-0003",
+            "volume": "vol-0003"
+          },
+          {
+            "name": "snap-0004",
+            "volume": "vol-0003"
+          }
+        ]
+      }
+    },
+    {
+      "name": "glance",
+      "seed": -6344715588088000837,
+      "glance": {
+        "scenario": "small/glance",
+        "seed": -6344715588088000837,
+        "images": [
+          {
+            "name": "img-0001",
+            "sizeMiB": 2
+          },
+          {
+            "name": "img-0002",
+            "sizeMiB": 8,
+            "shared": true,
+            "memberAccept": true,
+            "memberRemove": true,
+            "community": true,
+            "deactivate": true
+          },
+          {
+            "name": "img-0003",
+            "sizeMiB": 4,
+            "metadataUpdate": true,
+            "shared": true,
+            "memberAccept": true
+          },
+          {
+            "name": "img-0004",
+            "sizeMiB": 6,
+            "metadataUpdate": true
+          },
+          {
+            "name": "img-0005",
+            "sizeMiB": 2,
+            "shared": true,
+            "memberRemove": true,
+            "deactivate": true,
+            "delete": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "keystone",
+      "seed": 3280100466180871427,
+      "keystone": {
+        "scenario": "small/keystone",
+        "seed": 3280100466180871427,
+        "domains": [
+          {
+            "name": "dom-0001"
+          }
+        ],
+        "roles": [
+          {
+            "name": "role-0001"
+          },
+          {
+            "name": "role-0002"
+          }
+        ],
+        "projects": [
+          {
+            "name": "proj-0001",
+            "domain": "dom-0001"
+          },
+          {
+            "name": "proj-0002",
+            "domain": "dom-0001"
+          },
+          {
+            "name": "proj-0003",
+            "domain": "dom-0001"
+          },
+          {
+            "name": "proj-0004",
+            "domain": "dom-0001"
+          },
+          {
+            "name": "proj-0005",
+            "domain": "dom-0001"
+          }
+        ],
+        "users": [
+          {
+            "name": "user-0001",
+            "domain": "dom-0001"
+          },
+          {
+            "name": "user-0002",
+            "domain": "dom-0001"
+          },
+          {
+            "name": "user-0003",
+            "domain": "dom-0001"
+          },
+          {
+            "name": "user-0004",
+            "domain": "dom-0001"
+          },
+          {
+            "name": "user-0005",
+            "domain": "dom-0001"
+          },
+          {
+            "name": "user-0006",
+            "domain": "dom-0001"
+          },
+          {
+            "name": "user-0007",
+            "domain": "dom-0001"
+          },
+          {
+            "name": "user-0008",
+            "domain": "dom-0001"
+          },
+          {
+            "name": "user-0009",
+            "domain": "dom-0001"
+          },
+          {
+            "name": "user-0010",
+            "domain": "dom-0001"
+          }
+        ],
+        "assignments": [
+          {
+            "user": "user-0001",
+            "role": "role-0001",
+            "project": "proj-0001"
+          },
+          {
+            "user": "user-0002",
+            "role": "role-0001",
+            "project": "proj-0004"
+          },
+          {
+            "user": "user-0003",
+            "role": "role-0002",
+            "project": "proj-0002"
+          },
+          {
+            "user": "user-0003",
+            "role": "role-0002"
+          },
+          {
+            "user": "user-0003",
+            "role": "role-0002",
+            "project": "proj-0001"
+          },
+          {
+            "user": "user-0004",
+            "role": "role-0001",
+            "project": "proj-0003"
+          },
+          {
+            "user": "user-0004",
+            "role": "role-0002",
+            "project": "proj-0005"
+          },
+          {
+            "user": "user-0005",
+            "role": "role-0001",
+            "project": "proj-0004"
+          },
+          {
+            "user": "user-0005",
+            "role": "role-0001",
+            "project": "proj-0002"
+          },
+          {
+            "user": "user-0005",
+            "role": "role-0001",
+            "project": "proj-0005"
+          },
+          {
+            "user": "user-0006",
+            "role": "role-0001",
+            "project": "proj-0001"
+          },
+          {
+            "user": "user-0006",
+            "role": "role-0002",
+            "project": "proj-0005"
+          },
+          {
+            "user": "user-0007",
+            "role": "role-0001",
+            "project": "proj-0002"
+          },
+          {
+            "user": "user-0007",
+            "role": "role-0001",
+            "project": "proj-0004"
+          },
+          {
+            "user": "user-0007",
+            "role": "role-0001",
+            "project": "proj-0005"
+          },
+          {
+            "user": "user-0008",
+            "role": "role-0001",
+            "project": "proj-0002"
+          },
+          {
+            "user": "user-0008",
+            "role": "role-0001",
+            "project": "proj-0004"
+          },
+          {
+            "user": "user-0009",
+            "role": "role-0001",
+            "project": "proj-0001"
+          },
+          {
+            "user": "user-0010",
+            "role": "role-0001"
+          }
+        ],
+        "tokens": [
+          {
+            "user": "user-0004",
+            "project": "proj-0003"
+          },
+          {
+            "user": "user-0005",
+            "project": "proj-0004"
+          },
+          {
+            "user": "user-0006",
+            "project": "proj-0005"
+          },
+          {
+            "user": "user-0009",
+            "project": "proj-0001"
+          }
+        ]
+      }
+    },
+    {
+      "name": "neutron",
+      "seed": 5169415096656797778,
+      "neutron": {
+        "scenario": "small/neutron",
+        "seed": 5169415096656797778,
+        "addressScopes": [
+          {
+            "name": "as-0001",
+            "ipVersion": 4
+          }
+        ],
+        "subnetPools": [
+          {
+            "name": "pool-0001",
+            "ipVersion": 4,
+            "prefixes": [
+              "172.16.0.0/16"
+            ],
+            "defaultPrefixLen": 26
+          }
+        ],
+        "networks": [
+          {
+            "name": "net-0001"
+          },
+          {
+            "name": "net-0002"
+          },
+          {
+            "name": "net-0003"
+          },
+          {
+            "name": "link-net-0001"
+          }
+        ],
+        "subnets": [
+          {
+            "name": "subnet-0001",
+            "network": "net-0001",
+            "ipVersion": 4,
+            "cidr": "10.0.0.0/24"
+          },
+          {
+            "name": "subnet-0002",
+            "network": "net-0001",
+            "ipVersion": 6,
+            "cidr": "fd00::/64",
+            "ipv6AddressMode": "slaac",
+            "ipv6RAMode": "slaac"
+          },
+          {
+            "name": "subnet-0003",
+            "network": "net-0001",
+            "ipVersion": 4,
+            "subnetPool": "pool-0001",
+            "prefixLen": 26
+          },
+          {
+            "name": "subnet-0004",
+            "network": "net-0002",
+            "ipVersion": 4,
+            "subnetPool": "pool-0001",
+            "prefixLen": 26
+          },
+          {
+            "name": "subnet-0005",
+            "network": "net-0003",
+            "ipVersion": 4,
+            "subnetPool": "pool-0001",
+            "prefixLen": 26
+          },
+          {
+            "name": "link-subnet-0001",
+            "network": "link-net-0001",
+            "ipVersion": 4,
+            "cidr": "192.168.0.0/30",
+            "disableDHCP": true
+          }
+        ],
+        "routers": [
+          {
+            "name": "router-0001",
+            "externalGateway": true
+          },
+          {
+            "name": "router-0002"
+          }
+        ],
+        "routerInterfaces": [
+          {
+            "name": "rif-0001",
+            "router": "router-0002",
+            "subnet": "subnet-0002"
+          },
+          {
+            "name": "rif-0002",
+            "router": "router-0002",
+            "subnet": "subnet-0003"
+          },
+          {
+            "name": "rif-0003",
+            "router": "router-0001",
+            "subnet": "subnet-0005"
+          },
+          {
+            "name": "link-rif-a-0001",
+            "router": "router-0001",
+            "subnet": "link-subnet-0001"
+          },
+          {
+            "name": "link-rif-b-0001",
+            "router": "router-0002",
+            "port": "link-port-0001"
+          }
+        ],
+        "securityGroups": [
+          {
+            "name": "sg-0001",
+            "rules": [
+              {
+                "direction": "ingress",
+                "etherType": "IPv4",
+                "protocol": "icmp",
+                "remoteIPPrefix": "0.0.0.0/0"
+              },
+              {
+                "direction": "egress",
+                "etherType": "IPv6",
+                "protocol": "icmp",
+                "remoteGroup": "sg-0002"
+              },
+              {
+                "direction": "ingress",
+                "etherType": "IPv4",
+                "protocol": "tcp",
+                "portRangeMin": 1915,
+                "portRangeMax": 1915,
+                "remoteIPPrefix": "0.0.0.0/0"
+              }
+            ]
+          },
+          {
+            "name": "sg-0002",
+            "rules": [
+              {
+                "direction": "ingress",
+                "etherType": "IPv6",
+                "protocol": "udp",
+                "portRangeMin": 18453,
+                "portRangeMax": 18453,
+                "remoteIPPrefix": "::/0"
+              },
+              {
+                "direction": "egress",
+                "etherType": "IPv4",
+                "protocol": "udp",
+                "portRangeMin": 57087,
+                "portRangeMax": 57087,
+                "remoteIPPrefix": "0.0.0.0/0"
+              },
+              {
+                "direction": "egress",
+                "etherType": "IPv4",
+                "protocol": "tcp",
+                "portRangeMin": 15934,
+                "portRangeMax": 15934,
+                "remoteGroup": "sg-0002"
+              }
+            ]
+          }
+        ],
+        "ports": [
+          {
+            "name": "port-0001",
+            "network": "net-0001",
+            "fixedIPs": [
+              {
+                "subnet": "subnet-0001"
+              }
+            ],
+            "securityGroups": [
+              "sg-0001",
+              "sg-0002"
+            ]
+          },
+          {
+            "name": "port-0002",
+            "network": "net-0001",
+            "fixedIPs": [
+              {
+                "subnet": "subnet-0003"
+              }
+            ],
+            "securityGroups": [
+              "sg-0002",
+              "sg-0001"
+            ]
+          },
+          {
+            "name": "port-0003",
+            "network": "net-0002",
+            "fixedIPs": [
+              {
+                "subnet": "subnet-0004"
+              }
+            ],
+            "securityGroups": [
+              "sg-0002",
+              "sg-0001"
+            ]
+          },
+          {
+            "name": "port-0004",
+            "network": "net-0003",
+            "fixedIPs": [
+              {
+                "subnet": "subnet-0005"
+              }
+            ],
+            "securityGroups": [
+              "sg-0002"
+            ]
+          },
+          {
+            "name": "port-0005",
+            "network": "net-0003",
+            "fixedIPs": [
+              {
+                "subnet": "subnet-0005"
+              }
+            ],
+            "securityGroups": [
+              "sg-0002",
+              "sg-0001"
+            ]
+          },
+          {
+            "name": "link-port-0001",
+            "network": "link-net-0001",
+            "fixedIPs": [
+              {
+                "subnet": "link-subnet-0001",
+                "ipAddress": "192.168.0.2"
+              }
+            ],
+            "securityGroups": []
+          }
+        ],
+        "floatingIPs": [
+          {
+            "name": "fip-0001"
+          },
+          {
+            "name": "fip-0002",
+            "port": "port-0004"
+          }
+        ]
+      }
+    }
+  ]
+}

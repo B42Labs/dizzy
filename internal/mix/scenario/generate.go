@@ -155,23 +155,27 @@ func (s Scenario) legacyNova(servers int) novascenario.Scenario {
 // PersonaSeed derives a persona's seed from the scenario seed and the persona
 // name: the seed XOR the FNV-64a hash of the name, the derivation
 // glance.PayloadSeed uses. Two personas of one run draw from distinct seeds
-// while the whole run stays reproducible from its single seed.
+// while the whole run stays reproducible from its single seed. A background
+// lane derives its seed the same way from its name.
 func PersonaSeed(seed int64, name string) int64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(name))
 	return seed ^ int64(h.Sum64())
 }
 
-// Generate expands the scenario and its seed into a mix plan. It validates the
-// scenario, divides resources.servers among the personas by their shares, and
-// emits, in canonical order, one plan persona for every persona that received
-// at least one server, with its normalized share, its seed and its generated
-// compute plan. Every server of a persona that cold-migrates is marked for cold
+// Generate expands the scenario, its seed and the lane scenarios
+// LoadLanes read into a mix plan. It validates the scenario, divides
+// resources.servers among the personas by their shares, and emits, in
+// canonical order, one plan persona for every persona that received at least
+// one server, with its normalized share, its seed and its generated compute
+// plan. Every server of a persona that cold-migrates is marked for cold
 // migration, a persona with a shape has its compute plan rewritten, and a
-// long-lived or rolling persona is marked so. The returned plan
-// is validated before it is handed back, so a scenario with no server to
-// divide fails here.
-func (s Scenario) Generate() (*mixplan.Plan, error) {
+// long-lived or rolling persona is marked so. It then emits, in canonical
+// order, one plan lane for every enabled lane, with the seed and the generated
+// plan of its scenario in ls; the scenario of a disabled lane is ignored. The
+// returned plan is validated before it is handed back, so a scenario with no
+// server to divide fails here.
+func (s Scenario) Generate(ls LaneScenarios) (*mixplan.Plan, error) {
 	if err := s.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid scenario: %w", err)
 	}
@@ -216,6 +220,17 @@ func (s Scenario) Generate() (*mixplan.Plan, error) {
 			Rolling:   ps.rolling,
 			Nova:      np,
 		})
+	}
+
+	for _, b := range s.Lanes.blocks() {
+		if !b.lane.Enabled {
+			continue
+		}
+		l, err := ls.generate(b.name)
+		if err != nil {
+			return nil, err
+		}
+		p.Lanes = append(p.Lanes, l)
 	}
 
 	if err := p.Validate(); err != nil {
