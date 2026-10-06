@@ -388,6 +388,14 @@ level=WARN msg="live migration disabled for this run" reason="credentials lack t
 level=WARN msg="cold migration disabled for this run" reason="credentials lack the admin role"
 ```
 
+A scenario that sets `personas.legacy.cold_migration: false` plans no cold
+migration. The pre-check then decides live migration alone, and the persona
+logs one line after its pre-check lines:
+
+```text
+level=INFO msg="cold migration disabled for this run" reason="personas.legacy.cold_migration is false"
+```
+
 After the personas, each enabled lane authenticates with the `clouds.yaml`
 entry its block names under `cloud`, or with `--os-cloud` when that is empty,
 and runs the read-only pre-checks of its service's `chaos` command against its
