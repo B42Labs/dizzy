@@ -18,6 +18,7 @@ import (
 	"github.com/B42Labs/dizzy/internal/mix"
 	mixplan "github.com/B42Labs/dizzy/internal/mix/plan"
 	mixscenario "github.com/B42Labs/dizzy/internal/mix/scenario"
+	novascenario "github.com/B42Labs/dizzy/internal/nova/scenario"
 	"github.com/B42Labs/dizzy/internal/resource"
 	"github.com/B42Labs/dizzy/internal/run"
 )
@@ -48,13 +49,16 @@ func newMixChaosCmd(opts *globalOptions) *cobra.Command {
 				return err
 			}
 
-			// ci is the only persona this build defines, so its block configures
-			// every lane; mixPersonaCloud rejects any other persona.
-			cfg := mergeMixChaosConfig(cmd, opts, s, f)
-			cfg.CheckpointInterval = chaosCheckpointInterval
-			if err := cfg.Validate(); err != nil {
+			// Every persona's lane runs under a config of its own, built and
+			// checked before any API call.
+			cfgs, err := mixLaneConfigs(cmd, opts, s, f, p)
+			if err != nil {
 				return err
 			}
+			// Duration and unbounded mode are run-wide, so the first persona's
+			// config stands for the run in the heartbeat and the iteration
+			// outcome.
+			runCfg := cfgs[0]
 
 			// Two-phase shutdown, as in nova chaos: the first Ctrl-C / SIGTERM
 			// cancels the run so every engine stops and the teardown below runs,
@@ -84,7 +88,7 @@ func newMixChaosCmd(opts *globalOptions) *cobra.Command {
 				}
 			}()
 			for i, in := range inputs {
-				in.persona, in.scenario, in.cfg = &p.Personas[i], p.Scenario, cfg
+				in.persona, in.scenario, in.cfg = &p.Personas[i], p.Scenario, cfgs[i]
 				l, err := buildMixLane(ctx, opts, in)
 				if err != nil {
 					return err
@@ -104,7 +108,7 @@ func newMixChaosCmd(opts *globalOptions) *cobra.Command {
 				return buildMixRecord(p, lanes, results, overall, runID, start, finished)
 			}
 
-			hb := startHeartbeat(ctx, "churn in progress", collectorSnapshot(overall, start, "duration", chaosDurationLabel(cfg)))
+			hb := startHeartbeat(ctx, "churn in progress", collectorSnapshot(overall, start, "duration", chaosDurationLabel(runCfg)))
 			results, runErr := mix.Run(ctx, lanes, chaos.RealClock{}, chaosCheckpoint(".", build))
 			hb.stop()
 			finished := time.Now()
@@ -115,7 +119,7 @@ func newMixChaosCmd(opts *globalOptions) *cobra.Command {
 
 			// Each persona's churn is one iteration of its own telemetry
 			// resource; an interrupted run counts as a failed iteration.
-			interrupted := chaosInterrupted(ctx, cfg)
+			interrupted := chaosInterrupted(ctx, runCfg)
 			for i, l := range lanes {
 				m := rec.Personas[i].Metrics
 				l.Telemetry.RecordIteration(ctx, m.Wall, !interrupted)
@@ -154,16 +158,39 @@ func newMixChaosCmd(opts *globalOptions) *cobra.Command {
 	return cmd
 }
 
-// mergeMixChaosConfig builds the churn config every lane runs under from three
-// layers, lowest precedence first: built-in defaults, the scenario (the CI
-// persona's interval, churn ratio and target fill, and the run-wide chaos
-// block), and the dedicated flags (each one explicitly set). It reads the CI
-// block only, because ci is the one persona this build defines; a second
-// persona needs a config of its own. A zero scenario value falls back to the
-// default; --duration 0 given as a flag selects the unbounded mode. A CI server
-// has no lifecycle operation, so the mutate probability stays 0.
-func mergeMixChaosConfig(cmd *cobra.Command, opts *globalOptions, s mixscenario.Scenario, f chaosFlags) chaos.Config {
-	ci := s.Personas.CI
+// mixLaneConfigs builds the churn config of every persona's lane of p, in plan
+// order, each with the checkpoint interval set and validated.
+func mixLaneConfigs(cmd *cobra.Command, opts *globalOptions, s mixscenario.Scenario, f chaosFlags, p *mixplan.Plan) ([]chaos.Config, error) {
+	cfgs := make([]chaos.Config, len(p.Personas))
+	for i := range p.Personas {
+		cfg, err := mergeMixChaosConfig(cmd, opts, s, f, &p.Personas[i])
+		if err != nil {
+			return nil, err
+		}
+		cfg.CheckpointInterval = chaosCheckpointInterval
+		if err := cfg.Validate(); err != nil {
+			return nil, err
+		}
+		cfgs[i] = cfg
+	}
+	return cfgs, nil
+}
+
+// mergeMixChaosConfig builds the churn config of one persona's lane from three
+// layers, lowest precedence first: built-in defaults, the scenario (the
+// persona's block and the run-wide chaos block), and the dedicated flags (each
+// one explicitly set). The run-wide part (duration, unbounded mode, bucket
+// width, max parallel, concurrency and classifier) is the same for every
+// persona. For ci the block sets the interval, churn ratio and target fill,
+// and the mutate probability stays 0, since a CI server has no lifecycle
+// operation. For legacy the block sets the interval. A long-lived persona runs
+// with target fill 1, since it keeps every planned resource, and mutate
+// probability 1, since its graph of pinned nodes only mutates once the creates
+// are done; its churn ratio keeps the default, which such a graph never
+// consults. A zero scenario value falls back to the default; --duration 0
+// given as a flag selects the unbounded mode. A persona this build does not
+// define is an error.
+func mergeMixChaosConfig(cmd *cobra.Command, opts *globalOptions, s mixscenario.Scenario, f chaosFlags, ps *mixplan.Persona) (chaos.Config, error) {
 	cfg := chaos.Config{
 		MinInterval: defaultChaosMinInterval,
 		MaxInterval: defaultChaosMaxInterval,
@@ -175,17 +202,31 @@ func mergeMixChaosConfig(cmd *cobra.Command, opts *globalOptions, s mixscenario.
 		Classify:    novagraph.Classify,
 	}
 
-	if ci.Interval.Min > 0 {
-		cfg.MinInterval = time.Duration(ci.Interval.Min)
+	var interval novascenario.Interval
+	switch ps.Name {
+	case "ci":
+		ci := s.Personas.CI
+		interval = ci.Interval
+		if ci.ChurnRatio > 0 {
+			cfg.ChurnRatio = ci.ChurnRatio
+		}
+		if ci.TargetFill > 0 {
+			cfg.TargetFill = ci.TargetFill
+		}
+	case "legacy":
+		interval = s.Personas.Legacy.Interval
+	default:
+		return chaos.Config{}, fmt.Errorf("persona %q is not defined by this build of dizzy", ps.Name)
 	}
-	if ci.Interval.Max > 0 {
-		cfg.MaxInterval = time.Duration(ci.Interval.Max)
+	// A graph of pinned nodes only mutates once its creates are done.
+	if ps.LongLived {
+		cfg.TargetFill, cfg.ResizeRatio = 1, 1
 	}
-	if ci.ChurnRatio > 0 {
-		cfg.ChurnRatio = ci.ChurnRatio
+	if interval.Min > 0 {
+		cfg.MinInterval = time.Duration(interval.Min)
 	}
-	if ci.TargetFill > 0 {
-		cfg.TargetFill = ci.TargetFill
+	if interval.Max > 0 {
+		cfg.MaxInterval = time.Duration(interval.Max)
 	}
 
 	if c := s.Chaos; c != nil {
@@ -210,7 +251,7 @@ func mergeMixChaosConfig(cmd *cobra.Command, opts *globalOptions, s mixscenario.
 	if cmd.Flags().Changed("max-parallel") {
 		cfg.MaxParallel = f.maxParallel
 	}
-	return cfg
+	return cfg, nil
 }
 
 // buildMixRecord builds the run record of a mix run as of finished, for the

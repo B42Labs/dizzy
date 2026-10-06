@@ -12,12 +12,16 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/B42Labs/dizzy/internal/metrics"
 	"github.com/B42Labs/dizzy/internal/mix"
 	mixplan "github.com/B42Labs/dizzy/internal/mix/plan"
+	"github.com/B42Labs/dizzy/internal/nova"
+	novaexec "github.com/B42Labs/dizzy/internal/nova/executor"
+	novaplan "github.com/B42Labs/dizzy/internal/nova/plan"
 	"github.com/B42Labs/dizzy/internal/resource"
 	"github.com/B42Labs/dizzy/internal/run"
 	"github.com/B42Labs/dizzy/scenarios"
@@ -454,5 +458,45 @@ func TestNovaCleanupRejectsMixRecord(t *testing.T) {
 	_, err := execRoot(t, "nova", "cleanup", "--run", writeMixRecord(t))
 	if want := `run record is for service "mix", not "nova"`; err == nil || err.Error() != want {
 		t.Errorf("nova cleanup on a mix record = %v, want %q", err, want)
+	}
+}
+
+// TestBuildPersonaNodes confirms a long-lived persona's lane gets the pinned
+// long-lived graph, any other persona the graph nova chaos churns, and an
+// invalid compute plan the builder's error.
+func TestBuildPersonaNodes(t *testing.T) {
+	plan := func() *novaplan.Plan {
+		return &novaplan.Plan{
+			Networks: []novaplan.Network{{Name: "net-0001", Subnet: "sub-0001", CIDR: "10.0.1.0/24"}},
+			Servers:  []novaplan.Server{{Name: "srv-0001", Networks: []string{"net-0001"}, StopStart: novaplan.StopStartSoft, ColdMigrate: true}},
+			Volumes:  []novaplan.Volume{{Name: "vol-0001", SizeGiB: 1, Server: "srv-0001", Detach: true}},
+		}
+	}
+	var c *nova.Client // the builders only capture the client in their closures
+	for _, longLived := range []bool{false, true} {
+		t.Run(fmt.Sprintf("long-lived %v", longLived), func(t *testing.T) {
+			ps := &mixplan.Persona{Name: "x", LongLived: longLived, Nova: plan()}
+			nodes, err := buildPersonaNodes(ps, c, novaexec.Resolved{}, time.Minute)
+			if err != nil {
+				t.Fatalf("buildPersonaNodes: %v", err)
+			}
+			if len(nodes) != 3 {
+				t.Fatalf("built %d nodes, want 3", len(nodes))
+			}
+			for _, n := range nodes {
+				if n.Pinned != longLived {
+					t.Errorf("node %q pinned = %v, want %v", n.Key, n.Pinned, longLived)
+				}
+			}
+		})
+
+		t.Run(fmt.Sprintf("long-lived %v, invalid plan", longLived), func(t *testing.T) {
+			p := plan()
+			p.Servers[0].Networks = []string{"ghost"}
+			_, err := buildPersonaNodes(&mixplan.Persona{Name: "x", LongLived: longLived, Nova: p}, c, novaexec.Resolved{}, time.Minute)
+			if err == nil || !strings.HasPrefix(err.Error(), "invalid plan:") {
+				t.Errorf("buildPersonaNodes = %v, want an error starting with %q", err, "invalid plan:")
+			}
+		})
 	}
 }

@@ -52,9 +52,16 @@ func TestMixChaosRequiresScenario(t *testing.T) {
 func TestMixChaosRequiresDuration(t *testing.T) {
 	noCloud(t)
 	path := writeScenario(t, sampleMixScenarioYAML)
-	_, err := execRoot(t, "mix", "chaos", "--scenario", path)
-	if want := "chaos duration must be set and positive, got 0s"; err == nil || err.Error() != want {
-		t.Errorf("mix chaos without a duration = %v, want %q", err, want)
+	for name, sets := range map[string][]string{
+		"ci alone":      nil,
+		"ci and legacy": {"--set", "personas.legacy.share=1", "--set", "personas.legacy.networks=1"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := execRoot(t, append([]string{"mix", "chaos", "--scenario", path}, sets...)...)
+			if want := "chaos duration must be set and positive, got 0s"; err == nil || err.Error() != want {
+				t.Errorf("mix chaos without a duration = %v, want %q", err, want)
+			}
+		})
 	}
 }
 
@@ -75,6 +82,9 @@ func TestMixChaosRejectsBeforeCloud(t *testing.T) {
 		{"set without value", []string{"--scenario", path, "--set", "nokey"}, `invalid --set "nokey": want key=value`, false},
 		{"narrow bucket width", []string{"--scenario", path, "--duration", "0", "--bucket-width", "30s"},
 			"chaos bucket-width must be at least 1m0s, got 30s", false},
+		{"legacy interval with only a min", []string{"--scenario", path, "--set", "personas.legacy.share=1", "--set", "personas.legacy.networks=1",
+			"--set", "personas.legacy.interval.min=1s"},
+			"invalid scenario: personas.legacy.interval.min (1s) must not exceed personas.legacy.interval.max (0s)", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -107,6 +117,39 @@ func TestMixChaosHelpListsFlags(t *testing.T) {
 	}
 }
 
+// The plan personas of the config merge tests, as the mix generator emits
+// them: ci churns, and legacy is long-lived.
+var (
+	ciPersona     = mixplan.Persona{Name: "ci"}
+	legacyPersona = mixplan.Persona{Name: "legacy", LongLived: true}
+)
+
+// mergeFor runs mergeMixChaosConfig for ps and fails the test on an error.
+func mergeFor(t *testing.T, cmd *cobra.Command, opts *globalOptions, s mixscenario.Scenario, f chaosFlags, ps mixplan.Persona) chaos.Config {
+	t.Helper()
+	cfg, err := mergeMixChaosConfig(cmd, opts, s, f, &ps)
+	if err != nil {
+		t.Fatalf("mergeMixChaosConfig(%s): %v", ps.Name, err)
+	}
+	return cfg
+}
+
+// parseMix parses data as a mix scenario and applies sets, key=value each.
+func parseMix(t *testing.T, data string, sets ...string) mixscenario.Scenario {
+	t.Helper()
+	s, err := mixscenario.Parse([]byte(data))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	for _, set := range sets {
+		key, value, _ := strings.Cut(set, "=")
+		if err := s.Set(key, value); err != nil {
+			t.Fatalf("Set(%s): %v", set, err)
+		}
+	}
+	return s
+}
+
 func TestMergeMixChaosConfig(t *testing.T) {
 	t.Run("persona values", func(t *testing.T) {
 		s, err := mixscenario.Parse([]byte(mixChaosScenarioYAML))
@@ -115,7 +158,7 @@ func TestMergeMixChaosConfig(t *testing.T) {
 		}
 		opts := &globalOptions{concurrency: 8}
 		cmd := newMixChaosCmd(opts)
-		cfg := mergeMixChaosConfig(cmd, opts, s, chaosFlags{})
+		cfg := mergeFor(t, cmd, opts, s, chaosFlags{}, ciPersona)
 		if cfg.MinInterval != 50*time.Millisecond || cfg.MaxInterval != 2*time.Second || cfg.ChurnRatio != 0.4 || cfg.TargetFill != 0.6 {
 			t.Errorf("interval/churn/fill = %s-%s/%v/%v, want 50ms-2s/0.4/0.6", cfg.MinInterval, cfg.MaxInterval, cfg.ChurnRatio, cfg.TargetFill)
 		}
@@ -131,7 +174,7 @@ func TestMergeMixChaosConfig(t *testing.T) {
 		}
 		opts := &globalOptions{concurrency: 5}
 		cmd := newMixChaosCmd(opts)
-		cfg := mergeMixChaosConfig(cmd, opts, s, chaosFlags{})
+		cfg := mergeFor(t, cmd, opts, s, chaosFlags{}, ciPersona)
 		if cfg.MinInterval != defaultChaosMinInterval || cfg.MaxInterval != defaultChaosMaxInterval ||
 			cfg.ChurnRatio != defaultChaosChurnRatio || cfg.TargetFill != defaultChaosTargetFill || cfg.MaxParallel != 5 {
 			t.Errorf("merged config = %+v, want the defaults and max parallel from --concurrency", cfg)
@@ -148,7 +191,7 @@ func TestMergeMixChaosConfig(t *testing.T) {
 		if err := cmd.Flags().Set("max-parallel", "7"); err != nil {
 			t.Fatalf("setting --max-parallel: %v", err)
 		}
-		if cfg := mergeMixChaosConfig(cmd, opts, s, chaosFlags{maxParallel: 7}); cfg.MaxParallel != 7 {
+		if cfg := mergeFor(t, cmd, opts, s, chaosFlags{maxParallel: 7}, ciPersona); cfg.MaxParallel != 7 {
 			t.Errorf("MaxParallel = %d, want 7", cfg.MaxParallel)
 		}
 	})
@@ -175,8 +218,115 @@ func TestMergeMixChaosConfig(t *testing.T) {
 			}
 			opts := &globalOptions{concurrency: 8}
 			cmd := newMixChaosCmd(opts)
-			cfg := mergeMixChaosConfig(cmd, opts, s, setChaosFlags(t, cmd, tc.flags))
+			cfg := mergeFor(t, cmd, opts, s, setChaosFlags(t, cmd, tc.flags), ciPersona)
 			checkChaosMode(t, cfg, tc.wantUnbounded, tc.wantDuration, tc.wantWidth)
+		})
+	}
+
+	t.Run("legacy values", func(t *testing.T) {
+		s := parseMix(t, mixChaosScenarioYAML, "personas.legacy.interval.min=10s", "personas.legacy.interval.max=1m")
+		opts := &globalOptions{concurrency: 8}
+		cfg := mergeFor(t, newMixChaosCmd(opts), opts, s, chaosFlags{}, legacyPersona)
+		if cfg.MinInterval != 10*time.Second || cfg.MaxInterval != time.Minute {
+			t.Errorf("interval = %s-%s, want the legacy block's 10s-1m", cfg.MinInterval, cfg.MaxInterval)
+		}
+		if cfg.TargetFill != 1 || cfg.ResizeRatio != 1 || cfg.ChurnRatio != defaultChaosChurnRatio || cfg.Classify == nil {
+			t.Errorf("merged config = %+v, want target fill 1, resize ratio 1, the default churn ratio and a classifier", cfg)
+		}
+	})
+
+	t.Run("legacy zero bounds fall back to the defaults", func(t *testing.T) {
+		for name, sets := range map[string][]string{
+			"both zero":    nil,
+			"only max set": {"personas.legacy.interval.max=2m"},
+		} {
+			t.Run(name, func(t *testing.T) {
+				s := parseMix(t, sampleMixScenarioYAML, sets...)
+				opts := &globalOptions{concurrency: 5}
+				cfg := mergeFor(t, newMixChaosCmd(opts), opts, s, chaosFlags{}, legacyPersona)
+				wantMax := defaultChaosMaxInterval
+				if sets != nil {
+					wantMax = 2 * time.Minute
+				}
+				if cfg.MinInterval != defaultChaosMinInterval || cfg.MaxInterval != wantMax {
+					t.Errorf("interval = %s-%s, want %s-%s", cfg.MinInterval, cfg.MaxInterval, defaultChaosMinInterval, wantMax)
+				}
+			})
+		}
+	})
+
+	t.Run("run-wide values are the same for both personas", func(t *testing.T) {
+		s := parseMix(t, mixChaosScenarioYAML)
+		opts := &globalOptions{concurrency: 8}
+		cmd := newMixChaosCmd(opts)
+		f := setChaosFlags(t, cmd, map[string]string{"duration": "0", "bucket-width": "10m", "max-parallel": "7"})
+		f.maxParallel = 7
+		type runWide struct {
+			duration, bucketWidth    time.Duration
+			unbounded                bool
+			maxParallel, concurrency int
+		}
+		of := func(c chaos.Config) runWide {
+			return runWide{c.Duration, c.BucketWidth, c.Unbounded, c.MaxParallel, c.Concurrency}
+		}
+		ci, legacy := mergeFor(t, cmd, opts, s, f, ciPersona), mergeFor(t, cmd, opts, s, f, legacyPersona)
+		want := runWide{0, 10 * time.Minute, true, 7, 8}
+		if of(ci) != want || of(legacy) != want {
+			t.Errorf("run-wide ci = %+v, legacy = %+v, want both %+v", of(ci), of(legacy), want)
+		}
+		if ci.ResizeRatio != 0 {
+			t.Errorf("ci resize ratio = %v, want 0", ci.ResizeRatio)
+		}
+	})
+
+	t.Run("unknown persona", func(t *testing.T) {
+		opts := &globalOptions{concurrency: 8}
+		_, err := mergeMixChaosConfig(newMixChaosCmd(opts), opts, parseMix(t, sampleMixScenarioYAML), chaosFlags{}, &mixplan.Persona{Name: "nope"})
+		if want := `persona "nope" is not defined by this build of dizzy`; err == nil || err.Error() != want {
+			t.Errorf("mergeMixChaosConfig(nope) = %v, want %q", err, want)
+		}
+	})
+}
+
+// TestMixLaneConfigs confirms every lane runs under its own persona's config,
+// in plan order: the ci lane never mutates, and the long-lived legacy lane
+// keeps every planned resource and mutates on every step, also as the plan's
+// only persona. Every lane checkpoints.
+func TestMixLaneConfigs(t *testing.T) {
+	type lane struct{ resizeRatio, targetFill float64 }
+	ci, legacy := lane{0, 0.6}, lane{1, 1}
+	legacySets := []string{"personas.legacy.share=1", "personas.legacy.networks=1"}
+	tests := []struct {
+		name string
+		sets []string
+		want []lane
+	}{
+		{"ci and legacy", legacySets, []lane{ci, legacy}},
+		{"legacy alone", append([]string{"personas.ci.share=0"}, legacySets...), []lane{legacy}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := parseMix(t, mixChaosScenarioYAML, tc.sets...)
+			p, err := s.Generate()
+			if err != nil {
+				t.Fatalf("Generate: %v", err)
+			}
+			opts := &globalOptions{concurrency: 8}
+			cfgs, err := mixLaneConfigs(newMixChaosCmd(opts), opts, s, chaosFlags{}, p)
+			if err != nil {
+				t.Fatalf("mixLaneConfigs: %v", err)
+			}
+			if len(cfgs) != len(tc.want) {
+				t.Fatalf("got %d lane configs, want %d", len(cfgs), len(tc.want))
+			}
+			for i, want := range tc.want {
+				if got := (lane{cfgs[i].ResizeRatio, cfgs[i].TargetFill}); got != want {
+					t.Errorf("lane %d (%s) resize ratio and target fill = %v, want %v", i, p.Personas[i].Name, got, want)
+				}
+				if cfgs[i].CheckpointInterval != chaosCheckpointInterval {
+					t.Errorf("lane %d checkpoint interval = %s, want %s", i, cfgs[i].CheckpointInterval, chaosCheckpointInterval)
+				}
+			}
 		})
 	}
 }
@@ -185,13 +335,8 @@ func TestMergeMixChaosConfig(t *testing.T) {
 // <runID>-<persona>, which mix chaos tags the resources with and mix cleanup
 // --run-id finds them by, and under the cloud its scenario block names.
 func TestPlanLaneInputs(t *testing.T) {
-	s, err := mixscenario.Parse([]byte(sampleMixScenarioYAML))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	if err := s.Set("personas.ci.cloud", "tenant-ci"); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
+	s := parseMix(t, sampleMixScenarioYAML, "personas.ci.cloud=tenant-ci",
+		"personas.legacy.share=1", "personas.legacy.networks=1", "personas.legacy.cloud=tenant-legacy")
 	p, err := s.Generate()
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
@@ -202,11 +347,28 @@ func TestPlanLaneInputs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planLaneInputs: %v", err)
 	}
-	if len(inputs) != 1 {
-		t.Fatalf("got %d lane inputs, want 1", len(inputs))
+	if len(inputs) != 2 {
+		t.Fatalf("got %d lane inputs, want 2", len(inputs))
 	}
-	if in := inputs[0]; in.name != "ci" || in.runID != "run1234-ci" || in.cloud != "tenant-ci" || in.persona != nil || in.overall != overall {
-		t.Errorf("lane input = %+v, want ci under run1234-ci and tenant-ci, without a persona, recording into overall", in)
+	for i, want := range []struct{ name, runID, cloud string }{
+		{"ci", "run1234-ci", "tenant-ci"},
+		{"legacy", "run1234-legacy", "tenant-legacy"},
+	} {
+		if in := inputs[i]; in.name != want.name || in.runID != want.runID || in.cloud != want.cloud || in.persona != nil || in.overall != overall {
+			t.Errorf("lane input %d = %+v, want %s under %s and %s, without a persona, recording into overall", i, in, want.name, want.runID, want.cloud)
+		}
+	}
+}
+
+func TestMixPersonaCloud(t *testing.T) {
+	s := parseMix(t, sampleMixScenarioYAML, "personas.ci.cloud=tenant-ci", "personas.legacy.cloud=tenant-legacy")
+	for name, want := range map[string]string{"ci": "tenant-ci", "legacy": "tenant-legacy"} {
+		if got, err := mixPersonaCloud(s, name); err != nil || got != want {
+			t.Errorf("mixPersonaCloud(%s) = %q, %v, want %q", name, got, err, want)
+		}
+	}
+	if _, err := mixPersonaCloud(s, "nope"); err == nil || err.Error() != `persona "nope" is not defined by this build of dizzy` {
+		t.Errorf("mixPersonaCloud(nope) = %v, want the not-defined error", err)
 	}
 }
 
