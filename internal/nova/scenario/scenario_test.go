@@ -1,6 +1,7 @@
 package scenario
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -149,5 +150,46 @@ func TestSet(t *testing.T) {
 	}
 	if err := s.Set("resources.servers", "notanint"); err == nil {
 		t.Error("Set of a non-integer value: expected an error, got nil")
+	}
+}
+
+// TestChaosBucketWidth covers the chaos block's bucket_width key: a duration
+// string parses, an absent or zero key reads as unset, a negative width fails
+// validation, and a malformed one fails parsing.
+func TestChaosBucketWidth(t *testing.T) {
+	tests := []struct {
+		name    string
+		line    string
+		want    time.Duration
+		wantErr string
+	}{
+		{name: "set", line: "  bucket_width: 30m\n", want: 30 * time.Minute},
+		{name: "absent", line: ""},
+		{name: "zero is unset", line: "  bucket_width: 0\n"},
+		{name: "negative", line: "  bucket_width: -1m\n", wantErr: "chaos.bucket_width must not be negative"},
+		{name: "malformed", line: "  bucket_width: soon\n", wantErr: `parsing duration "soon"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			parsed, err := Parse([]byte("name: x\nchaos:\n  duration: 1m\n" + tc.line))
+			if err == nil {
+				s := smallScenario()
+				s.Chaos = parsed.Chaos
+				err = s.Validate()
+			}
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Parse and Validate = %v, want an error containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Parse and Validate = %v, want nil", err)
+			}
+			if got := time.Duration(parsed.Chaos.BucketWidth); got != tc.want {
+				t.Errorf("chaos.bucket_width = %s, want %s", got, tc.want)
+			}
+		})
 	}
 }
