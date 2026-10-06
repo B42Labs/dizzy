@@ -309,6 +309,37 @@ func TestRecordRoundTripWithPersonas(t *testing.T) {
 	}
 }
 
+// TestRecordRoundTripWithLanes confirms a mix record's lanes and the lane of
+// each of their resources survive a write/load round trip intact.
+func TestRecordRoundTripWithLanes(t *testing.T) {
+	rec := sampleRecord()
+	rec.RunID = "mix00001"
+	rec.Service = "mix"
+	rec.Created[0].Persona = "ci"
+	rec.Created[1].Lane = "keystone"
+	rec.Personas = []PersonaStats{{Name: "ci", RunID: "mix00001-ci", Share: 1, Servers: 6, Seed: 7}}
+	rec.Lanes = []LaneStats{{
+		Name: "keystone", RunID: "mix00001-keystone", Cloud: "admin", ProjectID: "proj-admin",
+		Scenario: "small/keystone", Seed: 9,
+		Metrics: metrics.Aggregate{Wall: time.Minute, Overall: metrics.Stats{Attempted: 4, Succeeded: 3, Failed: 1}},
+		Chaos:   &ChaosStats{Creates: 2, Mutates: 1, TargetFill: 0.8},
+	}, {
+		Name: "glance", RunID: "mix00001-glance", Scenario: "small/glance",
+	}}
+
+	path, err := Write(t.TempDir(), rec)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !reflect.DeepEqual(rec, loaded) {
+		t.Errorf("lane round-trip mismatch:\n got %+v\nwant %+v", loaded, rec)
+	}
+}
+
 // TestRecordOmitsPersonaKeys confirms a record of a single-service run carries
 // none of the mix keys, so its shape is unchanged.
 func TestRecordOmitsPersonaKeys(t *testing.T) {
@@ -320,7 +351,7 @@ func TestRecordOmitsPersonaKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading record: %v", err)
 	}
-	for _, key := range []string{`"services"`, `"personas"`, `"persona"`} {
+	for _, key := range []string{`"services"`, `"personas"`, `"persona"`, `"lanes"`, `"lane"`} {
 		if bytes.Contains(data, []byte(key)) {
 			t.Errorf("record carries %s although it is unset:\n%s", key, data)
 		}

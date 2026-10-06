@@ -11,12 +11,14 @@ type Kind string
 // Resource is the cloud identity of a created resource. Logical is the plan's
 // reference name (e.g. "net-0001" or "vol-0001"); Name is the applied cloud
 // name; ID is the service's UUID. An executor collects these and a later
-// cleanup consumes them. Persona names the workload persona that created the
-// resource; it is set only in the run record of a combined (mix) run.
+// cleanup consumes them. Persona names the workload persona and Lane the
+// background lane that created the resource; each is set only in the run
+// record of a combined (mix) run, and at most one of them.
 type Resource struct {
 	Kind    Kind   `json:"kind"`
 	Logical string `json:"logical"`
 	Name    string `json:"name"`
 	ID      string `json:"id"`
 	Persona string `json:"persona,omitempty"`
+	Lane    string `json:"lane,omitempty"`
 }

@@ -51,14 +51,16 @@ const meterName = "github.com/B42Labs/dizzy"
 // or mix, matching run.Record.Service); each is omitted from the resource when empty.
 // Service keeps the iteration-level series — which carry no kind —
 // distinguishable when several service monitors feed the same backend. Persona
-// names the workload persona of a combined (mix) run, which sets up one
-// Telemetry per persona; it is omitted when empty.
+// names the workload persona and Lane the background lane of a combined (mix)
+// run, which sets up one Telemetry per persona and per lane; each is omitted
+// when empty.
 type Config struct {
 	Enabled  bool
 	Cloud    string
 	Scenario string
 	Service  string
 	Persona  string
+	Lane     string
 }
 
 // Telemetry holds the constructed instruments and the provider shutdown hook.
@@ -117,8 +119,8 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 
 // buildResource assembles the OTEL resource that tags every exported series with
 // the run's identity: the fixed service.name/service.version plus the
-// bespoke cloud, scenario, service, and persona attributes, each appended only
-// when non-empty. service (neutron | cinder | keystone | nova | glance | mix) is deliberately
+// bespoke cloud, scenario, service, persona, and lane attributes, each
+// appended only when non-empty. service (neutron | cinder | keystone | nova | glance | mix) is deliberately
 // distinct from the semconv service.name (which stays dizzy) and mirrors
 // run.Record.Service, so the iteration-level series stay per-service.
 func buildResource(cfg Config) (*resource.Resource, error) {
@@ -137,6 +139,9 @@ func buildResource(cfg Config) (*resource.Resource, error) {
 	}
 	if cfg.Persona != "" {
 		attrs = append(attrs, attribute.String("persona", cfg.Persona))
+	}
+	if cfg.Lane != "" {
+		attrs = append(attrs, attribute.String("lane", cfg.Lane))
 	}
 	res, err := resource.Merge(resource.Default(),
 		resource.NewWithAttributes(semconv.SchemaURL, attrs...))
