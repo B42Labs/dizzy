@@ -86,7 +86,7 @@ These identify one installation across time.
 | `cloud` | The `--os-cloud` name; for a `mix` persona, the `clouds.yaml` entry it authenticated with |
 | `scenario` | The scenario name |
 | `service` | `neutron`, `cinder`, `keystone`, `nova`, `glance`, or `mix` |
-| `persona` | `mix` only; the persona name, `ci` or `legacy` |
+| `persona` | `mix` only; the persona name, `ci`, `gardener` or `legacy` |
 
 `mix chaos` exports one OTLP resource per persona, so each persona's series stay
 apart and carry the persona's own iteration counts.
@@ -115,7 +115,7 @@ Every value set is bounded.
 
 | Attribute | Values |
 |---|---|
-| `kind` | **neutron:** `address-scope`, `subnet-pool`, `network`, `subnet`, `router`, `router-interface`, `security-group`, `security-group-rule`, `port`, `floating-ip` — **cinder:** `volume`, `snapshot` — **keystone:** `domain`, `project`, `user`, `role`, `role_assignment`, `token` — **nova:** `server`, `network`, `subnet`, `port`, `volume` — **glance:** `image` |
+| `kind` | **neutron:** `address-scope`, `subnet-pool`, `network`, `subnet`, `router`, `router-interface`, `security-group`, `security-group-rule`, `port`, `floating-ip` — **cinder:** `volume`, `snapshot` — **keystone:** `domain`, `project`, `user`, `role`, `role_assignment`, `token` — **nova:** `server`, `network`, `subnet`, `port`, `volume`, `server_group` (only the `mix` Gardener persona creates server groups) — **glance:** `image` |
 | `operation` | `create`, `delete`, `get`, `list`, `tag`, `attach`, `detach`, `extend` (cinder resize), `update` (keystone domain disable-before-delete; glance property churn), `stop`, `start`, `reboot`, `resize`, `confirm-resize`, `live-migrate`, `cold-migrate` (nova server lifecycle; `cold-migrate` only for the `mix` Legacy persona), `upload`, `visibility`, `deactivate`, `reactivate`, `member-add`, `member-accept`, `member-remove` (glance image lifecycle) |
 | `outcome` | `success`, `error`, `timeout` for an operation; `success`, `timeout` for time-to-ready; `success`, `failure` for an iteration |
 | `result` | `attempted`, `succeeded`, `failed` |

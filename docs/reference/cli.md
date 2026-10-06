@@ -315,9 +315,10 @@ See [Resource identity and cleanup](../explanation/resource-identity.md).
 `mix` runs several workload personas side by side in one churn run. Each
 persona has its own churn engine, its own cloud project and its own identity,
 and the whole run shares one seed, one run id and one run record. This build
-has two personas: `ci`, whose servers are short-lived, and `legacy`, whose
-servers stay until teardown and are changed in place. See
-[Combined runs](../explanation/combined-runs.md).
+has three personas: `ci`, whose servers are short-lived; `gardener`, whose
+servers form clusters in anti-affinity server groups and are replaced one
+worker at a time; and `legacy`, whose servers stay until teardown and are
+changed in place. See [Combined runs](../explanation/combined-runs.md).
 
 | Subcommand | Touches the API | Purpose |
 |---|---|---|
@@ -331,7 +332,8 @@ There is no `mix apply` and no `mix monitor`: a persona is a behavior over
 time, which a one-shot build does not have.
 
 `--concurrency` and `--max-parallel` apply to each persona separately. A run
-of two personas can have up to twice `--concurrency` API calls in flight.
+of three personas can have up to three times `--concurrency` API calls in
+flight.
 
 `mix generate`, `mix chaos`, `mix status` and `mix cleanup` reject an opt-in
 service under `services` that this build does not support, before they make
@@ -361,9 +363,12 @@ entry its scenario block names under `cloud`, or with `--os-cloud` when that
 is empty, and churns its share of `resources.servers` under the identity
 `<run-id>-<persona>`. Before anything is created, every persona resolves the
 image and flavor and runs the compute quota pre-check against its own plan in
-its own project. When two personas authenticate against the same project, the
-run logs `personas share a project; each quota pre-check saw only its own plan`
-and goes on.
+its own project. For the `gardener` persona, whose plan has server groups, the
+pre-check also counts the groups against the `server_groups` limit and the
+largest group against the `server_group_members` limit. When two personas
+authenticate against the same project, the run logs
+`personas share a project; each quota pre-check saw only its own plan` and goes
+on.
 
 A persona whose plan migrates servers, `legacy`, also runs the migration
 pre-check in its own project. Live and cold migration need the admin role and
@@ -394,9 +399,10 @@ personas, then the record path:
 
 ```text
 Personas
-NAME    PROJECT                           SHARE  SERVERS  OPS   OK  FAILED    P50    P95    P99
-ci      5c3f1e0a9b2d4e6f8a7b9c0d1e2f3a4b    80%        5  412  410       2  310ms   1.9s   3.2s
-legacy  9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b    20%        1   96   95       1   2.4s  38.2s  52.1s
+NAME      PROJECT                           SHARE  SERVERS  OPS   OK  FAILED    P50    P95    P99
+ci        5c3f1e0a9b2d4e6f8a7b9c0d1e2f3a4b    50%        3  412  410       2  310ms   1.9s   3.2s
+gardener  7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a    30%        2   64   63       1   1.8s  41.5s  58.3s
+legacy    9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b    20%        1   96   95       1   2.4s  38.2s  52.1s
 run record written to run-1a2b3c4d.json
 ```
 
@@ -405,6 +411,7 @@ line per persona, and runs one leak check across all of them:
 
 ```text
 deleted 14 resource(s) for run 1a2b3c4d-ci
+deleted 6 resource(s) for run 1a2b3c4d-gardener
 deleted 5 resource(s) for run 1a2b3c4d-legacy
 leak check: no run-tagged resources remain
 ```
@@ -453,7 +460,11 @@ format; see [What `report` renders](metrics.md#what-report-renders).
 
 Deletes every persona's resources of a mix run, each by its identity
 `<run-id>-<persona>` and in the project of the cloud the persona ran under,
-with the `nova` discovery rules of [`cleanup`](#cleanup). Idempotent.
+with the `nova` discovery rules of [`cleanup`](#cleanup). Server groups carry
+neither metadata nor tags, so a persona's server groups are found by the name
+prefix `dizzy-<run-id>-<persona>-` and deleted after its other resources, even
+when one of those deletes failed.
+Idempotent.
 
 | Flag | Description |
 |---|---|
