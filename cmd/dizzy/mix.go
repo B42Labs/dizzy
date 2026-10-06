@@ -303,11 +303,19 @@ func recordLaneInputs(rec *run.Record, overall *metrics.Collector) []mixLaneInpu
 	return inputs
 }
 
-// buildCleanupLanes builds one cleanup-only lane per input.
-func buildCleanupLanes(ctx context.Context, opts *globalOptions, inputs []mixLaneInput) ([]*mix.Lane, error) {
-	lanes := make([]*mix.Lane, 0, len(inputs))
-	for _, in := range inputs {
+// buildCleanupLanes builds one cleanup-only lane per input, the personas
+// first and then the background lanes.
+func buildCleanupLanes(ctx context.Context, opts *globalOptions, personas []mixLaneInput, services []serviceLaneInput) ([]*mix.Lane, error) {
+	lanes := make([]*mix.Lane, 0, len(personas)+len(services))
+	for _, in := range personas {
 		l, err := buildMixLane(ctx, opts, in)
+		if err != nil {
+			return nil, err
+		}
+		lanes = append(lanes, l)
+	}
+	for _, in := range services {
+		l, err := buildServiceLane(ctx, opts, in)
 		if err != nil {
 			return nil, err
 		}

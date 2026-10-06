@@ -5,14 +5,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/B42Labs/dizzy/internal/chaos"
 	"github.com/B42Labs/dizzy/internal/metrics"
@@ -21,6 +26,7 @@ import (
 	mixscenario "github.com/B42Labs/dizzy/internal/mix/scenario"
 	"github.com/B42Labs/dizzy/internal/resource"
 	"github.com/B42Labs/dizzy/internal/run"
+	"github.com/B42Labs/dizzy/internal/telemetry"
 	"github.com/B42Labs/dizzy/scenarios"
 )
 
@@ -70,6 +76,7 @@ func TestMixChaosRequiresDuration(t *testing.T) {
 func TestMixChaosRejectsBeforeCloud(t *testing.T) {
 	noCloud(t)
 	path := writeScenario(t, mixChaosScenarioYAML)
+	laneFile := writeScenario(t, "name: lane\nresources: { volumes: 1 }\ndistribution: { volume_size_gib: { min: 1, max: 1 } }\nchaos: { parallel: { max: 2000 } }\n")
 	tests := []struct {
 		name   string
 		args   []string
@@ -85,6 +92,14 @@ func TestMixChaosRejectsBeforeCloud(t *testing.T) {
 		{"legacy interval with only a min", []string{"--scenario", path, "--set", "personas.legacy.share=1", "--set", "personas.legacy.networks=1",
 			"--set", "personas.legacy.interval.min=1s"},
 			"invalid scenario: personas.legacy.interval.min (1s) must not exceed personas.legacy.interval.max (0s)", false},
+		{"missing lane scenario", []string{"--scenario", path, "--set", "lanes.cinder.enabled=true", "--set", "lanes.cinder.profile=",
+			"--set", "lanes.cinder.scenario=missing.yaml"},
+			"lanes.cinder: reading scenario missing.yaml:", true},
+		{"enabled lane without a profile", []string{"--scenario", path, "--set", "lanes.keystone.enabled=true"},
+			"invalid scenario: lanes.keystone: an enabled lane needs a profile or a scenario", false},
+		{"lane config out of range", []string{"--scenario", path, "--set", "lanes.cinder.enabled=true",
+			"--set", "lanes.cinder.scenario=" + laneFile},
+			`lane "cinder": chaos max-parallel must be between 1 and 1024, got 2000`, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -641,6 +656,80 @@ func TestBuildMixRecordWithLanes(t *testing.T) {
 			t.Errorf("record JSON carries a lanes or lane key without a background lane: %s", data)
 		}
 	})
+}
+
+// iterationCounts collects reader and returns the dizzy.iterations count by
+// outcome and the dizzy.iteration.operations count by result.
+func iterationCounts(t *testing.T, reader *sdkmetric.ManualReader) (iterations, operations map[string]int64) {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collecting metrics: %v", err)
+	}
+	iterations, operations = map[string]int64{}, map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			counts, key := iterations, "outcome"
+			switch m.Name {
+			case "dizzy.iterations":
+			case "dizzy.iteration.operations":
+				counts, key = operations, "result"
+			default:
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("%s is not an int64 sum: %T", m.Name, m.Data)
+			}
+			for _, dp := range sum.DataPoints {
+				v, _ := dp.Attributes.Value(attribute.Key(key))
+				counts[v.AsString()] += dp.Value
+			}
+		}
+	}
+	return iterations, operations
+}
+
+// TestRecordLaneIterations confirms every lane, the personas' and the
+// background ones alike, records its churn as one iteration of its own
+// telemetry, with its own collector's operations, also when the lanes
+// outnumber the personas, and that an interrupted run counts as failed.
+func TestRecordLaneIterations(t *testing.T) {
+	for _, interrupted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("interrupted=%v", interrupted), func(t *testing.T) {
+			p := mixTestPlan()
+			overall := metrics.NewCollector()
+			lanes := append(mixTestLanes(p, overall), keystoneTestLane(overall))
+			readers := make([]*sdkmetric.ManualReader, len(lanes))
+			for i, l := range lanes {
+				readers[i] = sdkmetric.NewManualReader()
+				tel, err := telemetry.NewWithProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(readers[i])))
+				if err != nil {
+					t.Fatalf("NewWithProvider: %v", err)
+				}
+				l.Telemetry = tel
+				for range i + 1 {
+					l.Collector.Record(metrics.Sample{Type: "server", Duration: time.Second, Success: true})
+				}
+			}
+
+			recordLaneIterations(context.Background(), lanes, time.Minute, interrupted)
+
+			outcome := "success"
+			if interrupted {
+				outcome = "failure"
+			}
+			for i, l := range lanes {
+				iterations, operations := iterationCounts(t, readers[i])
+				if want := map[string]int64{outcome: 1}; !reflect.DeepEqual(iterations, want) {
+					t.Errorf("lane %s iterations = %v, want %v", l.Name, iterations, want)
+				}
+				if want := map[string]int64{"attempted": int64(i + 1), "succeeded": int64(i + 1), "failed": 0}; !reflect.DeepEqual(operations, want) {
+					t.Errorf("lane %s operations = %v, want %v", l.Name, operations, want)
+				}
+			}
+		})
+	}
 }
 
 // TestMixCheckpointWritesIncompleteRecord confirms the checkpoint callback mix

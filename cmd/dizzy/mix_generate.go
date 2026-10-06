@@ -15,8 +15,8 @@ import (
 )
 
 // newMixGenerateCmd builds "mix generate", which expands a mix scenario into a
-// plan, one compute plan per persona, and writes it as JSON to a file or
-// stdout. It never touches the API.
+// plan, one compute plan per persona and one service plan per enabled lane,
+// and writes it as JSON to a file or stdout. It never touches the API.
 func newMixGenerateCmd(opts *globalOptions) *cobra.Command {
 	var (
 		scenarioPath string
@@ -28,7 +28,7 @@ func newMixGenerateCmd(opts *globalOptions) *cobra.Command {
 		Use:   "generate",
 		Short: "Expand a mix scenario into a plan and dump it (never touches the API)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, p, err := buildMixPlanFromFlags(cmd, opts, scenarioPath, sets)
+			_, _, p, err := buildMixPlanFromFlags(cmd, opts, scenarioPath, sets)
 			if err != nil {
 				return err
 			}
@@ -49,7 +49,7 @@ func newMixGenerateCmd(opts *globalOptions) *cobra.Command {
 				servers += ps.Servers
 			}
 			slog.Info("generated plan", "scenario", p.Scenario, "seed", p.Seed,
-				"personas", len(p.Personas), "servers", servers, "destination", dest)
+				"personas", len(p.Personas), "servers", servers, "lanes", len(p.Lanes), "destination", dest)
 			return nil
 		},
 	}
@@ -65,37 +65,52 @@ func newMixGenerateCmd(opts *globalOptions) *cobra.Command {
 }
 
 // buildMixPlanFromFlags loads the mix scenario file, applies the --set
-// overrides and the global --seed override, expands it into a plan, and checks
-// that this build supports every opt-in service the plan names. It returns the
-// scenario too so the chaos command can read its persona and chaos blocks. It
-// makes no API calls.
-func buildMixPlanFromFlags(cmd *cobra.Command, opts *globalOptions, scenarioPath string, sets []string) (mixscenario.Scenario, *mixplan.Plan, error) {
-	data, err := os.ReadFile(scenarioPath)
-	if err != nil {
-		return mixscenario.Scenario{}, nil, fmt.Errorf("reading scenario: %w", err)
+// overrides and the global --seed override, reads the scenario of every
+// enabled lane, from the service's bundled profile or from the file the lane
+// names, expands it all into a plan, and checks that this build supports every
+// opt-in service the plan names. It returns the scenario and the lane
+// scenarios too so the chaos command can read their persona, lane and chaos
+// blocks. It makes no API calls.
+func buildMixPlanFromFlags(cmd *cobra.Command, opts *globalOptions, scenarioPath string, sets []string) (mixscenario.Scenario, mixscenario.LaneScenarios, *mixplan.Plan, error) {
+	fail := func(err error) (mixscenario.Scenario, mixscenario.LaneScenarios, *mixplan.Plan, error) {
+		return mixscenario.Scenario{}, mixscenario.LaneScenarios{}, nil, err
 	}
 
-	s, err := mixscenario.Parse(data)
+	s, err := loadMixScenarioFromFlags(cmd, opts, scenarioPath, sets)
+	if err != nil {
+		return fail(err)
+	}
+	ls, err := s.LoadLanes(os.ReadFile)
+	if err != nil {
+		return fail(err)
+	}
+	p, err := s.Generate(ls)
+	if err != nil {
+		return fail(err)
+	}
+	if err := mix.CheckServices(p.Services); err != nil {
+		return fail(err)
+	}
+	return s, ls, p, nil
+}
+
+// buildMixPersonaPlanFromFlags is buildMixPlanFromFlags without the lanes: it
+// validates the whole scenario, the lanes block included, but reads no lane
+// scenario and expands the personas alone, so the plan has no lanes. mix
+// cleanup --run-id uses it: it needs only each lane's name and cloud, which
+// the scenario names, and must not fail on a lane scenario file that moved,
+// changed or cannot be read since the run.
+func buildMixPersonaPlanFromFlags(cmd *cobra.Command, opts *globalOptions, scenarioPath string, sets []string) (mixscenario.Scenario, *mixplan.Plan, error) {
+	s, err := loadMixScenarioFromFlags(cmd, opts, scenarioPath, sets)
 	if err != nil {
 		return mixscenario.Scenario{}, nil, err
 	}
-
-	for _, set := range sets {
-		key, value, ok := strings.Cut(set, "=")
-		if !ok {
-			return mixscenario.Scenario{}, nil, fmt.Errorf("invalid --set %q: want key=value", set)
-		}
-		if err := s.Set(key, value); err != nil {
-			return mixscenario.Scenario{}, nil, err
-		}
+	if err := s.Validate(); err != nil {
+		return mixscenario.Scenario{}, nil, fmt.Errorf("invalid scenario: %w", err)
 	}
-
-	// The global --seed flag, when explicitly set, overrides the scenario seed.
-	if cmd.Flags().Changed("seed") {
-		s.Seed = opts.seed
-	}
-
-	p, err := s.Generate(mixscenario.LaneScenarios{})
+	personas := s
+	personas.Lanes = mixscenario.Lanes{}
+	p, err := personas.Generate(mixscenario.LaneScenarios{})
 	if err != nil {
 		return mixscenario.Scenario{}, nil, err
 	}
@@ -103,4 +118,35 @@ func buildMixPlanFromFlags(cmd *cobra.Command, opts *globalOptions, scenarioPath
 		return mixscenario.Scenario{}, nil, err
 	}
 	return s, p, nil
+}
+
+// loadMixScenarioFromFlags reads and parses the mix scenario file and applies
+// the --set overrides and the global --seed override. It reads no lane
+// scenario.
+func loadMixScenarioFromFlags(cmd *cobra.Command, opts *globalOptions, scenarioPath string, sets []string) (mixscenario.Scenario, error) {
+	data, err := os.ReadFile(scenarioPath)
+	if err != nil {
+		return mixscenario.Scenario{}, fmt.Errorf("reading scenario: %w", err)
+	}
+
+	s, err := mixscenario.Parse(data)
+	if err != nil {
+		return mixscenario.Scenario{}, err
+	}
+
+	for _, set := range sets {
+		key, value, ok := strings.Cut(set, "=")
+		if !ok {
+			return mixscenario.Scenario{}, fmt.Errorf("invalid --set %q: want key=value", set)
+		}
+		if err := s.Set(key, value); err != nil {
+			return mixscenario.Scenario{}, err
+		}
+	}
+
+	// The global --seed flag, when explicitly set, overrides the scenario seed.
+	if cmd.Flags().Changed("seed") {
+		s.Seed = opts.seed
+	}
+	return s, nil
 }
