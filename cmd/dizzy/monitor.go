@@ -79,20 +79,8 @@ func newMonitorCmd(opts *globalOptions) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("creating network client: %w", err)
 			}
-			extNet, haveExternal, err := neutron.FindExternalNetwork(ctx, gc, externalNetwork)
+			externalNetworkID, err := precheckNeutron(ctx, gc, externalNetwork, p)
 			if err != nil {
-				return err
-			}
-			externalNetworkID := ""
-			switch {
-			case haveExternal:
-				externalNetworkID = extNet.ID
-				slog.Info("using external network for gateways and floating IPs", "id", extNet.ID, "name", extNet.Name)
-			case p.RoutersWithExternalGateway() > 0 || len(p.FloatingIPs) > 0:
-				slog.Warn("plan wants external connectivity but no external network was found; gateways and floating IPs will be skipped",
-					"externalGatewayRouters", p.RoutersWithExternalGateway(), "floatingIPs", len(p.FloatingIPs))
-			}
-			if err := neutron.PrecheckQuota(ctx, gc, p, haveExternal); err != nil {
 				return err
 			}
 

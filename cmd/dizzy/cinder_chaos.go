@@ -96,22 +96,9 @@ func newCinderChaosCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("creating block storage client: %w", err)
 			}
 
-			// The volume type is a property of the target cloud, not of the
-			// cloud-independent plan: resolve it and normalize to the resolved name
-			// so the per-type quota keys and the run record use it. A named type
-			// that does not exist is an error; unset means the cloud's default type.
-			if volumeType != "" {
-				vt, err := cinder.FindVolumeType(ctx, gc, volumeType)
-				if err != nil {
-					return err
-				}
-				volumeType = vt.Name
-				slog.Info("using volume type", "name", vt.Name, "id", vt.ID)
-			}
-
 			// The envelope is the population's worst case, so quota is pre-checked
 			// against the full plan exactly as apply does.
-			if err := cinder.PrecheckQuota(ctx, gc, p, volumeType); err != nil {
+			if volumeType, err = precheckCinder(ctx, gc, volumeType, p); err != nil {
 				return err
 			}
 
