@@ -11,12 +11,16 @@ when the run ends. A consumer must check `incomplete` before it treats a
 a checkpoint as a finished run. `monitor` writes one per iteration only with
 `--keep-run-records`, since in a long loop they accumulate unboundedly.
 
+`mix chaos` writes one record for all of its personas, with `service: "mix"`, a
+`personas` array instead of a top-level `chaos` object, and checkpoints it the
+same way.
+
 ## Top level
 
 | Field | Type | Notes |
 |---|---|---|
 | `runID` | string | The run id; also the tag/metadata/name-prefix value |
-| `service` | string | `neutron`, `cinder`, `keystone`, `nova`, or `glance`. Omitted on older records |
+| `service` | string | `neutron`, `cinder`, `keystone`, `nova`, `glance`, or `mix`. Omitted on older records |
 | `scenario` | string | Scenario name |
 | `seed` | int | The seed the plan was expanded from |
 | `startedAt` | timestamp | RFC 3339 |
@@ -25,7 +29,9 @@ a checkpoint as a finished run. `monitor` writes one per iteration only with
 | `error` | string | Present only when the run failed |
 | `metrics` | object | Aggregate metrics; see below |
 | `volumeType` | string | Cinder only; the resolved volume type, for provenance |
-| `chaos` | object | Churn runs only; see below |
+| `chaos` | object | Churn runs only; see below. Absent on a `mix` record, whose personas carry their own |
+| `services` | array of strings | `mix` only; the opt-in services bound to the personas. Omitted when empty |
+| `personas` | array | `mix` only; one entry per persona; see below |
 | `incomplete` | bool | `true` on a record `chaos` wrote while still running; `finishedAt` is then the checkpoint time and `metrics.wall` the time elapsed so far. Omitted on a final record |
 
 ## `created[]`
@@ -39,6 +45,10 @@ is the same whichever service produced it.
 | `logical` | string | The plan's reference name, e.g. `net-0001` |
 | `name` | string | The applied cloud name, e.g. `dizzy-a1b2c3d4-net-0001` |
 | `id` | string | The service's UUID |
+| `persona` | string | `mix` only; the persona that created the resource |
+
+On a `mix` record the list holds every persona's resources, persona by persona,
+and an empty run writes `"created": []`.
 
 This list is `cleanup`'s belt-and-suspenders handle. It is the *only* handle for
 resources that cannot be discovered by tag — Neutron address scopes, and Keystone
@@ -114,6 +124,27 @@ the full width. A record written before the first tick has no buckets.
 | `start` | duration | Offset from the start of the run |
 | `stats` | Stats | Stats for this bucket |
 | `errors` | array | `{kind, count}` for this bucket |
+
+## `personas[]`
+
+Present only on a `mix` record: one entry per persona, in the order the run ran
+them. The top-level `metrics` are the exact aggregate of every persona's.
+
+| Field | Type | Notes |
+|---|---|---|
+| `name` | string | Persona name, e.g. `ci` |
+| `runID` | string | The identity the persona's resources carry, `<runID>-<name>`; `mix cleanup --run` deletes by it |
+| `cloud` | string | The `clouds.yaml` entry the scenario named for the persona. Omitted when the persona used `--os-cloud` |
+| `projectID` | string | The project the persona authenticated against. Omitted when the token did not name one |
+| `share` | float | The persona's share divided by the sum of all shares |
+| `servers` | int | The persona's part of `resources.servers` |
+| `seed` | int | The seed the persona's plan was expanded from |
+| `metrics` | object | The persona's own aggregate metrics, shaped like the top-level `metrics` |
+| `chaos` | object | The persona's churn statistics, shaped like [`chaos`](#chaos). Omitted in a checkpoint written before the persona's engine produced its first snapshot |
+
+There is no time series merged across personas: the percentiles of separate
+engines cannot be merged from their bucket statistics, so each persona carries
+its own `chaos.buckets`.
 
 ## Stability
 

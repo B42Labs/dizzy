@@ -356,6 +356,101 @@ admin-only on most clouds; raise it only against a cloud that grants the policy.
 Glance exposes no project-quota API, so none of the profiles is pre-checked — an
 over-limit request surfaces as a fast-failed 413.
 
+## Mix
+
+A mix scenario describes a combined run: the workload personas that run side by
+side, how they divide one server envelope, and the opt-in services bound to
+them. It has no `distribution` block, because each persona block shapes its
+own workload.
+
+```yaml
+name: small
+seed: 42
+
+image: cirros          # shared by every persona; referenced by name
+flavor: m1.tiny        # shared by every persona; referenced by name
+
+services: []           # opt-in services bound to every persona; this build supports none
+
+resources:
+  servers: 6           # the server envelope the personas divide by their shares
+
+personas:
+  ci:
+    share: 1
+    cloud: ""                                 # "" authenticates with --os-cloud
+    networks: 2
+    volumes_per_server: { min: 0, max: 1 }
+    volume_gib:         { min: 1, max: 2 }
+    interval:           { min: 100ms, max: 1s }
+    churn_ratio: 0.5
+    target_fill: 0.6
+
+chaos:
+  duration: 5m
+  parallel: { max: 4 }
+```
+
+The CI persona boots short-lived servers: each on one of the persona's
+networks, with zero or more data volumes, no extra port and no lifecycle
+operation.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `image` | string | Boot image of every persona, referenced by name (or id) |
+| `flavor` | string | Boot flavor of every persona, referenced by name (or id) |
+| `services` | list of strings | Opt-in services bound to every persona; no entry may be empty or appear twice. This build supports none |
+| `resources.servers` | int | Server envelope the personas divide by their shares, from 0 to 1,000,000; a plan needs at least 1 |
+| `personas.ci.share` | float | Share of `resources.servers`, a finite number of at least 0; at least one persona needs a share above 0 |
+| `personas.ci.cloud` | string | `clouds.yaml` entry the persona authenticates with; empty uses `--os-cloud` |
+| `personas.ci.networks` | int | Networks the persona's servers are spread over, one per server; at least 1 when the persona has servers |
+| `personas.ci.volumes_per_server` | range | Data volumes attached per server |
+| `personas.ci.volume_gib` | range | Size drawn per data volume; `min >= 1` when `volumes_per_server.max > 0` |
+| `personas.ci.interval.min` / `personas.ci.interval.max` | duration | Random delay range drawn per tick of the persona's engine; `0` falls back to `200ms` / `3s` |
+| `personas.ci.churn_ratio` | ratio | Create bias of the persona's engine at equilibrium; `0` falls back to `0.5` |
+| `personas.ci.target_fill` | ratio | Fraction of the persona's servers kept populated; `0` falls back to `0.8` |
+| `chaos.duration` | duration | Total wall-clock runtime of every persona's engine |
+| `chaos.parallel.max` | int | Per-tick fan-out of each persona's engine, drawn in `[1, max]` |
+| `chaos.bucket_width` | duration | Width of one time bucket of a run with `--duration 0` |
+
+The `--set` keys are `seed`, `image`, `flavor`, `resources.servers`,
+`services` (a comma-separated list; an empty value clears it), and every
+`personas.ci.*` key of the table, with `personas.ci.volumes_per_server.min`,
+`.max` and the like for the ranges and Go duration strings for the interval,
+e.g. `--set personas.ci.interval.max=2s`. The `chaos:` block has no `--set`
+keys; the `mix chaos` flags override it.
+
+### Shares
+
+`resources.servers` is divided among the personas with the largest-remainder
+method. Each persona gets `floor(servers × share / sum of shares)` servers, and
+the servers left over go one each to the personas with the largest fractional
+remainder, ties to the persona whose name sorts first. For example, 20 servers
+at shares 5, 3 and 2 give 10, 6 and 4 servers, and 7 servers at three equal
+shares give 3, 2 and 2.
+
+A persona that gets no server is left out of the plan, and a scenario in which
+no persona gets a server fails with `generated plan failed validation: plan has
+no persona with at least one server`. The plan records each persona's share
+divided by the sum of all shares. Each persona's compute plan is generated
+under a seed derived from the scenario seed and the persona name, so the same
+scenario and seed always yield the same plan.
+
+### Profiles
+
+| Profile | `resources.servers` | `personas.ci.networks` | `chaos.duration` |
+|---|---|---|---|
+| `small` | 6 | 2 | 5m |
+| `medium` | 20 | 4 | 30m |
+| `large` | 60 | 8 | 1h |
+
+All three set `seed: 42`, `image: cirros`, `flavor: m1.tiny`, `services: []`,
+`chaos.parallel.max: 4`, and give the CI persona `share: 1`, `cloud: ""`,
+`volumes_per_server: { min: 0, max: 1 }`, `volume_gib: { min: 1, max: 2 }`,
+`interval: { min: 100ms, max: 1s }`, `churn_ratio: 0.5` and
+`target_fill: 0.6`. `small` fits Nova's common default quota of 10 instances;
+`medium` and `large` need raised quotas.
+
 ## The `chaos:` block
 
 Optional, and read only by the `chaos` command. It adds a temporal frame to the
@@ -374,16 +469,18 @@ chaos:                                # the block shipped by scenarios/neutron/m
 | Key | Type | Services | Meaning |
 |---|---|---|---|
 | `duration` | duration | all | Total wall-clock runtime. `0` means unset; only `--duration 0` selects a run without an end |
-| `interval.min` / `interval.max` | duration | all | Random delay range drawn per tick |
+| `interval.min` / `interval.max` | duration | all but mix | Random delay range drawn per tick |
 | `parallel.max` | int | all | Per-tick fan-out, drawn in `[1, max]`, capped by `--concurrency` |
-| `churn_ratio` | ratio | all | Create bias at equilibrium |
-| `target_fill` | ratio | all | Fraction of the envelope kept populated |
+| `churn_ratio` | ratio | all but mix | Create bias at equilibrium |
+| `target_fill` | ratio | all but mix | Fraction of the envelope kept populated |
 | `bucket_width` | duration | all | Width of one time bucket of a run with `--duration 0`, at least `1m`. `0` or omitted falls back to `1h`; a bounded run ignores it |
 | `resize_ratio` | ratio | cinder | Probability per step of extending a live volume to its planned target |
 | `token_ratio` | ratio | keystone | Probability per step of issuing a token as a live, assigned user |
 | `lifecycle_ratio` | ratio | nova | Probability per step of mutating a live server (stop/start, resize, or live-migrate) |
 | `lifecycle_ratio` | ratio | glance | Probability per step of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, or metadata churn) |
 
-All fifteen built-in profiles carry a `chaos:` block, so `chaos` runs any of them
-with no flags at all. See [The churn engine](../explanation/churn-engine.md) for
+All eighteen built-in profiles carry a `chaos:` block, so `chaos` runs any of
+them with no flags at all. A mix scenario's block holds only `duration`,
+`parallel.max` and `bucket_width`; its interval, churn ratio and target fill
+are set per persona. See [The churn engine](../explanation/churn-engine.md) for
 what `churn_ratio` and `target_fill` actually control.

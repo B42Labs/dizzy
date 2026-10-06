@@ -17,6 +17,10 @@ same verbs.
 `neutron` additionally has `list-networks` (an auth smoke test) and `verify` (a
 stub that returns "not implemented yet").
 
+A sixth namespace, `mix`, runs several workload personas side by side in one
+churn run. It has its own subset of the verbs; see
+[The `mix` namespace](#the-mix-namespace).
+
 ## Global flags
 
 Accepted by every command.
@@ -244,7 +248,7 @@ Re-queries the current state of a run's resources from the API.
 ## `report`
 
 Renders metrics from a run record. Never touches the API. The same command
-builder backs all five namespaces, so `dizzy cinder report` and
+builder backs all six namespaces, so `dizzy cinder report` and
 `dizzy neutron report` are the same code.
 
 | Flag | Default | Description |
@@ -305,6 +309,163 @@ Discovery differs per service, and so does what `--run-id` alone can reach:
   `--run-id` reaches everything the run created.
 
 See [Resource identity and cleanup](../explanation/resource-identity.md).
+
+## The `mix` namespace
+
+`mix` runs several workload personas side by side in one churn run. Each
+persona has its own churn engine, its own cloud project and its own identity,
+and the whole run shares one seed, one run id and one run record. This build
+has one persona, `ci`. See [Combined runs](../explanation/combined-runs.md).
+
+| Subcommand | Touches the API | Purpose |
+|---|---|---|
+| `mix generate` | no | Expand a mix scenario into a plan and dump it |
+| `mix chaos` | yes | Run one churn engine per persona, each in its own project |
+| `mix status` | yes | Re-query the current state of a mix run's resources, per persona |
+| `mix report` | no | Render metrics from a run record, the shared `report` |
+| `mix cleanup` | yes | Delete every persona's resources of a mix run |
+
+There is no `mix apply` and no `mix monitor`: a persona is a behavior over
+time, which a one-shot build does not have.
+
+`--concurrency` and `--max-parallel` apply to each persona separately. A run
+of two personas can have up to twice `--concurrency` API calls in flight.
+
+`mix generate`, `mix chaos`, `mix status` and `mix cleanup` reject an opt-in
+service under `services` that this build does not support, before they make
+any API call:
+
+```console
+$ dizzy mix generate --scenario scenarios/mix/small.yaml --set services=octavia
+error: opt-in service "octavia" is not supported by this build of dizzy (supported: none)
+```
+
+### `mix generate`
+
+Expands a mix scenario into its plan and writes it as JSON: every persona with
+at least one server, with its share, its servers, its seed and its compute
+plan. Never touches the API.
+
+| Flag | Description |
+|---|---|
+| `--scenario <path>` | Path to the mix scenario YAML file (**required**) |
+| `--set <key>=<value>` | Override one scenario value; repeatable |
+| `--out <path>` | Write the plan to this file instead of stdout |
+
+### `mix chaos`
+
+Runs the combined churn. Each persona authenticates with the `clouds.yaml`
+entry its scenario block names under `cloud`, or with `--os-cloud` when that
+is empty, and churns its share of `resources.servers` under the identity
+`<run-id>-<persona>`. Before anything is created, every persona resolves the
+image and flavor and runs the compute quota pre-check against its own plan in
+its own project. When two personas authenticate against the same project, the
+run logs `personas share a project; each quota pre-check saw only its own plan`
+and goes on.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--scenario <path>` | — | Path to the mix scenario YAML file (**required**) |
+| `--set <key>=<value>` | — | Override one scenario value; repeatable |
+| `--duration <duration>` | — | Total wall-clock runtime (required, via flag or the `chaos:` block). `0` runs until SIGINT or SIGTERM |
+| `--bucket-width <duration>` | `1h` | Width of one time bucket in the series of a run with `--duration 0`, at least `1m` |
+| `--max-parallel <n>` | `--concurrency` | Maximum concurrent in-flight churn operations of each persona |
+| `--no-cleanup` | off | Leave every persona's resources in place at the end of the run *and* on interrupt |
+
+There are no `--min-interval`, `--max-interval`, `--churn-ratio` or
+`--target-fill` flags: each persona's block sets them, and `--set` overrides
+them, e.g. `--set personas.ci.target_fill=0.8`. The run writes and checkpoints
+one `run-<id>.json` the way `chaos` does, with a per-persona breakdown.
+
+At the end it prints the overall metrics summary, then a table of the
+personas, then the record path:
+
+```text
+Personas
+NAME  PROJECT                           SHARE  SERVERS  OPS   OK  FAILED    P50   P95   P99
+ci    5c3f1e0a9b2d4e6f8a7b9c0d1e2f3a4b   100%        6  412  410       2  310ms  1.9s  3.2s
+run record written to run-1a2b3c4d.json
+```
+
+Teardown then deletes each persona's resources by its identity, prints one
+line per persona, and runs one leak check across all of them:
+
+```text
+deleted 14 resource(s) for run 1a2b3c4d-ci
+leak check: no run-tagged resources remain
+```
+
+When resources remain, the last line is
+`leak check: <n> run-tagged resource(s) still present after teardown`. A
+persona whose teardown fails does not stop the others; the command then exits
+non-zero naming every failing persona and prints no leak-check line.
+
+With `--no-cleanup` the resources stay in place and the command prints the
+hint to reclaim them, `churn interrupted; …` after an interrupt:
+
+```text
+churn complete; resources left in place — reclaim with: mix cleanup --run run-1a2b3c4d.json
+```
+
+When the run record could not be written, the hint is
+`mix cleanup --run-id <id> --scenario '<file>'` instead, followed by one
+`--set '<key>=<value>'` for every `--set` the run was given. Either hint ends
+with `--os-cloud '<name>'` when the run took its cloud from `--os-cloud` or
+`$OS_CLOUD`, the cloud of every persona whose scenario block names none.
+Values are single-quoted so the hint pastes into a POSIX shell unchanged.
+
+### `mix status`
+
+Re-queries the current state of a mix run's resources, each persona under
+the cloud and identity the record names for it. A persona whose cloud now
+authenticates against another project than the record's `projectID` fails
+before anything is queried, because its resources would all show as `gone`.
+
+| Flag | Description |
+|---|---|
+| `--run <path>` | Path to the mix run record to re-query (**required**) |
+
+For each persona it prints a heading `persona <name> (run <run-id>-<name>)`
+and the status table of the resources that persona created. It visits every
+persona and exits non-zero with `re-querying <n> of <m> personas failed` when
+any table failed.
+
+### `mix report`
+
+The shared [`report`](#report). A mix record adds per-persona output in every
+format; see [What `report` renders](metrics.md#what-report-renders).
+
+### `mix cleanup`
+
+Deletes every persona's resources of a mix run, each by its identity
+`<run-id>-<persona>` and in the project of the cloud the persona ran under,
+with the `nova` discovery rules of [`cleanup`](#cleanup). Idempotent.
+
+| Flag | Description |
+|---|---|
+| `--run <path>` | Path to the mix run record whose resources to delete |
+| `--run-id <id>` | Delete resources for this run id directly, without a record; needs `--scenario` |
+| `--scenario <path>` | With `--run-id` only: the scenario the run used, which names the personas and their clouds |
+| `--set <key>=<value>` | With `--run-id` only: an override the run used; repeatable |
+
+Exactly one of `--run` and `--run-id` is required. With `--run`, the personas,
+their clouds and identities come from the record, and a persona whose cloud
+now authenticates against another project than the record's `projectID` fails
+before anything is deleted:
+
+```console
+$ dizzy mix cleanup --run run-1a2b3c4d.json --os-cloud other
+error: persona "ci" authenticated against project <id>, but the run record says it ran in project <id>; authenticate with the cloud the run used
+```
+
+With `--run-id`, they come from the scenario and overrides, which must be the
+ones the run used. It prints
+`deleted <n> resource(s) for run <run-id>-<persona>` per persona and continues
+past a failing persona, then exits non-zero naming it.
+
+`nova cleanup --run` on a mix record fails with
+`run record is for service "mix", not "nova"`, and `mix cleanup --run` on a
+`nova` record fails the same way the other way round.
 
 ## `list-networks`
 
