@@ -6,8 +6,10 @@
 // exceeds the plan's resource set, and only planned resources whose parents
 // exist are ever created. It also draws an optional mutate action
 // — an in-place change of a live instance (e.g. a volume extend) that is neither
-// a create nor a delete, bounded to at most once per instance lifetime. The
-// schedule of decisions is deterministic for a given seed and config, while the
+// a create nor a delete, bounded to at most once per instance lifetime unless
+// the node is pinned. A pinned node is created before any other decision and
+// never deleted, so it lives until the caller's teardown. The schedule of
+// decisions is deterministic for a given seed and config, while the
 // concurrent cloud-call completion order is not. The engine is service-neutral:
 // per-service builders under subpackages (neutrongraph, cindergraph) turn a plan
 // into the create/delete/mutate closures it schedules, each capturing its own
@@ -189,8 +191,17 @@ type Bucket struct {
 // identity of the resource; a delete removes it. Mutate, when non-nil, is an
 // in-place change of a live instance (e.g. a volume extend to its planned
 // target) that is neither a create nor a delete; the engine draws it at most
-// once per instance lifetime. A nil Mutate marks a node the engine never
-// mutates.
+// once per instance lifetime unless the node is Pinned, in which case it may
+// draw it any number of times. Each mutation still waits for the node's
+// previous operation, so the mutations of one node run one after another in
+// decision order. A nil Mutate marks a node the engine never mutates.
+//
+// Pinned marks a node the engine never deletes: once created it stays until the
+// caller's teardown. The engine creates the pinned nodes whose parents are
+// present before it draws any other decision. A node is present from the
+// moment its create is decided, so a pinned node whose create failed stays
+// present: it is never created again, and its mutations are skipped without an
+// outcome.
 //
 // Gate, when non-nil, serializes every operation of the nodes that share it: a
 // capacity-1 channel the engine acquires before granting a concurrency slot, so
@@ -204,6 +215,7 @@ type Node struct {
 	Kind    resource.Kind
 	Parents []string
 	Gate    chan struct{}
+	Pinned  bool
 	Create  func(ctx context.Context, ids map[string]string) (resource.Resource, error)
 	Delete  func(ctx context.Context, ids map[string]string, res resource.Resource) error
 	Mutate  func(ctx context.Context, ids map[string]string, res resource.Resource) error
@@ -248,9 +260,9 @@ type op struct {
 // children); last is the most recent op (create, delete, or mutate) and
 // serializes a node's own operations so its instance history stays linear.
 // mutated records that the current instance has already been mutated, so the
-// engine draws at most one mutation per lifetime; it is re-armed when the node
-// is created again. retired holds the node's deleted instances whose delete
-// has not confirmed their removal.
+// engine draws at most one mutation per lifetime of an unpinned node; it
+// is re-armed when the node is created again. retired holds the node's deleted
+// instances whose delete has not confirmed their removal.
 type nodeState struct {
 	present bool
 	mutated bool
@@ -464,6 +476,7 @@ type engine struct {
 	clk      Clock
 	rng      *rand.Rand
 	mutable  bool
+	pinned   bool
 
 	sem     chan struct{}
 	pending chan struct{}
@@ -520,6 +533,15 @@ func newEngine(nodes []Node, seed int64, cfg Config, clk Clock) *engine {
 			break
 		}
 	}
+	// A graph is pinned when any node is pinned. Only a pinned graph looks for
+	// a pinned create on each step.
+	pinned := false
+	for _, nd := range nodes {
+		if nd.Pinned {
+			pinned = true
+			break
+		}
+	}
 
 	return &engine{
 		nodes:    nodes,
@@ -529,6 +551,7 @@ func newEngine(nodes []Node, seed int64, cfg Config, clk Clock) *engine {
 		clk:      clk,
 		rng:      rand.New(rand.NewSource(seed)),
 		mutable:  mutable,
+		pinned:   pinned,
 		sem:      make(chan struct{}, limit),
 		pending:  make(chan struct{}, limit),
 		res:      newResults(cfg),
@@ -589,17 +612,29 @@ func (e *engine) drawDelay() time.Duration {
 	return e.cfg.MinInterval + time.Duration(e.rng.Int63n(span+1))
 }
 
-// step makes and dispatches one churn decision. When the graph is mutable it
-// first draws, with probability ResizeRatio, a mutation of a live, not-yet-
-// mutated node; otherwise it picks a create or a delete from the currently valid
-// candidates, biased by the controller. It transitions the logical inventory,
-// records the decision, and launches the operation. With no valid action it
-// records a no-op.
+// step makes and dispatches one churn decision. When the graph has pinned nodes
+// it first creates one of the absent pinned nodes whose parents are present, if
+// any. When the graph is mutable it then draws, with probability ResizeRatio, a
+// mutation of a live node that is not yet mutated or is pinned; otherwise
+// it picks a create or a delete from the currently valid candidates, biased by
+// the controller. It transitions the logical inventory, records the decision,
+// and launches the operation. With no valid action it records a no-op.
 //
-// The mutate draw is double-gated on mutable and ResizeRatio so a non-mutable
-// graph never touches the RNG here, keeping the create/delete decision schedule
-// for such a graph byte-for-byte what it was before mutations existed.
+// The pinned create draws only from a non-empty candidate list and the mutate
+// draw is gated on mutable and ResizeRatio, so a graph without pinned or
+// mutable nodes never touches the RNG here, keeping the create/delete decision
+// schedule for such a graph byte-for-byte what it was before either existed.
 func (e *engine) step(ctx context.Context, offset time.Duration) {
+	if cands := e.pinnedCreateCandidates(); len(cands) > 0 {
+		idx := cands[e.rng.Intn(len(cands))]
+		nd := e.nodes[idx]
+		e.record(Decision{Offset: offset, Action: "create", Kind: nd.Kind, Key: nd.Key})
+		slog.Info("churn create", "kind", nd.Kind, "key", nd.Key, "offset", offset.Round(time.Millisecond))
+		e.dispatchCreate(ctx, idx, offset)
+		e.samplePopulation()
+		return
+	}
+
 	if e.mutable && e.cfg.ResizeRatio > 0 && e.rng.Float64() < e.cfg.ResizeRatio {
 		if cands := e.mutateCandidates(); len(cands) > 0 {
 			idx := cands[e.rng.Intn(len(cands))]
@@ -610,7 +645,7 @@ func (e *engine) step(ctx context.Context, offset time.Duration) {
 			e.samplePopulation()
 			return
 		}
-		// No live, un-mutated candidate this tick: fall through to create/delete.
+		// No live candidate this tick: fall through to create/delete.
 	}
 
 	creates := e.createCandidates()
@@ -703,12 +738,29 @@ func (e *engine) createCandidates() []int {
 	return out
 }
 
-// deleteCandidates returns the indices of present nodes whose dependents are all
-// absent — the nodes that may be deleted without a dependency violation.
+// pinnedCreateCandidates returns the entries of createCandidates whose node is
+// pinned. A graph without pinned nodes has none, so it skips the scan.
+func (e *engine) pinnedCreateCandidates() []int {
+	if !e.pinned {
+		return nil
+	}
+	var out []int
+	for _, i := range e.createCandidates() {
+		if e.nodes[i].Pinned {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// deleteCandidates returns the indices of present, non-pinned nodes whose
+// dependents are all absent — the nodes that may be deleted without a
+// dependency violation. A parent of a present pinned node is never a candidate,
+// since that dependent stays present.
 func (e *engine) deleteCandidates() []int {
 	var out []int
 	for i := range e.nodes {
-		if !e.states[i].present {
+		if !e.states[i].present || e.nodes[i].Pinned {
 			continue
 		}
 		free := true
@@ -726,13 +778,15 @@ func (e *engine) deleteCandidates() []int {
 }
 
 // mutateCandidates returns the indices of present, mutable nodes whose current
-// instance has not yet been mutated — the nodes a mutation may target. A node
-// stays a candidate across dependency changes (a mutation does not touch the
-// graph), so the only bounds are liveness and the once-per-lifetime flag.
+// instance has not yet been mutated or that are pinned — the nodes a
+// mutation may target. A node stays a candidate across dependency changes (a
+// mutation does not touch the graph), so the only bounds are liveness and,
+// unless the node is pinned, the once-per-lifetime flag.
 func (e *engine) mutateCandidates() []int {
 	var out []int
 	for i := range e.nodes {
-		if e.states[i].present && e.nodes[i].Mutate != nil && !e.states[i].mutated {
+		st, nd := &e.states[i], &e.nodes[i]
+		if st.present && nd.Mutate != nil && (!st.mutated || nd.Pinned) {
 			out = append(out, i)
 		}
 	}
