@@ -21,7 +21,8 @@ var update = flag.Bool("update", false, "update golden files")
 
 // smallScenario equals the shipped small profile: six servers, three for the
 // CI persona on two networks, two for the Gardener persona in one cluster and
-// one for the Legacy persona on one network. It backs the golden test.
+// one for the Legacy persona on one network, and four disabled lanes on the
+// small profiles. It backs the golden tests.
 func smallScenario() Scenario {
 	return Scenario{
 		Name:      "small",
@@ -45,6 +46,12 @@ func smallScenario() Scenario {
 			},
 			Gardener: gardenerBlock(),
 			Legacy:   legacyBlock(),
+		},
+		Lanes: Lanes{
+			Cinder:   CinderLane{Lane: Lane{Profile: "small"}},
+			Glance:   Lane{Profile: "small"},
+			Keystone: KeystoneLane{Lane: Lane{Profile: "small"}},
+			Neutron:  NeutronLane{Lane: Lane{Profile: "small"}},
 		},
 		Chaos: &Chaos{
 			Duration: novascenario.Duration(5 * time.Minute),
@@ -198,14 +205,13 @@ func TestGenerateEnabledLaneNotLoaded(t *testing.T) {
 }
 
 // loadLaneFile loads the scenarios of s with the lane named by lane switched
-// on, reading data as its scenario file.
+// on and moved from its profile to a scenario file, reading data as that file.
 func loadLaneFile(t *testing.T, s Scenario, lane, data string) (Scenario, LaneScenarios) {
 	t.Helper()
-	if err := s.Set("lanes."+lane+".enabled", "true"); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-	if err := s.Set("lanes."+lane+".scenario", lane+".yaml"); err != nil {
-		t.Fatalf("Set: %v", err)
+	for key, value := range map[string]string{"enabled": "true", "profile": "", "scenario": lane + ".yaml"} {
+		if err := s.Set("lanes."+lane+"."+key, value); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
 	}
 	var paths []string
 	ls, err := s.LoadLanes(fileRead(data, &paths))
