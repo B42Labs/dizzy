@@ -41,11 +41,30 @@ func (c *Client) CreateVolume(ctx context.Context, v novaplan.Volume) (resource.
 
 // AttachVolume attaches a data volume to a server through the compute
 // volume-attach API. It records under the volume type and the attach operation.
+// A repeated attach can hit a 400 because the volume is already attached from
+// an earlier request whose answer or in-use wait was lost. Nova answers the
+// same 400 when the volume is attached to another server, so only when this
+// server has the volume's attachment does that 400 confirm the earlier attach
+// committed and is treated as success; a 404 surfaces the 400. When the lookup
+// itself fails, its error surfaces instead, so a transient one stays retryable.
+// The waitVolumeStatus(in-use) that follows stays the source of truth.
 func (c *Client) AttachVolume(ctx context.Context, server, volume resource.Resource) error {
 	err := c.timed(ctx, string(KindVolume), "attach", func(ctx context.Context) error {
 		_, err := volumeattach.Create(ctx, c.compute, server.ID, volumeattach.CreateOpts{VolumeID: volume.ID}).Extract()
 		return err
 	})
+	if err != nil && badRequestMentions(err, "already attached") {
+		_, gerr := volumeattach.Get(ctx, c.compute, server.ID, volume.ID).Extract()
+		switch {
+		case gerr == nil:
+			slog.Info("volume already attached; treating a repeated attach as success",
+				"volume", volume.Logical, "server", server.Logical, "id", volume.ID)
+			return nil
+		case !IsNotFound(gerr):
+			return fmt.Errorf("attaching volume %q to server %q: checking the attachment after %v: %w",
+				volume.Logical, server.Logical, err, gerr)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("attaching volume %q to server %q: %w", volume.Logical, server.Logical, err)
 	}

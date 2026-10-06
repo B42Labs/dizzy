@@ -3,7 +3,10 @@ package nova
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"time"
 
+	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/attachinterfaces"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/ports"
 
@@ -26,11 +29,22 @@ func (c *Client) CreatePort(ctx context.Context, pt novaplan.Port, networkID str
 
 // AttachPort attaches an existing port to a server through the compute
 // attach-interface API. It records under the port type and the attach operation.
+// A repeated attach can hit a 409 (the port is in use) because an earlier
+// request whose answer was lost already attached it. When the server then has
+// the port's interface attachment, that 409 confirms the earlier attach
+// committed, so it is treated as success; otherwise the 409 surfaces.
 func (c *Client) AttachPort(ctx context.Context, server, port resource.Resource) error {
 	err := c.timed(ctx, string(KindPort), "attach", func(ctx context.Context) error {
 		_, err := attachinterfaces.Create(ctx, c.compute, server.ID, attachinterfaces.CreateOpts{PortID: port.ID}).Extract()
 		return err
 	})
+	if err != nil && gophercloud.ResponseCodeIs(err, 409) {
+		if _, gerr := attachinterfaces.Get(ctx, c.compute, server.ID, port.ID).Extract(); gerr == nil {
+			slog.Info("port already attached; treating a repeated attach as success",
+				"port", port.Logical, "server", server.Logical, "id", port.ID)
+			return nil
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("attaching port %q to server %q: %w", port.Logical, server.Logical, err)
 	}
@@ -47,4 +61,29 @@ func (c *Client) DetachPort(ctx context.Context, server, port resource.Resource)
 		return fmt.Errorf("detaching port %q from server %q: %w", port.Logical, server.Logical, err)
 	}
 	return nil
+}
+
+// WaitForPortDetached polls the server's interface attachment of the port
+// until Nova no longer has it (a 404). DetachPort returns once Nova accepted
+// the detach, not once it is done, so a re-attach must wait here first. Every
+// other answer, an error other than a 404 included, is polled again with the
+// backoff WaitForGone uses: the caller's context is the only bound, and it
+// returns ctx.Err() when that ends first. It records no metrics sample.
+func (c *Client) WaitForPortDetached(ctx context.Context, server, port resource.Resource) error {
+	backoff := 200 * time.Millisecond
+	for {
+		if _, err := attachinterfaces.Get(ctx, c.compute, server.ID, port.ID).Extract(); IsNotFound(err) {
+			return nil
+		}
+
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		if backoff = time.Duration(float64(backoff) * 1.5); backoff > 2*time.Second {
+			backoff = 2 * time.Second
+		}
+	}
 }

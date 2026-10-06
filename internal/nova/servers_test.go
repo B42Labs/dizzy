@@ -2,6 +2,8 @@ package nova
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -89,4 +91,99 @@ func TestLifecycleOpsTolerateCommittedConflict(t *testing.T) {
 			t.Error("ResizeServer on an ERROR-state 409 = nil, want an error")
 		}
 	})
+}
+
+// TestColdMigrateServer verifies the cold-migrate action body, that a retried
+// 409 naming a resize task state is success, and that every other failure
+// surfaces wrapped with the logical name.
+func TestColdMigrateServer(t *testing.T) {
+	srv := resource.Resource{Kind: KindServer, ID: "srv-1", Logical: "srv-0001"}
+
+	t.Run("accepted", func(t *testing.T) {
+		var body string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost || r.URL.Path != "/servers/srv-1/action" {
+				t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			}
+			data, _ := io.ReadAll(r.Body)
+			body = string(data)
+			w.WriteHeader(http.StatusAccepted)
+		}))
+		defer ts.Close()
+		if err := testComputeClient(ts).ColdMigrateServer(context.Background(), srv); err != nil {
+			t.Fatalf("ColdMigrateServer = %v, want nil", err)
+		}
+		if body != `{"migrate":null}` {
+			t.Errorf("posted body = %s, want {\"migrate\":null}", body)
+		}
+	})
+
+	t.Run("already migrating", func(t *testing.T) {
+		ts := conflictActionServer(t, `{"conflictingRequest":{"message":"Cannot 'migrate' instance srv-1 while it is in task_state resize_migrating"}}`)
+		defer ts.Close()
+		if err := testComputeClient(ts).ColdMigrateServer(context.Background(), srv); err != nil {
+			t.Errorf("ColdMigrateServer = %v, want nil (a committed-then-retried 409 is success)", err)
+		}
+	})
+
+	t.Run("error state is not tolerated", func(t *testing.T) {
+		ts := conflictActionServer(t, `{"conflictingRequest":{"message":"Cannot 'migrate' instance srv-1 while it is in vm_state error"}}`)
+		defer ts.Close()
+		err := testComputeClient(ts).ColdMigrateServer(context.Background(), srv)
+		if want := `cold-migrating server "srv-0001":`; err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Errorf("ColdMigrateServer = %v, want an error starting with %q", err, want)
+		}
+	})
+
+	t.Run("forbidden", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+		}))
+		defer ts.Close()
+		err := testComputeClient(ts).ColdMigrateServer(context.Background(), srv)
+		if want := `cold-migrating server "srv-0001":`; err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Fatalf("ColdMigrateServer = %v, want an error starting with %q", err, want)
+		}
+		var code gophercloud.ErrUnexpectedResponseCode
+		if !errors.As(err, &code) || code.Actual != http.StatusForbidden {
+			t.Errorf("ColdMigrateServer = %v, want it to wrap the gophercloud 403", err)
+		}
+	})
+}
+
+// TestIsSameFlavor verifies Nova's 400 for a resize to the flavor the server
+// already has surfaces from ResizeServer as an error IsSameFlavor recognizes,
+// and that no other rejection does.
+func TestIsSameFlavor(t *testing.T) {
+	srv := resource.Resource{Kind: KindServer, ID: "srv-1", Logical: "srv-0001"}
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{"resize to the current flavor", http.StatusBadRequest, `{"badRequest":{"code":400,"message":"When resizing, instances must change flavor!"}}`, true},
+		{"another bad request", http.StatusBadRequest, `{"badRequest":{"code":400,"message":"Invalid flavorRef provided."}}`, false},
+		{"a conflict", http.StatusConflict, `{"conflictingRequest":{"message":"Cannot 'resize' instance srv-1 while it is in vm_state error"}}`, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer ts.Close()
+			err := testComputeClient(ts).ResizeServer(context.Background(), srv, "flavor-2")
+			if err == nil {
+				t.Fatal("ResizeServer = nil, want the rejection")
+			}
+			if got := IsSameFlavor(err); got != tc.want {
+				t.Errorf("IsSameFlavor(%v) = %v, want %v", err, got, tc.want)
+			}
+		})
+	}
+	if IsSameFlavor(nil) {
+		t.Error("IsSameFlavor(nil) = true, want false")
+	}
 }
