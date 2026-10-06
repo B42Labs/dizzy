@@ -12,7 +12,11 @@
 // the engine creates it first and never deletes it, and the mutations are
 // repeatable. A kept server runs one of its enabled lifecycle operations per
 // mutation, and a kept volume or port marked for detach toggles its attachment.
-// Keeping the Nova coupling here leaves the chaos engine free of any
+// BuildRolling builds the graph of a Gardener persona, whose servers boot into
+// server groups: the server group and network nodes are pinned, and each group
+// with its servers and their volumes and ports is one rolling set whose roots
+// are the servers, so the engine replaces the workers of a group one at a
+// time. Keeping the Nova coupling here leaves the chaos engine free of any
 // service-specific import.
 package novagraph
 
@@ -36,9 +40,11 @@ import (
 // through the nodes this package builds. It is the consumer-defined
 // ports-and-adapters seam to the cloud — *nova.Client satisfies it in production
 // and a fake satisfies it in tests. It mirrors the apply executor's Nova seam
-// plus the DeleteNetworkPorts the network churn deletes need and the
-// ColdMigrateServer and WaitForPortDetached the long-lived graph needs.
+// plus the DeleteNetworkPorts the network churn deletes need, the
+// ColdMigrateServer and WaitForPortDetached the long-lived graph needs, and the
+// CreateServerGroup the server group nodes need.
 type Nova interface {
+	CreateServerGroup(ctx context.Context, g novaplan.ServerGroup) (resource.Resource, error)
 	CreateNetwork(ctx context.Context, n novaplan.Network) (resource.Resource, error)
 	CreateSubnet(ctx context.Context, n novaplan.Network, networkID string) (resource.Resource, error)
 	DeleteNetworkPorts(ctx context.Context, networkID string) (int, error)
@@ -76,11 +82,13 @@ const (
 	statusVolumeInUse        = "in-use"
 )
 
-// Build turns a Nova plan into the churn graph: one network node per network
-// (parentless, creating its subnet), one server node per server (parented on its
-// networks, mutable when it has a planned lifecycle op), one volume node per data
-// volume (parented on its server), and one port node per port (parented on its
-// server and its network, so the network outlives the port). Every node's
+// Build turns a Nova plan into the churn graph: one server group node per
+// server group (parentless), one network node per network (parentless, creating
+// its subnet), one server node per server (parented on its networks and its
+// server group, if any, and mutable when it has a planned lifecycle op), one
+// volume node per data volume (parented on its server), and one port node per
+// port (parented on its server and its network, so the network outlives the
+// port). A server with a group boots into it. Every node's
 // closures capture c and r and run through the nova executor's retry policy,
 // bounded by opTimeout. The plan is validated first so a dangling reference fails
 // loudly instead of yielding a node that can never be created.
@@ -101,6 +109,21 @@ func Build(p *novaplan.Plan, c Nova, r novaexec.Resolved, opTimeout time.Duratio
 
 	var nodes []chaos.Node
 
+	for _, g := range p.ServerGroups {
+		g := g
+		nodes = append(nodes, chaos.Node{
+			Key: g.Name, Kind: nova.KindServerGroup,
+			Create: func(ctx context.Context, _ map[string]string) (resource.Resource, error) {
+				return createRetry(ctx, opTimeout, func(ctx context.Context) (resource.Resource, error) {
+					return c.CreateServerGroup(ctx, g)
+				})
+			},
+			Delete: func(ctx context.Context, _ map[string]string, res resource.Resource) error {
+				return deleteGone(ctx, opTimeout, c, res)
+			},
+		})
+	}
+
 	for _, n := range p.Networks {
 		n := n
 		nodes = append(nodes, chaos.Node{
@@ -119,8 +142,12 @@ func Build(p *novaplan.Plan, c Nova, r novaexec.Resolved, opTimeout time.Duratio
 
 	for _, s := range p.Servers {
 		s := s
+		parents := append([]string(nil), s.Networks...)
+		if s.Group != "" {
+			parents = append(parents, s.Group)
+		}
 		node := chaos.Node{
-			Key: s.Name, Kind: nova.KindServer, Parents: append([]string(nil), s.Networks...), Gate: family[s.Name],
+			Key: s.Name, Kind: nova.KindServer, Parents: parents, Gate: family[s.Name],
 			Create: func(ctx context.Context, ids map[string]string) (resource.Resource, error) {
 				return createServer(ctx, opTimeout, c, r, s, ids)
 			},
@@ -162,6 +189,45 @@ func Build(p *novaplan.Plan, c Nova, r novaexec.Resolved, opTimeout time.Duratio
 		})
 	}
 
+	return nodes, nil
+}
+
+// BuildRolling turns a Nova plan whose servers each name a server group into
+// the churn graph of a Gardener persona: the nodes Build returns, so an invalid
+// plan fails the same way, with every server group and network node pinned,
+// every server node and the volume and port nodes of that server carrying the
+// server's group name as their Roll value, and no mutation. A group and its
+// workers are therefore one rolling set whose roots are the workers, which the
+// engine keeps whole and replaces one worker at a time. The per-server family
+// gate of Build stays.
+func BuildRolling(p *novaplan.Plan, c Nova, r novaexec.Resolved, opTimeout time.Duration) ([]chaos.Node, error) {
+	nodes, err := Build(p, c, r, opTimeout)
+	if err != nil {
+		return nil, err
+	}
+	group := make(map[string]string, len(p.Servers)+len(p.Volumes)+len(p.Ports))
+	for _, s := range p.Servers {
+		if s.Group == "" {
+			return nil, fmt.Errorf("server %q has no server group, which a rolling graph needs", s.Name)
+		}
+		group[s.Name] = s.Group
+	}
+	for _, v := range p.Volumes {
+		group[v.Name] = group[v.Server]
+	}
+	for _, pt := range p.Ports {
+		group[pt.Name] = group[pt.Server]
+	}
+	for i := range nodes {
+		nd := &nodes[i]
+		nd.Mutate = nil
+		switch nd.Kind {
+		case nova.KindServerGroup, nova.KindNetwork:
+			nd.Pinned = true
+		default:
+			nd.Roll = group[nd.Key]
+		}
+	}
 	return nodes, nil
 }
 
@@ -385,13 +451,16 @@ func createNetwork(ctx context.Context, opTimeout time.Duration, c Nova, n novap
 }
 
 // createServer boots a server and waits for it to become ACTIVE, resolving its
-// network ids from the engine-supplied parent ids.
+// network ids and its server group id from the engine-supplied parent ids.
 func createServer(ctx context.Context, opTimeout time.Duration, c Nova, r novaexec.Resolved, s novaplan.Server, ids map[string]string) (resource.Resource, error) {
 	networkIDs := make([]string, 0, len(s.Networks))
 	for _, name := range s.Networks {
 		networkIDs = append(networkIDs, ids[name])
 	}
 	boot := nova.BootSpec{ImageID: r.ImageID, FlavorID: r.FlavorID, NetworkIDs: networkIDs}
+	if s.Group != "" {
+		boot.GroupID = ids[s.Group]
+	}
 	res, err := createRetry(ctx, opTimeout, func(ctx context.Context) (resource.Resource, error) {
 		return c.CreateServer(ctx, s, boot)
 	})

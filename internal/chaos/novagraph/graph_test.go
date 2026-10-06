@@ -475,3 +475,94 @@ func TestLongLivedColdMigrateErrorSurfaces(t *testing.T) {
 		t.Errorf("operations = %v, want %v", got, want)
 	}
 }
+
+// TestBuildServerGroupShape confirms a planned server group becomes a
+// parentless server_group node ahead of the networks, and that a server in it
+// is parented on its network and then its group.
+func TestBuildServerGroupShape(t *testing.T) {
+	p := &novaplan.Plan{
+		Networks:     []novaplan.Network{{Name: "net-0001", Subnet: "sub-0001", CIDR: "10.0.1.0/24"}},
+		ServerGroups: []novaplan.ServerGroup{{Name: "grp-0001", Policy: novaplan.PolicyAntiAffinity}},
+		Servers: []novaplan.Server{
+			{Name: "srv-0001", Networks: []string{"net-0001"}, Group: "grp-0001"},
+			{Name: "srv-0002", Networks: []string{"net-0001"}, Group: "grp-0001"},
+		},
+	}
+	nodes, err := Build(p, newFakeNova(), novaexec.Resolved{}, time.Minute)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if len(nodes) != 4 || nodes[0].Key != "grp-0001" {
+		t.Fatalf("built %d nodes starting with %q, want 4 starting with grp-0001", len(nodes), nodes[0].Key)
+	}
+	if g := nodes[0]; g.Kind != nova.KindServerGroup || len(g.Parents) != 0 || g.Gate != nil || g.Mutate != nil {
+		t.Errorf("group node: kind=%q parents=%v gated=%v mutable=%v, want server_group/none/ungated/immutable",
+			g.Kind, g.Parents, g.Gate != nil, g.Mutate != nil)
+	}
+	for _, s := range p.Servers {
+		if got, want := nodeByKey(t, nodes, s.Name).Parents, []string{"net-0001", "grp-0001"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("server node %q parents = %v, want %v", s.Name, got, want)
+		}
+	}
+}
+
+// TestBuildRollingShape confirms the rolling graph pins the server groups and
+// networks, gives every server and the volumes and ports of that server its
+// group as the Roll value, and mutates nothing.
+func TestBuildRollingShape(t *testing.T) {
+	p := rollingPlan()
+	p.Servers[0].StopStart = novaplan.StopStartSoft // Build would make it mutable
+	p.Ports = []novaplan.Port{{Name: "port-0001", Network: "net-0001", Server: "srv-0001"}}
+	nodes, err := BuildRolling(p, newFakeNova(), resolvedAll(), time.Minute)
+	if err != nil {
+		t.Fatalf("BuildRolling: %v", err)
+	}
+	if want := len(p.ServerGroups) + len(p.Networks) + len(p.Servers) + len(p.Volumes) + len(p.Ports); len(nodes) != want {
+		t.Fatalf("built %d nodes, want %d", len(nodes), want)
+	}
+	group := map[string]string{"port-0001": "grp-0001"}
+	for _, s := range p.Servers {
+		group[s.Name] = s.Group
+	}
+	for _, v := range p.Volumes {
+		group[v.Name] = group[v.Server]
+	}
+	for _, nd := range nodes {
+		if nd.Mutate != nil {
+			t.Errorf("node %q is mutable, want no mutation", nd.Key)
+		}
+		switch nd.Kind {
+		case nova.KindServerGroup, nova.KindNetwork:
+			if !nd.Pinned || nd.Roll != "" {
+				t.Errorf("node %q pinned=%v roll=%q, want pinned and no roll", nd.Key, nd.Pinned, nd.Roll)
+			}
+		default:
+			if nd.Pinned || nd.Roll != group[nd.Key] {
+				t.Errorf("node %q pinned=%v roll=%q, want unpinned and roll %q", nd.Key, nd.Pinned, nd.Roll, group[nd.Key])
+			}
+		}
+	}
+}
+
+// TestBuildRollingRejects confirms the rolling graph refuses a server without
+// a group, fails an invalid plan as Build does, and yields no node for an
+// empty plan.
+func TestBuildRollingRejects(t *testing.T) {
+	net := []novaplan.Network{{Name: "net-0001", Subnet: "sub-0001", CIDR: "10.0.1.0/24"}}
+
+	p := &novaplan.Plan{Networks: net, Servers: []novaplan.Server{{Name: "srv-0001", Networks: []string{"net-0001"}}}}
+	_, err := BuildRolling(p, newFakeNova(), novaexec.Resolved{}, time.Minute)
+	if want := `server "srv-0001" has no server group, which a rolling graph needs`; err == nil || err.Error() != want {
+		t.Errorf("BuildRolling without a group = %v, want %q", err, want)
+	}
+
+	p = &novaplan.Plan{Networks: net, Servers: []novaplan.Server{{Name: "srv-0001", Networks: []string{"ghost"}}}}
+	if _, err := BuildRolling(p, newFakeNova(), novaexec.Resolved{}, time.Minute); err == nil || !strings.HasPrefix(err.Error(), "invalid plan:") {
+		t.Errorf("BuildRolling of an invalid plan = %v, want an error starting with \"invalid plan:\"", err)
+	}
+
+	nodes, err := BuildRolling(&novaplan.Plan{}, newFakeNova(), novaexec.Resolved{}, time.Minute)
+	if err != nil || len(nodes) != 0 {
+		t.Errorf("BuildRolling of an empty plan = %d nodes, %v, want none and nil", len(nodes), err)
+	}
+}
