@@ -509,8 +509,8 @@ func unboundedConfig() Config {
 
 // TestConfigValidate covers the rules that select and shape an unbounded run:
 // its duration must be 0 and its bucket width set, a bucket width must be at
-// least a minute in either mode, and a bounded run still needs a positive
-// duration.
+// least a minute in either mode, a bounded run still needs a positive
+// duration, and a checkpoint callback needs a positive interval.
 func TestConfigValidate(t *testing.T) {
 	unbounded := func(c *Config) {
 		c.Unbounded = true
@@ -529,6 +529,8 @@ func TestConfigValidate(t *testing.T) {
 		{name: "unbounded without bucket width", mutate: func(c *Config) { unbounded(c); c.BucketWidth = 0 }, wantErr: "bucket-width must be set"},
 		{name: "unbounded narrow bucket width", mutate: func(c *Config) { unbounded(c); c.BucketWidth = 30 * time.Second }, wantErr: "bucket-width must be at least 1m0s"},
 		{name: "bounded narrow bucket width", mutate: func(c *Config) { c.BucketWidth = 30 * time.Second }, wantErr: "bucket-width must be at least 1m0s"},
+		{name: "checkpoint without interval", mutate: func(c *Config) { c.OnCheckpoint = func(*Result) {} }, wantErr: "checkpoint interval must be positive"},
+		{name: "checkpoint with interval", mutate: func(c *Config) { c.OnCheckpoint, c.CheckpointInterval = func(*Result) {}, time.Minute }},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -776,13 +778,21 @@ func TestResultsAdvanceAppendsEmptyBuckets(t *testing.T) {
 }
 
 // TestRunUnboundedCancelledBeforeStart confirms an unbounded run whose context
-// is already cancelled returns an empty result with no buckets.
+// is already cancelled returns an empty result with no buckets and writes no
+// checkpoint.
 func TestRunUnboundedCancelledBeforeStart(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	r, err := Run(ctx, plainNodes(newMutFake(), 4), 7, unboundedConfig(), newFakeClock())
+	cfg := unboundedConfig()
+	checkpoints := 0
+	cfg.CheckpointInterval = time.Nanosecond
+	cfg.OnCheckpoint = func(*Result) { checkpoints++ }
+	r, err := Run(ctx, plainNodes(newMutFake(), 4), 7, cfg, newFakeClock())
 	if err != nil {
 		t.Fatalf("Run: %v", err)
+	}
+	if checkpoints != 0 {
+		t.Errorf("OnCheckpoint was called %d times, want 0", checkpoints)
 	}
 	if r.Creates != 0 || r.Deletes != 0 || r.Mutates != 0 || r.Cycles != 0 {
 		t.Errorf("counters = %d/%d/%d/%d, want all zero", r.Creates, r.Deletes, r.Mutates, r.Cycles)
@@ -818,5 +828,225 @@ func TestRunUnboundedReleasesRawData(t *testing.T) {
 	}
 	if e.creates == 0 {
 		t.Error("the run created nothing; the test exercises nothing")
+	}
+}
+
+// TestRunCheckpointsOncePerInterval confirms the scheduler hands out a snapshot
+// about once per checkpoint interval of virtual time, never twice within one
+// interval, and that the snapshots' counters only grow. Nine maximum intervals
+// stay under a minute, which keeps the count at 9 or 10 over 10 minutes.
+func TestRunCheckpointsOncePerInterval(t *testing.T) {
+	cfg := validConfig()
+	cfg.Duration = 10 * time.Minute
+	cfg.MinInterval, cfg.MaxInterval = time.Second, 2*time.Second
+	cfg.CheckpointInterval = time.Minute
+	clk := newFakeClock()
+	var at []time.Time
+	var creates []int
+	cfg.OnCheckpoint = func(r *Result) {
+		at = append(at, clk.Now())
+		creates = append(creates, r.Creates)
+		if r.Decisions != nil {
+			t.Error("a checkpoint snapshot carries the decision log")
+		}
+	}
+
+	if _, err := Run(context.Background(), plainNodes(newMutFake(), 4), 7, cfg, clk); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(at) < 9 || len(at) > 10 {
+		t.Fatalf("OnCheckpoint was called %d times in 10 virtual minutes, want 9 or 10", len(at))
+	}
+	prev := time.Unix(0, 0)
+	for i := range at {
+		if gap := at[i].Sub(prev); gap < time.Minute {
+			t.Errorf("checkpoint %d came %s after the previous one, want at least 1m", i, gap)
+		}
+		if i > 0 && creates[i] < creates[i-1] {
+			t.Errorf("checkpoint %d has %d creates, fewer than the %d before it", i, creates[i], creates[i-1])
+		}
+		prev = at[i]
+	}
+}
+
+// TestCheckpointOmitsCreateInFlight confirms a checkpoint taken while a create
+// is still running does not list its resource (it has no cloud id yet), and
+// that the final result does once the create has finished.
+func TestCheckpointOmitsCreateInFlight(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	cfg := validConfig()
+	cfg.MaxParallel, cfg.Concurrency = 1, 1
+	cfg.CheckpointInterval = time.Nanosecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var snap *Result
+	cfg.OnCheckpoint = func(r *Result) {
+		if snap != nil {
+			return
+		}
+		snap = r
+		<-started
+		close(release)
+		cancel()
+	}
+
+	final, err := Run(ctx, []Node{blockingNode(started, release)}, 7, cfg, newFakeClock())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if snap == nil {
+		t.Fatal("OnCheckpoint was never called")
+	}
+	for _, res := range snap.Created {
+		if res.ID == "" || res.Logical == "vol-0" {
+			t.Errorf("checkpoint lists %+v, want neither the in-flight create nor an empty id", res)
+		}
+	}
+	if len(final.Created) != 1 || final.Created[0].ID != "id-0" {
+		t.Errorf("final Created = %+v, want the finished create id-0", final.Created)
+	}
+}
+
+// TestStopCheckpointsBeforeDrain confirms a stopped run hands out a checkpoint
+// before it waits for the create still in flight, which in an unbounded run
+// may take several op timeouts, so a kill during the drain leaves a recent
+// record. The interval is far beyond the run, so no periodic checkpoint fires.
+func TestStopCheckpointsBeforeDrain(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	finish := func() { once.Do(func() { close(release) }) }
+	cfg := unboundedConfig()
+	cfg.CheckpointInterval = 24 * time.Hour
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var snap *Result
+	cfg.OnCheckpoint = func(r *Result) {
+		snap = r
+		finish()
+	}
+	go func() {
+		<-started
+		cancel()
+	}()
+
+	done := make(chan *Result, 1)
+	go func() {
+		r, _ := Run(ctx, []Node{blockingNode(started, release)}, 7, cfg, newFakeClock())
+		done <- r
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		finish()
+		<-done
+		t.Fatal("the stopped run waited for the create in flight without a checkpoint first")
+	}
+	if snap == nil {
+		t.Fatal("OnCheckpoint was never called")
+	}
+	if snap.Creates == 0 || len(snap.Created) != 0 {
+		t.Errorf("checkpoint has %d creates and lists %+v, want the create counted but not listed while in flight",
+			snap.Creates, snap.Created)
+	}
+}
+
+// liveIDs returns the cloud ids of e's live resources, in record order.
+func liveIDs(e *engine) []string {
+	var ids []string
+	for _, r := range e.liveResources() {
+		ids = append(ids, r.ID)
+	}
+	return ids
+}
+
+// TestLiveResourcesKeepsInstanceUntilDeleteConfirms confirms the run record
+// lists an instance while its delete is in flight, also when the node's
+// re-create already waits behind that delete, drops it once the delete
+// confirms removal, and keeps it next to its re-created successor when the
+// delete fails.
+func TestLiveResourcesKeepsInstanceUntilDeleteConfirms(t *testing.T) {
+	tests := []struct {
+		name      string
+		recreate  bool
+		deleteErr error
+		want      []string // ids listed after the drain
+	}{
+		{name: "delete confirms", want: nil},
+		{name: "delete confirms, node created again", recreate: true, want: []string{"id-1"}},
+		{name: "delete fails, node created again", recreate: true, deleteErr: errors.New("conflict"), want: []string{"id-0", "id-1"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			started, release := make(chan struct{}), make(chan struct{})
+			creates := 0 // the node's ops run one after another
+			node := Node{
+				Key: "vol-0", Kind: resource.Kind("volume"),
+				Create: func(context.Context, map[string]string) (resource.Resource, error) {
+					id := fmt.Sprintf("id-%d", creates)
+					creates++
+					return resource.Resource{Kind: "volume", Logical: "vol-0", ID: id}, nil
+				},
+				Delete: func(context.Context, map[string]string, resource.Resource) error {
+					started <- struct{}{}
+					<-release
+					return tc.deleteErr
+				},
+			}
+			e := newEngine([]Node{node}, 7, validConfig(), newFakeClock())
+			ctx := context.Background()
+			e.res.advance(0)
+			e.dispatchCreate(ctx, 0, 0)
+			<-e.states[0].create.done
+			e.dispatchDelete(ctx, 0, 0)
+			<-started
+			if tc.recreate {
+				e.dispatchCreate(ctx, 0, 0) // waits for the delete in flight
+			}
+
+			if got := liveIDs(e); !reflect.DeepEqual(got, []string{"id-0"}) {
+				t.Errorf("liveResources with the delete in flight = %v, want [id-0]", got)
+			}
+			close(release)
+			e.wg.Wait()
+			if got := liveIDs(e); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("liveResources after the drain = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDeleteCancelledBeforeItRunsKeepsResource confirms a delete whose context
+// is cancelled while it waits to be admitted, here behind its busy family
+// gate, never reaches the cloud and leaves its resource in the run record.
+func TestDeleteCancelledBeforeItRunsKeepsResource(t *testing.T) {
+	deletes := 0
+	gate := make(chan struct{}, 1)
+	node := Node{
+		Key: "vol-0", Kind: resource.Kind("volume"), Gate: gate,
+		Create: func(context.Context, map[string]string) (resource.Resource, error) {
+			return resource.Resource{Kind: "volume", Logical: "vol-0", ID: "id-0"}, nil
+		},
+		Delete: func(context.Context, map[string]string, resource.Resource) error {
+			deletes++
+			return nil
+		},
+	}
+	e := newEngine([]Node{node}, 7, validConfig(), newFakeClock())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.res.advance(0)
+	e.dispatchCreate(ctx, 0, 0)
+	<-e.states[0].create.done
+
+	gate <- struct{}{} // another op of the family holds the gate
+	e.dispatchDelete(ctx, 0, 0)
+	cancel()
+	e.wg.Wait()
+
+	if deletes != 0 {
+		t.Fatalf("the cancelled delete reached the cloud %d times, want 0", deletes)
+	}
+	if got := liveIDs(e); !reflect.DeepEqual(got, []string{"id-0"}) {
+		t.Errorf("liveResources after the cancelled delete = %v, want [id-0]", got)
 	}
 }

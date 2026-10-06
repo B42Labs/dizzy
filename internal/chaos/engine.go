@@ -11,7 +11,9 @@
 // concurrent cloud-call completion order is not. The engine is service-neutral:
 // per-service builders under subpackages (neutrongraph, cindergraph) turn a plan
 // into the create/delete/mutate closures it schedules, each capturing its own
-// cloud client, so nothing in the engine names a specific service.
+// cloud client, so nothing in the engine names a specific service. While it
+// runs, the scheduler can hand a snapshot of the result to a checkpoint
+// callback at a fixed interval, so a caller can persist the run's progress.
 package chaos
 
 import (
@@ -66,6 +68,14 @@ const (
 // cancelled, Duration must be 0, and its time series is sliced into buckets of
 // BucketWidth instead of into bucketCount equal parts of Duration. A bounded
 // run ignores BucketWidth.
+//
+// OnCheckpoint, when non-nil, receives a snapshot of the result whenever at
+// least CheckpointInterval has passed on the run's clock since the start or
+// the previous checkpoint. The scheduler calls it on its own goroutine after a
+// tick's fan-out, so a checkpoint is late by up to one tick delay plus the
+// time the scheduler waited for the pending pool, and the next tick waits for
+// the callback to return. A run whose context is cancelled while operations
+// are in flight hands it one more snapshot before it waits for them.
 type Config struct {
 	Duration    time.Duration
 	MinInterval time.Duration
@@ -78,6 +88,9 @@ type Config struct {
 	Classify    func(error) string
 	Unbounded   bool
 	BucketWidth time.Duration
+
+	CheckpointInterval time.Duration
+	OnCheckpoint       func(*Result)
 }
 
 // Validate checks the merged config (defaults, YAML block, and flag overrides
@@ -96,6 +109,9 @@ func (c Config) Validate() error {
 	}
 	if c.BucketWidth != 0 && c.BucketWidth < minBucketWidth {
 		return fmt.Errorf("chaos bucket-width must be at least %s, got %s", minBucketWidth, c.BucketWidth)
+	}
+	if c.OnCheckpoint != nil && c.CheckpointInterval <= 0 {
+		return fmt.Errorf("chaos checkpoint interval must be positive, got %s", c.CheckpointInterval)
 	}
 	if c.MinInterval <= 0 {
 		return fmt.Errorf("chaos min-interval must be positive, got %s", c.MinInterval)
@@ -214,9 +230,10 @@ func Run(ctx context.Context, nodes []Node, seed int64, cfg Config, clk Clock) (
 // publishes res to any goroutine that reads it after waiting on done. failed is
 // set on a create op when the create closure returned an error, so a doomed
 // child (whose parent create failed) is skipped even when the failed create
-// still published a partial resource. deleteFailed is set on a delete op when
-// the cloud delete did not confirm the resource was removed (so it may still
-// exist); it is read by liveResources after the drain to keep the run record
+// still published a partial resource. deleteFailed is set on a delete op until
+// the cloud delete confirms the resource was removed, so a delete that failed
+// or was cancelled before it ran leaves a resource that may still exist;
+// liveResources reads it once the op is finished to keep the run record
 // authoritative.
 type op struct {
 	done         chan struct{}
@@ -232,12 +249,31 @@ type op struct {
 // serializes a node's own operations so its instance history stays linear.
 // mutated records that the current instance has already been mutated, so the
 // engine draws at most one mutation per lifetime; it is re-armed when the node
-// is created again.
+// is created again. retired holds the node's deleted instances whose delete
+// has not confirmed their removal.
 type nodeState struct {
 	present bool
 	mutated bool
 	create  *op
 	last    *op
+	retired []retired
+}
+
+// retired is a deleted instance of a node: its create and the delete that
+// removes it. The instance may still be in the cloud until that delete
+// confirms its removal, even once the node has been created again.
+type retired struct{ create, del *op }
+
+// retire records the instance of create as deleted by del and drops the
+// earlier instances whose delete has confirmed their removal.
+func (st *nodeState) retire(create, del *op) {
+	kept := st.retired[:0]
+	for _, r := range st.retired {
+		if !finished(r.del) || r.del.deleteFailed {
+			kept = append(kept, r)
+		}
+	}
+	st.retired = append(kept, retired{create: create, del: del})
 }
 
 // outcome records one completed operation for the time-bucketed report.
@@ -342,6 +378,19 @@ func (r *results) end(offset time.Duration) {
 	r.mu.Lock()
 	r.slots[r.index(offset)].inFlight--
 	r.mu.Unlock()
+}
+
+// inFlight reports whether any operation is still in flight. A sealed slot has
+// none, so only the slots from open on are checked.
+func (r *results) inFlight() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := r.open; i < len(r.slots); i++ {
+		if r.slots[i].inFlight > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // add stores one completed operation's outcome in the slot of its decision
@@ -492,8 +541,14 @@ func newEngine(nodes []Node, seed int64, cfg Config, clk Clock) *engine {
 // delay then dispatches a random fan-out of decisions, each transitioning the
 // logical inventory and launching a bounded, retrying cloud operation. After
 // the loop it lets in-flight work drain and assembles the result.
+//
+// With a checkpoint callback set, it hands the callback a snapshot after a
+// tick's fan-out once CheckpointInterval has passed on the clock since the
+// start or the previous checkpoint, and once more when the context is
+// cancelled while operations are in flight, before the drain.
 func (e *engine) run(ctx context.Context) *Result {
 	start := e.clk.Now()
+	lastCheckpoint := start
 	for e.cfg.Unbounded || e.clk.Now().Sub(start) < e.cfg.Duration {
 		if ctx.Err() != nil {
 			break
@@ -507,6 +562,22 @@ func (e *engine) run(ctx context.Context) *Result {
 		for i := 0; i < fanout; i++ {
 			e.step(ctx, offset)
 		}
+		if e.cfg.OnCheckpoint != nil {
+			if now := e.clk.Now(); now.Sub(lastCheckpoint) >= e.cfg.CheckpointInterval {
+				lastCheckpoint = now
+				e.cfg.OnCheckpoint(e.assemble(nil))
+			}
+		}
+	}
+	if e.res.inFlight() {
+		// A stopped unbounded run lets its calls in flight finish, and with its
+		// retries and wait phases one call can take several op timeouts. Persist
+		// where the run stands first, so a second signal or a supervisor's kill
+		// during the drain still leaves a recent record.
+		if ctx.Err() != nil && e.cfg.OnCheckpoint != nil {
+			e.cfg.OnCheckpoint(e.assemble(nil))
+		}
+		slog.Info("churn stopped; draining in-flight operations")
 	}
 	e.wg.Wait()
 	return e.assemble(e.decisions)
@@ -731,7 +802,11 @@ func (e *engine) dispatchCreate(ctx context.Context, idx int, offset time.Durati
 func (e *engine) dispatchDelete(ctx context.Context, idx int, offset time.Duration) {
 	nd := e.nodes[idx]
 	st := &e.states[idx]
-	newOp := &op{done: make(chan struct{})}
+	// Assume the resource survives until the delete confirms otherwise, so a
+	// delete cancelled before it ran, or a failed (or panicking) one, keeps it in
+	// the run record rather than leaking it — address scopes can only be
+	// reclaimed by recorded id.
+	newOp := &op{done: make(chan struct{}), deleteFailed: true}
 	createOp := st.create // node is present, so this is its current create
 
 	deps := make([]*op, 0, len(e.parents[idx])+len(e.children[idx])+1)
@@ -746,23 +821,21 @@ func (e *engine) dispatchDelete(ctx context.Context, idx int, offset time.Durati
 
 	st.present = false
 	st.last = newOp
+	st.retire(createOp, newOp)
 	e.present--
 
 	e.launch(ctx, newOp, offset, func() {
 		if !e.await(ctx, deps, nd.Gate) {
-			return
+			return // never ran: the resource may still be there
 		}
 		defer e.release(nd.Gate)
 		ids := resolveIDs(parentKeys, parentOps)
 		res := createOp.res
 		if res.ID == "" {
+			newOp.deleteFailed = false
 			return // the create never produced a cloud resource; nothing to delete
 		}
-		// Assume the resource survives until the delete confirms otherwise, so a
-		// failed (or panicking) delete keeps it in the run record rather than
-		// leaking it — address scopes can only be reclaimed by recorded id. The
-		// delete closure owns retry and already-gone (404) tolerance.
-		newOp.deleteFailed = true
+		// The delete closure owns retry and already-gone (404) tolerance.
 		t0 := time.Now()
 		err := nd.Delete(e.opContext(ctx), ids, res)
 		newOp.deleteFailed = err != nil
@@ -941,7 +1014,8 @@ func (e *engine) release(gate chan struct{}) {
 
 // assemble builds a Result carrying decisions from the engine's counters,
 // population summary, buckets and live resources. It runs on the scheduler
-// goroutine.
+// goroutine. A mid-run snapshot for a checkpoint carries no decision log, and
+// its Created lists only the resources whose create has finished.
 func (e *engine) assemble(decisions []Decision) *Result {
 	r := &Result{
 		Decisions:  decisions,
@@ -967,24 +1041,41 @@ func (e *engine) assemble(decisions []Decision) *Result {
 	return r
 }
 
-// liveResources returns the cloud resources that may still exist at the end of
-// the run, the run record's Created list. It runs after the drain, so every
-// node's last operation has finished and its outcome is published. A node is
-// recorded when it is logically present, or when its last delete did not confirm
-// removal: the resource may still be in the cloud, and dropping it would leak a
-// kind cleanup can only reclaim by recorded id (address scopes) silently.
+// liveResources returns the cloud resources that may still exist, the run
+// record's Created list. It runs on the scheduler goroutine, mid-run for a
+// checkpoint or after the drain, and reads an op's outcome only once the op is
+// finished. An instance whose create has finished with a cloud id is recorded
+// when the node is logically present, or, for a deleted instance, while its
+// delete is in flight or when it did not confirm removal, even if the node has
+// been created again: the resource may still be in the cloud, and dropping it
+// would leak a kind cleanup can only reclaim by recorded id (address scopes)
+// silently. A create still in flight is not listed. After the drain every op
+// is finished.
 func (e *engine) liveResources() []resource.Resource {
 	var live []resource.Resource
 	for i := range e.nodes {
 		st := &e.states[i]
-		if st.create == nil || st.create.res.ID == "" {
-			continue
+		for _, r := range st.retired {
+			if finished(r.create) && r.create.res.ID != "" && (!finished(r.del) || r.del.deleteFailed) {
+				live = append(live, r.create.res)
+			}
 		}
-		if st.present || (st.last != nil && st.last.deleteFailed) {
+		if st.present && finished(st.create) && st.create.res.ID != "" {
 			live = append(live, st.create.res)
 		}
 	}
 	return live
+}
+
+// finished reports, without blocking, whether o has completed. Once it has,
+// o's outcome fields are published to the caller.
+func finished(o *op) bool {
+	select {
+	case <-o.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // parentOpFailed reports whether any parent's create op failed or produced no
