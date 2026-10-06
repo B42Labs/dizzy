@@ -14,9 +14,11 @@ import (
 
 func TestParseRejectsUnknownKey(t *testing.T) {
 	for key, data := range map[string]string{
-		"personas.nope":          "name: x\npersonas:\n  nope:\n    share: 1\n",
-		"personas.legacy.nope":   "name: x\npersonas:\n  legacy:\n    nope: 1\n",
-		"personas.gardener.nope": "name: x\npersonas:\n  gardener:\n    nope: 1\n",
+		"personas.nope":           "name: x\npersonas:\n  nope:\n    share: 1\n",
+		"personas.legacy.nope":    "name: x\npersonas:\n  legacy:\n    nope: 1\n",
+		"personas.gardener.nope":  "name: x\npersonas:\n  gardener:\n    nope: 1\n",
+		"lanes.cinder.volumetype": "name: x\nlanes:\n  cinder:\n    volumetype: x\n",
+		"lanes.swift":             "name: x\nlanes:\n  swift: {}\n",
 	} {
 		t.Run(key, func(t *testing.T) {
 			t.Parallel()
@@ -166,6 +168,62 @@ chaos: { duration: 5m, parallel: { max: 4 } }
 	}
 }
 
+// TestParseWithoutLanes confirms a scenario without a lanes key parses to four
+// disabled lanes.
+func TestParseWithoutLanes(t *testing.T) {
+	s, err := Parse([]byte("name: x\npersonas:\n  ci: { share: 1 }\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if s.Lanes != (Lanes{}) {
+		t.Errorf("lanes = %+v, want four disabled lanes", s.Lanes)
+	}
+}
+
+// TestParseLanesBlock confirms every key of the lanes block decodes into its
+// field, the shared keys through the embedded Lane.
+func TestParseLanesBlock(t *testing.T) {
+	s, err := Parse([]byte(`
+lanes:
+  cinder:   { enabled: true, cloud: tenant-cinder, profile: small, volume_type: ssd }
+  glance:   { enabled: true, cloud: tenant-glance, scenario: lanes/glance.yaml }
+  keystone: { enabled: false, profile: medium, privilege: domain-manager, domain: soak, roles: "member,reader" }
+  neutron:  { enabled: true, profile: large, external_network: public }
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	want := Lanes{
+		Cinder:   CinderLane{Lane: Lane{Enabled: true, Cloud: "tenant-cinder", Profile: "small"}, VolumeType: "ssd"},
+		Glance:   Lane{Enabled: true, Cloud: "tenant-glance", Scenario: "lanes/glance.yaml"},
+		Keystone: KeystoneLane{Lane: Lane{Profile: "medium"}, Privilege: "domain-manager", Domain: "soak", Roles: "member,reader"},
+		Neutron:  NeutronLane{Lane: Lane{Enabled: true, Profile: "large"}, ExternalNetwork: "public"},
+	}
+	if s.Lanes != want {
+		t.Errorf("lanes = %+v, want %+v", s.Lanes, want)
+	}
+}
+
+// TestLanesEnabled confirms Enabled names every enabled lane with its keys, in
+// canonical order, and skips a disabled one.
+func TestLanesEnabled(t *testing.T) {
+	l := Lanes{
+		Cinder:   CinderLane{Lane: Lane{Enabled: true, Cloud: "tenant-cinder", Scenario: "cinder.yaml"}, VolumeType: "ssd"},
+		Keystone: KeystoneLane{Lane: Lane{Cloud: "admin", Profile: "small"}},
+		Neutron:  NeutronLane{Lane: Lane{Enabled: true, Profile: "large"}},
+	}
+	want := []NamedLane{
+		{Name: "cinder", Lane: Lane{Enabled: true, Cloud: "tenant-cinder", Scenario: "cinder.yaml"}},
+		{Name: "neutron", Lane: Lane{Enabled: true, Profile: "large"}},
+	}
+	if got := l.Enabled(); !reflect.DeepEqual(got, want) {
+		t.Errorf("Enabled() = %+v, want %+v", got, want)
+	}
+	if got := (&Lanes{}).Enabled(); len(got) != 0 {
+		t.Errorf("Enabled() without an enabled lane = %+v, want none", got)
+	}
+}
+
 // TestParseEmptyInput confirms empty input decodes to the zero scenario, which
 // Validate then rejects for its missing name.
 func TestParseEmptyInput(t *testing.T) {
@@ -200,7 +258,11 @@ func TestValidate(t *testing.T) {
 			"at least one persona must have a share above 0"},
 		{"negative legacy share", func(s *Scenario) { s.Personas.Legacy.Share = -1 }, "personas.legacy.share must be a finite number of at least 0, got -1"},
 		{"NaN legacy share", func(s *Scenario) { s.Personas.Legacy.Share = math.NaN() }, "personas.legacy.share must be a finite number of at least 0, got NaN"},
-		{"legacy alone", func(s *Scenario) { s.Personas.CI.Share = 0; s.Personas.Gardener.Share = 0; s.Personas.Legacy = legacyBlock() }, ""},
+		{"legacy alone", func(s *Scenario) {
+			s.Personas.CI.Share = 0
+			s.Personas.Gardener.Share = 0
+			s.Personas.Legacy = legacyBlock()
+		}, ""},
 		{"negative interval", func(s *Scenario) { s.Personas.CI.Interval.Min = d(-time.Second) }, "personas.ci.interval.min must not be negative, got -1s"},
 		{"inverted interval", func(s *Scenario) { s.Personas.CI.Interval.Min = d(2 * time.Second) }, "personas.ci.interval.min (2s) must not exceed personas.ci.interval.max (1s)"},
 		{"churn ratio above 1", func(s *Scenario) { s.Personas.CI.ChurnRatio = 1.5 }, "personas.ci.churn_ratio must be between 0 and 1, got 1.5"},
@@ -239,6 +301,61 @@ func TestValidate(t *testing.T) {
 				t.Errorf("Validate() = %v, want nil", err)
 			case tc.want != "" && (err == nil || err.Error() != tc.want):
 				t.Errorf("Validate() = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateLanes covers the checks of an enabled lane, in canonical order,
+// and confirms a disabled lane with the same values passes.
+func TestValidateLanes(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Lanes)
+		want   string
+	}{
+		{"profile and scenario", func(l *Lanes) { l.Glance = Lane{Enabled: true, Profile: "small", Scenario: "glance.yaml"} },
+			"lanes.glance: set profile or scenario, not both"},
+		{"neither profile nor scenario", func(l *Lanes) { l.Glance = Lane{Enabled: true} },
+			"lanes.glance: an enabled lane needs a profile or a scenario"},
+		{"unknown profile", func(l *Lanes) { l.Glance = Lane{Enabled: true, Profile: "huge"} },
+			`lanes.glance.profile must be small, medium or large, got "huge"`},
+		{"unknown privilege", func(l *Lanes) {
+			l.Keystone = KeystoneLane{Lane: Lane{Enabled: true, Profile: "small"}, Privilege: "root"}
+		},
+			`lanes.keystone.privilege must be auto, admin or domain-manager, got "root"`},
+		{"two bad lanes", func(l *Lanes) {
+			l.Cinder.Lane = Lane{Enabled: true}
+			l.Neutron.Lane = Lane{Enabled: true, Profile: "huge"}
+		},
+			"lanes.cinder: an enabled lane needs a profile or a scenario"},
+		{"empty privilege", func(l *Lanes) { l.Keystone = KeystoneLane{Lane: Lane{Enabled: true, Profile: "small"}} }, ""},
+		{"every lane on a profile or a scenario", func(l *Lanes) {
+			l.Cinder.Lane = Lane{Enabled: true, Profile: "small"}
+			l.Glance = Lane{Enabled: true, Scenario: "glance.yaml"}
+			l.Keystone = KeystoneLane{Lane: Lane{Enabled: true, Profile: "medium"}, Privilege: "domain-manager"}
+			l.Neutron.Lane = Lane{Enabled: true, Profile: "large"}
+		}, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := smallScenario()
+			tc.mutate(&s.Lanes)
+			err := s.Validate()
+			switch {
+			case tc.want == "" && err != nil:
+				t.Errorf("Validate() = %v, want nil", err)
+			case tc.want != "" && (err == nil || err.Error() != tc.want):
+				t.Errorf("Validate() = %v, want %q", err, tc.want)
+			}
+
+			// The same values on a disabled lane are not checked.
+			for _, b := range s.Lanes.blocks() {
+				b.lane.Enabled = false
+			}
+			if err := s.Validate(); err != nil {
+				t.Errorf("Validate() with every lane disabled = %v, want nil", err)
 			}
 		})
 	}
@@ -344,6 +461,27 @@ func TestSet(t *testing.T) {
 		{"personas.legacy.interval.max", "2m", func(s Scenario) bool {
 			return s.Personas.Legacy.Interval.Max == novascenario.Duration(2*time.Minute)
 		}},
+		{"lanes.cinder.enabled", "true", func(s Scenario) bool { return s.Lanes.Cinder.Enabled }},
+		{"lanes.cinder.cloud", "tenant-cinder", func(s Scenario) bool { return s.Lanes.Cinder.Cloud == "tenant-cinder" }},
+		{"lanes.cinder.profile", "medium", func(s Scenario) bool { return s.Lanes.Cinder.Profile == "medium" }},
+		{"lanes.cinder.scenario", "lanes/cinder.yaml", func(s Scenario) bool { return s.Lanes.Cinder.Scenario == "lanes/cinder.yaml" }},
+		{"lanes.cinder.volume_type", "ssd", func(s Scenario) bool { return s.Lanes.Cinder.VolumeType == "ssd" }},
+		{"lanes.glance.enabled", " 1 ", func(s Scenario) bool { return s.Lanes.Glance.Enabled }},
+		{"lanes.glance.cloud", "tenant-glance", func(s Scenario) bool { return s.Lanes.Glance.Cloud == "tenant-glance" }},
+		{"lanes.glance.profile", "large", func(s Scenario) bool { return s.Lanes.Glance.Profile == "large" }},
+		{"lanes.glance.scenario", "lanes/glance.yaml", func(s Scenario) bool { return s.Lanes.Glance.Scenario == "lanes/glance.yaml" }},
+		{"lanes.keystone.enabled", "true", func(s Scenario) bool { return s.Lanes.Keystone.Enabled }},
+		{"lanes.keystone.cloud", "admin", func(s Scenario) bool { return s.Lanes.Keystone.Cloud == "admin" }},
+		{"lanes.keystone.profile", "", func(s Scenario) bool { return s.Lanes.Keystone.Profile == "" }},
+		{"lanes.keystone.scenario", "lanes/keystone.yaml", func(s Scenario) bool { return s.Lanes.Keystone.Scenario == "lanes/keystone.yaml" }},
+		{"lanes.keystone.privilege", "domain-manager", func(s Scenario) bool { return s.Lanes.Keystone.Privilege == "domain-manager" }},
+		{"lanes.keystone.domain", "soak", func(s Scenario) bool { return s.Lanes.Keystone.Domain == "soak" }},
+		{"lanes.keystone.roles", "member", func(s Scenario) bool { return s.Lanes.Keystone.Roles == "member" }},
+		{"lanes.neutron.enabled", "false", func(s Scenario) bool { return !s.Lanes.Neutron.Enabled }},
+		{"lanes.neutron.cloud", "tenant-net", func(s Scenario) bool { return s.Lanes.Neutron.Cloud == "tenant-net" }},
+		{"lanes.neutron.profile", "small", func(s Scenario) bool { return s.Lanes.Neutron.Profile == "small" }},
+		{"lanes.neutron.scenario", "lanes/neutron.yaml", func(s Scenario) bool { return s.Lanes.Neutron.Scenario == "lanes/neutron.yaml" }},
+		{"lanes.neutron.external_network", "public", func(s Scenario) bool { return s.Lanes.Neutron.ExternalNetwork == "public" }},
 	}
 	for _, tc := range tests {
 		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
@@ -374,6 +512,10 @@ func TestSetErrors(t *testing.T) {
 		{"personas.legacy.networks", "two", `override personas.legacy.networks: "two" is not an integer`},
 		{"personas.gardener.nope", "1", `unknown override key "personas.gardener.nope"`},
 		{"personas.gardener.clusters", "x", `override personas.gardener.clusters: "x" is not an integer`},
+		{"lanes.cinder.enabled", "maybe", `override lanes.cinder.enabled: "maybe" is not a boolean`},
+		{"lanes.swift.enabled", "true", `unknown override key "lanes.swift.enabled"`},
+		{"lanes.glance.volume_type", "ssd", `unknown override key "lanes.glance.volume_type"`},
+		{"enabled", "true", `unknown override key "enabled"`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.key, func(t *testing.T) {
@@ -393,6 +535,7 @@ func FuzzParse(f *testing.F) {
 	f.Add([]byte("chaos: { duration: 1m, parallel: { max: 4 } }\nservices: [a, a]\n"))
 	f.Add([]byte("name: x\nresources: { servers: 2 }\npersonas:\n  legacy: { share: 1, networks: 1, resize_flavor: m1.small, ports_per_server: { min: 0, max: 1 } }\n"))
 	f.Add([]byte("name: x\nresources: { servers: 3 }\npersonas:\n  gardener: { share: 1, clusters: 2, policy: anti-affinity, volume_gib: { min: 1, max: 1 } }\n"))
+	f.Add([]byte("name: x\nlanes:\n  cinder: { enabled: true, profile: small, scenario: c.yaml }\n  keystone: { enabled: true, profile: small, privilege: root }\n"))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		s, err := Parse(data)
 		if err != nil {
