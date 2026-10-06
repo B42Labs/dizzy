@@ -4,7 +4,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/quotasets"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
 
 	"github.com/B42Labs/dizzy/internal/nova/plan"
 )
@@ -101,5 +103,28 @@ func TestCheckQuota(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestProjectIDWithoutAuthResult confirms a client that recorded no auth result
+// reports no project rather than guessing one.
+func TestProjectIDWithoutAuthResult(t *testing.T) {
+	gc := &gophercloud.ServiceClient{ProviderClient: &gophercloud.ProviderClient{}}
+	if id, ok := ProjectID(gc); id != "" || ok {
+		t.Errorf("ProjectID = (%q, %v), want (\"\", false)", id, ok)
+	}
+}
+
+// TestProjectIDFromToken confirms the project id is read from a v3 token auth
+// result.
+func TestProjectIDFromToken(t *testing.T) {
+	gc := &gophercloud.ServiceClient{ProviderClient: &gophercloud.ProviderClient{}}
+	ar := tokens.CreateResult{}
+	ar.Body = map[string]any{"token": map[string]any{"project": map[string]any{"id": "proj-1"}}}
+	if err := gc.SetTokenAndAuthResult(ar); err != nil {
+		t.Fatalf("SetTokenAndAuthResult: %v", err)
+	}
+	if id, ok := ProjectID(gc); id != "proj-1" || !ok {
+		t.Errorf("ProjectID = (%q, %v), want (\"proj-1\", true)", id, ok)
 	}
 }

@@ -59,7 +59,7 @@ func planNeeds(p *plan.Plan, boot, resize Flavor) needs {
 // failure is returned so the plan aborts before creating anything rather than
 // hitting the real quota wall mid-apply.
 func PrecheckQuota(ctx context.Context, gc *gophercloud.ServiceClient, p *plan.Plan, boot, resize Flavor) error {
-	projectID, ok := projectIDFromAuth(gc)
+	projectID, ok := ProjectID(gc)
 	if !ok {
 		slog.Warn("quota pre-check skipped: project id unavailable from auth result")
 		return nil
@@ -75,11 +75,12 @@ func PrecheckQuota(ctx context.Context, gc *gophercloud.ServiceClient, p *plan.P
 	return checkQuota(planNeeds(p, boot, resize), quota)
 }
 
-// projectIDFromAuth extracts the authenticated project id from the v3 token auth
-// result. It returns false when the result was not recorded (e.g. a manually
-// supplied token) or is not a v3 create-token result, so the caller can skip the
-// pre-check rather than guess.
-func projectIDFromAuth(gc *gophercloud.ServiceClient) (string, bool) {
+// ProjectID returns the project the client authenticated against, read from its
+// v3 token auth result. It returns false when the result was not recorded (e.g.
+// a manually supplied token) or is not a v3 create-token result, so the quota
+// pre-check can be skipped rather than guess. A combined (mix) run reports it
+// per persona and warns when two personas share a project.
+func ProjectID(gc *gophercloud.ServiceClient) (string, bool) {
 	ar := gc.GetAuthResult()
 	if ar == nil {
 		return "", false
