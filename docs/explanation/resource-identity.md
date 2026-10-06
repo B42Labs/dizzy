@@ -59,7 +59,10 @@ server in run `a1b2c3d4` is therefore `dizzy-a1b2c3d4-ci-srv-0001` and carries
 `dizzy:run=a1b2c3d4-ci`. Each persona is torn down, leak-checked and cleaned
 up by its own identity, because Neutron lists by tag across projects for an
 administrator and a shared identity would let one persona's teardown reach
-another persona's resources. See [Combined runs](combined-runs.md).
+another persona's resources. A background lane of a combined run gets the
+identity `<runID>-<lane>` the same way: the Glance lane's images in run
+`a1b2c3d4` carry `dizzy:run=a1b2c3d4-glance`, and the Keystone lane's names
+start with `dizzy-a1b2c3d4-keystone-`. See [Combined runs](combined-runs.md).
 
 ## Where the stamp doesn't reach
 

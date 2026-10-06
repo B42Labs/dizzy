@@ -12,7 +12,9 @@ one run and keeps them apart in the results. This build ships three personas:
 `ci`, whose servers live for minutes; `gardener`, whose servers form
 Kubernetes clusters in anti-affinity server groups and are replaced one worker
 at a time; and `legacy`, whose servers live for the whole run and are changed
-in place. This page explains how the combined run is put together and why.
+in place. Next to the personas, a run can add the churn of single services as
+background lanes. This page explains how the combined run is put together and
+why.
 
 ## One engine per persona
 
@@ -175,10 +177,10 @@ the compute quota pre-check of `nova chaos` against its own plan in its own
 project. For the Gardener persona the check also counts its server groups
 against the `server_groups` limit and its largest group against the
 `server_group_members` limit, which Nova applies to each group on its own.
-When two personas name entries of the same project, each check passes
-on its own even when both plans together do not fit. The run does not reject
-this setup, since the suffixed identities keep the two personas' resources
-apart. It logs `lanes share a project; each quota pre-check saw only its own
+When two personas, or a persona and a background lane, name entries of the
+same project, each check passes on its own even when both plans together do
+not fit. The run does not reject this setup, since the suffixed identities
+keep their resources apart. It logs `lanes share a project; each quota pre-check saw only its own
 plan` and goes on, with a weaker pre-check.
 
 ## One record, no merged time series
@@ -194,6 +196,60 @@ engines together is not a function of their two p99s. A merged series would
 show numbers that no sample produced. The record therefore has no top-level
 `chaos` object; each persona carries its own, and `report` draws each
 persona's series separately.
+
+## Background lanes
+
+The personas drive Nova, Neutron and Cinder, but they touch Glance only to look
+up the boot image and Keystone only to get tokens. A **background lane** adds
+the churn of one service to the run: `cinder`, `glance`, `keystone` or
+`neutron`. It is the node graph that service's own `chaos` command builds, run
+in a lane of its own next to the personas. Image or identity churn and the
+personas' error rates then land in one record, where running a second `chaos`
+command by hand would give a second seed, a second record and a second leak
+check, to be lined up by wall-clock time.
+
+A lane is switched on in the scenario's `lanes:` block and is off by default.
+Its plan comes from the service's bundled profile or from a scenario file the
+operator names. It has no share, because it does not divide the server
+envelope, and it never runs alone: a combined run still needs a persona with a
+server, and the single-service `chaos` commands already cover one service on
+its own.
+
+A lane's identity follows the persona rule, the run id with the lane name
+appended, `<runID>-<lane>`, so its teardown, leak check and `mix cleanup`
+reach only its own resources. Its seed is derived from the run seed and the
+lane name the way a persona's is, so the seed in the lane's scenario has no
+effect and the whole run still replays from one seed.
+
+A lane keeps its own rhythm. Its interval, churn ratio, target fill, mutate
+ratio and fan-out come from the `chaos:` block of its own scenario, the values
+its service's `chaos` command would run with. Only what makes the lanes one
+run is shared: the duration, the unbounded mode of `--duration 0`, the bucket
+width and the signal that interrupts the run.
+
+An enabled lane either runs or stops the run before it starts. Each lane runs
+the read-only pre-checks of its service's `chaos` command: the Keystone
+privilege pre-check, the Neutron and Cinder quota pre-checks, the lookup of
+the volume type and of the external network, and the `clouds.yaml` entry it
+authenticates with. A soak that runs for hours without the churn the operator
+asked for measures something else, and nothing in its record would say so. A
+failing pre-check therefore ends `mix chaos` with an error that names the
+lane, before a single resource exists; an operator on a cloud without the
+rights switches the lane off.
+
+That rule decides one ordering. `keystone chaos` creates its domains and roles
+right after its own pre-check. In a combined run the Neutron lane's pre-check
+comes after the Keystone lane's, and domains created before it fails would
+have to be torn down again. The Keystone lane therefore creates its scaffold in
+a step of its own, once every persona and every lane has passed its
+pre-checks. When that step fails, the run deletes what the step created and
+stops. The domains and roles it created join the record as the lane's first
+resources, so the teardown and `mix cleanup` reclaim them.
+
+A lane that names no `clouds.yaml` entry authenticates with `--os-cloud`, the
+project of every persona that names none either. It then shares that
+project's quota with them, and like a persona's its quota pre-check saw only
+its own plan.
 
 ## Opt-in services
 

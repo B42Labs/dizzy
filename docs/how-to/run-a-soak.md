@@ -205,8 +205,27 @@ hosts. Without them the run logs `live migration disabled for this run` and
 resizes need the flavor `resize_flavor` names, `m1.small` in the bundled
 profiles; `--set personas.legacy.resize_flavor=` turns them off instead.
 
-Every persona's teardown prints its own
-`deleted N resource(s) for run <id>-<persona>` line, and the run ends with one
+To churn images and identities in the same run, switch on the Glance and
+Keystone lanes. Each runs its service's bundled `small` profile in an engine
+of its own, under the identity `<id>-glance` or `<id>-keystone`. The Keystone
+lane needs admin rights or a domain manager, so point it at a `clouds.yaml`
+entry that has them, here `soak-admin`; the Glance lane uses `--os-cloud`:
+
+```console
+$ dizzy mix chaos --scenario scenarios/mix/small.yaml --os-cloud soak \
+    --set personas.ci.cloud=tenant-ci --set personas.gardener.cloud=tenant-gardener \
+    --set personas.legacy.cloud=tenant-legacy \
+    --set lanes.glance.enabled=true \
+    --set lanes.keystone.enabled=true --set lanes.keystone.cloud=soak-admin
+```
+
+A lane whose pre-check fails stops the run before it creates anything, with an
+error that starts with `lane "keystone": ` or `lane "glance": `; switch that
+lane off with `--set lanes.keystone.enabled=false` and run again. The run
+prints a `Lanes` table after the `Personas` table.
+
+Every persona's and lane's teardown prints its own
+`deleted N resource(s) for run <id>-<name>` line, and the run ends with one
 leak check across all of them.
 To re-query a run that is still live, or one kept with `--no-cleanup`:
 
@@ -215,14 +234,14 @@ $ dizzy mix status --run run-<id>.json --os-cloud soak
 ```
 
 To reclaim a killed or kept run, pass the record; the record names each
-persona's cloud and identity:
+persona's and lane's cloud and identity:
 
 ```console
 $ dizzy mix cleanup --run run-<id>.json --os-cloud soak
 ```
 
 Without a record, pass the run id together with the scenario and every `--set`
-the run used:
+the run used, the lane keys included:
 
 ```console
 $ dizzy mix cleanup --run-id <id> --scenario scenarios/mix/small.yaml --os-cloud soak \
@@ -230,9 +249,9 @@ $ dizzy mix cleanup --run-id <id> --scenario scenarios/mix/small.yaml --os-cloud
     --set personas.legacy.cloud=tenant-legacy
 ```
 
-`--concurrency` and `--max-parallel` bound each persona separately. See
-[Combined runs](../explanation/combined-runs.md) for how the personas share the
-server envelope.
+`--concurrency` and `--max-parallel` bound each persona and each lane
+separately. See [Combined runs](../explanation/combined-runs.md) for how the
+personas share the server envelope and how the lanes run next to them.
 
 ## Read the results
 
