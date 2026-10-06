@@ -28,6 +28,24 @@ type Cleaner interface {
 // The production *nova.Client must satisfy the seam.
 var _ Cleaner = (*nova.Client)(nil)
 
+// ServerGroupCleaner is the teardown surface CleanupServerGroups drives:
+// discover a run's server groups by their dizzy-<id>- name prefix, since a
+// server group carries neither metadata nor tags, and delete one. Only the mix
+// teardown drives it, so Cleaner and the nova commands stay as they are.
+type ServerGroupCleaner interface {
+	ListServerGroupsByName(ctx context.Context, runID string) ([]resource.Resource, error)
+	Delete(ctx context.Context, r resource.Resource) error
+}
+
+// The production *nova.Client must satisfy the seam.
+var _ ServerGroupCleaner = (*nova.Client)(nil)
+
+// deleter is the one method deleteOne and deleteResources need, which both
+// cleanup seams provide.
+type deleter interface {
+	Delete(ctx context.Context, r resource.Resource) error
+}
+
 // Cleanup deletes every resource a run created, strictly by run identity, in
 // dependency order — servers first (so their volume and port attachments
 // release), then ports, then volumes, then the companion networks (each preceded
@@ -126,6 +144,26 @@ func Cleanup(ctx context.Context, c Cleaner, runID string, recorded []resource.R
 	return deleted, nil
 }
 
+// CleanupServerGroups deletes every server group of a run: those whose name
+// carries the run's dizzy-<id>- prefix, unioned (deduplicated by id) with the
+// server groups of the run record's created list. It returns the number
+// deleted; an already-gone group (a 404) counts as success and is not counted.
+// A listing error is returned unchanged with a count of 0, and the first other
+// delete error stops the sweep and is returned with the count so far. Nova
+// deletes a group whatever its members, so the caller need not wait for the
+// run's servers to be gone. An empty runID is refused, as Cleanup
+// refuses it, so nothing is deleted by an empty identity.
+func CleanupServerGroups(ctx context.Context, c ServerGroupCleaner, runID string, recorded []resource.Resource) (int, error) {
+	if runID == "" {
+		return 0, fmt.Errorf("cleanup: empty run id; refusing to delete by empty identity")
+	}
+	found, err := c.ListServerGroupsByName(ctx, runID)
+	if err != nil {
+		return 0, err
+	}
+	return deleteResources(ctx, c, union(found, recordedOfKind(recorded, nova.KindServerGroup)))
+}
+
 // deleteAndWaitGone deletes a resource and waits for it to be fully gone,
 // bounded by opTimeout, so the deletes that follow are not blocked by a
 // lingering attachment. It returns whether the resource was actually deleted (a
@@ -148,7 +186,7 @@ func deleteAndWaitGone(ctx context.Context, c Cleaner, r resource.Resource, opTi
 
 // deleteOne deletes a single resource, treating an already-gone resource (a 404)
 // as success. It returns whether the resource was deleted and any non-404 error.
-func deleteOne(ctx context.Context, c Cleaner, r resource.Resource) (bool, error) {
+func deleteOne(ctx context.Context, c deleter, r resource.Resource) (bool, error) {
 	slog.Info("deleting resource", "kind", r.Kind, "id", r.ID)
 	if err := c.Delete(ctx, r); err != nil {
 		if nova.IsNotFound(err) {
@@ -162,7 +200,7 @@ func deleteOne(ctx context.Context, c Cleaner, r resource.Resource) (bool, error
 // deleteResources deletes each resource, treating an already-gone resource (a
 // 404) as success so cleanup is idempotent. It returns the number actually
 // deleted, so a no-op second sweep returns zero.
-func deleteResources(ctx context.Context, c Cleaner, resources []resource.Resource) (int, error) {
+func deleteResources(ctx context.Context, c deleter, resources []resource.Resource) (int, error) {
 	var deleted int
 	for _, r := range resources {
 		gone, err := deleteOne(ctx, c, r)

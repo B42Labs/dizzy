@@ -3,6 +3,8 @@ package executor
 import (
 	"context"
 	"errors"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -171,4 +173,121 @@ func TestCleanupStopsOnFirstError(t *testing.T) {
 	if deleted != 1 {
 		t.Errorf("deleted = %d, want 1 (the server, before the port failed)", deleted)
 	}
+}
+
+// fakeGroupCleaner is an in-memory ServerGroupCleaner. listed is what the name
+// listing finds while live; live holds the ids a delete removes, so an unknown
+// id deletes as a 404. calls records every call in order.
+type fakeGroupCleaner struct {
+	listed       []resource.Resource
+	listErr      error
+	live         map[string]bool
+	failDeleteID string // id whose delete returns a 500
+	calls        []string
+}
+
+func newFakeGroupCleaner(listed ...resource.Resource) *fakeGroupCleaner {
+	f := &fakeGroupCleaner{listed: listed, live: map[string]bool{}}
+	for _, g := range listed {
+		f.live[g.ID] = true
+	}
+	return f
+}
+
+func (f *fakeGroupCleaner) ListServerGroupsByName(_ context.Context, _ string) ([]resource.Resource, error) {
+	f.calls = append(f.calls, "list")
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	var out []resource.Resource
+	for _, g := range f.listed {
+		if f.live[g.ID] {
+			out = append(out, g)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeGroupCleaner) Delete(_ context.Context, r resource.Resource) error {
+	f.calls = append(f.calls, "delete:"+r.ID)
+	if r.ID == f.failDeleteID {
+		return gophercloud.ErrUnexpectedResponseCode{Actual: 500}
+	}
+	if !f.live[r.ID] {
+		return notFound
+	}
+	f.live[r.ID] = false
+	return nil
+}
+
+func TestCleanupServerGroups(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("empty run id", func(t *testing.T) {
+		f := newFakeGroupCleaner(r(nova.KindServerGroup, "g1"))
+		_, err := CleanupServerGroups(ctx, f, "", nil)
+		if want := "cleanup: empty run id; refusing to delete by empty identity"; err == nil || err.Error() != want {
+			t.Errorf("CleanupServerGroups = %v, want %q", err, want)
+		}
+		if len(f.calls) != 0 {
+			t.Errorf("calls = %v, want none", f.calls)
+		}
+	})
+
+	t.Run("nothing listed or recorded", func(t *testing.T) {
+		n, err := CleanupServerGroups(ctx, newFakeGroupCleaner(), "run0", nil)
+		if n != 0 || err != nil {
+			t.Errorf("CleanupServerGroups = %d, %v, want 0, nil", n, err)
+		}
+	})
+
+	t.Run("recorded only", func(t *testing.T) {
+		f := newFakeGroupCleaner()
+		f.live["g-rec"] = true
+		recorded := []resource.Resource{r(nova.KindServer, "s1"), r(nova.KindServerGroup, "g-rec")}
+		n, err := CleanupServerGroups(ctx, f, "run0", recorded)
+		if n != 1 || err != nil || f.live["g-rec"] {
+			t.Errorf("CleanupServerGroups = %d, %v (still live: %v), want 1, nil and the group deleted", n, err, f.live["g-rec"])
+		}
+	})
+
+	t.Run("listed and recorded", func(t *testing.T) {
+		f := newFakeGroupCleaner(r(nova.KindServerGroup, "g1"))
+		n, err := CleanupServerGroups(ctx, f, "run0", []resource.Resource{r(nova.KindServerGroup, "g1")})
+		if n != 1 || err != nil {
+			t.Errorf("CleanupServerGroups = %d, %v, want 1, nil", n, err)
+		}
+		if want := []string{"list", "delete:g1"}; !slices.Equal(f.calls, want) {
+			t.Errorf("calls = %v, want %v", f.calls, want)
+		}
+	})
+
+	t.Run("already gone", func(t *testing.T) {
+		f := newFakeGroupCleaner()
+		n, err := CleanupServerGroups(ctx, f, "run0", []resource.Resource{r(nova.KindServerGroup, "g-gone")})
+		if n != 0 || err != nil {
+			t.Errorf("CleanupServerGroups = %d, %v, want 0, nil", n, err)
+		}
+	})
+
+	t.Run("list error", func(t *testing.T) {
+		f := newFakeGroupCleaner(r(nova.KindServerGroup, "g1"))
+		f.listErr = errors.New("listing server groups by name: boom")
+		n, err := CleanupServerGroups(ctx, f, "run0", []resource.Resource{r(nova.KindServerGroup, "g1")})
+		if n != 0 || err != f.listErr {
+			t.Errorf("CleanupServerGroups = %d, %v, want 0 and the list error unchanged", n, err)
+		}
+	})
+
+	t.Run("delete error", func(t *testing.T) {
+		f := newFakeGroupCleaner(r(nova.KindServerGroup, "g1"), r(nova.KindServerGroup, "g2"))
+		f.failDeleteID = "g2"
+		n, err := CleanupServerGroups(ctx, f, "run0", nil)
+		if want := "deleting server_group g2: "; err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Errorf("CleanupServerGroups error = %v, want it to start with %q", err, want)
+		}
+		if n != 1 {
+			t.Errorf("deleted = %d, want 1 (g1, before g2 failed)", n)
+		}
+	})
 }
