@@ -7,14 +7,22 @@
 // completes only when the resource reaches its ready state, and a delete only
 // when it is gone — and every operation on one server's family (the server and
 // its volumes and ports) is serialized behind a per-server gate, since Nova
-// rejects concurrent state transitions on one server. Keeping the Nova coupling
-// here leaves the chaos engine free of any service-specific import.
+// rejects concurrent state transitions on one server. BuildLongLived builds the
+// graph of a long-lived persona from the same nodes: every node is pinned, so
+// the engine creates it first and never deletes it, and the mutations are
+// repeatable. A kept server runs one of its enabled lifecycle operations per
+// mutation, and a kept volume or port marked for detach toggles its attachment.
+// Keeping the Nova coupling here leaves the chaos engine free of any
+// service-specific import.
 package novagraph
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"log/slog"
+	"math/rand"
 	"time"
 
 	"github.com/B42Labs/dizzy/internal/chaos"
@@ -28,7 +36,8 @@ import (
 // through the nodes this package builds. It is the consumer-defined
 // ports-and-adapters seam to the cloud — *nova.Client satisfies it in production
 // and a fake satisfies it in tests. It mirrors the apply executor's Nova seam
-// plus the DeleteNetworkPorts the network churn deletes need.
+// plus the DeleteNetworkPorts the network churn deletes need and the
+// ColdMigrateServer and WaitForPortDetached the long-lived graph needs.
 type Nova interface {
 	CreateNetwork(ctx context.Context, n novaplan.Network) (resource.Resource, error)
 	CreateSubnet(ctx context.Context, n novaplan.Network, networkID string) (resource.Resource, error)
@@ -42,10 +51,12 @@ type Nova interface {
 	ResizeServer(ctx context.Context, r resource.Resource, flavorID string) error
 	ConfirmResizeServer(ctx context.Context, r resource.Resource) error
 	LiveMigrateServer(ctx context.Context, r resource.Resource) error
+	ColdMigrateServer(ctx context.Context, r resource.Resource) error
 	AttachVolume(ctx context.Context, server, volume resource.Resource) error
 	DetachVolume(ctx context.Context, server, volume resource.Resource) error
 	AttachPort(ctx context.Context, server, port resource.Resource) error
 	DetachPort(ctx context.Context, server, port resource.Resource) error
+	WaitForPortDetached(ctx context.Context, server, port resource.Resource) error
 	Delete(ctx context.Context, r resource.Resource) error
 	WaitForReady(ctx context.Context, r resource.Resource) error
 	WaitForServerStatus(ctx context.Context, r resource.Resource, want string) error
@@ -154,6 +165,173 @@ func Build(p *novaplan.Plan, c Nova, r novaexec.Resolved, opTimeout time.Duratio
 	return nodes, nil
 }
 
+// mutation is the signature of chaos.Node.Mutate.
+type mutation = func(ctx context.Context, ids map[string]string, res resource.Resource) error
+
+// BuildLongLived turns a Nova plan into the churn graph of a long-lived
+// persona: the nodes Build returns, so an invalid plan fails the same way, with
+// every node pinned and every mutation replaced. A server whose operations
+// include at least one the run enabled is repeatable, and each of its
+// mutations runs one of those operations, drawn uniformly from a generator
+// seeded from the plan seed and the server name. Its operations are stop-start
+// when it has a stop/start variant, resize when it is marked for resize and the
+// resize flavor is resolved, live-migrate when it is marked for it and the run
+// enabled live migration, and cold-migrate likewise. A volume or port marked
+// for detach is repeatable and toggles its attachment. Every other node has no
+// mutation.
+//
+// The engine runs one node's mutations one after another in decision order, so
+// the n-th mutation of a server always gets the n-th draw, and the generator
+// and flags a closure holds need no lock. No generator or flag is shared
+// between two nodes.
+func BuildLongLived(p *novaplan.Plan, c Nova, r novaexec.Resolved, opTimeout time.Duration) ([]chaos.Node, error) {
+	nodes, err := Build(p, c, r, opTimeout)
+	if err != nil {
+		return nil, err
+	}
+	index := make(map[string]int, len(nodes))
+	for i := range nodes {
+		nodes[i].Pinned, nodes[i].Mutate = true, nil
+		index[nodes[i].Key] = i
+	}
+
+	for _, s := range p.Servers {
+		if m := serverMutation(p.Seed, s, c, r, opTimeout); m != nil {
+			nodes[index[s.Name]].Mutate = m
+		}
+	}
+	for _, v := range p.Volumes {
+		if v.Detach {
+			nodes[index[v.Name]].Mutate = volumeToggle(v, c, opTimeout)
+		}
+	}
+	for _, pt := range p.Ports {
+		if pt.Detach {
+			nodes[index[pt.Name]].Mutate = portToggle(pt, c, opTimeout)
+		}
+	}
+	return nodes, nil
+}
+
+// serverMutation returns the repeatable mutation of a kept server, or nil when
+// the run enabled none of its operations. A resize targets the resize flavor
+// while the server is on the boot flavor and the boot flavor afterwards; the
+// flag that tracks it flips only once the whole resize sequence succeeded.
+// When Nova rejects a resize because the server already has the target
+// flavor, an earlier resize or migration finished in the cloud after its wait
+// gave up, so the flag flips to match the server and it resizes the other way.
+func serverMutation(seed int64, s novaplan.Server, c Nova, r novaexec.Resolved, opTimeout time.Duration) mutation {
+	var ops []func(ctx context.Context, res resource.Resource) error
+	if s.StopStart != "" {
+		ops = append(ops, func(ctx context.Context, res resource.Resource) error {
+			return stopStartServer(ctx, opTimeout, c, res, s.StopStart)
+		})
+	}
+	if s.Resize && r.ResizeFlavorID != "" {
+		resized := false
+		target := func() string {
+			if resized {
+				return r.FlavorID
+			}
+			return r.ResizeFlavorID
+		}
+		ops = append(ops, func(ctx context.Context, res resource.Resource) error {
+			err := resizeServer(ctx, opTimeout, c, res, target())
+			if nova.IsSameFlavor(err) {
+				slog.Info("server already has the resize target flavor; resizing the other way", "logical", res.Logical, "flavor", target())
+				resized = !resized
+				err = resizeServer(ctx, opTimeout, c, res, target())
+			}
+			if err != nil {
+				return err
+			}
+			resized = !resized
+			return nil
+		})
+	}
+	if s.LiveMigrate && r.LiveMigration {
+		ops = append(ops, func(ctx context.Context, res resource.Resource) error {
+			return liveMigrateServer(ctx, opTimeout, c, res)
+		})
+	}
+	if s.ColdMigrate && r.ColdMigration {
+		ops = append(ops, func(ctx context.Context, res resource.Resource) error {
+			return coldMigrateServer(ctx, opTimeout, c, res)
+		})
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+	rng := rand.New(rand.NewSource(opSeed(seed, s.Name)))
+	return func(ctx context.Context, _ map[string]string, res resource.Resource) error {
+		return ops[rng.Intn(len(ops))](ctx, res)
+	}
+}
+
+// opSeed derives the seed of a kept server's operation draw from the plan seed
+// and the server name: the seed XOR the FNV-64a hash of the name, the
+// derivation the mix scenario uses for a persona seed.
+func opSeed(seed int64, name string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(name))
+	return seed ^ int64(h.Sum64())
+}
+
+// volumeToggle returns the repeatable mutation of a kept data volume marked for
+// detach: it detaches the volume and waits for available, or attaches it and
+// waits for in-use.
+func volumeToggle(v novaplan.Volume, c Nova, opTimeout time.Duration) mutation {
+	return toggle(v.Server,
+		func(ctx context.Context, server, res resource.Resource) error {
+			if err := detach(ctx, opTimeout, func(ctx context.Context) error { return c.DetachVolume(ctx, server, res) }); err != nil {
+				return err
+			}
+			return waitVolumeStatus(ctx, opTimeout, c, res, statusVolumeAvailable)
+		},
+		func(ctx context.Context, server, res resource.Resource) error {
+			if err := novaexec.WithRetry(ctx, opTimeout, func(ctx context.Context) error { return c.AttachVolume(ctx, server, res) }); err != nil {
+				return err
+			}
+			return waitVolumeStatus(ctx, opTimeout, c, res, statusVolumeInUse)
+		})
+}
+
+// portToggle returns the repeatable mutation of a kept port marked for detach:
+// it detaches the port and waits until the server no longer has it, or
+// attaches it, without a wait, as createPort does.
+func portToggle(pt novaplan.Port, c Nova, opTimeout time.Duration) mutation {
+	return toggle(pt.Server,
+		func(ctx context.Context, server, res resource.Resource) error {
+			if err := detach(ctx, opTimeout, func(ctx context.Context) error { return c.DetachPort(ctx, server, res) }); err != nil {
+				return err
+			}
+			return waitPortDetached(ctx, opTimeout, c, server, res)
+		},
+		func(ctx context.Context, server, res resource.Resource) error {
+			return novaexec.WithRetry(ctx, opTimeout, func(ctx context.Context) error { return c.AttachPort(ctx, server, res) })
+		})
+}
+
+// toggle returns a mutation that runs detachStep while the resource is
+// attached to its server and attachStep while it is not. The resource starts
+// attached, as its create leaves it. The state flips only when the step
+// succeeded, so a failed step is tried again in the same direction by the next
+// mutation.
+func toggle(server string, detachStep, attachStep func(ctx context.Context, server, res resource.Resource) error) mutation {
+	attached := true
+	return func(ctx context.Context, ids map[string]string, res resource.Resource) error {
+		step := detachStep
+		if !attached {
+			step = attachStep
+		}
+		if err := step(ctx, serverRef(server, ids), res); err != nil {
+			return err
+		}
+		attached = !attached
+		return nil
+	}
+}
+
 // hasLifecycle reports whether a server carries any lifecycle mutation the churn
 // engine can apply: a stop/start, a resize, or a live migration that the run
 // enabled.
@@ -231,7 +409,25 @@ func createServer(ctx context.Context, opTimeout time.Duration, c Nova, r novaex
 // run enabled it) — at most once per instance lifetime (the engine bounds the
 // call). Attach/detach are handled by the volume and port child nodes.
 func mutateServer(ctx context.Context, opTimeout time.Duration, c Nova, r novaexec.Resolved, s novaplan.Server, res resource.Resource) error {
-	switch s.StopStart {
+	if err := stopStartServer(ctx, opTimeout, c, res, s.StopStart); err != nil {
+		return err
+	}
+	if s.Resize {
+		if err := resizeServer(ctx, opTimeout, c, res, r.ResizeFlavorID); err != nil {
+			return err
+		}
+	}
+	if s.LiveMigrate && r.LiveMigration {
+		return liveMigrateServer(ctx, opTimeout, c, res)
+	}
+	return nil
+}
+
+// stopStartServer runs a server's stop/start variant: os-stop then os-start for
+// "soft", a hard reboot for "hard", nothing for "". Each step waits for the
+// state it leads to.
+func stopStartServer(ctx context.Context, opTimeout time.Duration, c Nova, res resource.Resource, variant string) error {
+	switch variant {
 	case novaplan.StopStartSoft:
 		if err := novaexec.WithRetry(ctx, opTimeout, func(ctx context.Context) error { return c.StopServer(ctx, res) }); err != nil {
 			return err
@@ -253,33 +449,47 @@ func mutateServer(ctx context.Context, opTimeout time.Duration, c Nova, r novaex
 			return err
 		}
 	}
-
-	if s.Resize {
-		if err := novaexec.WithRetry(ctx, opTimeout, func(ctx context.Context) error {
-			return c.ResizeServer(ctx, res, r.ResizeFlavorID)
-		}); err != nil {
-			return err
-		}
-		if err := waitServerStatus(ctx, opTimeout, c, res, statusServerVerifyResize); err != nil {
-			return err
-		}
-		if err := novaexec.WithRetry(ctx, opTimeout, func(ctx context.Context) error { return c.ConfirmResizeServer(ctx, res) }); err != nil {
-			return err
-		}
-		if err := waitServerStatus(ctx, opTimeout, c, res, statusServerActive); err != nil {
-			return err
-		}
-	}
-
-	if s.LiveMigrate && r.LiveMigration {
-		if err := novaexec.WithRetry(ctx, opTimeout, func(ctx context.Context) error { return c.LiveMigrateServer(ctx, res) }); err != nil {
-			return err
-		}
-		if err := waitServerStatus(ctx, opTimeout, c, res, statusServerActive); err != nil {
-			return err
-		}
-	}
 	return nil
+}
+
+// resizeServer resizes a server to flavorID, waits for VERIFY_RESIZE, confirms
+// the resize and waits for ACTIVE.
+func resizeServer(ctx context.Context, opTimeout time.Duration, c Nova, res resource.Resource, flavorID string) error {
+	if err := novaexec.WithRetry(ctx, opTimeout, func(ctx context.Context) error {
+		return c.ResizeServer(ctx, res, flavorID)
+	}); err != nil {
+		return err
+	}
+	return confirmResize(ctx, opTimeout, c, res)
+}
+
+// liveMigrateServer live-migrates a server and waits for ACTIVE.
+func liveMigrateServer(ctx context.Context, opTimeout time.Duration, c Nova, res resource.Resource) error {
+	if err := novaexec.WithRetry(ctx, opTimeout, func(ctx context.Context) error { return c.LiveMigrateServer(ctx, res) }); err != nil {
+		return err
+	}
+	return waitServerStatus(ctx, opTimeout, c, res, statusServerActive)
+}
+
+// coldMigrateServer cold-migrates a server, waits for VERIFY_RESIZE, confirms
+// the migration and waits for ACTIVE.
+func coldMigrateServer(ctx context.Context, opTimeout time.Duration, c Nova, res resource.Resource) error {
+	if err := novaexec.WithRetry(ctx, opTimeout, func(ctx context.Context) error { return c.ColdMigrateServer(ctx, res) }); err != nil {
+		return err
+	}
+	return confirmResize(ctx, opTimeout, c, res)
+}
+
+// confirmResize waits for a resized or cold-migrated server to reach
+// VERIFY_RESIZE, confirms it and waits for ACTIVE.
+func confirmResize(ctx context.Context, opTimeout time.Duration, c Nova, res resource.Resource) error {
+	if err := waitServerStatus(ctx, opTimeout, c, res, statusServerVerifyResize); err != nil {
+		return err
+	}
+	if err := novaexec.WithRetry(ctx, opTimeout, func(ctx context.Context) error { return c.ConfirmResizeServer(ctx, res) }); err != nil {
+		return err
+	}
+	return waitServerStatus(ctx, opTimeout, c, res, statusServerActive)
 }
 
 // createVolume creates a data volume, waits it to available, attaches it to its
@@ -354,6 +564,14 @@ func waitReady(ctx context.Context, opTimeout time.Duration, c Nova, res resourc
 	readyCtx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 	return c.WaitForReady(readyCtx, res)
+}
+
+// waitPortDetached polls until server no longer has port attached, bounded by
+// opTimeout.
+func waitPortDetached(ctx context.Context, opTimeout time.Duration, c Nova, server, port resource.Resource) error {
+	detachCtx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+	return c.WaitForPortDetached(detachCtx, server, port)
 }
 
 // waitServerStatus polls a server to want, bounded by opTimeout.
