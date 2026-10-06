@@ -42,7 +42,8 @@ type Resources struct {
 
 // Personas holds one block per workload persona.
 type Personas struct {
-	CI CI `yaml:"ci"`
+	CI     CI     `yaml:"ci"`
+	Legacy Legacy `yaml:"legacy"`
 }
 
 // CI is the CI persona: short-lived servers on one network each, with zero or
@@ -60,6 +61,27 @@ type CI struct {
 	Interval         novascenario.Interval `yaml:"interval"`
 	ChurnRatio       float64               `yaml:"churn_ratio"`
 	TargetFill       float64               `yaml:"target_fill"`
+}
+
+// Legacy is the Legacy persona: long-lived servers on one network each that
+// stay until the run's teardown and are changed in place again and again, by a
+// stop and start, a resize, a live or a cold migration, or the detach or
+// re-attach of one of their data volumes or ports. Share, Cloud and Networks
+// mean what they mean for the CI persona. ResizeFlavor is the second flavor
+// the servers alternate with; empty, the servers are never resized.
+// VolumesPerServer and VolumeGiB shape the data volumes and PortsPerServer the
+// extra ports. Interval configures the persona's churn engine; a zero bound
+// falls back to the command's default. The persona keeps every planned
+// resource and mutates on every step, so it has no churn ratio or target fill.
+type Legacy struct {
+	Share            float64               `yaml:"share"`
+	Cloud            string                `yaml:"cloud"`
+	Networks         int                   `yaml:"networks"`
+	ResizeFlavor     string                `yaml:"resize_flavor"`
+	VolumesPerServer novascenario.Range    `yaml:"volumes_per_server"`
+	VolumeGiB        novascenario.Range    `yaml:"volume_gib"`
+	PortsPerServer   novascenario.Range    `yaml:"ports_per_server"`
+	Interval         novascenario.Interval `yaml:"interval"`
 }
 
 // Chaos holds the run-wide churn settings, applied to every persona's engine.
@@ -99,25 +121,30 @@ func (s Scenario) Validate() error {
 		return fmt.Errorf("resources.servers exceeds the limit of %d, got %d", maxServers, s.Resources.Servers)
 	}
 
-	ci := s.Personas.CI
-	if math.IsNaN(ci.Share) || math.IsInf(ci.Share, 0) || ci.Share < 0 {
-		return fmt.Errorf("personas.ci.share must be a finite number of at least 0, got %v", ci.Share)
+	personas := s.personas()
+	active := false
+	for _, p := range personas {
+		if math.IsNaN(p.share) || math.IsInf(p.share, 0) || p.share < 0 {
+			return fmt.Errorf("personas.%s.share must be a finite number of at least 0, got %v", p.name, p.share)
+		}
+		active = active || p.share > 0
 	}
-	if ci.Share == 0 {
+	if !active {
 		return fmt.Errorf("at least one persona must have a share above 0")
 	}
-	if ci.Interval.Min < 0 {
-		return fmt.Errorf("personas.ci.interval.min must not be negative, got %s", time.Duration(ci.Interval.Min))
-	}
-	if ci.Interval.Min > ci.Interval.Max {
-		return fmt.Errorf("personas.ci.interval.min (%s) must not exceed personas.ci.interval.max (%s)",
-			time.Duration(ci.Interval.Min), time.Duration(ci.Interval.Max))
+
+	ci := s.Personas.CI
+	if err := validateInterval("personas.ci.interval", ci.Interval); err != nil {
+		return err
 	}
 	if math.IsNaN(ci.ChurnRatio) || ci.ChurnRatio < 0 || ci.ChurnRatio > 1 {
 		return fmt.Errorf("personas.ci.churn_ratio must be between 0 and 1, got %v", ci.ChurnRatio)
 	}
 	if math.IsNaN(ci.TargetFill) || ci.TargetFill < 0 || ci.TargetFill > 1 {
 		return fmt.Errorf("personas.ci.target_fill must be between 0 and 1, got %v", ci.TargetFill)
+	}
+	if err := validateInterval("personas.legacy.interval", s.Personas.Legacy.Interval); err != nil {
+		return err
 	}
 
 	if c := s.Chaos; c != nil {
@@ -143,7 +170,6 @@ func (s Scenario) Validate() error {
 		seen[name] = true
 	}
 
-	personas := s.personas()
 	servers := Apportion(s.Resources.Servers, shares(personas))
 	for i, p := range personas {
 		if p.share == 0 {
@@ -156,13 +182,25 @@ func (s Scenario) Validate() error {
 	return nil
 }
 
+// validateInterval checks a persona's interval block, naming it by key: its
+// lower bound must not be negative or exceed its upper bound.
+func validateInterval(key string, iv novascenario.Interval) error {
+	if iv.Min < 0 {
+		return fmt.Errorf("%s.min must not be negative, got %s", key, time.Duration(iv.Min))
+	}
+	if iv.Min > iv.Max {
+		return fmt.Errorf("%s.min (%s) must not exceed %s.max (%s)", key, time.Duration(iv.Min), key, time.Duration(iv.Max))
+	}
+	return nil
+}
+
 // Set applies a single dotted-key override of the form key=value, matching the
 // documented scenario fields. services takes a comma-separated list, and the
 // empty string clears it; the interval bounds take Go duration strings. It
 // returns an error for an unknown key or a value that does not parse to the
 // field's type.
 func (s *Scenario) Set(key, value string) error {
-	ci := &s.Personas.CI
+	ci, legacy := &s.Personas.CI, &s.Personas.Legacy
 	switch key {
 	case "seed":
 		return setInt64(&s.Seed, key, value)
@@ -206,6 +244,32 @@ func (s *Scenario) Set(key, value string) error {
 		return setFloat(&ci.ChurnRatio, key, value)
 	case "personas.ci.target_fill":
 		return setFloat(&ci.TargetFill, key, value)
+	case "personas.legacy.share":
+		return setFloat(&legacy.Share, key, value)
+	case "personas.legacy.cloud":
+		legacy.Cloud = value
+		return nil
+	case "personas.legacy.networks":
+		return setInt(&legacy.Networks, key, value)
+	case "personas.legacy.resize_flavor":
+		legacy.ResizeFlavor = value
+		return nil
+	case "personas.legacy.volumes_per_server.min":
+		return setInt(&legacy.VolumesPerServer.Min, key, value)
+	case "personas.legacy.volumes_per_server.max":
+		return setInt(&legacy.VolumesPerServer.Max, key, value)
+	case "personas.legacy.volume_gib.min":
+		return setInt(&legacy.VolumeGiB.Min, key, value)
+	case "personas.legacy.volume_gib.max":
+		return setInt(&legacy.VolumeGiB.Max, key, value)
+	case "personas.legacy.ports_per_server.min":
+		return setInt(&legacy.PortsPerServer.Min, key, value)
+	case "personas.legacy.ports_per_server.max":
+		return setInt(&legacy.PortsPerServer.Max, key, value)
+	case "personas.legacy.interval.min":
+		return setDuration(&legacy.Interval.Min, key, value)
+	case "personas.legacy.interval.max":
+		return setDuration(&legacy.Interval.Max, key, value)
 	default:
 		return fmt.Errorf("unknown override key %q", key)
 	}

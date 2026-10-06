@@ -24,13 +24,16 @@ type Plan struct {
 // Persona is one workload persona of a mix run. Share is its normalized share,
 // its scenario share divided by the sum of all shares, and Servers its part of
 // the scenario's server envelope. Seed is derived from the plan seed and the
-// persona name, and Nova is the compute plan the persona churns.
+// persona name. LongLived marks a persona whose resources are kept until the
+// run's teardown and mutated repeatedly. Nova is the compute plan the persona
+// churns.
 type Persona struct {
-	Name    string         `json:"name"`
-	Share   float64        `json:"share"`
-	Servers int            `json:"servers"`
-	Seed    int64          `json:"seed"`
-	Nova    *novaplan.Plan `json:"nova"`
+	Name      string         `json:"name"`
+	Share     float64        `json:"share"`
+	Servers   int            `json:"servers"`
+	Seed      int64          `json:"seed"`
+	LongLived bool           `json:"longLived,omitempty"`
+	Nova      *novaplan.Plan `json:"nova"`
 }
 
 // Validate checks the plan for well-formedness: at least one persona has a

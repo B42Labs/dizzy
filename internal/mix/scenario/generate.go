@@ -9,12 +9,15 @@ import (
 )
 
 // persona is one workload persona of a scenario: its name, its share as the
-// scenario states it, and the builder of its compute scenario for a given
+// scenario states it, whether its resources are long-lived, whether its
+// servers cold-migrate, and the builder of its compute scenario for a given
 // number of servers.
 type persona struct {
-	name  string
-	share float64
-	nova  func(servers int) novascenario.Scenario
+	name        string
+	share       float64
+	longLived   bool
+	coldMigrate bool
+	nova        func(servers int) novascenario.Scenario
 }
 
 // personas returns the scenario's personas in canonical order, alphabetical
@@ -22,6 +25,7 @@ type persona struct {
 func (s Scenario) personas() []persona {
 	return []persona{
 		{name: "ci", share: s.Personas.CI.Share, nova: s.ciNova},
+		{name: "legacy", share: s.Personas.Legacy.Share, longLived: true, coldMigrate: true, nova: s.legacyNova},
 	}
 }
 
@@ -54,6 +58,38 @@ func (s Scenario) ciNova(servers int) novascenario.Scenario {
 	}
 }
 
+// legacyNova builds the compute scenario of the Legacy persona: servers
+// servers on one network each, spread over the persona's networks, with its
+// data volumes and extra ports. Every server is stop/started (soft),
+// live-migrated and, when the block names a resize flavor, resized, and every
+// volume and port is detached. Generate marks every server for cold migration
+// on top, an operation the compute scenario has no ratio for.
+func (s Scenario) legacyNova(servers int) novascenario.Scenario {
+	legacy := s.Personas.Legacy
+	d := novascenario.Distribution{
+		NetworksPerServer: novascenario.Range{Min: 1, Max: 1},
+		VolumesPerServer:  legacy.VolumesPerServer,
+		PortsPerServer:    legacy.PortsPerServer,
+		AttachedVolumeGiB: legacy.VolumeGiB,
+		StopStartRatio:    1,
+		LiveMigratedRatio: 1,
+		VolumeDetachRatio: 1,
+		PortDetachRatio:   1,
+	}
+	if legacy.ResizeFlavor != "" {
+		d.ResizedRatio = 1
+	}
+	return novascenario.Scenario{
+		Name:         s.Name + "/legacy",
+		Seed:         PersonaSeed(s.Seed, "legacy"),
+		Image:        s.Image,
+		Flavor:       s.Flavor,
+		ResizeFlavor: legacy.ResizeFlavor,
+		Resources:    novascenario.Resources{Servers: servers, Networks: legacy.Networks},
+		Distribution: d,
+	}
+}
+
 // PersonaSeed derives a persona's seed from the scenario seed and the persona
 // name: the seed XOR the FNV-64a hash of the name, the derivation
 // glance.PayloadSeed uses. Two personas of one run draw from distinct seeds
@@ -68,8 +104,10 @@ func PersonaSeed(seed int64, name string) int64 {
 // scenario, divides resources.servers among the personas by their shares, and
 // emits, in canonical order, one plan persona for every persona that received
 // at least one server, with its normalized share, its seed and its generated
-// compute plan. The returned plan is validated before it is handed back, so a
-// scenario with no server to divide fails here.
+// compute plan. Every server of a persona that cold-migrates is marked for cold
+// migration, and a long-lived persona is marked long-lived. The returned plan
+// is validated before it is handed back, so a scenario with no server to
+// divide fails here.
 func (s Scenario) Generate() (*mixplan.Plan, error) {
 	if err := s.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid scenario: %w", err)
@@ -98,12 +136,18 @@ func (s Scenario) Generate() (*mixplan.Plan, error) {
 		if err != nil {
 			return nil, fmt.Errorf("personas.%s: %w", ps.name, err)
 		}
+		if ps.coldMigrate {
+			for j := range np.Servers {
+				np.Servers[j].ColdMigrate = true
+			}
+		}
 		p.Personas = append(p.Personas, mixplan.Persona{
-			Name:    ps.name,
-			Share:   ps.share / sum,
-			Servers: servers[i],
-			Seed:    ns.Seed,
-			Nova:    np,
+			Name:      ps.name,
+			Share:     ps.share / sum,
+			Servers:   servers[i],
+			Seed:      ns.Seed,
+			LongLived: ps.longLived,
+			Nova:      np,
 		})
 	}
 

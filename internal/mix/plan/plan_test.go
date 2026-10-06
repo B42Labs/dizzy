@@ -1,6 +1,8 @@
 package plan
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	novaplan "github.com/B42Labs/dizzy/internal/nova/plan"
@@ -43,5 +45,26 @@ func TestValidate(t *testing.T) {
 				t.Errorf("Validate() = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestPersonaLongLivedOmittedWhenFalse confirms a persona that is not
+// long-lived encodes without a longLived key, so the CI persona's entry keeps
+// its bytes.
+func TestPersonaLongLivedOmittedWhenFalse(t *testing.T) {
+	for _, tc := range []struct {
+		persona Persona
+		want    bool
+	}{
+		{Persona{Name: "ci", Servers: 1, Nova: novaPlan(1)}, false},
+		{Persona{Name: "legacy", Servers: 1, LongLived: true, Nova: novaPlan(1)}, true},
+	} {
+		data, err := json.Marshal(tc.persona)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if got := strings.Contains(string(data), `"longLived"`); got != tc.want {
+			t.Errorf("JSON %s has a longLived key = %v, want %v", data, got, tc.want)
+		}
 	}
 }
