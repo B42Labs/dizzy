@@ -1,6 +1,8 @@
 package scenario
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"math"
 	"reflect"
 	"strings"
@@ -12,8 +14,9 @@ import (
 
 func TestParseRejectsUnknownKey(t *testing.T) {
 	for key, data := range map[string]string{
-		"personas.nope":        "name: x\npersonas:\n  nope:\n    share: 1\n",
-		"personas.legacy.nope": "name: x\npersonas:\n  legacy:\n    nope: 1\n",
+		"personas.nope":          "name: x\npersonas:\n  nope:\n    share: 1\n",
+		"personas.legacy.nope":   "name: x\npersonas:\n  legacy:\n    nope: 1\n",
+		"personas.gardener.nope": "name: x\npersonas:\n  gardener:\n    nope: 1\n",
 	} {
 		t.Run(key, func(t *testing.T) {
 			t.Parallel()
@@ -81,6 +84,85 @@ personas:
 	}
 	if len(p.Personas) != 1 || p.Personas[0].Name != "ci" || p.Personas[0].Servers != 3 {
 		t.Errorf("personas = %+v, want ci with 3 servers alone", p.Personas)
+	}
+}
+
+// TestParseGardenerBlock confirms every key of the gardener block decodes into
+// its field.
+func TestParseGardenerBlock(t *testing.T) {
+	s, err := Parse([]byte(`
+personas:
+  gardener:
+    share: 0.3
+    cloud: tenant-gardener
+    clusters: 2
+    policy: anti-affinity
+    volume_gib: { min: 1, max: 2 }
+    interval: { min: 10s, max: 1m }
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	want := Gardener{
+		Share: 0.3, Cloud: "tenant-gardener", Clusters: 2, Policy: "anti-affinity",
+		VolumeGiB: novascenario.Range{Min: 1, Max: 2},
+		Interval:  novascenario.Interval{Min: novascenario.Duration(10 * time.Second), Max: novascenario.Duration(time.Minute)},
+	}
+	if s.Personas.Gardener != want {
+		t.Errorf("personas.gardener = %+v, want %+v", s.Personas.Gardener, want)
+	}
+}
+
+// beforeGardenerSHA256 is the SHA-256 of testdata/golden/small.plan.json as
+// it was before the Gardener persona existed: the plan of the small profile
+// with the CI and the Legacy persona alone.
+const beforeGardenerSHA256 = "f912c7098069ff5725e457139106febb21e971cdfce52b6117430c46334f95d7"
+
+// TestParseWithoutGardener confirms a scenario without a gardener block has a
+// zero Gardener, validates, and generates byte for byte the plan it generated
+// before the Gardener persona existed.
+func TestParseWithoutGardener(t *testing.T) {
+	s, err := Parse([]byte(`
+name: small
+seed: 42
+image: cirros
+flavor: m1.tiny
+services: []
+resources: { servers: 6 }
+personas:
+  ci:
+    share: 0.8
+    networks: 2
+    volumes_per_server: { min: 0, max: 1 }
+    volume_gib: { min: 1, max: 2 }
+    interval: { min: 100ms, max: 1s }
+    churn_ratio: 0.5
+    target_fill: 0.6
+  legacy:
+    share: 0.2
+    networks: 1
+    resize_flavor: m1.small
+    volumes_per_server: { min: 1, max: 2 }
+    volume_gib: { min: 1, max: 2 }
+    ports_per_server: { min: 0, max: 1 }
+    interval: { min: 10s, max: 1m }
+chaos: { duration: 5m, parallel: { max: 4 } }
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if s.Personas.Gardener != (Gardener{}) {
+		t.Errorf("personas.gardener = %+v, want the zero block", s.Personas.Gardener)
+	}
+	if err := s.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	p, err := s.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if sum := sha256.Sum256(marshal(t, p)); hex.EncodeToString(sum[:]) != beforeGardenerSHA256 {
+		t.Errorf("plan without a gardener block differs from the plan generated before the persona existed:\n%s", marshal(t, p))
 	}
 }
 
@@ -161,6 +243,51 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+// TestValidateGardener covers the gardener block: its share, its interval,
+// its policy and cluster count, which are checked only when the persona has a
+// share, and the compute scenario it builds.
+func TestValidateGardener(t *testing.T) {
+	d := func(v time.Duration) novascenario.Duration { return novascenario.Duration(v) }
+	tests := []struct {
+		name   string
+		mutate func(*Scenario)
+		want   string
+	}{
+		{"valid", func(*Scenario) {}, ""},
+		{"hard policy", func(s *Scenario) { s.Personas.Gardener.Policy = "anti-affinity" }, ""},
+		{"gardener alone", func(s *Scenario) { s.Personas.CI.Share = 0; s.Personas.Legacy.Share = 0 }, ""},
+		{"zero servers", func(s *Scenario) { s.Resources.Servers = 0 }, ""},
+		{"negative share", func(s *Scenario) { s.Personas.Gardener.Share = -1 }, "personas.gardener.share must be a finite number of at least 0, got -1"},
+		{"negative interval", func(s *Scenario) { s.Personas.Gardener.Interval.Min = d(-time.Second) }, "personas.gardener.interval.min must not be negative, got -1s"},
+		{"inverted interval", func(s *Scenario) {
+			s.Personas.Gardener.Interval = novascenario.Interval{Min: d(2 * time.Second), Max: d(time.Second)}
+		}, "personas.gardener.interval.min (2s) must not exceed personas.gardener.interval.max (1s)"},
+		{"empty policy", func(s *Scenario) { s.Personas.Gardener.Policy = "" },
+			`personas.gardener.policy must be "anti-affinity" or "soft-anti-affinity", got ""`},
+		{"affinity policy", func(s *Scenario) { s.Personas.Gardener.Policy = "affinity" },
+			`personas.gardener.policy must be "anti-affinity" or "soft-anti-affinity", got "affinity"`},
+		{"inactive block without policy", func(s *Scenario) { s.Personas.Gardener = Gardener{} }, ""},
+		{"no cluster", func(s *Scenario) { s.Personas.Gardener.Clusters = 0 }, "personas.gardener.clusters must be at least 1, got 0"},
+		{"more clusters than servers", func(s *Scenario) { s.Personas.Gardener.Clusters = 3 }, "personas.gardener.clusters (3) exceeds the persona's 2 server(s)"},
+		{"zero volume size", func(s *Scenario) { s.Personas.Gardener.VolumeGiB = novascenario.Range{} },
+			"personas.gardener: distribution.attached_volume_gib.min must be at least 1 when volumes_per_server.max > 0, got 0"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := mixedScenario()
+			tc.mutate(&s)
+			err := s.Validate()
+			switch {
+			case tc.want == "" && err != nil:
+				t.Errorf("Validate() = %v, want nil", err)
+			case tc.want != "" && (err == nil || err.Error() != tc.want):
+				t.Errorf("Validate() = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestSet(t *testing.T) {
 	tests := []struct {
 		key, value string
@@ -187,6 +314,18 @@ func TestSet(t *testing.T) {
 		}},
 		{"personas.ci.churn_ratio", "0.25", func(s Scenario) bool { return s.Personas.CI.ChurnRatio == 0.25 }},
 		{"personas.ci.target_fill", "0.9", func(s Scenario) bool { return s.Personas.CI.TargetFill == 0.9 }},
+		{"personas.gardener.share", "0.4", func(s Scenario) bool { return s.Personas.Gardener.Share == 0.4 }},
+		{"personas.gardener.cloud", "tenant-gardener", func(s Scenario) bool { return s.Personas.Gardener.Cloud == "tenant-gardener" }},
+		{"personas.gardener.clusters", "3", func(s Scenario) bool { return s.Personas.Gardener.Clusters == 3 }},
+		{"personas.gardener.policy", "anti-affinity", func(s Scenario) bool { return s.Personas.Gardener.Policy == "anti-affinity" }},
+		{"personas.gardener.volume_gib.min", "2", func(s Scenario) bool { return s.Personas.Gardener.VolumeGiB.Min == 2 }},
+		{"personas.gardener.volume_gib.max", "4", func(s Scenario) bool { return s.Personas.Gardener.VolumeGiB.Max == 4 }},
+		{"personas.gardener.interval.min", "5s", func(s Scenario) bool {
+			return s.Personas.Gardener.Interval.Min == novascenario.Duration(5*time.Second)
+		}},
+		{"personas.gardener.interval.max", "2m", func(s Scenario) bool {
+			return s.Personas.Gardener.Interval.Max == novascenario.Duration(2*time.Minute)
+		}},
 		{"personas.legacy.share", "0.3", func(s Scenario) bool { return s.Personas.Legacy.Share == 0.3 }},
 		{"personas.legacy.cloud", "tenant-legacy", func(s Scenario) bool { return s.Personas.Legacy.Cloud == "tenant-legacy" }},
 		{"personas.legacy.networks", "2", func(s Scenario) bool { return s.Personas.Legacy.Networks == 2 }},
@@ -232,6 +371,8 @@ func TestSetErrors(t *testing.T) {
 		{"personas.legacy.nope", "1", `unknown override key "personas.legacy.nope"`},
 		{"personas.legacy.interval.min", "x", `override personas.legacy.interval.min: "x" is not a duration`},
 		{"personas.legacy.networks", "two", `override personas.legacy.networks: "two" is not an integer`},
+		{"personas.gardener.nope", "1", `unknown override key "personas.gardener.nope"`},
+		{"personas.gardener.clusters", "x", `override personas.gardener.clusters: "x" is not an integer`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.key, func(t *testing.T) {
@@ -250,6 +391,7 @@ func FuzzParse(f *testing.F) {
 	f.Add([]byte("name: x\npersonas:\n  ci: { share: .nan }\n"))
 	f.Add([]byte("chaos: { duration: 1m, parallel: { max: 4 } }\nservices: [a, a]\n"))
 	f.Add([]byte("name: x\nresources: { servers: 2 }\npersonas:\n  legacy: { share: 1, networks: 1, resize_flavor: m1.small, ports_per_server: { min: 0, max: 1 } }\n"))
+	f.Add([]byte("name: x\nresources: { servers: 3 }\npersonas:\n  gardener: { share: 1, clusters: 2, policy: anti-affinity, volume_gib: { min: 1, max: 1 } }\n"))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		s, err := Parse(data)
 		if err != nil {

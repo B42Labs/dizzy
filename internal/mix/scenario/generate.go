@@ -5,19 +5,26 @@ import (
 	"hash/fnv"
 
 	mixplan "github.com/B42Labs/dizzy/internal/mix/plan"
+	novaplan "github.com/B42Labs/dizzy/internal/nova/plan"
 	novascenario "github.com/B42Labs/dizzy/internal/nova/scenario"
 )
 
 // persona is one workload persona of a scenario: its name, its share as the
 // scenario states it, whether its resources are long-lived, whether its
-// servers cold-migrate, and the builder of its compute scenario for a given
-// number of servers.
+// servers cold-migrate, whether its servers are replaced one at a time within
+// their server group, and the builder of its compute scenario for a given
+// number of servers. check, when set, validates what the compute scenario
+// cannot for a given number of servers, and shape, when set, rewrites the
+// generated compute plan.
 type persona struct {
 	name        string
 	share       float64
 	longLived   bool
 	coldMigrate bool
+	rolling     bool
 	nova        func(servers int) novascenario.Scenario
+	check       func(servers int) error
+	shape       func(np *novaplan.Plan)
 }
 
 // personas returns the scenario's personas in canonical order, alphabetical
@@ -25,6 +32,7 @@ type persona struct {
 func (s Scenario) personas() []persona {
 	return []persona{
 		{name: "ci", share: s.Personas.CI.Share, nova: s.ciNova},
+		{name: "gardener", share: s.Personas.Gardener.Share, rolling: true, nova: s.gardenerNova, check: s.gardenerCheck, shape: s.gardenerShape},
 		{name: "legacy", share: s.Personas.Legacy.Share, longLived: true, coldMigrate: true, nova: s.legacyNova},
 	}
 }
@@ -55,6 +63,60 @@ func (s Scenario) ciNova(servers int) novascenario.Scenario {
 			VolumesPerServer:  ci.VolumesPerServer,
 			AttachedVolumeGiB: ci.VolumeGiB,
 		},
+	}
+}
+
+// gardenerNova builds the compute scenario of the Gardener persona: servers
+// servers on one network each, one network per cluster, with one data volume
+// each and no extra port or lifecycle operation. gardenerShape then spreads
+// the servers over the clusters.
+func (s Scenario) gardenerNova(servers int) novascenario.Scenario {
+	g := s.Personas.Gardener
+	return novascenario.Scenario{
+		Name:      s.Name + "/gardener",
+		Seed:      PersonaSeed(s.Seed, "gardener"),
+		Image:     s.Image,
+		Flavor:    s.Flavor,
+		Resources: novascenario.Resources{Servers: servers, Networks: g.Clusters},
+		Distribution: novascenario.Distribution{
+			NetworksPerServer: novascenario.Range{Min: 1, Max: 1},
+			VolumesPerServer:  novascenario.Range{Min: 1, Max: 1},
+			AttachedVolumeGiB: g.VolumeGiB,
+		},
+	}
+}
+
+// gardenerCheck validates the Gardener block for a persona of servers
+// servers: the policy is one of the two anti-affinity policies, there is at
+// least one cluster, and no cluster is left without a worker.
+func (s Scenario) gardenerCheck(servers int) error {
+	g := s.Personas.Gardener
+	if !novaplan.ValidPolicy(g.Policy) {
+		return fmt.Errorf("personas.gardener.policy must be %q or %q, got %q", novaplan.PolicyAntiAffinity, novaplan.PolicySoftAntiAffinity, g.Policy)
+	}
+	if g.Clusters < 1 {
+		return fmt.Errorf("personas.gardener.clusters must be at least 1, got %d", g.Clusters)
+	}
+	if servers >= 1 && g.Clusters > servers {
+		return fmt.Errorf("personas.gardener.clusters (%d) exceeds the persona's %d server(s)", g.Clusters, servers)
+	}
+	return nil
+}
+
+// gardenerShape turns the Gardener persona's compute plan into clusters: with
+// K networks it adds the server groups grp-0001 to grp-%04d of K, each with
+// the block's policy, and gives the server at index i the one network
+// Networks[i%K] and the group ServerGroups[i%K]. Network k and group k form
+// cluster k, so cluster sizes differ by at most one.
+func (s Scenario) gardenerShape(np *novaplan.Plan) {
+	k := len(np.Networks)
+	np.ServerGroups = make([]novaplan.ServerGroup, k)
+	for i := range np.ServerGroups {
+		np.ServerGroups[i] = novaplan.ServerGroup{Name: fmt.Sprintf("grp-%04d", i+1), Policy: s.Personas.Gardener.Policy}
+	}
+	for i := range np.Servers {
+		np.Servers[i].Networks = []string{np.Networks[i%k].Name}
+		np.Servers[i].Group = np.ServerGroups[i%k].Name
 	}
 }
 
@@ -105,7 +167,8 @@ func PersonaSeed(seed int64, name string) int64 {
 // emits, in canonical order, one plan persona for every persona that received
 // at least one server, with its normalized share, its seed and its generated
 // compute plan. Every server of a persona that cold-migrates is marked for cold
-// migration, and a long-lived persona is marked long-lived. The returned plan
+// migration, a persona with a shape has its compute plan rewritten, and a
+// long-lived or rolling persona is marked so. The returned plan
 // is validated before it is handed back, so a scenario with no server to
 // divide fails here.
 func (s Scenario) Generate() (*mixplan.Plan, error) {
@@ -141,12 +204,16 @@ func (s Scenario) Generate() (*mixplan.Plan, error) {
 				np.Servers[j].ColdMigrate = true
 			}
 		}
+		if ps.shape != nil {
+			ps.shape(np)
+		}
 		p.Personas = append(p.Personas, mixplan.Persona{
 			Name:      ps.name,
 			Share:     ps.share / sum,
 			Servers:   servers[i],
 			Seed:      ns.Seed,
 			LongLived: ps.longLived,
+			Rolling:   ps.rolling,
 			Nova:      np,
 		})
 	}

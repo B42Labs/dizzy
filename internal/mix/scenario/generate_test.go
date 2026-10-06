@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	novaplan "github.com/B42Labs/dizzy/internal/nova/plan"
 	novascenario "github.com/B42Labs/dizzy/internal/nova/scenario"
 )
 
@@ -65,6 +66,29 @@ func legacyBlock() Legacy {
 			Max: novascenario.Duration(time.Minute),
 		},
 	}
+}
+
+// gardenerBlock is the gardener block of the shipped small profile.
+func gardenerBlock() Gardener {
+	return Gardener{
+		Share:     0.3,
+		Clusters:  1,
+		Policy:    "soft-anti-affinity",
+		VolumeGiB: novascenario.Range{Min: 1, Max: 2},
+		Interval: novascenario.Interval{
+			Min: novascenario.Duration(10 * time.Second),
+			Max: novascenario.Duration(time.Minute),
+		},
+	}
+}
+
+// mixedScenario is smallScenario with the three personas at the shares 0.5,
+// 0.3 and 0.2, which give them 3, 2 and 1 servers.
+func mixedScenario() Scenario {
+	s := smallScenario()
+	s.Personas.CI.Share = 0.5
+	s.Personas.Gardener = gardenerBlock()
+	return s
 }
 
 // marshal encodes v as the indented JSON mix generate writes.
@@ -315,9 +339,10 @@ func TestGenerateLegacyOnly(t *testing.T) {
 
 // TestCIPlanJSONUnchangedKeys confirms the CI persona's entry carries neither
 // longLived nor coldMigrate, so its plan JSON keeps its bytes, while the
-// Legacy entry carries both.
+// Legacy entry carries both, and that only the Gardener entry carries the
+// rolling, serverGroups and group keys.
 func TestCIPlanJSONUnchangedKeys(t *testing.T) {
-	p, err := smallScenario().Generate()
+	p, err := mixedScenario().Generate()
 	if err != nil {
 		t.Fatalf("Generate(): %v", err)
 	}
@@ -327,6 +352,116 @@ func TestCIPlanJSONUnchangedKeys(t *testing.T) {
 		if strings.Contains(data, `"longLived"`) != want || strings.Contains(data, `"coldMigrate"`) != want {
 			t.Errorf("persona %s JSON has longLived=%v coldMigrate=%v, want both %v",
 				ps.Name, strings.Contains(data, `"longLived"`), strings.Contains(data, `"coldMigrate"`), want)
+		}
+		want = ps.Name == "gardener"
+		for _, key := range []string{`"rolling"`, `"serverGroups"`, `"group"`} {
+			if strings.Contains(data, key) != want {
+				t.Errorf("persona %s JSON has %s = %v, want %v", ps.Name, key, !want, want)
+			}
+		}
+	}
+}
+
+// TestGardenerPersonaShape confirms the Gardener persona of the mixed
+// scenario is one cluster: one network, one soft-anti-affinity group, and two
+// workers that each name both and have one data volume, with no port, and
+// that the persona is the only rolling one.
+func TestGardenerPersonaShape(t *testing.T) {
+	p, err := mixedScenario().Generate()
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	var names []string
+	for _, ps := range p.Personas {
+		names = append(names, ps.Name)
+		if ps.Rolling != (ps.Name == "gardener") {
+			t.Errorf("persona %s rolling = %v", ps.Name, ps.Rolling)
+		}
+	}
+	if want := []string{"ci", "gardener", "legacy"}; !reflect.DeepEqual(names, want) {
+		t.Fatalf("personas = %v, want %v", names, want)
+	}
+	g := p.Personas[1]
+	np := g.Nova
+	if g.Servers != 2 || np.Scenario != "small/gardener" || g.Seed != PersonaSeed(42, "gardener") {
+		t.Errorf("gardener = %d servers, scenario %s, seed %d, want 2, small/gardener and the persona seed", g.Servers, np.Scenario, g.Seed)
+	}
+	if len(np.Networks) != 1 || np.Networks[0].Name != "net-0001" {
+		t.Errorf("networks = %+v, want net-0001 alone", np.Networks)
+	}
+	if want := []novaplan.ServerGroup{{Name: "grp-0001", Policy: "soft-anti-affinity"}}; !reflect.DeepEqual(np.ServerGroups, want) {
+		t.Errorf("server groups = %+v, want %+v", np.ServerGroups, want)
+	}
+	for _, srv := range np.Servers {
+		if !reflect.DeepEqual(srv.Networks, []string{"net-0001"}) || srv.Group != "grp-0001" ||
+			srv.StopStart != "" || srv.Resize || srv.LiveMigrate || srv.ColdMigrate || srv.Delete || srv.BootFromVolume {
+			t.Errorf("server %+v, want a plain worker on net-0001 in grp-0001", srv)
+		}
+	}
+	perServer := map[string]int{}
+	for _, v := range np.Volumes {
+		perServer[v.Server]++
+	}
+	if len(np.Volumes) != 2 || perServer["srv-0001"] != 1 || perServer["srv-0002"] != 1 || len(np.Ports) != 0 {
+		t.Errorf("volumes = %+v, ports = %d, want one volume per worker and no port", np.Volumes, len(np.Ports))
+	}
+}
+
+// TestGardenerClustersRoundRobin confirms the workers are spread over the
+// clusters round-robin, so cluster sizes differ by at most one, and that each
+// worker's network and group belong to the same cluster.
+func TestGardenerClustersRoundRobin(t *testing.T) {
+	s := mixedScenario()
+	s.Resources.Servers = 7
+	s.Personas.CI.Share, s.Personas.Legacy.Share = 0, 0
+	s.Personas.Gardener.Clusters = 3
+	p, err := s.Generate()
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	np := p.Personas[0].Nova
+	if len(np.Networks) != 3 || len(np.ServerGroups) != 3 {
+		t.Fatalf("%d networks and %d groups, want 3 of each", len(np.Networks), len(np.ServerGroups))
+	}
+	size := map[string]int{}
+	for _, srv := range np.Servers {
+		size[srv.Group]++
+		if len(srv.Networks) != 1 || strings.TrimPrefix(srv.Networks[0], "net-") != strings.TrimPrefix(srv.Group, "grp-") {
+			t.Errorf("server %s is on %v in %s, want the network and group of one cluster", srv.Name, srv.Networks, srv.Group)
+		}
+	}
+	if want := map[string]int{"grp-0001": 3, "grp-0002": 2, "grp-0003": 2}; !reflect.DeepEqual(size, want) {
+		t.Errorf("cluster sizes = %v, want %v", size, want)
+	}
+}
+
+// TestGenerateGardenerOnly confirms a scenario whose only share above 0 is the
+// Gardener persona's gives it every server.
+func TestGenerateGardenerOnly(t *testing.T) {
+	s := mixedScenario()
+	s.Personas.CI.Share, s.Personas.Legacy.Share = 0, 0
+	p, err := s.Generate()
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	if len(p.Personas) != 1 || p.Personas[0].Name != "gardener" || p.Personas[0].Servers != 6 || !p.Personas[0].Rolling {
+		t.Errorf("personas = %+v, want gardener alone, rolling, with 6 servers", p.Personas)
+	}
+}
+
+// TestGenerateOneServerDropsGardener confirms a Gardener persona that receives
+// no server is left out of the plan without an error, though its cluster
+// count exceeds its servers.
+func TestGenerateOneServerDropsGardener(t *testing.T) {
+	s := mixedScenario()
+	s.Resources.Servers = 1
+	p, err := s.Generate()
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	for _, ps := range p.Personas {
+		if ps.Name == "gardener" {
+			t.Errorf("personas = %+v, want no gardener persona", p.Personas)
 		}
 	}
 }

@@ -25,14 +25,16 @@ type Plan struct {
 // its scenario share divided by the sum of all shares, and Servers its part of
 // the scenario's server envelope. Seed is derived from the plan seed and the
 // persona name. LongLived marks a persona whose resources are kept until the
-// run's teardown and mutated repeatedly. Nova is the compute plan the persona
-// churns.
+// run's teardown and mutated repeatedly. Rolling marks a persona whose servers
+// are replaced one at a time within their server group. Nova is the compute
+// plan the persona churns.
 type Persona struct {
 	Name      string         `json:"name"`
 	Share     float64        `json:"share"`
 	Servers   int            `json:"servers"`
 	Seed      int64          `json:"seed"`
 	LongLived bool           `json:"longLived,omitempty"`
+	Rolling   bool           `json:"rolling,omitempty"`
 	Nova      *novaplan.Plan `json:"nova"`
 }
 
