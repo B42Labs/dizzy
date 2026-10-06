@@ -551,6 +551,98 @@ func TestBuildMixRecord(t *testing.T) {
 	})
 }
 
+// keystoneTestLane is a fake background Keystone lane with two roots,
+// recording into a child of overall.
+func keystoneTestLane(overall *metrics.Collector) *mix.Lane {
+	return &mix.Lane{
+		Name: "keystone", Service: "keystone", RunID: "run1234-keystone", Cloud: "admin", ProjectID: "proj-admin",
+		Scenario: "small/keystone", Seed: 13, Collector: overall.Child(),
+		Roots: []resource.Resource{{Kind: "domain", Logical: "dom-0001", ID: "d1"}, {Kind: "role", Logical: "role-0001", ID: "r1"}},
+	}
+}
+
+func TestBuildMixRecordWithLanes(t *testing.T) {
+	start := time.Date(2026, 10, 6, 10, 0, 0, 0, time.UTC)
+	finished := start.Add(2 * time.Minute)
+
+	t.Run("two personas and a lane with a result", func(t *testing.T) {
+		p := mixTestPlan()
+		overall := metrics.NewCollector()
+		keystone := keystoneTestLane(overall)
+		lanes := append(mixTestLanes(p, overall), keystone)
+		keystone.Collector.Record(metrics.Sample{Type: "project", Duration: time.Second, Success: true})
+		results := map[string]*chaos.Result{
+			"ci": {Created: []resource.Resource{{Kind: "server", ID: "s1"}}},
+			"keystone": {Creates: 3, Created: []resource.Resource{
+				{Kind: "project", Logical: "proj-0001", ID: "p1"}, {Kind: "user", Logical: "user-0001", ID: "u1"}, {Kind: "user", Logical: "user-0002", ID: "u2"},
+			}},
+		}
+
+		rec := buildMixRecord(p, lanes, results, overall, "run1234", start, finished)
+		if len(rec.Personas) != 2 || len(rec.Lanes) != 1 {
+			t.Fatalf("personas/lanes = %+v / %+v, want two personas and one lane", rec.Personas, rec.Lanes)
+		}
+		l := rec.Lanes[0]
+		if l.Name != "keystone" || l.RunID != "run1234-keystone" || l.Cloud != "admin" || l.ProjectID != "proj-admin" ||
+			l.Scenario != "small/keystone" || l.Seed != 13 || l.Chaos == nil || l.Chaos.Creates != 3 || l.Metrics.Overall.Attempted != 1 {
+			t.Errorf("lane entry = %+v, want keystone with its identity, cloud, project, scenario, seed, chaos and own sample", l)
+		}
+		var got []string
+		for _, r := range rec.Created {
+			if r.Lane != "" && r.Persona != "" {
+				t.Errorf("created entry %+v names both a lane and a persona", r)
+			}
+			got = append(got, r.Persona+"|"+r.Lane+"|"+r.ID)
+		}
+		want := []string{"ci||s1", "|keystone|d1", "|keystone|r1", "|keystone|p1", "|keystone|u1", "|keystone|u2"}
+		if strings.Join(got, " ") != strings.Join(want, " ") {
+			t.Errorf("created = %v, want %v", got, want)
+		}
+		if keystone.Roots[0].Lane != "" || results["keystone"].Created[0].Lane != "" {
+			t.Error("buildMixRecord marked the lane's roots or the engine's own result")
+		}
+
+		data, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if !bytes.Contains(data, []byte(`"lanes":[{"name":"keystone","runID":"run1234-keystone"`)) || !bytes.Contains(data, []byte(`"lane":"keystone"`)) {
+			t.Errorf("record JSON lacks the lane entry or the lane marks: %s", data)
+		}
+	})
+
+	t.Run("a lane without a result", func(t *testing.T) {
+		p := mixTestPlan()
+		overall := metrics.NewCollector()
+		lanes := append(mixTestLanes(p, overall), keystoneTestLane(overall))
+
+		rec := buildMixRecord(p, lanes, map[string]*chaos.Result{}, overall, "run1234", start, finished)
+		if len(rec.Lanes) != 1 || rec.Lanes[0].Chaos != nil {
+			t.Fatalf("lanes = %+v, want one lane without chaos", rec.Lanes)
+		}
+		if len(rec.Created) != 2 || rec.Created[0].ID != "d1" || rec.Created[1].ID != "r1" || rec.Created[0].Lane != "keystone" {
+			t.Errorf("created = %+v, want only the lane's two roots", rec.Created)
+		}
+	})
+
+	t.Run("no background lane", func(t *testing.T) {
+		p := mixTestPlan()
+		overall := metrics.NewCollector()
+		results := map[string]*chaos.Result{"ci": {Created: []resource.Resource{{Kind: "server", ID: "s1"}}}}
+		rec := buildMixRecord(p, mixTestLanes(p, overall), results, overall, "run1234", start, finished)
+		if rec.Lanes != nil {
+			t.Errorf("lanes = %+v, want nil", rec.Lanes)
+		}
+		data, err := json.Marshal(rec)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if bytes.Contains(data, []byte(`"lanes"`)) || bytes.Contains(data, []byte(`"lane"`)) {
+			t.Errorf("record JSON carries a lanes or lane key without a background lane: %s", data)
+		}
+	})
+}
+
 // TestMixCheckpointWritesIncompleteRecord confirms the checkpoint callback mix
 // chaos hands mix.Run writes the record built from the snapshots, marked
 // incomplete.
@@ -636,6 +728,13 @@ func (f *teardownLane) lane(name string) *mix.Lane {
 	}
 }
 
+// serviceLane is lane for the background lane of the service name.
+func (f *teardownLane) serviceLane(name string) *mix.Lane {
+	l := f.lane(name)
+	l.Service = name
+	return l
+}
+
 // mixCreated is a mix record's created list with resources of ci and legacy.
 var mixCreated = []resource.Resource{
 	{Kind: "server", ID: "s1", Persona: "ci"},
@@ -704,6 +803,62 @@ func TestFinishMixChurn(t *testing.T) {
 		}
 		if strings.Contains(out.String(), "leak check") {
 			t.Errorf("output %q has a leak-check line although teardown failed", out.String())
+		}
+	})
+
+	t.Run("tears down a persona and a background lane", func(t *testing.T) {
+		var log []string
+		cmd := &cobra.Command{}
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		created := append(append([]resource.Resource{}, mixCreated...), resource.Resource{Kind: "project", ID: "p1", Lane: "keystone"})
+		lanes := []*mix.Lane{(&teardownLane{log: &log, leaked: 1}).lane("ci"), (&teardownLane{log: &log, leaked: 2}).serviceLane("keystone")}
+
+		if err := finishMixChurn(context.Background(), cmd, &globalOptions{}, lanes, created, "run1234", "", "small.yaml", nil, false, false); err != nil {
+			t.Fatalf("finishMixChurn: %v", err)
+		}
+		wantLog := []string{"cleanup ci s1,n1", "cleanup keystone p1", "leaked ci", "leaked keystone"}
+		if strings.Join(log, "|") != strings.Join(wantLog, "|") {
+			t.Errorf("calls = %q, want %q", log, wantLog)
+		}
+		wantOut := "deleted 2 resource(s) for run run1234-ci\n" +
+			"deleted 1 resource(s) for run run1234-keystone\n" +
+			"leak check: 3 run-tagged resource(s) still present after teardown\n"
+		if out.String() != wantOut {
+			t.Errorf("output = %q, want %q", out.String(), wantOut)
+		}
+	})
+
+	t.Run("a failing background lane does not stop the persona", func(t *testing.T) {
+		var log []string
+		boom := errors.New("boom")
+		cmd := &cobra.Command{}
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		lanes := []*mix.Lane{(&teardownLane{log: &log, cleanupErr: boom}).serviceLane("keystone"), (&teardownLane{log: &log}).lane("ci")}
+
+		err := finishMixChurn(context.Background(), cmd, &globalOptions{}, lanes, mixCreated, "run1234", "", "small.yaml", nil, false, false)
+		if !errors.Is(err, boom) || !strings.Contains(err.Error(), `tearing down lane "keystone" (run run1234-keystone): boom`) {
+			t.Fatalf("finishMixChurn = %v, want it to name the failing lane", err)
+		}
+		if len(log) != 2 || log[1] != "cleanup ci s1,n1" {
+			t.Errorf("calls = %q, want the ci persona cleaned up after the lane failed", log)
+		}
+		if strings.Contains(out.String(), "leak check") {
+			t.Errorf("output %q has a leak-check line although teardown failed", out.String())
+		}
+	})
+
+	t.Run("a failing leak check names the lane", func(t *testing.T) {
+		var log []string
+		boom := errors.New("listing projects: 503")
+		cmd := &cobra.Command{}
+		cmd.SetOut(&bytes.Buffer{})
+		lanes := []*mix.Lane{(&teardownLane{log: &log}).lane("ci"), (&teardownLane{log: &log, leakErr: boom}).serviceLane("keystone")}
+
+		err := finishMixChurn(context.Background(), cmd, &globalOptions{}, lanes, nil, "run1234", "", "small.yaml", nil, false, false)
+		if !errors.Is(err, boom) || !strings.HasPrefix(err.Error(), `leak check for lane "keystone": `) {
+			t.Errorf("finishMixChurn = %v, want the wrapped leak-check error", err)
 		}
 	})
 
@@ -779,16 +934,16 @@ func TestWarnSharedProjects(t *testing.T) {
 
 	warnSharedProjects([]*mix.Lane{
 		{Name: "ci", ProjectID: "proj-1"},
-		{Name: "legacy", ProjectID: "proj-1"},
-		{Name: "gardener", ProjectID: "proj-2"},
+		{Name: "legacy", ProjectID: "proj-2"},
+		{Name: "keystone", Service: "keystone", ProjectID: "proj-1"},
 		{Name: "a"},
-		{Name: "b"},
+		{Name: "glance", Service: "glance"},
 	})
 
 	if got := strings.Count(logs.String(), "level=WARN"); got != 1 {
 		t.Fatalf("got %d warnings, want 1:\n%s", got, logs.String())
 	}
-	for _, want := range []string{`msg="personas share a project; each quota pre-check saw only its own plan"`, "project=proj-1", "personas=\"[ci legacy]\""} {
+	for _, want := range []string{`msg="lanes share a project; each quota pre-check saw only its own plan"`, "project=proj-1", "lanes=\"[ci keystone]\""} {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("warning lacks %s:\n%s", want, logs.String())
 		}

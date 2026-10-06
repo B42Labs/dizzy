@@ -58,27 +58,33 @@ func newMixStatusCmd(opts *globalOptions) *cobra.Command {
 }
 
 // writeMixStatus prints, for every lane, a "persona <name> (run <identity>)"
-// heading and the status table of the record's resources that persona created,
-// re-queried through the lane. It visits every lane and returns an error when
-// any table failed.
+// heading, or "lane <name> (run <identity>)" for a background lane, and the
+// status table of the record's resources that lane created, re-queried
+// through the lane. It visits every lane and returns an error when any table
+// failed.
 func writeMixStatus(ctx context.Context, cmd *cobra.Command, rec *run.Record, lanes []*mix.Lane) error {
 	out := cmd.OutOrStdout()
 	var failed int
+	what := "personas"
 	for i, l := range lanes {
 		sep := ""
 		if i > 0 {
 			sep = "\n"
 		}
-		if _, err := fmt.Fprintf(out, "%spersona %s (run %s)\n", sep, l.Name, l.RunID); err != nil {
+		noun := laneNoun(l)
+		if l.Background() {
+			what = "personas and lanes"
+		}
+		if _, err := fmt.Fprintf(out, "%s%s %s (run %s)\n", sep, noun, l.Name, l.RunID); err != nil {
 			return fmt.Errorf("writing output: %w", err)
 		}
-		if err := writeStatusTable(ctx, cmd, observeFunc(l.Observe), resourcesOfPersona(rec.Created, l.Name)); err != nil {
+		if err := writeStatusTable(ctx, cmd, observeFunc(l.Observe), resourcesOfLane(rec.Created, l)); err != nil {
 			failed++
-			slog.Warn("re-querying persona failed", "persona", l.Name, "run", l.RunID, "error", err)
+			slog.Warn("re-querying "+noun+" failed", noun, l.Name, "run", l.RunID, "error", err)
 		}
 	}
 	if failed > 0 {
-		return fmt.Errorf("re-querying %d of %d personas failed", failed, len(lanes))
+		return fmt.Errorf("re-querying %d of %d %s failed", failed, len(lanes), what)
 	}
 	return nil
 }

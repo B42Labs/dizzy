@@ -178,7 +178,7 @@ against the `server_groups` limit and its largest group against the
 When two personas name entries of the same project, each check passes
 on its own even when both plans together do not fit. The run does not reject
 this setup, since the suffixed identities keep the two personas' resources
-apart. It logs `personas share a project; each quota pre-check saw only its own
+apart. It logs `lanes share a project; each quota pre-check saw only its own
 plan` and goes on, with a weaker pre-check.
 
 ## One record, no merged time series

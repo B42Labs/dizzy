@@ -103,11 +103,8 @@ func buildMixLane(ctx context.Context, opts *globalOptions, in mixLaneInput) (_ 
 	cleaner := novaTimeoutCleaner{client, opts.timeout}
 	groups := serverGroupTimeoutCleaner{client, opts.timeout}
 	projectID, _ := nova.ProjectID(cs.Compute)
-	// Discovery is project-scoped, so in another project it finds nothing and
-	// the recorded ids are 404s that count as deleted: refuse instead.
-	if in.project != "" && projectID != "" && projectID != in.project {
-		return nil, fmt.Errorf("persona %q authenticated against project %s, but the run record says it ran in project %s; authenticate with the cloud the run used",
-			in.name, projectID, in.project)
+	if err := refuseOtherProject("persona", in.name, projectID, in.project); err != nil {
+		return nil, err
 	}
 
 	l := &mix.Lane{
@@ -140,6 +137,28 @@ func buildMixLane(ctx context.Context, opts *globalOptions, in mixLaneInput) (_ 
 	}
 	l.Nodes, l.Seed, l.Config = nodes, in.persona.Seed, in.cfg
 	return l, nil
+}
+
+// refuseOtherProject returns an error when a lane authenticated against
+// project got although the run record says it ran in project recorded, and
+// nil when either is unknown. Discovery is project-scoped, so in another
+// project it finds nothing and the recorded ids are 404s that count as
+// deleted. noun names the kind of lane, as laneNoun does.
+func refuseOtherProject(noun, name, got, recorded string) error {
+	if recorded == "" || got == "" || got == recorded {
+		return nil
+	}
+	return fmt.Errorf("%s %q authenticated against project %s, but the run record says it ran in project %s; authenticate with the cloud the run used",
+		noun, name, got, recorded)
+}
+
+// laneNoun names the kind of a lane in messages: "lane" for a background lane
+// and "persona" for a persona's lane.
+func laneNoun(l *mix.Lane) string {
+	if l.Background() {
+		return "lane"
+	}
+	return "persona"
 }
 
 // laneCleanup tears down one lane under its identity: it runs novaexec.Cleanup
@@ -202,10 +221,11 @@ func buildPersonaNodes(ps *mixplan.Persona, c novagraph.Nova, r novaexec.Resolve
 	return novagraph.Build(ps.Nova, c, r, opTimeout)
 }
 
-// warnSharedProjects logs one warning for every project two or more lanes
-// authenticated against: each lane pre-checked the compute quota against its
-// own plan only, so together they may exceed it. Their resources stay apart by
-// identity, so the run goes on. A lane without a known project is skipped.
+// warnSharedProjects logs one warning for every project two or more lanes,
+// personas' or background ones, authenticated against: each lane pre-checked
+// the quota against its own plan only, so together they may exceed it. Their
+// resources stay apart by identity, so the run goes on. A lane without a known
+// project is skipped.
 func warnSharedProjects(lanes []*mix.Lane) {
 	var projects []string
 	names := make(map[string][]string)
@@ -220,7 +240,7 @@ func warnSharedProjects(lanes []*mix.Lane) {
 	}
 	for _, id := range projects {
 		if len(names[id]) > 1 {
-			slog.Warn("personas share a project; each quota pre-check saw only its own plan", "project", id, "personas", names[id])
+			slog.Warn("lanes share a project; each quota pre-check saw only its own plan", "project", id, "lanes", names[id])
 		}
 	}
 }
@@ -256,12 +276,17 @@ func planLaneInputs(s mixscenario.Scenario, p *mixplan.Plan, runID string, overa
 	return inputs, nil
 }
 
-// resourcesOfPersona returns the entries of a mix record's created list that
-// the named persona created.
-func resourcesOfPersona(created []resource.Resource, name string) []resource.Resource {
+// resourcesOfLane returns the entries of a mix record's created list that the
+// lane created: those whose lane is its name for a background lane, and those
+// whose persona is its name for a persona's lane.
+func resourcesOfLane(created []resource.Resource, l *mix.Lane) []resource.Resource {
 	var out []resource.Resource
 	for _, r := range created {
-		if r.Persona == name {
+		owner := r.Persona
+		if l.Background() {
+			owner = r.Lane
+		}
+		if owner == l.Name {
 			out = append(out, r)
 		}
 	}
@@ -292,19 +317,19 @@ func buildCleanupLanes(ctx context.Context, opts *globalOptions, inputs []mixLan
 }
 
 // deleteLaneResources runs every lane's Cleanup with the entries of created
-// its persona made, in lane order, and prints how many each deleted under its
+// the lane made, in lane order, and prints how many each deleted under its
 // identity. A failing lane does not stop the others; their errors come back
-// joined, each naming the persona after action ("tearing down", "cleaning
-// up").
+// joined, each naming the persona or lane after action ("tearing down",
+// "cleaning up").
 func deleteLaneResources(ctx context.Context, out io.Writer, lanes []*mix.Lane, created []resource.Resource, action string) error {
 	var errs []error
 	for _, l := range lanes {
-		deleted, err := l.Cleanup(ctx, resourcesOfPersona(created, l.Name))
+		deleted, err := l.Cleanup(ctx, resourcesOfLane(created, l))
 		if _, werr := fmt.Fprintf(out, "deleted %d resource(s) for run %s\n", deleted, l.RunID); werr != nil {
 			return fmt.Errorf("writing output: %w", werr)
 		}
 		if err != nil {
-			errs = append(errs, fmt.Errorf("%s persona %q (run %s): %w", action, l.Name, l.RunID, err))
+			errs = append(errs, fmt.Errorf("%s %s %q (run %s): %w", action, laneNoun(l), l.Name, l.RunID, err))
 		}
 	}
 	return errors.Join(errs...)
