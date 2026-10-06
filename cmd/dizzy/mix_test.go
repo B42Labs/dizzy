@@ -147,7 +147,8 @@ func TestMixGenerateErrors(t *testing.T) {
 
 // TestMixGenerateSmallProfile runs mix generate on the shipped small profile
 // twice and checks the output is byte-identical and has the documented shape,
-// and that --set personas.legacy.share=0 gives the CI persona every server.
+// and that --set personas.gardener.share=0 divides the servers between the CI
+// and the Legacy persona.
 func TestMixGenerateSmallProfile(t *testing.T) {
 	data, err := scenarios.Files.ReadFile("mix/small.yaml")
 	if err != nil {
@@ -168,10 +169,10 @@ func TestMixGenerateSmallProfile(t *testing.T) {
 	}
 
 	type persona struct {
-		name      string
-		servers   int
-		share     float64
-		longLived bool
+		name               string
+		servers            int
+		share              float64
+		longLived, rolling bool
 	}
 	personasOf := func(out string) []persona {
 		var got []persona
@@ -179,20 +180,39 @@ func TestMixGenerateSmallProfile(t *testing.T) {
 			if len(ps.Nova.Servers) != ps.Servers {
 				t.Errorf("persona %s plans %d servers, want its share %d", ps.Name, len(ps.Nova.Servers), ps.Servers)
 			}
-			got = append(got, persona{ps.Name, ps.Servers, ps.Share, ps.LongLived})
+			got = append(got, persona{ps.Name, ps.Servers, ps.Share, ps.LongLived, ps.Rolling})
 		}
 		return got
 	}
-	if got, want := personasOf(first), []persona{{"ci", 5, 0.8, false}, {"legacy", 1, 0.2, true}}; !reflect.DeepEqual(got, want) {
+	want := []persona{{"ci", 3, 0.5, false, false}, {"gardener", 2, 0.3, false, true}, {"legacy", 1, 0.2, true, false}}
+	if got := personasOf(first); !reflect.DeepEqual(got, want) {
 		t.Errorf("personas = %+v, want %+v", got, want)
 	}
 
-	ciOnly, err := execRoot(t, "mix", "generate", "--scenario", path, "--set", "personas.legacy.share=0")
+	noGardener, err := execRoot(t, "mix", "generate", "--scenario", path, "--set", "personas.gardener.share=0")
 	if err != nil {
-		t.Fatalf("generate --set personas.legacy.share=0: %v", err)
+		t.Fatalf("generate --set personas.gardener.share=0: %v", err)
 	}
-	if got, want := personasOf(ciOnly), []persona{{"ci", 6, 1, false}}; !reflect.DeepEqual(got, want) {
-		t.Errorf("personas with the legacy share 0 = %+v, want %+v", got, want)
+	var split []string
+	for _, ps := range personasOf(noGardener) {
+		split = append(split, fmt.Sprintf("%s %d", ps.name, ps.servers))
+	}
+	if want := []string{"ci 4", "legacy 2"}; !reflect.DeepEqual(split, want) {
+		t.Errorf("personas with the gardener share 0 = %v, want %v", split, want)
+	}
+}
+
+// TestMixGenerateRejectsGardenerPolicy confirms a Gardener policy other than
+// the two anti-affinity policies fails the small profile before any API call.
+func TestMixGenerateRejectsGardenerPolicy(t *testing.T) {
+	noCloud(t)
+	data, err := scenarios.Files.ReadFile("mix/small.yaml")
+	if err != nil {
+		t.Fatalf("reading shipped profile: %v", err)
+	}
+	_, err = execRoot(t, "mix", "generate", "--scenario", writeScenario(t, string(data)), "--set", "personas.gardener.policy=affinity")
+	if want := `invalid scenario: personas.gardener.policy must be "anti-affinity" or "soft-anti-affinity", got "affinity"`; err == nil || err.Error() != want {
+		t.Errorf("mix generate = %v, want %q", err, want)
 	}
 }
 

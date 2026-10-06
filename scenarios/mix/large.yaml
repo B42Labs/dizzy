@@ -14,7 +14,7 @@ resources:
 
 personas:
   ci:                                         # short-lived servers on one network each, no lifecycle operation
-    share: 0.8                                # share of resources.servers
+    share: 0.5                                # share of resources.servers
     cloud: ""                                 # clouds.yaml entry of the persona's project; "" uses --os-cloud
     networks: 8                               # networks the persona's servers are spread over
     volumes_per_server: { min: 0, max: 1 }    # data volumes attached per server
@@ -22,6 +22,13 @@ personas:
     interval:           { min: 100ms, max: 1s }  # random delay drawn per churn tick
     churn_ratio: 0.5                          # create bias at steady state (0..1)
     target_fill: 0.6                          # fraction of the persona's envelope kept populated (0..1)
+  gardener:                                   # Kubernetes clusters: workers in an anti-affinity server group, replaced one at a time
+    share: 0.3                                # share of resources.servers
+    cloud: ""                                 # clouds.yaml entry of the persona's project; "" uses --os-cloud
+    clusters: 3                               # clusters the workers are spread over, each with its own network and server group
+    policy: soft-anti-affinity                # or anti-affinity, which needs a compute host per worker of a cluster
+    volume_gib:         { min: 1, max: 2 }    # size drawn for the one data volume of each worker
+    interval:           { min: 10s, max: 1m } # random delay drawn per tick of the persona's engine
   legacy:                                     # long-lived servers changed in place until teardown
     share: 0.2                                # share of resources.servers
     cloud: ""                                 # clouds.yaml entry of the persona's project; "" uses --os-cloud

@@ -196,10 +196,11 @@ func TestValidate(t *testing.T) {
 		{"negative share", func(s *Scenario) { s.Personas.CI.Share = -1 }, "personas.ci.share must be a finite number of at least 0, got -1"},
 		{"NaN share", func(s *Scenario) { s.Personas.CI.Share = math.NaN() }, "personas.ci.share must be a finite number of at least 0, got NaN"},
 		{"infinite share", func(s *Scenario) { s.Personas.CI.Share = math.Inf(1) }, "personas.ci.share must be a finite number of at least 0, got +Inf"},
-		{"zero shares", func(s *Scenario) { s.Personas.CI.Share = 0; s.Personas.Legacy.Share = 0 }, "at least one persona must have a share above 0"},
+		{"zero shares", func(s *Scenario) { s.Personas.CI.Share = 0; s.Personas.Gardener.Share = 0; s.Personas.Legacy.Share = 0 },
+			"at least one persona must have a share above 0"},
 		{"negative legacy share", func(s *Scenario) { s.Personas.Legacy.Share = -1 }, "personas.legacy.share must be a finite number of at least 0, got -1"},
 		{"NaN legacy share", func(s *Scenario) { s.Personas.Legacy.Share = math.NaN() }, "personas.legacy.share must be a finite number of at least 0, got NaN"},
-		{"legacy alone", func(s *Scenario) { s.Personas.CI.Share = 0; s.Personas.Legacy = legacyBlock() }, ""},
+		{"legacy alone", func(s *Scenario) { s.Personas.CI.Share = 0; s.Personas.Gardener.Share = 0; s.Personas.Legacy = legacyBlock() }, ""},
 		{"negative interval", func(s *Scenario) { s.Personas.CI.Interval.Min = d(-time.Second) }, "personas.ci.interval.min must not be negative, got -1s"},
 		{"inverted interval", func(s *Scenario) { s.Personas.CI.Interval.Min = d(2 * time.Second) }, "personas.ci.interval.min (2s) must not exceed personas.ci.interval.max (1s)"},
 		{"churn ratio above 1", func(s *Scenario) { s.Personas.CI.ChurnRatio = 1.5 }, "personas.ci.churn_ratio must be between 0 and 1, got 1.5"},
@@ -275,7 +276,7 @@ func TestValidateGardener(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			s := mixedScenario()
+			s := smallScenario()
 			tc.mutate(&s)
 			err := s.Validate()
 			switch {
