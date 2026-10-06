@@ -8,10 +8,11 @@ error rate of a soak rises, the useful question is which of these patterns
 caused it.
 
 `mix chaos` runs several such patterns, called **personas**, side by side in
-one run and keeps them apart in the results. This build ships two personas:
-`ci`, whose servers live for minutes, and `legacy`, whose servers live for the
-whole run and are changed in place. This page explains how the combined run is
-put together and why.
+one run and keeps them apart in the results. This build ships three personas:
+`ci`, whose servers live for minutes; `gardener`, whose servers form
+Kubernetes clusters in anti-affinity server groups and are replaced one worker
+at a time; and `legacy`, whose servers live for the whole run and are changed
+in place. This page explains how the combined run is put together and why.
 
 ## One engine per persona
 
@@ -78,6 +79,59 @@ read an operation's outcome, and the schedule would stop being a function of
 scenario, seed and settings. The failure shows as a failed create, and the
 persona runs with one server fewer.
 
+## Clusters that roll
+
+Gardener runs Kubernetes clusters on OpenStack. The worker nodes of a cluster
+boot into one server group with an anti-affinity policy, so the scheduler puts
+them on different compute hosts, and a rolling update replaces them one after
+another for as long as the cluster exists. The Gardener persona brings both to
+the cloud: placement constraints that compete for hosts with the CI churn and
+the Legacy migrations, and a steady sequence of one delete and one create per
+cluster.
+
+A cluster is one network, one server group and the workers booted into that
+group on that network, each with one data volume. The persona's servers are
+spread over `clusters` clusters round-robin, so cluster sizes differ by at most
+one, and every group has the block's `policy`. `anti-affinity` fails a worker
+the scheduler cannot put on a host of its own, so a cluster needs as many
+compute hosts as it has workers; `soft-anti-affinity` spreads the workers as
+far as the hosts allow. The bundled profiles use the soft policy so that they
+run on a small lab.
+
+The replacement is a third node lifecycle of the churn engine, next to
+churned and pinned. The networks and server groups are pinned. Every worker and
+its volume carry the name of the worker's group as their **Roll** value, and
+the nodes that share one form a **rolling set**, whose roots are the workers.
+The engine creates absent rolling nodes before anything else, as it does pinned
+ones. Once every node of a set is present, a worker may be drawn for a delete,
+and the engine then deletes the worker's volume and the worker in the same
+step, children first. The steps that follow create the worker and then its
+volume again under the same names.
+
+A replacement deletes the worker first and creates it afterwards. There is no
+surge server: booting the replacement before the old worker is gone would need
+a spare server per cluster beyond the persona's share. While a worker is
+replaced, its cluster runs one worker short.
+
+The engine decides a replacement from its logical inventory alone. It does not
+wait for a delete to return before it decides the create, or for a create to
+return before it rolls the next worker. The order in the cloud comes from
+operation dependencies instead: every delete of a roll waits for every earlier
+operation of the same set, and a create waits for the delete before it. The
+cloud therefore sees the replacements of one cluster strictly one after
+another, while two clusters replace concurrently. Reading the outcomes would
+make the next decision depend on how fast the cloud answered, and the schedule
+would stop being a function of scenario, seed and settings.
+
+A worker whose boot failed is still present in the inventory, since the engine
+marks a node present when it decides to create it, so its cluster counts as
+whole. A later roll that draws the worker deletes whatever the failed create
+left, nothing at all when the create produced no server, and boots it again.
+Until then the cluster runs one worker short, and a roll of another worker of
+the cluster can take a second one down. A failed create of a network or a
+server group is not repaired, as for every pinned node, and the workers that
+need it are skipped.
+
 ## Shares divide servers
 
 `resources.servers` is the server envelope of the whole run, and each
@@ -118,7 +172,10 @@ resources, whoever the caller is and whichever project the resources are in.
 
 Before anything is created, each lane resolves the image and flavor and runs
 the compute quota pre-check of `nova chaos` against its own plan in its own
-project. When two personas name entries of the same project, each check passes
+project. For the Gardener persona the check also counts its server groups
+against the `server_groups` limit and its largest group against the
+`server_group_members` limit, which Nova applies to each group on its own.
+When two personas name entries of the same project, each check passes
 on its own even when both plans together do not fit. The run does not reject
 this setup, since the suffixed identities keep the two personas' resources
 apart. It logs `personas share a project; each quota pre-check saw only its own

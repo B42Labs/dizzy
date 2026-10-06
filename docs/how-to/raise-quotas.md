@@ -99,6 +99,13 @@ boot-from-volume root) volumes consume and the Neutron port/network quotas the
 companion networks and ports consume are *not* pre-checked. The executor's quota
 fast-fail is the backstop there.
 
+For a plan with server groups, which only the `mix` Gardener persona has, the
+pre-check also counts the groups against **server_groups** and the largest
+group against **server_group_members**. Nova applies the member limit to each
+group on its own, so the check compares the largest group with the limit
+alone, without usage. The bundled `mix` profiles need 1, 2 and 3 server groups
+of up to 2, 3 and 6 members, within Nova's defaults of 10 and 10.
+
 ## When the pre-check cannot run
 
 If the project cannot read its own quota, the pre-check **fails open**: it logs a
