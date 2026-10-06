@@ -383,6 +383,28 @@ func mixRecord() *Record {
 	return r
 }
 
+// mixLanesRecord is mixRecord with two background lanes: keystone, with a
+// project, churn buckets and a user type, and glance, with no project, no
+// operations and no churn statistics yet.
+func mixLanesRecord() *Record {
+	r := mixRecord()
+	r.Lanes = []LaneStats{
+		{
+			Name: "keystone", RunID: "abcd1234-keystone", Cloud: "admin", ProjectID: "proj-admin",
+			Scenario: "small/keystone", Seed: 11,
+			Metrics: metrics.Aggregate{
+				Wall: 90 * time.Second,
+				Overall: metrics.Stats{Attempted: 4, Succeeded: 4, Throughput: 0.04,
+					Latency: metrics.Latency{Median: 50 * time.Millisecond, P95: 200 * time.Millisecond, P99: 300 * time.Millisecond}},
+				ByType: []metrics.Stats{{Type: "user", Attempted: 4, Succeeded: 4}},
+			},
+			Chaos: chaosRecord().Chaos,
+		},
+		{Name: "glance", RunID: "abcd1234-glance", Scenario: "small/glance", Seed: 12},
+	}
+	return r
+}
+
 // failingWriter fails every write with errWrite.
 type failingWriter struct{}
 
@@ -435,6 +457,84 @@ func TestWritePersonaTableWriteError(t *testing.T) {
 	}
 	if !strings.HasPrefix(err.Error(), "writing persona table: ") {
 		t.Errorf("error %q does not start with %q", err, "writing persona table: ")
+	}
+}
+
+func TestWriteLaneTableEmpty(t *testing.T) {
+	for name, ls := range map[string][]LaneStats{"nil": nil, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := WriteLaneTable(&buf, ls); err != nil {
+				t.Fatalf("WriteLaneTable: %v", err)
+			}
+			if buf.Len() != 0 {
+				t.Errorf("WriteLaneTable wrote %q, want nothing", buf.String())
+			}
+		})
+	}
+}
+
+// TestWriteLaneTableRows confirms the table opens with a blank line and its
+// title, that each row carries the lane's project ("-" when unknown),
+// scenario, counts and latencies ("-" without operations), and that every row
+// is aligned to the same width.
+func TestWriteLaneTableRows(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteLaneTable(&buf, mixLanesRecord().Lanes); err != nil {
+		t.Fatalf("WriteLaneTable: %v", err)
+	}
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	if len(lines) != 5 || lines[0] != "" || lines[1] != "Lanes" {
+		t.Fatalf("table = %q, want a blank line, the title, a header and two rows", buf.String())
+	}
+	want := [][]string{
+		{"NAME", "PROJECT", "SCENARIO", "OPS", "OK", "FAILED", "P50", "P95", "P99"},
+		{"keystone", "proj-admin", "small/keystone", "4", "4", "0", "50ms", "200ms", "300ms"},
+		{"glance", "-", "small/glance", "0", "0", "0", "-", "-", "-"},
+	}
+	for i, w := range want {
+		if got := strings.Fields(lines[i+2]); !reflect.DeepEqual(got, w) {
+			t.Errorf("row %d = %q, want %q", i, got, w)
+		}
+		if len(lines[i+2]) != len(lines[2]) {
+			t.Errorf("row %d is %d wide, want the header's %d:\n%s", i, len(lines[i+2]), len(lines[2]), buf.String())
+		}
+	}
+	if !strings.HasPrefix(lines[4], "glance    -         ") {
+		t.Errorf("glance row %q does not left-align its name and project", lines[4])
+	}
+}
+
+func TestWriteLaneTableWriteError(t *testing.T) {
+	err := WriteLaneTable(failingWriter{}, mixLanesRecord().Lanes)
+	if !errors.Is(err, errWrite) {
+		t.Fatalf("WriteLaneTable error = %v, want it to wrap the writer's error", err)
+	}
+	if !strings.HasPrefix(err.Error(), "writing lane table: ") {
+		t.Errorf("error %q does not start with %q", err, "writing lane table: ")
+	}
+}
+
+// TestWriteTableMixLanes confirms a mix record with lanes gets the lane table
+// and one section per lane after the persona sections, with the churn summary
+// only for the lane that has churn statistics.
+func TestWriteTableMixLanes(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteTable(&buf, mixLanesRecord()); err != nil {
+		t.Fatalf("WriteTable: %v", err)
+	}
+	out := buf.String()
+	last := -1
+	for _, want := range []string{"\nPersonas\n", "\nPersona ci\nRun metrics", "\nPersona legacy\nRun metrics",
+		"\nLanes\n", "\nLane keystone\nRun metrics", "\nLane glance\nRun metrics"} {
+		i := strings.Index(out, want)
+		if i <= last {
+			t.Errorf("mix table report has %q at %d, want it after offset %d:\n%s", want, i, last, out)
+		}
+		last = i
+	}
+	if got := strings.Count(out, "Churn summary"); got != 2 {
+		t.Errorf("mix table report has %d churn summaries, want 2 (ci and keystone):\n%s", got, out)
 	}
 }
 
@@ -508,6 +608,54 @@ func TestWriteJSONMix(t *testing.T) {
 			t.Errorf(".incomplete = %s, want true", got["incomplete"])
 		}
 	})
+}
+
+// TestWriteJSONMixLanes confirms a mix record's JSON report carries the lanes
+// after the personas, and omits the key for a record without lanes.
+func TestWriteJSONMixLanes(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteJSON(&buf, mixLanesRecord()); err != nil {
+		t.Fatalf("WriteJSON: %v", err)
+	}
+	out := buf.String()
+	if p, l := strings.Index(out, `"personas"`), strings.Index(out, `"lanes"`); p < 0 || l < p {
+		t.Errorf("report JSON has personas at %d and lanes at %d, want lanes after personas:\n%s", p, l, out)
+	}
+	var got struct {
+		Lanes []LaneStats `json:"lanes"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil || len(got.Lanes) != 2 || got.Lanes[0].Name != "keystone" || got.Lanes[0].RunID != "abcd1234-keystone" {
+		t.Errorf(".lanes = %+v (err %v), want keystone first of two", got.Lanes, err)
+	}
+
+	buf.Reset()
+	if err := WriteJSON(&buf, mixRecord()); err != nil {
+		t.Fatalf("WriteJSON: %v", err)
+	}
+	if strings.Contains(buf.String(), `"lanes"`) {
+		t.Errorf("report JSON of a record without lanes has a lanes key:\n%s", buf.String())
+	}
+}
+
+// TestWriteCSVMixLanes confirms a mix record's CSV appends the per-lane rows
+// after the per-persona ones.
+func TestWriteCSVMixLanes(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteCSV(&buf, mixLanesRecord()); err != nil {
+		t.Fatalf("WriteCSV: %v", err)
+	}
+	records, err := csv.NewReader(&buf).ReadAll()
+	if err != nil {
+		t.Fatalf("parsing csv: %v", err)
+	}
+	var labels []string
+	for _, rec := range records[1:] {
+		labels = append(labels, rec[0])
+	}
+	want := []string{"overall", "network", "subnet", "ci/overall", "ci/server", "legacy/overall", "keystone/overall", "keystone/user", "glance/overall"}
+	if !reflect.DeepEqual(labels, want) {
+		t.Errorf("row labels = %v, want %v", labels, want)
+	}
 }
 
 // TestWriteCSVMix confirms a mix record's CSV keeps the header and appends

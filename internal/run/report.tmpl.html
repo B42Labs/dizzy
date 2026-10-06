@@ -209,29 +209,21 @@ svg { max-width: 100%; height: auto; border: 1px solid var(--line); border-radiu
   <div class="kpi"><div class="v">{{.Value}}</div><div class="l">{{.Label}}</div></div>
 {{end}}
 </div>
-{{- with .Chaos}}{{if .HasBuckets}}
-<h3>Throughput over time</h3>
-<svg viewBox="0 0 720 {{.Volume.Height}}" role="img" aria-label="attempted and failed operations per time bucket">
-  <line class="grid" x1="46" y1="{{.Volume.Baseline}}" x2="704" y2="{{.Volume.Baseline}}"></line>
-  {{range .Volume.Bars}}
-  <rect class="bar" x="{{.X}}" y="{{.Y}}" width="{{.W}}" height="{{.H}}"></rect>
-  {{if .HasFail}}<rect class="bar-fail" x="{{.X}}" y="{{.FailY}}" width="{{.W}}" height="{{.FailH}}"></rect>{{end}}
-  {{end}}
-  <text class="axis" x="46" y="{{.Volume.Baseline}}" dy="16">{{.Volume.FirstTime}}</text>
-  <text class="axis" x="704" y="{{.Volume.Baseline}}" dy="16" text-anchor="end">{{.Volume.LastTime}}</text>
-</svg>
-<p class="legend"><span class="sw" style="background:var(--bar)"></span>attempted<span class="sw" style="background:var(--fail)"></span>failed. axis max {{.Volume.AxisMax}} ops/bucket.</p>
+{{- with .Chaos}}{{if .HasBuckets}}{{template "seriesCharts" .}}{{- end}}{{end}}
+{{- end}}
+{{- range .Lanes}}
 
-<h3>Latency over time</h3>
-<svg viewBox="0 0 720 {{.Latency.Height}}" role="img" aria-label="p50 and p99 latency per time bucket">
-  <line class="grid" x1="46" y1="{{.Latency.Baseline}}" x2="704" y2="{{.Latency.Baseline}}"></line>
-  <polyline class="line-p50" points="{{.Latency.P50Points}}"></polyline>
-  <polyline class="line-p99" points="{{.Latency.P99Points}}"></polyline>
-  <text class="axis" x="46" y="{{.Latency.Baseline}}" dy="16">{{.Latency.FirstTime}}</text>
-  <text class="axis" x="704" y="{{.Latency.Baseline}}" dy="16" text-anchor="end">{{.Latency.LastTime}}</text>
-</svg>
-<p class="legend"><span class="sw" style="background:var(--p50)"></span>p50<span class="sw" style="background:var(--p99)"></span>p99. axis max {{.Latency.AxisMax}}.</p>
-{{- end}}{{end}}
+<h2>Lane {{.Name}}</h2>
+<div class="chips">
+  <span class="chip">project {{.Project}}</span>
+  <span class="chip">scenario {{.Scenario}}</span>
+</div>
+<div class="kpis">
+{{range .KPIs}}
+  <div class="kpi"><div class="v">{{.Value}}</div><div class="l">{{.Label}}</div></div>
+{{end}}
+</div>
+{{- with .Chaos}}{{if .HasBuckets}}{{template "seriesCharts" .}}{{- end}}{{end}}
 {{- end}}
 
 <script>
@@ -267,3 +259,26 @@ document.querySelectorAll("table.sortable").forEach(function (table) {
 </script>
 </body>
 </html>
+{{define "seriesCharts"}}
+<h3>Throughput over time</h3>
+<svg viewBox="0 0 720 {{.Volume.Height}}" role="img" aria-label="attempted and failed operations per time bucket">
+  <line class="grid" x1="46" y1="{{.Volume.Baseline}}" x2="704" y2="{{.Volume.Baseline}}"></line>
+  {{range .Volume.Bars}}
+  <rect class="bar" x="{{.X}}" y="{{.Y}}" width="{{.W}}" height="{{.H}}"></rect>
+  {{if .HasFail}}<rect class="bar-fail" x="{{.X}}" y="{{.FailY}}" width="{{.W}}" height="{{.FailH}}"></rect>{{end}}
+  {{end}}
+  <text class="axis" x="46" y="{{.Volume.Baseline}}" dy="16">{{.Volume.FirstTime}}</text>
+  <text class="axis" x="704" y="{{.Volume.Baseline}}" dy="16" text-anchor="end">{{.Volume.LastTime}}</text>
+</svg>
+<p class="legend"><span class="sw" style="background:var(--bar)"></span>attempted<span class="sw" style="background:var(--fail)"></span>failed. axis max {{.Volume.AxisMax}} ops/bucket.</p>
+
+<h3>Latency over time</h3>
+<svg viewBox="0 0 720 {{.Latency.Height}}" role="img" aria-label="p50 and p99 latency per time bucket">
+  <line class="grid" x1="46" y1="{{.Latency.Baseline}}" x2="704" y2="{{.Latency.Baseline}}"></line>
+  <polyline class="line-p50" points="{{.Latency.P50Points}}"></polyline>
+  <polyline class="line-p99" points="{{.Latency.P99Points}}"></polyline>
+  <text class="axis" x="46" y="{{.Latency.Baseline}}" dy="16">{{.Latency.FirstTime}}</text>
+  <text class="axis" x="704" y="{{.Latency.Baseline}}" dy="16" text-anchor="end">{{.Latency.LastTime}}</text>
+</svg>
+<p class="legend"><span class="sw" style="background:var(--p50)"></span>p50<span class="sw" style="background:var(--p99)"></span>p99. axis max {{.Latency.AxisMax}}.</p>
+{{- end -}}

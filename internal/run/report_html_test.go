@@ -295,3 +295,69 @@ func TestWriteHTMLEscapesPersonaName(t *testing.T) {
 		t.Error("persona name rendered without escaping (XSS)")
 	}
 }
+
+// mixOneLaneRecord is a mix record with the ci persona and the keystone lane.
+func mixOneLaneRecord() *Record {
+	r := mixLanesRecord()
+	r.Personas = r.Personas[:1]
+	r.Lanes = r.Lanes[:1]
+	return r
+}
+
+// TestWriteHTMLGoldenMixLanes locks the rendered HTML for a mix record with
+// one persona and one lane: the persona section, then the lane section with
+// its chips, KPIs and time-series charts.
+func TestWriteHTMLGoldenMixLanes(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteHTML(&buf, mixOneLaneRecord()); err != nil {
+		t.Fatalf("WriteHTML: %v", err)
+	}
+	checkGolden(t, "report-mix-lanes.html", buf.Bytes())
+}
+
+// TestWriteHTMLLaneWithoutChaos confirms a lane with no churn statistics
+// renders its heading, chips and KPIs and no chart, while the lane with
+// buckets gets both charts, after the persona sections.
+func TestWriteHTMLLaneWithoutChaos(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteHTML(&buf, mixLanesRecord()); err != nil {
+		t.Fatalf("WriteHTML: %v", err)
+	}
+	out := buf.String()
+	legacy := strings.Index(out, "<h2>Persona legacy</h2>")
+	keystone := strings.Index(out, "<h2>Lane keystone</h2>")
+	glance := strings.Index(out, "<h2>Lane glance</h2>")
+	end := strings.Index(out, "<script>")
+	if legacy < 0 || keystone < legacy || glance < keystone || end < glance {
+		t.Fatalf("sections missing or out of order (legacy %d, keystone %d, glance %d, script %d)", legacy, keystone, glance, end)
+	}
+	keystoneSection, glanceSection := out[keystone:glance], out[glance:end]
+	if got := strings.Count(keystoneSection, "<svg"); got != 2 {
+		t.Errorf("keystone section has %d charts, want 2", got)
+	}
+	for _, want := range []string{"project -", "scenario small/glance", "total ops"} {
+		if !strings.Contains(glanceSection, want) {
+			t.Errorf("glance section lacks %q:\n%s", want, glanceSection)
+		}
+	}
+	if strings.Contains(glanceSection, "<svg") {
+		t.Errorf("glance section without churn statistics renders a chart:\n%s", glanceSection)
+	}
+}
+
+// TestWriteHTMLEscapesLaneName confirms a lane name carrying markup is
+// HTML-escaped.
+func TestWriteHTMLEscapesLaneName(t *testing.T) {
+	rec := mixLanesRecord()
+	rec.Lanes[0].Name = "<script>alert(1)</script>"
+	var buf bytes.Buffer
+	if err := WriteHTML(&buf, rec); err != nil {
+		t.Fatalf("WriteHTML: %v", err)
+	}
+	if strings.Contains(buf.String(), "<script>alert(1)</script>") {
+		t.Error("lane name rendered without escaping (XSS)")
+	}
+	if !strings.Contains(buf.String(), "<h2>Lane &lt;script&gt;alert(1)&lt;/script&gt;</h2>") {
+		t.Error("lane heading lacks the escaped name")
+	}
+}
