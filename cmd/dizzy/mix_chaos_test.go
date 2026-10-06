@@ -343,7 +343,7 @@ func TestMixLaneConfigs(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			s := parseMix(t, mixChaosScenarioYAML, tc.sets...)
-			p, err := s.Generate()
+			p, err := s.Generate(mixscenario.LaneScenarios{})
 			if err != nil {
 				t.Fatalf("Generate: %v", err)
 			}
@@ -375,7 +375,7 @@ func TestPlanLaneInputs(t *testing.T) {
 		"personas.gardener.share=1", "personas.gardener.clusters=1", "personas.gardener.policy=anti-affinity",
 		"personas.gardener.volume_gib.min=1", "personas.gardener.volume_gib.max=1", "personas.gardener.cloud=tenant-gardener",
 		"personas.legacy.share=1", "personas.legacy.networks=1", "personas.legacy.cloud=tenant-legacy")
-	p, err := s.Generate()
+	p, err := s.Generate(mixscenario.LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}

@@ -80,7 +80,7 @@ personas:
 	if s.Personas.Legacy != (Legacy{}) {
 		t.Errorf("personas.legacy = %+v, want the zero block", s.Personas.Legacy)
 	}
-	p, err := s.Generate()
+	p, err := s.Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
@@ -159,7 +159,7 @@ chaos: { duration: 5m, parallel: { max: 4 } }
 	if err := s.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
-	p, err := s.Generate()
+	p, err := s.Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}

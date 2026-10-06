@@ -42,7 +42,7 @@ func TestProfilesGenerateValidPlans(t *testing.T) {
 			if err := s.Validate(); err != nil {
 				t.Fatalf("Validate() = %v, want nil", err)
 			}
-			if _, err := s.Generate(); err != nil {
+			if _, err := s.Generate(LaneScenarios{}); err != nil {
 				t.Fatalf("Generate() = %v, want nil", err)
 			}
 		})
@@ -130,7 +130,7 @@ func TestProfilesSplitServers(t *testing.T) {
 	for _, name := range profileNames {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			p, err := readProfile(t, name).Generate()
+			p, err := readProfile(t, name).Generate(LaneScenarios{})
 			if err != nil {
 				t.Fatalf("Generate() = %v, want nil", err)
 			}
@@ -152,7 +152,7 @@ func TestProfilesSplitServers(t *testing.T) {
 // Nova's common default quota of 10 instances and its default limits of 10
 // server groups and 10 members per group.
 func TestSmallProfileFitsDefaultQuotas(t *testing.T) {
-	p, err := readProfile(t, "small").Generate()
+	p, err := readProfile(t, "small").Generate(LaneScenarios{})
 	if err != nil {
 		t.Fatalf("Generate(small): %v", err)
 	}
