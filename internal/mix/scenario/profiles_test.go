@@ -154,7 +154,7 @@ func TestProfilesMatchDocumentedSizes(t *testing.T) {
 					Max: novascenario.Duration(time.Minute),
 				},
 			}
-			if s.Personas.Legacy != wantLegacy {
+			if !reflect.DeepEqual(s.Personas.Legacy, wantLegacy) {
 				t.Errorf("personas.legacy = %+v, want %+v", s.Personas.Legacy, wantLegacy)
 			}
 		})
