@@ -377,7 +377,7 @@ resources:
 
 personas:
   ci:
-    share: 0.8
+    share: 0.5
     cloud: ""                                 # "" authenticates with --os-cloud
     networks: 2
     volumes_per_server: { min: 0, max: 1 }
@@ -385,6 +385,13 @@ personas:
     interval:           { min: 100ms, max: 1s }
     churn_ratio: 0.5
     target_fill: 0.6
+  gardener:
+    share: 0.3
+    cloud: ""
+    clusters: 1
+    policy: soft-anti-affinity                # or anti-affinity
+    volume_gib:         { min: 1, max: 2 }
+    interval:           { min: 10s, max: 1m }
   legacy:
     share: 0.2
     cloud: ""
@@ -403,6 +410,18 @@ chaos:
 The CI persona boots short-lived servers: each on one of the persona's
 networks, with zero or more data volumes, no extra port and no lifecycle
 operation.
+
+The Gardener persona keeps Kubernetes clusters as Gardener runs them on
+OpenStack. Its servers are spread over `clusters` clusters round-robin, so
+cluster sizes differ by at most one. A cluster is one network, one server group
+with the block's `policy`, and the worker servers booted into that group on
+that network, each with one data volume and no extra port. The networks and
+server groups are created before anything else and stay until the run's
+teardown. Once every worker of a cluster is up, the persona replaces the
+cluster's workers one at a time: it deletes a worker with its volume and boots
+it again under the same name. The clusters are replaced concurrently. The block
+has no `churn_ratio` or `target_fill`, because the persona keeps its clusters
+whole.
 
 The Legacy persona boots long-lived servers: each on one of the persona's
 networks, with its data volumes and extra ports. Its servers, volumes and ports
@@ -428,6 +447,12 @@ persona keeps every planned resource.
 | `personas.ci.interval.min` / `personas.ci.interval.max` | duration | Random delay range drawn per tick of the persona's engine; `0` falls back to `200ms` / `3s` |
 | `personas.ci.churn_ratio` | ratio | Create bias of the persona's engine at equilibrium; `0` falls back to `0.5` |
 | `personas.ci.target_fill` | ratio | Fraction of the persona's servers kept populated; `0` falls back to `0.8` |
+| `personas.gardener.share` | float | Share of `resources.servers`, a finite number of at least 0; at least one persona needs a share above 0 |
+| `personas.gardener.cloud` | string | `clouds.yaml` entry the persona authenticates with; empty uses `--os-cloud` |
+| `personas.gardener.clusters` | int | Clusters the persona's servers are spread over, each with its own network and server group; with a share above 0, at least 1 and at most the persona's servers |
+| `personas.gardener.policy` | string | Policy of every cluster's server group, `anti-affinity` or `soft-anti-affinity`; required with a share above 0. `anti-affinity` needs a compute host per worker of a cluster |
+| `personas.gardener.volume_gib` | range | Size drawn for the one data volume of each worker; `min >= 1` |
+| `personas.gardener.interval.min` / `personas.gardener.interval.max` | duration | Random delay range drawn per tick of the persona's engine; `0` falls back to `200ms` / `3s` |
 | `personas.legacy.share` | float | Share of `resources.servers`, a finite number of at least 0; at least one persona needs a share above 0 |
 | `personas.legacy.cloud` | string | `clouds.yaml` entry the persona authenticates with; empty uses `--os-cloud` |
 | `personas.legacy.networks` | int | Networks the persona's servers are spread over, one per server; at least 1 when the persona has servers |
@@ -442,9 +467,11 @@ persona keeps every planned resource.
 
 The `--set` keys are `seed`, `image`, `flavor`, `resources.servers`,
 `services` (a comma-separated list; an empty value clears it), and every
-`personas.ci.*` and `personas.legacy.*` key of the table, with
-`personas.ci.volumes_per_server.min`, `.max` and the like for the ranges and Go
-duration strings for the intervals, e.g. `--set personas.ci.interval.max=2s` or
+`personas.ci.*`, `personas.gardener.*` and `personas.legacy.*` key of the
+table, with `personas.ci.volumes_per_server.min`, `.max` and the like for the
+ranges and Go duration strings for the intervals, e.g.
+`--set personas.ci.interval.max=2s`,
+`--set personas.gardener.policy=anti-affinity` or
 `--set personas.legacy.resize_flavor=`. The `chaos:` block has no `--set` keys;
 the `mix chaos` flags override it.
 
@@ -466,22 +493,33 @@ scenario and seed always yield the same plan.
 
 ### Profiles
 
-| Profile | `resources.servers` | CI servers | Legacy servers | `personas.ci.networks` | `personas.legacy.networks` | `chaos.duration` |
+| Profile | `resources.servers` | CI servers | Gardener servers | Legacy servers | `personas.gardener.clusters` | Workers per cluster |
 |---|---|---|---|---|---|---|
-| `small` | 6 | 5 | 1 | 2 | 1 | 5m |
-| `medium` | 20 | 16 | 4 | 4 | 2 | 30m |
-| `large` | 60 | 48 | 12 | 8 | 2 | 1h |
+| `small` | 6 | 3 | 2 | 1 | 1 | 2 |
+| `medium` | 20 | 10 | 6 | 4 | 2 | 3 |
+| `large` | 60 | 30 | 18 | 12 | 3 | 6 |
+
+| Profile | `personas.ci.networks` | `personas.legacy.networks` | `chaos.duration` |
+|---|---|---|---|
+| `small` | 2 | 1 | 5m |
+| `medium` | 4 | 2 | 30m |
+| `large` | 8 | 2 | 1h |
 
 All three set `seed: 42`, `image: cirros`, `flavor: m1.tiny`, `services: []`
-and `chaos.parallel.max: 4`. They give the CI persona `share: 0.8`,
+and `chaos.parallel.max: 4`. They give the CI persona `share: 0.5`,
 `cloud: ""`, `volumes_per_server: { min: 0, max: 1 }`,
 `volume_gib: { min: 1, max: 2 }`, `interval: { min: 100ms, max: 1s }`,
-`churn_ratio: 0.5` and `target_fill: 0.6`, and the Legacy persona `share: 0.2`,
+`churn_ratio: 0.5` and `target_fill: 0.6`; the Gardener persona `share: 0.3`,
+`cloud: ""`, `policy: soft-anti-affinity`, `volume_gib: { min: 1, max: 2 }` and
+`interval: { min: 10s, max: 1m }`; and the Legacy persona `share: 0.2`,
 `cloud: ""`, `resize_flavor: m1.small`, `volumes_per_server: { min: 1, max: 2 }`,
 `volume_gib: { min: 1, max: 2 }`, `ports_per_server: { min: 0, max: 1 }` and
 `interval: { min: 10s, max: 1m }`. Each needs the flavor `m1.small` for the
-Legacy persona's resizes. `small` fits Nova's common default quota of 10
-instances; `medium` and `large` need raised quotas.
+Legacy persona's resizes. The profiles use the soft policy so that a cluster
+boots on a cloud with fewer compute hosts than the cluster has workers.
+`small` fits Nova's common default quota of 10 instances and its default
+limits of 10 server groups and 10 members per group; `medium` and `large` need
+raised quotas.
 
 ## The `chaos:` block
 
