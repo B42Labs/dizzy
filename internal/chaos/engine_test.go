@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -468,5 +469,354 @@ func TestPanicCountsInDecisionBucket(t *testing.T) {
 	e.res.mu.Unlock()
 	if inFlight != 0 {
 		t.Errorf("bucket 3 in-flight count = %d after the panic, want 0", inFlight)
+	}
+}
+
+// cancelClock is a fakeClock that ends an unbounded run: once limit of virtual
+// time has passed, its Sleep cancels the run's context and returns the
+// context's error without advancing.
+type cancelClock struct {
+	*fakeClock
+	start  time.Time
+	limit  time.Duration
+	cancel context.CancelFunc
+}
+
+func newCancelClock(limit time.Duration, cancel context.CancelFunc) *cancelClock {
+	c := newFakeClock()
+	return &cancelClock{fakeClock: c, start: c.cur, limit: limit, cancel: cancel}
+}
+
+func (c *cancelClock) Sleep(ctx context.Context, d time.Duration) error {
+	if c.cur.Sub(c.start) >= c.limit {
+		c.cancel()
+		return ctx.Err()
+	}
+	return c.fakeClock.Sleep(ctx, d)
+}
+
+// unboundedConfig is validConfig as an unbounded run with hourly buckets and
+// intervals long enough that hours of virtual time take a few hundred ticks.
+func unboundedConfig() Config {
+	c := validConfig()
+	c.Unbounded = true
+	c.Duration = 0
+	c.BucketWidth = time.Hour
+	c.MinInterval = 30 * time.Second
+	c.MaxInterval = 2 * time.Minute
+	return c
+}
+
+// TestConfigValidate covers the rules that select and shape an unbounded run:
+// its duration must be 0 and its bucket width set, a bucket width must be at
+// least a minute in either mode, and a bounded run still needs a positive
+// duration.
+func TestConfigValidate(t *testing.T) {
+	unbounded := func(c *Config) {
+		c.Unbounded = true
+		c.Duration = 0
+		c.BucketWidth = time.Hour
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{name: "valid bounded", mutate: func(*Config) {}},
+		{name: "valid unbounded", mutate: unbounded},
+		{name: "bounded zero duration", mutate: func(c *Config) { c.Duration = 0 }, wantErr: "chaos duration must be set and positive"},
+		{name: "unbounded with a duration", mutate: func(c *Config) { unbounded(c); c.Duration = time.Minute }, wantErr: "must be 0 for an unbounded run"},
+		{name: "unbounded without bucket width", mutate: func(c *Config) { unbounded(c); c.BucketWidth = 0 }, wantErr: "bucket-width must be set"},
+		{name: "unbounded narrow bucket width", mutate: func(c *Config) { unbounded(c); c.BucketWidth = 30 * time.Second }, wantErr: "bucket-width must be at least 1m0s"},
+		{name: "bounded narrow bucket width", mutate: func(c *Config) { c.BucketWidth = 30 * time.Second }, wantErr: "bucket-width must be at least 1m0s"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validConfig()
+			tc.mutate(&cfg)
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("Validate() = %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestRunUnboundedStopsOnCancel confirms an unbounded run has no end of its
+// own: it returns a result and no error once its context is cancelled, on the
+// virtual clock and on the real one, and not before.
+func TestRunUnboundedStopsOnCancel(t *testing.T) {
+	t.Run("virtual clock", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		r, err := Run(ctx, plainNodes(newMutFake(), 4), 7, unboundedConfig(), newCancelClock(10*time.Minute, cancel))
+		if err != nil || r == nil {
+			t.Fatalf("Run = %v, %v; want a result and a nil error", r, err)
+		}
+		if r.Creates == 0 {
+			t.Error("the unbounded run created nothing in 10 virtual minutes")
+		}
+	})
+
+	t.Run("real clock", func(t *testing.T) {
+		cfg := unboundedConfig()
+		cfg.MinInterval, cfg.MaxInterval = time.Millisecond, 5*time.Millisecond
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		type outcome struct {
+			r   *Result
+			err error
+		}
+		done := make(chan outcome, 1)
+		go func() {
+			r, err := Run(ctx, plainNodes(newMutFake(), 4), 7, cfg, RealClock{})
+			done <- outcome{r, err}
+		}()
+
+		select {
+		case <-done:
+			t.Fatal("unbounded Run returned before its context was cancelled")
+		case <-time.After(200 * time.Millisecond):
+		}
+		cancel()
+		select {
+		case got := <-done:
+			if got.err != nil || got.r == nil {
+				t.Errorf("Run = %v, %v after cancel; want a result and a nil error", got.r, got.err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("unbounded Run did not return within 5s of the cancel")
+		}
+	})
+}
+
+// TestStopLetsUnboundedCallInFlightFinish confirms the stop signal of an
+// unbounded run, its normal end, lets a create already in flight finish with
+// its resource and count as a success, while the cancel of a bounded run, an
+// interruption, still cuts the call short.
+func TestStopLetsUnboundedCallInFlightFinish(t *testing.T) {
+	tests := []struct {
+		name       string
+		cfg        Config
+		wantFailed int
+		wantID     string
+	}{
+		{name: "unbounded run stopped", cfg: unboundedConfig(), wantFailed: 0, wantID: "id-0"},
+		{name: "bounded run interrupted", cfg: validConfig(), wantFailed: 1, wantID: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			started, release := make(chan struct{}), make(chan struct{})
+			node := Node{
+				Key: "vol-0", Kind: resource.Kind("volume"),
+				Create: func(ctx context.Context, _ map[string]string) (resource.Resource, error) {
+					started <- struct{}{}
+					<-release
+					if err := ctx.Err(); err != nil {
+						return resource.Resource{}, err
+					}
+					return resource.Resource{Kind: "volume", Logical: "vol-0", ID: "id-0"}, nil
+				},
+				Delete: func(context.Context, map[string]string, resource.Resource) error { return nil },
+			}
+			e := newEngine([]Node{node}, 7, tc.cfg, newFakeClock())
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			e.res.advance(0)
+			e.dispatchCreate(ctx, 0, 0)
+			<-started
+			cancel()
+			close(release)
+			e.wg.Wait()
+
+			if got := e.res.buckets()[0].Stats.Failed; got != tc.wantFailed {
+				t.Errorf("bucket 0 failed = %d, want %d", got, tc.wantFailed)
+			}
+			if got := e.states[0].create.res.ID; got != tc.wantID {
+				t.Errorf("created id = %q, want %q", got, tc.wantID)
+			}
+		})
+	}
+}
+
+// TestNoCallStartsAfterUnboundedStop confirms an operation dispatched once an
+// unbounded run is stopped never reaches the cloud and holds neither its family
+// gate nor a slot, even though both are free: an admitted call would ignore the
+// stop and run to completion. One dispatch could pass by chance, since select
+// picks at random among ready cases; a hundred cannot.
+func TestNoCallStartsAfterUnboundedStop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	creates := 0
+	gate := make(chan struct{}, 1)
+	node := Node{
+		Key: "vol-0", Kind: resource.Kind("volume"), Gate: gate,
+		Create: func(context.Context, map[string]string) (resource.Resource, error) {
+			creates++
+			return resource.Resource{Kind: "volume", Logical: "vol-0", ID: "id-0"}, nil
+		},
+		Delete: func(context.Context, map[string]string, resource.Resource) error { return nil },
+	}
+	for i := 0; i < 100; i++ {
+		e := newEngine([]Node{node}, 7, unboundedConfig(), newFakeClock())
+		e.res.advance(0)
+		e.dispatchCreate(ctx, 0, 0)
+		e.wg.Wait()
+		if len(gate) != 0 || len(e.sem) != 0 {
+			t.Fatalf("dispatch %d left gate=%d slots=%d held, want none", i, len(gate), len(e.sem))
+		}
+	}
+	if creates != 0 {
+		t.Errorf("%d creates reached the cloud after the stop, want 0", creates)
+	}
+}
+
+// TestRunUnboundedMatchesBoundedSchedule confirms an unbounded run stopped
+// after 10 virtual minutes makes the same decisions as a bounded 10-minute
+// run of the same seed and nodes, while keeping no decision log and slicing
+// its series at the configured width.
+func TestRunUnboundedMatchesBoundedSchedule(t *testing.T) {
+	bcfg := mutConfig()
+	bcfg.Duration = 10 * time.Minute
+	bcfg.MinInterval, bcfg.MaxInterval = time.Second, 5*time.Second
+	bounded, err := Run(context.Background(), mutableNodes(newMutFake(), 4), 7, bcfg, newFakeClock())
+	if err != nil {
+		t.Fatalf("Run(bounded): %v", err)
+	}
+
+	ucfg := bcfg
+	ucfg.Unbounded, ucfg.Duration, ucfg.BucketWidth = true, 0, time.Hour
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	unbounded, err := Run(ctx, mutableNodes(newMutFake(), 4), 7, ucfg, newCancelClock(10*time.Minute, cancel))
+	if err != nil {
+		t.Fatalf("Run(unbounded): %v", err)
+	}
+
+	if bounded.Mutates == 0 {
+		t.Fatal("no mutations were scheduled; the comparison exercises less than it should")
+	}
+	type summary struct {
+		Creates, Deletes, Mutates, PopMin, PopMax int
+		PopMean                                   float64
+	}
+	sum := func(r *Result) summary {
+		return summary{r.Creates, r.Deletes, r.Mutates, r.PopMin, r.PopMax, r.PopMean}
+	}
+	if sum(bounded) != sum(unbounded) {
+		t.Errorf("unbounded summary %+v differs from bounded %+v", sum(unbounded), sum(bounded))
+	}
+	if unbounded.Decisions != nil || unbounded.BucketWidth != time.Hour {
+		t.Errorf("unbounded Decisions=%d BucketWidth=%s, want nil and 1h", len(unbounded.Decisions), unbounded.BucketWidth)
+	}
+	if len(bounded.Decisions) == 0 || bounded.BucketWidth != 0 || len(bounded.Buckets) != bucketCount {
+		t.Errorf("bounded Decisions=%d BucketWidth=%s buckets=%d, want a log, 0 and %d",
+			len(bounded.Decisions), bounded.BucketWidth, len(bounded.Buckets), bucketCount)
+	}
+}
+
+// TestRunUnboundedFixedWidthBuckets confirms an unbounded run slices its series
+// at the bucket width, one bucket per width reached including the partial last
+// one, and that the buckets count every operation that ran.
+func TestRunUnboundedFixedWidthBuckets(t *testing.T) {
+	f := newMutFake()
+	cfg := unboundedConfig()
+	cfg.ResizeRatio = 0.5
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r, err := Run(ctx, mutableNodes(f, 4), 7, cfg, newCancelClock(3*time.Hour+10*time.Minute, cancel))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if len(r.Buckets) != 4 {
+		t.Fatalf("got %d buckets, want 4", len(r.Buckets))
+	}
+	attempted := 0
+	for i, b := range r.Buckets {
+		if want := time.Duration(i) * time.Hour; b.Start != want {
+			t.Errorf("bucket %d starts at %s, want %s", i, b.Start, want)
+		}
+		attempted += b.Stats.Attempted
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if calls := f.creates + f.deletes + f.mutates; attempted != calls {
+		t.Errorf("buckets count %d operations, want the %d closure calls that returned", attempted, calls)
+	}
+}
+
+// TestResultsAdvanceAppendsEmptyBuckets confirms the series of an unbounded run
+// keeps a bucket for every width reached, even one without operations.
+func TestResultsAdvanceAppendsEmptyBuckets(t *testing.T) {
+	r := newResults(Config{Unbounded: true, BucketWidth: time.Hour})
+	if got := r.buckets(); got != nil {
+		t.Errorf("buckets() before the first advance = %+v, want nil", got)
+	}
+	r.advance(0)
+	r.advance(3 * time.Hour)
+
+	got := r.buckets()
+	if len(got) != 4 {
+		t.Fatalf("got %d buckets, want 4", len(got))
+	}
+	for i, b := range got {
+		if b.Start != time.Duration(i)*time.Hour || b.Stats.Attempted != 0 || b.Stats.Latency != (metrics.Latency{}) {
+			t.Errorf("bucket %d = %+v, want an empty bucket starting at %dh", i, b, i)
+		}
+	}
+}
+
+// TestRunUnboundedCancelledBeforeStart confirms an unbounded run whose context
+// is already cancelled returns an empty result with no buckets.
+func TestRunUnboundedCancelledBeforeStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r, err := Run(ctx, plainNodes(newMutFake(), 4), 7, unboundedConfig(), newFakeClock())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if r.Creates != 0 || r.Deletes != 0 || r.Mutates != 0 || r.Cycles != 0 {
+		t.Errorf("counters = %d/%d/%d/%d, want all zero", r.Creates, r.Deletes, r.Mutates, r.Cycles)
+	}
+	if r.Buckets != nil || len(r.Created) != 0 {
+		t.Errorf("buckets=%+v created=%+v, want none", r.Buckets, r.Created)
+	}
+}
+
+// TestRunUnboundedReleasesRawData confirms a long unbounded run keeps raw
+// latencies only for the bucket that can still receive outcomes and keeps no
+// decision log. A pool of one finishes each operation before the next launch,
+// and the half hour past six hours gives the last bucket several ticks, so
+// every earlier bucket is sealed by the end.
+func TestRunUnboundedReleasesRawData(t *testing.T) {
+	cfg := unboundedConfig()
+	cfg.MaxParallel, cfg.Concurrency = 1, 1
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e := newEngine(plainNodes(newMutFake(), 4), 7, cfg, newCancelClock(6*time.Hour+30*time.Minute, cancel))
+	e.run(ctx)
+
+	if len(e.res.slots) != 7 {
+		t.Fatalf("got %d slots, want 7", len(e.res.slots))
+	}
+	for i, s := range e.res.slots[:len(e.res.slots)-1] {
+		if !s.sealed || s.latencies != nil || s.errs != nil {
+			t.Errorf("slot %d sealed=%v latencies=%d, want sealed with no raw data", i, s.sealed, len(s.latencies))
+		}
+	}
+	if len(e.decisions) != 0 {
+		t.Errorf("the unbounded engine logged %d decisions, want 0", len(e.decisions))
+	}
+	if e.creates == 0 {
+		t.Error("the run created nothing; the test exercises nothing")
 	}
 }
