@@ -24,14 +24,16 @@ import (
 )
 
 // newGlanceChaosCmd builds "glance chaos": a random churn/soak run that, for a
-// configured duration, continuously creates and deletes images (each with its
-// synthetic uploaded payload) and occasionally drives a live image through its
-// planned lifecycle — a deactivate/reactivate cycle, visibility flips, member
-// add/accept/remove, and metadata churn — bounded by the scenario as the spatial
-// envelope. It authenticates, runs the churn, records the run, and — whether it
+// configured duration or until it is stopped (--duration 0), continuously
+// creates and deletes images (each with its synthetic uploaded payload) and
+// occasionally drives a live image through its planned lifecycle — a
+// deactivate/reactivate cycle, visibility flips, member add/accept/remove, and
+// metadata churn — bounded by the scenario as the spatial envelope. It
+// authenticates, runs the churn, rewrites its run record every
+// chaosCheckpointInterval while it runs, records the run, and — whether it
 // completed or was interrupted, unless --no-cleanup — tears the images down by
-// identity and reports any leak. It mirrors "nova chaos" with the image-specific
-// --lifecycle-ratio.
+// identity and reports any leak. It mirrors "nova chaos" with the
+// image-specific --lifecycle-ratio.
 func newGlanceChaosCmd(opts *globalOptions) *cobra.Command {
 	var (
 		scenarioPath   string
@@ -99,41 +101,48 @@ func newGlanceChaosCmd(opts *globalOptions) *cobra.Command {
 			}
 
 			slog.Info("starting churn run", "run", runID, "scenario", p.Scenario,
-				"duration", cfg.Duration, "minInterval", cfg.MinInterval, "maxInterval", cfg.MaxInterval,
+				"duration", chaosDurationLabel(cfg), "minInterval", cfg.MinInterval, "maxInterval", cfg.MaxInterval,
 				"maxParallel", cfg.MaxParallel, "lifecycleRatio", cfg.ResizeRatio, "concurrency", cfg.Concurrency)
 
 			start := time.Now()
-			hb := startHeartbeat(ctx, "churn in progress", collectorSnapshot(collector, start, "duration", cfg.Duration))
+			// buildRecord builds the run record as of finished, for the
+			// checkpoints written while the churn runs and for the final record.
+			buildRecord := func(r *chaos.Result, finished time.Time) *run.Record {
+				return &run.Record{
+					RunID:      runID,
+					Service:    "glance",
+					Scenario:   p.Scenario,
+					Seed:       p.Seed,
+					StartedAt:  start,
+					FinishedAt: finished,
+					Created:    r.Created,
+					Metrics:    collector.Aggregate(finished.Sub(start)),
+					Chaos:      chaosStats(r),
+				}
+			}
+			cfg.CheckpointInterval = chaosCheckpointInterval
+			cfg.OnCheckpoint = chaosCheckpoint(".", buildRecord)
+
+			hb := startHeartbeat(ctx, "churn in progress", collectorSnapshot(collector, start, "duration", chaosDurationLabel(cfg)))
 			result, runErr := chaos.Run(ctx, nodes, p.Seed, cfg, chaos.RealClock{})
 			hb.stop()
 			finished := time.Now()
 			if runErr != nil {
 				return fmt.Errorf("running churn (run %s): %w", runID, runErr)
 			}
-			wall := finished.Sub(start)
-			agg := collector.Aggregate(wall)
+			rec := buildRecord(result, finished)
 
 			// A churn run is a single iteration: export the same per-iteration
 			// summary metrics from the pre-teardown aggregate. An interrupted run
 			// counts as a failed iteration.
-			tel.RecordIteration(ctx, wall, ctx.Err() == nil)
-			tel.RecordIterationOperations(ctx, agg.Overall.Attempted, agg.Overall.Succeeded, agg.Overall.Failed)
+			interrupted := chaosInterrupted(ctx, cfg)
+			tel.RecordIteration(ctx, rec.Metrics.Wall, !interrupted)
+			tel.RecordIterationOperations(ctx, rec.Metrics.Overall.Attempted, rec.Metrics.Overall.Succeeded, rec.Metrics.Overall.Failed)
 
-			if _, err := fmt.Fprint(cmd.OutOrStdout(), agg.Summary()); err != nil {
+			if _, err := fmt.Fprint(cmd.OutOrStdout(), rec.Metrics.Summary()); err != nil {
 				return fmt.Errorf("writing metrics: %w", err)
 			}
 
-			rec := &run.Record{
-				RunID:      runID,
-				Service:    "glance",
-				Scenario:   p.Scenario,
-				Seed:       p.Seed,
-				StartedAt:  start,
-				FinishedAt: finished,
-				Created:    result.Created,
-				Metrics:    agg,
-				Chaos:      chaosStats(result),
-			}
 			recordPath, werr := run.Write(".", rec)
 			if werr != nil {
 				slog.Error("writing run record failed; clean up by run id", "run", runID, "error", werr)
@@ -141,14 +150,15 @@ func newGlanceChaosCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("writing output: %w", err)
 			}
 
-			return finishGlanceChurn(ctx, cmd, client, runID, recordPath, result.Created, ctx.Err() != nil, noCleanup, opts.concurrency, opts.timeout)
+			return finishGlanceChurn(ctx, cmd, client, runID, recordPath, rec.Created, interrupted, noCleanup, opts.concurrency, opts.timeout)
 		},
 	}
 
 	flags := cmd.Flags()
 	flags.StringVar(&scenarioPath, "scenario", "", "path to the scenario YAML file (required)")
 	flags.StringArrayVar(&sets, "set", nil, "override a scenario value, e.g. --set resources.images=20 (repeatable)")
-	flags.DurationVar(&f.duration, "duration", 0, "total wall-clock runtime of the churn (required via flag or the scenario chaos block)")
+	flags.DurationVar(&f.duration, "duration", 0, "total wall-clock runtime of the churn; 0 runs until interrupted (required via flag or the scenario chaos block)")
+	flags.DurationVar(&f.bucketWidth, "bucket-width", defaultChaosBucketWidth, "width of one time bucket in an unbounded run's time series, at least 1m")
 	flags.DurationVar(&f.minInterval, "min-interval", defaultChaosMinInterval, "minimum random delay between scheduled actions")
 	flags.DurationVar(&f.maxInterval, "max-interval", defaultChaosMaxInterval, "maximum random delay between scheduled actions")
 	flags.IntVar(&f.maxParallel, "max-parallel", 0, "maximum concurrent in-flight churn operations (default: --concurrency)")
@@ -179,6 +189,7 @@ func mergeGlanceChaosConfig(cmd *cobra.Command, opts *globalOptions, s glancesce
 		TargetFill:  defaultChaosTargetFill,
 		ResizeRatio: defaultChaosLifecycleRatio,
 		Concurrency: opts.concurrency,
+		BucketWidth: defaultChaosBucketWidth,
 	}
 
 	if c := s.Chaos; c != nil {
@@ -200,6 +211,9 @@ func mergeGlanceChaosConfig(cmd *cobra.Command, opts *globalOptions, s glancesce
 		if c.TargetFill > 0 {
 			cfg.TargetFill = c.TargetFill
 		}
+		if c.BucketWidth > 0 {
+			cfg.BucketWidth = time.Duration(c.BucketWidth)
+		}
 		if c.LifecycleRatio != nil {
 			cfg.ResizeRatio = *c.LifecycleRatio
 		}
@@ -207,6 +221,10 @@ func mergeGlanceChaosConfig(cmd *cobra.Command, opts *globalOptions, s glancesce
 
 	if cmd.Flags().Changed("duration") {
 		cfg.Duration = f.duration
+		cfg.Unbounded = f.duration == 0
+	}
+	if cmd.Flags().Changed("bucket-width") {
+		cfg.BucketWidth = f.bucketWidth
 	}
 	if cmd.Flags().Changed("min-interval") {
 		cfg.MinInterval = f.minInterval

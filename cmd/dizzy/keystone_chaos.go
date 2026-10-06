@@ -29,14 +29,16 @@ import (
 // chaos.go, shared with the neutron and cinder chaos commands.
 const defaultChaosTokenRatio = 0.3
 
-// newKeystoneChaosCmd builds "keystone chaos": a random churn/soak run that, for
-// a configured duration, continuously creates and deletes projects, users, and
-// role assignments within the stable domain/role scaffold, and occasionally
-// issues a scoped token as a live, assigned user. It authenticates, runs the
-// privilege pre-check, provisions the scaffold once, runs the churn, records the
-// run, and — whether it completed or was interrupted, unless --no-cleanup —
-// tears the resources down by name prefix and reports any leak. It mirrors
-// "cinder chaos" with the identity-specific --token-ratio and privilege flags.
+// newKeystoneChaosCmd builds "keystone chaos": a random churn/soak run that,
+// for a configured duration or until it is stopped (--duration 0), continuously
+// creates and deletes projects, users, and role assignments within the stable
+// domain/role scaffold, and occasionally issues a scoped token as a live,
+// assigned user. It authenticates, runs the privilege pre-check, provisions the
+// scaffold once, runs the churn, rewrites its run record every
+// chaosCheckpointInterval while it runs, records the run, and — whether it
+// completed or was interrupted, unless --no-cleanup — tears the resources down
+// by name prefix and reports any leak. It mirrors "cinder chaos" with the
+// identity-specific --token-ratio and privilege flags.
 func newKeystoneChaosCmd(opts *globalOptions) *cobra.Command {
 	var (
 		scenarioPath string
@@ -111,39 +113,45 @@ func newKeystoneChaosCmd(opts *globalOptions) *cobra.Command {
 			}
 
 			slog.Info("starting churn run", "run", runID, "scenario", p.Scenario, "tier", tier,
-				"duration", cfg.Duration, "minInterval", cfg.MinInterval, "maxInterval", cfg.MaxInterval,
+				"duration", chaosDurationLabel(cfg), "minInterval", cfg.MinInterval, "maxInterval", cfg.MaxInterval,
 				"maxParallel", cfg.MaxParallel, "tokenRatio", cfg.ResizeRatio, "concurrency", cfg.Concurrency)
 
 			start := time.Now()
-			hb := startHeartbeat(ctx, "churn in progress", collectorSnapshot(collector, start, "duration", cfg.Duration))
+			// buildRecord builds the run record as of finished, for the
+			// checkpoints written while the churn runs and for the final record.
+			buildRecord := func(r *chaos.Result, finished time.Time) *run.Record {
+				return &run.Record{
+					RunID:      runID,
+					Service:    "keystone",
+					Scenario:   p.Scenario,
+					Seed:       p.Seed,
+					StartedAt:  start,
+					FinishedAt: finished,
+					Created:    append(append([]resource.Resource{}, roots...), r.Created...),
+					Metrics:    collector.Aggregate(finished.Sub(start)),
+					Chaos:      chaosStats(r),
+				}
+			}
+			cfg.CheckpointInterval = chaosCheckpointInterval
+			cfg.OnCheckpoint = chaosCheckpoint(".", buildRecord)
+
+			hb := startHeartbeat(ctx, "churn in progress", collectorSnapshot(collector, start, "duration", chaosDurationLabel(cfg)))
 			result, runErr := chaos.Run(ctx, nodes, p.Seed, cfg, chaos.RealClock{})
 			hb.stop()
 			finished := time.Now()
 			if runErr != nil {
 				return fmt.Errorf("running churn (run %s): %w", runID, runErr)
 			}
-			wall := finished.Sub(start)
-			agg := collector.Aggregate(wall)
+			rec := buildRecord(result, finished)
 
-			tel.RecordIteration(ctx, wall, ctx.Err() == nil)
-			tel.RecordIterationOperations(ctx, agg.Overall.Attempted, agg.Overall.Succeeded, agg.Overall.Failed)
+			interrupted := chaosInterrupted(ctx, cfg)
+			tel.RecordIteration(ctx, rec.Metrics.Wall, !interrupted)
+			tel.RecordIterationOperations(ctx, rec.Metrics.Overall.Attempted, rec.Metrics.Overall.Succeeded, rec.Metrics.Overall.Failed)
 
-			if _, err := fmt.Fprint(cmd.OutOrStdout(), agg.Summary()); err != nil {
+			if _, err := fmt.Fprint(cmd.OutOrStdout(), rec.Metrics.Summary()); err != nil {
 				return fmt.Errorf("writing metrics: %w", err)
 			}
 
-			created := append(append([]resource.Resource{}, roots...), result.Created...)
-			rec := &run.Record{
-				RunID:      runID,
-				Service:    "keystone",
-				Scenario:   p.Scenario,
-				Seed:       p.Seed,
-				StartedAt:  start,
-				FinishedAt: finished,
-				Created:    created,
-				Metrics:    agg,
-				Chaos:      chaosStats(result),
-			}
 			recordPath, werr := run.Write(".", rec)
 			if werr != nil {
 				slog.Error("writing run record failed; clean up by run id", "run", runID, "error", werr)
@@ -151,14 +159,15 @@ func newKeystoneChaosCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("writing output: %w", err)
 			}
 
-			return finishKeystoneChurn(ctx, cmd, client, runID, recordPath, created, ctx.Err() != nil, noCleanup, opts.timeout)
+			return finishKeystoneChurn(ctx, cmd, client, runID, recordPath, rec.Created, interrupted, noCleanup, opts.timeout)
 		},
 	}
 
 	flags := cmd.Flags()
 	flags.StringVar(&scenarioPath, "scenario", "", "path to the scenario YAML file (required)")
 	flags.StringArrayVar(&sets, "set", nil, "override a scenario value, e.g. --set resources.users=20 (repeatable)")
-	flags.DurationVar(&f.duration, "duration", 0, "total wall-clock runtime of the churn (required via flag or the scenario chaos block)")
+	flags.DurationVar(&f.duration, "duration", 0, "total wall-clock runtime of the churn; 0 runs until interrupted (required via flag or the scenario chaos block)")
+	flags.DurationVar(&f.bucketWidth, "bucket-width", defaultChaosBucketWidth, "width of one time bucket in an unbounded run's time series, at least 1m")
 	flags.DurationVar(&f.minInterval, "min-interval", defaultChaosMinInterval, "minimum random delay between scheduled actions")
 	flags.DurationVar(&f.maxInterval, "max-interval", defaultChaosMaxInterval, "maximum random delay between scheduled actions")
 	flags.IntVar(&f.maxParallel, "max-parallel", 0, "maximum concurrent in-flight churn operations (default: --concurrency)")
@@ -191,6 +200,7 @@ func mergeKeystoneChaosConfig(cmd *cobra.Command, opts *globalOptions, s keyston
 		TargetFill:  defaultChaosTargetFill,
 		ResizeRatio: defaultChaosTokenRatio,
 		Concurrency: opts.concurrency,
+		BucketWidth: defaultChaosBucketWidth,
 	}
 
 	if c := s.Chaos; c != nil {
@@ -212,6 +222,9 @@ func mergeKeystoneChaosConfig(cmd *cobra.Command, opts *globalOptions, s keyston
 		if c.TargetFill > 0 {
 			cfg.TargetFill = c.TargetFill
 		}
+		if c.BucketWidth > 0 {
+			cfg.BucketWidth = time.Duration(c.BucketWidth)
+		}
 		if c.TokenRatio != nil {
 			cfg.ResizeRatio = *c.TokenRatio
 		}
@@ -219,6 +232,10 @@ func mergeKeystoneChaosConfig(cmd *cobra.Command, opts *globalOptions, s keyston
 
 	if cmd.Flags().Changed("duration") {
 		cfg.Duration = f.duration
+		cfg.Unbounded = f.duration == 0
+	}
+	if cmd.Flags().Changed("bucket-width") {
+		cfg.BucketWidth = f.bucketWidth
 	}
 	if cmd.Flags().Changed("min-interval") {
 		cfg.MinInterval = f.minInterval

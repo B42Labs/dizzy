@@ -52,11 +52,7 @@ func newCleanupCmd(opts *globalOptions) *cobra.Command {
 			collector := metrics.NewCollector()
 			client := neutron.New(gc, id, collector)
 
-			// Address scopes cannot be discovered by tag and are reclaimed only
-			// from a run record. Cleaning up from a bare id leaves any behind.
-			if rec == nil {
-				slog.Warn("cleaning up by id without a run record; resources that cannot be discovered by tag (e.g. address scopes) will not be reclaimed — pass --run to reclaim them", "run", id)
-			}
+			warnUnreclaimable(id, rec)
 
 			hb := startHeartbeat(ctx, "cleanup in progress", collectorSnapshot(collector, time.Now()))
 			deleted, cleanupErr := executor.Cleanup(ctx, client, id, recordedFrom(rec))
@@ -98,6 +94,19 @@ func resolveRun(runPath, runID string) (id string, rec *run.Record, err error) {
 		return "", nil, err
 	}
 	return rec.RunID, rec, nil
+}
+
+// warnUnreclaimable warns when cleanup will leave resources behind. Address
+// scopes cannot be discovered by tag and are reclaimed only from a run record,
+// so cleaning up from a bare id leaves all of them behind, and cleaning up from
+// a mid-run checkpoint (an incomplete record) leaves those created after it.
+func warnUnreclaimable(id string, rec *run.Record) {
+	switch {
+	case rec == nil:
+		slog.Warn("cleaning up by id without a run record; resources that cannot be discovered by tag (e.g. address scopes) will not be reclaimed — pass --run to reclaim them", "run", id)
+	case rec.Incomplete:
+		slog.Warn("run record is a mid-run checkpoint; resources created after it that cannot be discovered by tag (e.g. address scopes) will not be reclaimed", "run", id, "checkpoint", rec.FinishedAt)
+	}
 }
 
 // recordedFrom returns a record's created list, or nil when there is no record
