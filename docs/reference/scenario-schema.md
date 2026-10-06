@@ -397,6 +397,7 @@ personas:
     cloud: ""
     networks: 1
     resize_flavor: m1.small                   # "" disables resize
+    cold_migration: true                      # optional; false disables cold migration
     volumes_per_server: { min: 1, max: 2 }
     volume_gib:         { min: 1, max: 2 }
     ports_per_server:   { min: 0, max: 1 }
@@ -436,8 +437,10 @@ mutation of a server runs one of a stop and start, a resize to the other of
 `flavor` and `resize_flavor`, a live migration or a cold migration; each
 mutation of a volume or port detaches it or attaches it again. The two
 migrations need the admin role and two usable compute hosts, and a run without
-them skips both. The block has no `churn_ratio` or `target_fill`, because the
-persona keeps every planned resource.
+them skips both. `cold_migration: false` turns cold migration off for the run
+and leaves live migration to that pre-check; a server then draws from the
+operations that remain. The block has no `churn_ratio` or `target_fill`,
+because the persona keeps every planned resource.
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -463,6 +466,7 @@ persona keeps every planned resource.
 | `personas.legacy.cloud` | string | `clouds.yaml` entry the persona authenticates with; empty uses `--os-cloud` |
 | `personas.legacy.networks` | int | Networks the persona's servers are spread over, one per server; at least 1 when the persona has servers |
 | `personas.legacy.resize_flavor` | string | Second flavor the servers alternate with, referenced by name (or id); must differ from `flavor`. Empty disables resize |
+| `personas.legacy.cold_migration` | bool | `false` turns cold migration off and leaves live migration to the migration pre-check. Omitted means `true` |
 | `personas.legacy.volumes_per_server` | range | Data volumes per server, each detached and attached again |
 | `personas.legacy.volume_gib` | range | Size drawn per data volume; `min >= 1` when `volumes_per_server.max > 0` |
 | `personas.legacy.ports_per_server` | range | Extra ports per server, each detached and attached again |
@@ -486,8 +490,9 @@ The `--set` keys are `seed`, `image`, `flavor`, `resources.servers`,
 table, with `personas.ci.volumes_per_server.min`, `.max` and the like for the
 ranges and Go duration strings for the intervals, e.g.
 `--set personas.ci.interval.max=2s`,
-`--set personas.gardener.policy=anti-affinity` or
-`--set personas.legacy.resize_flavor=`. They also include
+`--set personas.gardener.policy=anti-affinity`,
+`--set personas.legacy.resize_flavor=` or
+`--set personas.legacy.cold_migration=false`. They also include
 `lanes.<name>.enabled`, `lanes.<name>.cloud`, `lanes.<name>.profile` and
 `lanes.<name>.scenario` for `cinder`, `glance`, `keystone` and `neutron`, with
 `true` or `false` for `enabled`, and `lanes.cinder.volume_type`,
@@ -575,8 +580,10 @@ and `chaos.parallel.max: 4`. They give the CI persona `share: 0.5`,
 `cloud: ""`, `resize_flavor: m1.small`, `volumes_per_server: { min: 1, max: 2 }`,
 `volume_gib: { min: 1, max: 2 }`, `ports_per_server: { min: 0, max: 1 }` and
 `interval: { min: 10s, max: 1m }`. Each needs the flavor `m1.small` for the
-Legacy persona's resizes. The profiles use the soft policy so that a cluster
-boots on a cloud with fewer compute hosts than the cluster has workers.
+Legacy persona's resizes. None sets `cold_migration`, so each cold-migrates
+when the migration pre-check allows it. The profiles use the soft policy so
+that a cluster boots on a cloud with fewer compute hosts than the cluster has
+workers.
 `small` fits Nova's common default quota of 10 instances and its default
 limits of 10 server groups and 10 members per group; `medium` and `large` need
 raised quotas.
