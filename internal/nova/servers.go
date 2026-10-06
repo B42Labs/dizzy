@@ -155,6 +155,14 @@ func (c *Client) ResizeServer(ctx context.Context, r resource.Resource, flavorID
 	return nil
 }
 
+// IsSameFlavor reports whether err is Nova's 400 rejection of a resize to the
+// flavor the server already has ("When resizing, instances must change
+// flavor!"). A caller that alternates flavors uses it to notice an earlier
+// resize or migration that finished in the cloud after its wait gave up.
+func IsSameFlavor(err error) bool {
+	return badRequestMentions(err, "must change flavor")
+}
+
 // ConfirmResizeServer confirms a resize, returning the server from VERIFY_RESIZE
 // to ACTIVE on the new flavor. A retried confirm can hit a 409 because the
 // instance is already ACTIVE (vm_state active) from the first request; that 409
@@ -212,6 +220,29 @@ func (c *Client) LiveMigrateServer(ctx context.Context, r resource.Resource) err
 	return nil
 }
 
+// ColdMigrateServer cold-migrates the server, letting the scheduler pick the
+// destination host. The migration leaves the server in VERIFY_RESIZE, which
+// ConfirmResizeServer then confirms. It is only called when the admin
+// pre-check permits migration for the run. A retried migrate can hit a 409
+// because the instance is already in a resize task state (resize_prep,
+// resize_migrating, resize_migrated, resize_finish) or in vm_state resized from
+// the first request; that 409 confirms the earlier migrate committed, so it is
+// treated as success and the waitServerStatus(VERIFY_RESIZE) that follows stays
+// the source of truth.
+func (c *Client) ColdMigrateServer(ctx context.Context, r resource.Resource) error {
+	err := c.timed(ctx, string(KindServer), "cold-migrate", func(ctx context.Context) error {
+		return servers.Migrate(ctx, c.compute, r.ID).ExtractErr()
+	})
+	if err != nil && conflictMentions(err, "resiz") {
+		slog.Info("server already migrating; treating a retried cold-migrate as success", "logical", r.Logical, "id", r.ID)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("cold-migrating server %q: %w", r.Logical, err)
+	}
+	return nil
+}
+
 // ListServersByMetadata returns the servers carrying this run's
 // dizzy:run=<runID> metadata, the discovery step metadata-based cleanup deletes
 // from.
@@ -259,6 +290,18 @@ func (c *Client) listServersByMetadata(ctx context.Context, filter map[string]st
 func conflictMentions(err error, substr string) bool {
 	var code gophercloud.ErrUnexpectedResponseCode
 	if !errors.As(err, &code) || code.Actual != 409 {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(code.Body)), substr)
+}
+
+// badRequestMentions reports whether err is a 400 whose body contains substr
+// (case-insensitively). Nova rejects some requests for a state the resource
+// already has, a resize to its current flavor or an attach of a volume that is
+// already attached, with a 400 whose body says so.
+func badRequestMentions(err error, substr string) bool {
+	var code gophercloud.ErrUnexpectedResponseCode
+	if !errors.As(err, &code) || code.Actual != 400 {
 		return false
 	}
 	return strings.Contains(strings.ToLower(string(code.Body)), substr)
