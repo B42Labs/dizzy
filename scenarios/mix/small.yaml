@@ -39,6 +39,13 @@ personas:
     ports_per_server:   { min: 0, max: 1 }    # extra ports per server, detached and re-attached
     interval:           { min: 10s, max: 1m } # random delay drawn per tick of the persona's engine
 
+# A lane shares the quota of any persona that authenticates against its project.
+lanes:                                                    # single-service churn next to the personas; off by default
+  cinder:   { enabled: false, cloud: "", profile: small }  # volumes and snapshots; volume_type: "" uses the default type
+  glance:   { enabled: false, cloud: "", profile: small }  # image upload and lifecycle
+  keystone: { enabled: false, cloud: "", profile: small }  # projects, users, assignments; needs admin or a domain manager
+  neutron:  { enabled: false, cloud: "", profile: small }  # networks, routers, ports, floating IPs
+
 chaos:                                 # `mix chaos --scenario scenarios/mix/small.yaml` runs as-is
   duration: 5m                         # total runtime; the only hard stop besides Ctrl-C
   parallel: { max: 4 }                 # per-tick fan-out of each persona, drawn in [1, max]; capped by --concurrency

@@ -49,6 +49,44 @@ func TestProfilesGenerateValidPlans(t *testing.T) {
 	}
 }
 
+// TestProfilesLanes confirms every shipped mix profile has four disabled
+// lanes on the small profiles, and that switching each on with Set yields a
+// plan with that lane.
+func TestProfilesLanes(t *testing.T) {
+	for _, name := range profileNames {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			s := readProfile(t, name)
+			want := Lanes{
+				Cinder:   CinderLane{Lane: Lane{Profile: "small"}},
+				Glance:   Lane{Profile: "small"},
+				Keystone: KeystoneLane{Lane: Lane{Profile: "small"}},
+				Neutron:  NeutronLane{Lane: Lane{Profile: "small"}},
+			}
+			if s.Lanes != want {
+				t.Errorf("lanes = %+v, want %+v", s.Lanes, want)
+			}
+			for _, lane := range []string{"cinder", "glance", "keystone", "neutron"} {
+				s := readProfile(t, name)
+				if err := s.Set("lanes."+lane+".enabled", "true"); err != nil {
+					t.Fatalf("Set: %v", err)
+				}
+				ls, err := s.LoadLanes(noRead(t))
+				if err != nil {
+					t.Fatalf("LoadLanes(%s): %v", lane, err)
+				}
+				p, err := s.Generate(ls)
+				if err != nil {
+					t.Fatalf("Generate(%s): %v", lane, err)
+				}
+				if len(p.Lanes) != 1 || p.Lanes[0].Name != lane || p.Lanes[0].Scenario() != name+"/"+lane {
+					t.Errorf("lanes with %s enabled = %+v, want that lane alone under %s/%s", lane, p.Lanes, name, lane)
+				}
+			}
+		})
+	}
+}
+
 // TestSmallProfileMatchesFixture ties the shipped small profile to the
 // smallScenario fixture the golden test builds on.
 func TestSmallProfileMatchesFixture(t *testing.T) {

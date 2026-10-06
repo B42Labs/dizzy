@@ -204,6 +204,31 @@ func TestMixGenerateSmallProfile(t *testing.T) {
 	}
 }
 
+// TestMixGenerateLane confirms switching on a lane of the shipped small
+// profile with --set adds it to the plan, under the lane's scenario name.
+func TestMixGenerateLane(t *testing.T) {
+	data, err := scenarios.Files.ReadFile("mix/small.yaml")
+	if err != nil {
+		t.Fatalf("reading shipped profile: %v", err)
+	}
+	out, err := execRoot(t, "mix", "generate", "--scenario", writeScenario(t, string(data)), "--set", "lanes.neutron.enabled=true")
+	if err != nil {
+		t.Fatalf("generate --set lanes.neutron.enabled=true: %v", err)
+	}
+	p := decodeMixPlan(t, out)
+	if len(p.Lanes) != 1 || p.Lanes[0].Name != "neutron" || p.Lanes[0].Neutron == nil || p.Lanes[0].Neutron.Scenario != "small/neutron" {
+		t.Errorf("plan lanes = %+v, want neutron alone with the scenario small/neutron", p.Lanes)
+	}
+
+	without, err := execRoot(t, "mix", "generate", "--scenario", writeScenario(t, string(data)))
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if strings.Contains(without, `"lanes"`) {
+		t.Errorf("plan of the small profile as shipped has a lanes key:\n%s", without)
+	}
+}
+
 // TestMixGenerateRejectsGardenerPolicy confirms a Gardener policy other than
 // the two anti-affinity policies fails the small profile before any API call.
 func TestMixGenerateRejectsGardenerPolicy(t *testing.T) {
