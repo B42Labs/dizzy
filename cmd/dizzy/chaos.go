@@ -114,23 +114,10 @@ func newChaosCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("creating network client: %w", err)
 			}
 
-			extNet, haveExternal, err := neutron.FindExternalNetwork(ctx, gc, externalNetwork)
-			if err != nil {
-				return err
-			}
-			var externalNetworkID string
-			switch {
-			case haveExternal:
-				externalNetworkID = extNet.ID
-				slog.Info("using external network for gateways and floating IPs", "id", extNet.ID, "name", extNet.Name)
-			case p.RoutersWithExternalGateway() > 0 || len(p.FloatingIPs) > 0:
-				slog.Warn("plan wants external connectivity but no external network was found; gateways and floating IPs will be skipped",
-					"externalGatewayRouters", p.RoutersWithExternalGateway(), "floatingIPs", len(p.FloatingIPs))
-			}
-
 			// The envelope is the population's worst case, so quota is pre-checked
 			// against the full plan exactly as apply does.
-			if err := neutron.PrecheckQuota(ctx, gc, p, haveExternal); err != nil {
+			externalNetworkID, err := precheckNeutron(ctx, gc, externalNetwork, p)
+			if err != nil {
 				return err
 			}
 

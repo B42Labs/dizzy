@@ -14,6 +14,7 @@ import (
 	"github.com/B42Labs/dizzy/internal/keystone"
 	keystoneexec "github.com/B42Labs/dizzy/internal/keystone/executor"
 	"github.com/B42Labs/dizzy/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/run"
 )
 
 // newKeystoneCleanupCmd builds "keystone cleanup", which deletes every domain,
@@ -51,13 +52,7 @@ func newKeystoneCleanupCmd(opts *globalOptions) *cobra.Command {
 			collector := metrics.NewCollector()
 			client := keystone.New(gc, id, collector)
 
-			// Assignments have no name or tag: they are discovered from each
-			// surviving user's live grants and from the run record. Without a record,
-			// the sweep still reclaims them via the users it discovers by prefix, but
-			// a record is the authoritative handle.
-			if rec == nil {
-				slog.Warn("cleaning up by id without a run record; role assignments are best reclaimed with a record — pass --run to use it", "run", id)
-			}
+			warnKeystoneUnreclaimable(id, rec)
 
 			hb := startHeartbeat(ctx, "cleanup in progress", collectorSnapshot(collector, time.Now()))
 			deleted, cleanupErr := keystoneexec.Cleanup(ctx, client, id, recordedFrom(rec), opts.timeout)
@@ -79,4 +74,15 @@ func newKeystoneCleanupCmd(opts *globalOptions) *cobra.Command {
 	flags.StringVar(&runID, "run-id", "", "delete resources for this run id directly, without a run record")
 
 	return cmd
+}
+
+// warnKeystoneUnreclaimable warns when a keystone cleanup of run id runs without
+// a record. Assignments have no name or tag: they are discovered from each
+// surviving user's live grants and from the run record. Without a record, the
+// sweep still reclaims them via the users it discovers by prefix, but a record
+// is the authoritative handle.
+func warnKeystoneUnreclaimable(id string, rec *run.Record) {
+	if rec == nil {
+		slog.Warn("cleaning up by id without a run record; role assignments are best reclaimed with a record — pass --run to use it", "run", id)
+	}
 }

@@ -90,28 +90,8 @@ func newApplyCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("creating network client: %w", err)
 			}
 
-			// Resolve the external network the run will use for router gateways and
-			// floating IPs. A named network that does not exist is an error; with no
-			// name and no external network present, external connectivity is simply
-			// skipped (the plan's intent degrades to a no-op).
-			extNet, haveExternal, err := neutron.FindExternalNetwork(ctx, gc, externalNetwork)
+			externalNetworkID, err := precheckNeutron(ctx, gc, externalNetwork, p)
 			if err != nil {
-				return err
-			}
-			externalNetworkID := ""
-			switch {
-			case haveExternal:
-				externalNetworkID = extNet.ID
-				slog.Info("using external network for gateways and floating IPs", "id", extNet.ID, "name", extNet.Name)
-			case p.RoutersWithExternalGateway() > 0 || len(p.FloatingIPs) > 0:
-				slog.Warn("plan wants external connectivity but no external network was found; gateways and floating IPs will be skipped",
-					"externalGatewayRouters", p.RoutersWithExternalGateway(), "floatingIPs", len(p.FloatingIPs))
-			}
-
-			// Abort an oversized plan before creating anything, turning a late,
-			// messy mid-apply quota failure into an early, clear one. External
-			// gateway ports and floating IPs only count when a network is available.
-			if err := neutron.PrecheckQuota(ctx, gc, p, haveExternal); err != nil {
 				return err
 			}
 

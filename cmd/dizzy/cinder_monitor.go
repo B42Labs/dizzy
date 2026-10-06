@@ -80,20 +80,8 @@ func newCinderMonitorCmd(opts *globalOptions) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("creating block storage client: %w", err)
 			}
-			// Like Neutron's external network, the volume type is a property of the
-			// target cloud, not of the cloud-independent plan: resolve it once and
-			// normalize to the resolved name so the per-type quota keys and the run
-			// records use it. A named type that does not exist is an error; unset
-			// means the cloud's default type.
-			if volumeType != "" {
-				vt, err := cinder.FindVolumeType(ctx, gc, volumeType)
-				if err != nil {
-					return err
-				}
-				volumeType = vt.Name
-				slog.Info("using volume type", "name", vt.Name, "id", vt.ID)
-			}
-			if err := cinder.PrecheckQuota(ctx, gc, p, volumeType); err != nil {
+			// The volume type is resolved once, for every iteration.
+			if volumeType, err = precheckCinder(ctx, gc, volumeType, p); err != nil {
 				return err
 			}
 

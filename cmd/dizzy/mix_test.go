@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -422,16 +424,36 @@ func tenantClouds(t *testing.T, authURL string) {
 }
 
 // fakeKeystone serves a v3 token scoped to projectID whose catalog points every
-// service of the compute stack at the server itself, and returns its auth URL.
-// The endpoints carry their major version, so the client skips discovery.
+// service of the compute stack and the identity service at the server itself,
+// and returns its auth URL. The endpoints carry their major version, so the
+// client skips discovery. The token carries no role.
 func fakeKeystone(t *testing.T, projectID string) string {
 	t.Helper()
+	url, _ := fakeKeystoneLog(t, projectID, nil)
+	return url
+}
+
+// fakeKeystoneLog is fakeKeystone that also returns a function listing the
+// method and path of every request the server received, in order. A request
+// other than the token request is answered with the JSON body bodies holds for
+// its "<method> <path>", or else with 404.
+func fakeKeystoneLog(t *testing.T, projectID string, bodies map[string]string) (string, func() []string) {
+	t.Helper()
+	var (
+		mu       sync.Mutex
+		requests []string
+	)
 	mux := http.NewServeMux()
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		mux.ServeHTTP(w, r)
+	}))
 	t.Cleanup(ts.Close)
 	mux.HandleFunc("POST /v3/auth/tokens", func(w http.ResponseWriter, _ *http.Request) {
 		var catalog []string
-		for _, svc := range [][2]string{{"compute", "v2.1"}, {"network", "v2.0"}, {"block-storage", "v3"}, {"image", "v2"}} {
+		for _, svc := range [][2]string{{"compute", "v2.1"}, {"network", "v2.0"}, {"block-storage", "v3"}, {"image", "v2"}, {"identity", "v3"}} {
 			catalog = append(catalog, fmt.Sprintf(`{"type":%q,"endpoints":[{"interface":"public","region":"RegionOne","url":%q}]}`,
 				svc[0], ts.URL+"/"+svc[0]+"/"+svc[1]+"/"))
 		}
@@ -440,7 +462,17 @@ func fakeKeystone(t *testing.T, projectID string) string {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = fmt.Fprintf(w, `{"token":{"expires_at":"2030-01-01T00:00:00Z","project":{"id":%q},"catalog":[%s]}}`, projectID, strings.Join(catalog, ","))
 	})
-	return ts.URL + "/v3"
+	for pattern, body := range bodies {
+		mux.HandleFunc(pattern, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, body)
+		})
+	}
+	return ts.URL + "/v3", func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(requests)
+	}
 }
 
 // writeTenantMixRecord writes a mix record whose ci persona ran under the
