@@ -359,9 +359,9 @@ over-limit request surfaces as a fast-failed 413.
 ## Mix
 
 A mix scenario describes a combined run: the workload personas that run side by
-side, how they divide one server envelope, and the opt-in services bound to
-them. It has no `distribution` block, because each persona block shapes its
-own workload.
+side, how they divide one server envelope, the background lanes that run next
+to them, and the opt-in services bound to them. It has no `distribution`
+block, because each persona block shapes its own workload.
 
 ```yaml
 name: small
@@ -401,6 +401,12 @@ personas:
     volume_gib:         { min: 1, max: 2 }
     ports_per_server:   { min: 0, max: 1 }
     interval:           { min: 10s, max: 1m }
+
+lanes:                 # single-service churn next to the personas; off by default
+  cinder:   { enabled: false, cloud: "", profile: small }   # also volume_type
+  glance:   { enabled: false, cloud: "", profile: small }
+  keystone: { enabled: false, cloud: "", profile: small }   # also privilege, domain, roles
+  neutron:  { enabled: false, cloud: "", profile: small }   # also external_network
 
 chaos:
   duration: 5m
@@ -461,9 +467,18 @@ persona keeps every planned resource.
 | `personas.legacy.volume_gib` | range | Size drawn per data volume; `min >= 1` when `volumes_per_server.max > 0` |
 | `personas.legacy.ports_per_server` | range | Extra ports per server, each detached and attached again |
 | `personas.legacy.interval.min` / `personas.legacy.interval.max` | duration | Random delay range drawn per tick of the persona's engine; `0` falls back to `200ms` / `3s` |
-| `chaos.duration` | duration | Total wall-clock runtime of every persona's engine |
+| `lanes.<name>.enabled` | bool | Switches the lane on; `<name>` is `cinder`, `glance`, `keystone` or `neutron`. Omitted means off |
+| `lanes.<name>.cloud` | string | `clouds.yaml` entry the lane authenticates with; empty uses `--os-cloud` |
+| `lanes.<name>.profile` | string | Bundled profile of the lane's service, `small`, `medium` or `large`. An enabled lane sets `profile` or `scenario`, not both |
+| `lanes.<name>.scenario` | string | Path to a scenario file of the lane's service, relative to the working directory |
+| `lanes.cinder.volume_type` | string | Volume type the lane's volumes are created with, by name or id; empty uses the cloud's default type |
+| `lanes.keystone.privilege` | string | Privilege tier of the lane, `auto`, `admin` or `domain-manager`; empty means `auto` |
+| `lanes.keystone.domain` | string | In-scope domain in domain-manager mode; empty uses the domain the token is scoped to |
+| `lanes.keystone.roles` | string | Existing roles to reuse in domain-manager mode, comma-separated; empty means `member,reader` |
+| `lanes.neutron.external_network` | string | External network for gateways and floating IPs, by name; empty uses the first external network |
+| `chaos.duration` | duration | Total wall-clock runtime of every persona's and lane's engine |
 | `chaos.parallel.max` | int | Per-tick fan-out of each persona's engine, drawn in `[1, max]` |
-| `chaos.bucket_width` | duration | Width of one time bucket of a run with `--duration 0` |
+| `chaos.bucket_width` | duration | Width of one time bucket of a run with `--duration 0`, for every persona and lane |
 
 The `--set` keys are `seed`, `image`, `flavor`, `resources.servers`,
 `services` (a comma-separated list; an empty value clears it), and every
@@ -472,8 +487,16 @@ table, with `personas.ci.volumes_per_server.min`, `.max` and the like for the
 ranges and Go duration strings for the intervals, e.g.
 `--set personas.ci.interval.max=2s`,
 `--set personas.gardener.policy=anti-affinity` or
-`--set personas.legacy.resize_flavor=`. The `chaos:` block has no `--set` keys;
-the `mix chaos` flags override it.
+`--set personas.legacy.resize_flavor=`. They also include
+`lanes.<name>.enabled`, `lanes.<name>.cloud`, `lanes.<name>.profile` and
+`lanes.<name>.scenario` for `cinder`, `glance`, `keystone` and `neutron`, with
+`true` or `false` for `enabled`, and `lanes.cinder.volume_type`,
+`lanes.keystone.privilege`, `lanes.keystone.domain`, `lanes.keystone.roles`
+and `lanes.neutron.external_network`, e.g.
+`--set lanes.keystone.enabled=true` or
+`--set lanes.cinder.profile= --set lanes.cinder.scenario=lanes/cinder.yaml`.
+No `--set` key reaches into a lane's scenario; name a scenario file for that.
+The `chaos:` block has no `--set` keys; the `mix chaos` flags override it.
 
 ### Shares
 
@@ -490,6 +513,43 @@ no persona with at least one server`. The plan records each persona's share
 divided by the sum of all shares. Each persona's compute plan is generated
 under a seed derived from the scenario seed and the persona name, so the same
 scenario and seed always yield the same plan.
+
+### Lanes
+
+A lane is the churn of one service, the graph that service's own `chaos`
+command builds, run in an engine of its own next to the personas. An enabled
+lane names its scenario in exactly one way: `profile` takes the service's
+bundled profile, `scenarios/<name>/<profile>.yaml`, and `scenario` reads a
+scenario file of the service, the format its own `chaos` command reads.
+Validation checks every enabled lane, in the order `cinder`, `glance`,
+`keystone`, `neutron`, and reports the first of:
+
+- `lanes.<name>: set profile or scenario, not both`
+- `lanes.<name>: an enabled lane needs a profile or a scenario`
+- `lanes.<name>.profile must be small, medium or large, got "<value>"`
+- `lanes.keystone.privilege must be auto, admin or domain-manager, got "<value>"`
+
+A disabled lane is not checked. A scenario file that cannot be read fails with
+`lanes.<name>: reading scenario <path>: …`, and one that does not parse with
+`lanes.<name>: parsing scenario: …`.
+
+The lane's scenario is named `<mix scenario name>/<lane>`, for example
+`small/keystone`, and seeded with a seed derived from the mix scenario seed and
+the lane name, the derivation the personas use. Its own `name` and `seed`
+therefore have no effect, and the plan lists every enabled lane under `lanes`,
+in the order above, with that seed. A lane whose plan has nothing to churn
+(no volumes, no images, neither projects nor users, or no networks, routers
+and security groups) fails with
+`lanes.<name>: the scenario plans no resources to churn`.
+
+A lane takes the interval, the churn ratio, the target fill, its service's
+mutate ratio (`resize_ratio`, `lifecycle_ratio` or `token_ratio`) and
+`parallel.max` from its own scenario's `chaos:` block. An omitted key falls
+back to the default of its service's `chaos` command, and `--max-parallel`
+overrides `parallel.max`. It takes the duration, the unbounded mode of
+`--duration 0` and the bucket width from the run, so its own `chaos.duration`
+and `chaos.bucket_width` have no effect, and the mix scenario's
+`chaos.parallel.max` does not apply to it.
 
 ### Profiles
 
@@ -520,6 +580,11 @@ boots on a cloud with fewer compute hosts than the cluster has workers.
 `small` fits Nova's common default quota of 10 instances and its default
 limits of 10 server groups and 10 members per group; `medium` and `large` need
 raised quotas.
+
+All three carry the same four lanes, each with `enabled: false`, `cloud: ""`
+and `profile: small`. They use the services' `small` profiles because
+Keystone's `small` is the only one a domain manager can run. A lane on the
+default cloud shares the quota of every persona that also names none.
 
 ## The `chaos:` block
 
@@ -552,5 +617,6 @@ chaos:                                # the block shipped by scenarios/neutron/m
 All eighteen built-in profiles carry a `chaos:` block, so `chaos` runs any of
 them with no flags at all. A mix scenario's block holds only `duration`,
 `parallel.max` and `bucket_width`; its interval, churn ratio and target fill
-are set per persona. See [The churn engine](../explanation/churn-engine.md) for
+are set per persona. A background lane of a mix run reads its own scenario's
+block instead; see [Lanes](#lanes). See [The churn engine](../explanation/churn-engine.md) for
 what `churn_ratio` and `target_fill` actually control.

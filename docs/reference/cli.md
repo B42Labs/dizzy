@@ -318,22 +318,28 @@ and the whole run shares one seed, one run id and one run record. This build
 has three personas: `ci`, whose servers are short-lived; `gardener`, whose
 servers form clusters in anti-affinity server groups and are replaced one
 worker at a time; and `legacy`, whose servers stay until teardown and are
-changed in place. See [Combined runs](../explanation/combined-runs.md).
+changed in place. Next to the personas, a run can churn single services as
+background lanes: `cinder`, `glance`, `keystone` and `neutron`. A lane runs the
+churn graph of that service's own `chaos` command in an engine of its own,
+under the identity `<run-id>-<lane>`. Every lane is off unless the scenario's
+`lanes:` block or `--set lanes.<name>.enabled=true` switches it on, and a run
+still needs a persona with a server. See
+[Combined runs](../explanation/combined-runs.md).
 
 | Subcommand | Touches the API | Purpose |
 |---|---|---|
 | `mix generate` | no | Expand a mix scenario into a plan and dump it |
-| `mix chaos` | yes | Run one churn engine per persona, each in its own project |
-| `mix status` | yes | Re-query the current state of a mix run's resources, per persona |
+| `mix chaos` | yes | Run one churn engine per persona and per enabled lane |
+| `mix status` | yes | Re-query the current state of a mix run's resources, per persona and lane |
 | `mix report` | no | Render metrics from a run record, the shared `report` |
-| `mix cleanup` | yes | Delete every persona's resources of a mix run |
+| `mix cleanup` | yes | Delete every persona's and lane's resources of a mix run |
 
 There is no `mix apply` and no `mix monitor`: a persona is a behavior over
 time, which a one-shot build does not have.
 
-`--concurrency` and `--max-parallel` apply to each persona separately. A run
-of three personas can have up to three times `--concurrency` API calls in
-flight.
+`--concurrency` and `--max-parallel` apply to each persona and each lane
+separately. A run of three personas and two lanes can have up to five times
+`--concurrency` API calls in flight.
 
 `mix generate`, `mix chaos`, `mix status` and `mix cleanup` reject an opt-in
 service under `services` that this build does not support, before they make
@@ -348,7 +354,9 @@ error: opt-in service "octavia" is not supported by this build of dizzy (support
 
 Expands a mix scenario into its plan and writes it as JSON: every persona with
 at least one server, with its share, its servers, its seed and its compute
-plan. Never touches the API.
+plan, and under `lanes` every enabled lane, with its seed and the plan of its
+service. A lane's scenario comes from the service's bundled profile or from
+the file the lane names. Never touches the API.
 
 | Flag | Description |
 |---|---|
@@ -380,22 +388,49 @@ level=WARN msg="live migration disabled for this run" reason="credentials lack t
 level=WARN msg="cold migration disabled for this run" reason="credentials lack the admin role"
 ```
 
+After the personas, each enabled lane authenticates with the `clouds.yaml`
+entry its block names under `cloud`, or with `--os-cloud` when that is empty,
+and runs the read-only pre-checks of its service's `chaos` command against its
+own plan: the volume type and the quota pre-check for `cinder`, the external
+network and the quota pre-check for `neutron`, and the privilege pre-check for
+`keystone`; `glance` has none. Nothing is created before every persona and
+every lane has passed. A lane whose pre-check fails, or whose cloud is not in
+`clouds.yaml`, ends the run before anything is created, with an error that
+names the lane; a lane is never dropped from a run with a warning:
+
+```console
+$ dizzy mix chaos --scenario scenarios/mix/small.yaml --set lanes.keystone.enabled=true
+error: lane "keystone": caller is neither cloud admin nor domain manager: token carries roles [member reader]; keystone needs the 'admin' role (any scope) or the 'manager' role on a domain-scoped token (use --privilege to override)
+```
+
+On a cloud without those rights, switch the lane off with
+`--set lanes.keystone.enabled=false`, or bind it with
+`--set lanes.keystone.privilege=domain-manager` and the lane's `domain` and
+`roles`. Once every pre-check has passed, the `keystone` lane creates its
+domain and role scaffold, or binds the existing domain and roles in
+domain-manager mode, and only then do the engines start. When the scaffold
+fails, the run deletes what it created and exits with
+`provisioning lane "keystone" (run <run-id>-keystone): binding scaffold: …`.
+
 | Flag | Default | Description |
 |---|---|---|
 | `--scenario <path>` | — | Path to the mix scenario YAML file (**required**) |
 | `--set <key>=<value>` | — | Override one scenario value; repeatable |
 | `--duration <duration>` | — | Total wall-clock runtime (required, via flag or the `chaos:` block). `0` runs until SIGINT or SIGTERM |
 | `--bucket-width <duration>` | `1h` | Width of one time bucket in the series of a run with `--duration 0`, at least `1m` |
-| `--max-parallel <n>` | `--concurrency` | Maximum concurrent in-flight churn operations of each persona |
-| `--no-cleanup` | off | Leave every persona's resources in place at the end of the run *and* on interrupt |
+| `--max-parallel <n>` | `--concurrency` | Maximum concurrent in-flight churn operations of each persona and lane. Without it, a lane takes `parallel.max` from its own scenario |
+| `--no-cleanup` | off | Leave every persona's and lane's resources in place at the end of the run *and* on interrupt |
 
 There are no `--min-interval`, `--max-interval`, `--churn-ratio` or
 `--target-fill` flags: each persona's block sets them, and `--set` overrides
-them, e.g. `--set personas.ci.target_fill=0.8`. The run writes and checkpoints
-one `run-<id>.json` the way `chaos` does, with a per-persona breakdown.
+them, e.g. `--set personas.ci.target_fill=0.8`. A lane takes them from its own
+scenario's `chaos:` block; see [Lanes](scenario-schema.md#lanes). The run
+writes and checkpoints one `run-<id>.json` the way `chaos` does, with a
+per-persona and per-lane breakdown.
 
 At the end it prints the overall metrics summary, then a table of the
-personas, then the record path:
+personas, then a table of the lanes when the run has any, then the record
+path:
 
 ```text
 Personas
@@ -403,23 +438,35 @@ NAME      PROJECT                           SHARE  SERVERS  OPS   OK  FAILED    
 ci        5c3f1e0a9b2d4e6f8a7b9c0d1e2f3a4b    50%        3  412  410       2  310ms   1.9s   3.2s
 gardener  7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a    30%        2   64   63       1   1.8s  41.5s  58.3s
 legacy    9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b    20%        1   96   95       1   2.4s  38.2s  52.1s
+
+Lanes
+NAME      PROJECT                           SCENARIO        OPS   OK  FAILED    P50    P95    P99
+glance    5c3f1e0a9b2d4e6f8a7b9c0d1e2f3a4b  small/glance     88   88       0  420ms   2.1s   3.4s
+keystone  2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e  small/keystone  240  239       1   95ms  310ms  480ms
 run record written to run-1a2b3c4d.json
 ```
 
-Teardown then deletes each persona's resources by its identity, prints one
-line per persona, and runs one leak check across all of them:
+Teardown then deletes each persona's and lane's resources by its identity,
+prints one line per persona and lane, and runs one leak check across all of
+them:
 
 ```text
 deleted 14 resource(s) for run 1a2b3c4d-ci
 deleted 6 resource(s) for run 1a2b3c4d-gardener
 deleted 5 resource(s) for run 1a2b3c4d-legacy
+deleted 3 resource(s) for run 1a2b3c4d-glance
+deleted 9 resource(s) for run 1a2b3c4d-keystone
 leak check: no run-tagged resources remain
 ```
 
 When resources remain, the last line is
 `leak check: <n> run-tagged resource(s) still present after teardown`. A
-persona whose teardown fails does not stop the others; the command then exits
-non-zero naming every failing persona and prints no leak-check line.
+persona or lane whose teardown fails does not stop the others; the command
+then exits non-zero naming every failing one, as
+`tearing down persona "ci" (run 1a2b3c4d-ci): …` or
+`tearing down lane "keystone" (run 1a2b3c4d-keystone): …`, and prints no
+leak-check line. A failing leak check reports
+`leak check for lane "keystone": …` or `leak check for persona "ci": …`.
 
 With `--no-cleanup` the resources stay in place and the command prints the
 hint to reclaim them, `churn interrupted; …` after an interrupt:
@@ -432,61 +479,83 @@ When the run record could not be written, the hint is
 `mix cleanup --run-id <id> --scenario '<file>'` instead, followed by one
 `--set '<key>=<value>'` for every `--set` the run was given. Either hint ends
 with `--os-cloud '<name>'` when the run took its cloud from `--os-cloud` or
-`$OS_CLOUD`, the cloud of every persona whose scenario block names none.
+`$OS_CLOUD`, the cloud of every persona and lane whose block names none.
 Values are single-quoted so the hint pastes into a POSIX shell unchanged.
 
 ### `mix status`
 
-Re-queries the current state of a mix run's resources, each persona under
-the cloud and identity the record names for it. A persona whose cloud now
-authenticates against another project than the record's `projectID` fails
-before anything is queried, because its resources would all show as `gone`.
+Re-queries the current state of a mix run's resources, each persona and lane
+under the cloud and identity the record names for it. A persona or lane whose
+cloud now authenticates against another project than the record's `projectID`
+fails before anything is queried, because its resources would all show as
+`gone`.
 
 | Flag | Description |
 |---|---|
 | `--run <path>` | Path to the mix run record to re-query (**required**) |
 
-For each persona it prints a heading `persona <name> (run <run-id>-<name>)`
-and the status table of the resources that persona created. It visits every
-persona and exits non-zero with `re-querying <n> of <m> personas failed` when
-any table failed.
+For each persona it prints a heading `persona <name> (run <run-id>-<name>)`,
+for each lane a heading `lane <name> (run <run-id>-<name>)`, and then the
+status table of the resources that persona or lane created. It visits every
+persona and lane and exits non-zero when any table failed, with
+`re-querying <n> of <m> personas failed`, or
+`re-querying <n> of <m> personas and lanes failed` for a record with lanes.
 
 ### `mix report`
 
-The shared [`report`](#report). A mix record adds per-persona output in every
-format; see [What `report` renders](metrics.md#what-report-renders).
+The shared [`report`](#report). A mix record adds per-persona and per-lane
+output in every format; see
+[What `report` renders](metrics.md#what-report-renders).
 
 ### `mix cleanup`
 
-Deletes every persona's resources of a mix run, each by its identity
-`<run-id>-<persona>` and in the project of the cloud the persona ran under,
-with the `nova` discovery rules of [`cleanup`](#cleanup). Server groups carry
-neither metadata nor tags, so a persona's server groups are found by the name
-prefix `dizzy-<run-id>-<persona>-` and deleted after its other resources, even
-when one of those deletes failed.
-Idempotent.
+Deletes every persona's and lane's resources of a mix run, each by its
+identity, `<run-id>-<persona>` or `<run-id>-<lane>`, and in the project of the
+cloud it ran under. A persona follows the `nova` discovery rules of
+[`cleanup`](#cleanup). Server groups carry neither metadata nor tags, so a
+persona's server groups are found by the name prefix
+`dizzy-<run-id>-<persona>-` and deleted after its other resources, even when
+one of those deletes failed. A lane follows the discovery rules of its
+service's `cleanup`. Idempotent.
 
 | Flag | Description |
 |---|---|
 | `--run <path>` | Path to the mix run record whose resources to delete |
 | `--run-id <id>` | Delete resources for this run id directly, without a record; needs `--scenario` |
-| `--scenario <path>` | With `--run-id` only: the scenario the run used, which names the personas and their clouds |
+| `--scenario <path>` | With `--run-id` only: the scenario the run used, which names the personas, the lanes and their clouds |
 | `--set <key>=<value>` | With `--run-id` only: an override the run used; repeatable |
 
 Exactly one of `--run` and `--run-id` is required. With `--run`, the personas,
-their clouds and identities come from the record, and a persona whose cloud
-now authenticates against another project than the record's `projectID` fails
-before anything is deleted:
+the lanes, their clouds and identities come from the record, and a persona or
+lane whose cloud now authenticates against another project than the record's
+`projectID` fails before anything is deleted:
 
 ```console
 $ dizzy mix cleanup --run run-1a2b3c4d.json --os-cloud other
 error: persona "ci" authenticated against project <id>, but the run record says it ran in project <id>; authenticate with the cloud the run used
 ```
 
+A lane reports the same with `lane "<name>"`, and a lane whose cloud is not in
+`clouds.yaml` fails with `creating <api> client for lane "<name>": …`, where
+`<api>` is `block storage`, `image`, `identity` or `network`.
+
 With `--run-id`, they come from the scenario and overrides, which must be the
-ones the run used. It prints
-`deleted <n> resource(s) for run <run-id>-<persona>` per persona and continues
-past a failing persona, then exits non-zero naming it.
+ones the run used. A lane needs only its name and cloud, so its scenario is
+not read again: a lane scenario file moved or changed since the run does not
+stop the cleanup. Without a record, the `neutron` and `keystone` lanes cannot
+reclaim everything `neutron cleanup` and `keystone cleanup` reclaim with one,
+and the command logs their warnings under the lane identity before it deletes
+anything:
+
+```text
+level=WARN msg="cleaning up by id without a run record; resources that cannot be discovered by tag (e.g. address scopes) will not be reclaimed — pass --run to reclaim them" run=1a2b3c4d-neutron
+level=WARN msg="cleaning up by id without a run record; role assignments are best reclaimed with a record — pass --run to use it" run=1a2b3c4d-keystone
+```
+
+It prints `deleted <n> resource(s) for run <run-id>-<name>` per persona and
+lane and continues past a failing one, then exits non-zero naming it, as
+`cleaning up persona "ci" (run …): …` or
+`cleaning up lane "keystone" (run …): …`.
 
 `nova cleanup --run` on a mix record fails with
 `run record is for service "mix", not "nova"`, and `mix cleanup --run` on a
