@@ -376,9 +376,11 @@ func chaosStats(r *chaos.Result) *run.ChaosStats {
 // it builds the run record as of now from the engine's snapshot, marks it
 // incomplete, and writes it to dir over the previous one. A failed write is
 // logged as a warning and the run goes on, since the previous record stays on
-// disk and the next checkpoint tries again. It writes nothing to stdout.
-func chaosCheckpoint(dir string, build func(r *chaos.Result, finished time.Time) *run.Record) func(*chaos.Result) {
-	return func(r *chaos.Result) {
+// disk and the next checkpoint tries again. It writes nothing to stdout. The
+// snapshot is one engine's *chaos.Result, or for mix chaos the latest result
+// of every persona's engine keyed by persona.
+func chaosCheckpoint[S any](dir string, build func(r S, finished time.Time) *run.Record) func(S) {
+	return func(r S) {
 		rec := build(r, time.Now())
 		rec.Incomplete = true
 		path, err := run.Write(dir, rec)
