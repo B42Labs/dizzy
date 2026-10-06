@@ -3,11 +3,14 @@ package scenario
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"math"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v2"
 
 	novascenario "github.com/B42Labs/dizzy/internal/nova/scenario"
 )
@@ -43,6 +46,7 @@ personas:
     cloud: tenant-legacy
     networks: 3
     resize_flavor: m1.small
+    cold_migration: false
     volumes_per_server: { min: 1, max: 2 }
     volume_gib: { min: 3, max: 4 }
     ports_per_server: { min: 0, max: 5 }
@@ -51,16 +55,70 @@ personas:
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
+	off := false
 	want := Legacy{
-		Share: 0.2, Cloud: "tenant-legacy", Networks: 3, ResizeFlavor: "m1.small",
+		Share: 0.2, Cloud: "tenant-legacy", Networks: 3, ResizeFlavor: "m1.small", ColdMigration: &off,
 		VolumesPerServer: novascenario.Range{Min: 1, Max: 2},
 		VolumeGiB:        novascenario.Range{Min: 3, Max: 4},
 		PortsPerServer:   novascenario.Range{Min: 0, Max: 5},
 		Interval:         novascenario.Interval{Min: novascenario.Duration(10 * time.Second), Max: novascenario.Duration(time.Minute)},
 	}
-	if s.Personas.Legacy != want {
+	if !reflect.DeepEqual(s.Personas.Legacy, want) {
 		t.Errorf("personas.legacy = %+v, want %+v", s.Personas.Legacy, want)
 	}
+}
+
+// TestParseLegacyColdMigration confirms cold_migration decodes into a pointer
+// that is nil when the key is absent or null, that ColdMigrates is false only
+// for an explicit false, and that a value other than a boolean fails Parse.
+func TestParseLegacyColdMigration(t *testing.T) {
+	on, off := true, false
+	tests := []struct {
+		name         string
+		line         string
+		want         *bool
+		coldMigrates bool
+	}{
+		{"true", "cold_migration: true", &on, true},
+		{"false", "cold_migration: false", &off, false},
+		{"absent", "share: 0.2", nil, true},
+		{"null", "cold_migration:", nil, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s, err := Parse([]byte("personas:\n  legacy:\n    " + tc.line + "\n"))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			got := s.Personas.Legacy.ColdMigration
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("cold_migration = %v, want %v", got, tc.want)
+			}
+			if got := s.Personas.Legacy.ColdMigrates(); got != tc.coldMigrates {
+				t.Errorf("ColdMigrates() = %v, want %v", got, tc.coldMigrates)
+			}
+		})
+	}
+
+	t.Run("not a boolean", func(t *testing.T) {
+		t.Parallel()
+		_, err := Parse([]byte("personas:\n  legacy:\n    cold_migration: maybe\n"))
+		if err == nil || !strings.HasPrefix(err.Error(), "parsing scenario: ") {
+			t.Fatalf("Parse = %v, want an error starting with %q", err, "parsing scenario: ")
+		}
+		var typeErr *yaml.TypeError
+		if !errors.As(err, &typeErr) {
+			t.Errorf("Parse = %v, want a *yaml.TypeError", err)
+		}
+	})
+
+	t.Run("zero block", func(t *testing.T) {
+		t.Parallel()
+		if !(Legacy{}).ColdMigrates() {
+			t.Error("Legacy{}.ColdMigrates() = false, want true")
+		}
+	})
 }
 
 // TestParseWithoutLegacy confirms a scenario without a legacy block has a zero
@@ -77,7 +135,7 @@ personas:
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if s.Personas.Legacy != (Legacy{}) {
+	if !reflect.DeepEqual(s.Personas.Legacy, Legacy{}) {
 		t.Errorf("personas.legacy = %+v, want the zero block", s.Personas.Legacy)
 	}
 	p, err := s.Generate(LaneScenarios{})
@@ -534,6 +592,7 @@ func FuzzParse(f *testing.F) {
 	f.Add([]byte("name: x\npersonas:\n  ci: { share: .nan }\n"))
 	f.Add([]byte("chaos: { duration: 1m, parallel: { max: 4 } }\nservices: [a, a]\n"))
 	f.Add([]byte("name: x\nresources: { servers: 2 }\npersonas:\n  legacy: { share: 1, networks: 1, resize_flavor: m1.small, ports_per_server: { min: 0, max: 1 } }\n"))
+	f.Add([]byte("name: x\nresources: { servers: 2 }\npersonas:\n  legacy: { share: 1, networks: 1, cold_migration: false }\n"))
 	f.Add([]byte("name: x\nresources: { servers: 3 }\npersonas:\n  gardener: { share: 1, clusters: 2, policy: anti-affinity, volume_gib: { min: 1, max: 1 } }\n"))
 	f.Add([]byte("name: x\nlanes:\n  cinder: { enabled: true, profile: small, scenario: c.yaml }\n  keystone: { enabled: true, profile: small, privilege: root }\n"))
 	f.Fuzz(func(t *testing.T, data []byte) {

@@ -95,6 +95,8 @@ type Gardener struct {
 // re-attach of one of their data volumes or ports. Share, Cloud and Networks
 // mean what they mean for the CI persona. ResizeFlavor is the second flavor
 // the servers alternate with; empty, the servers are never resized.
+// ColdMigration set to false turns cold migration off and leaves live
+// migration to the migration pre-check; nil or true keeps it on.
 // VolumesPerServer and VolumeGiB shape the data volumes and PortsPerServer the
 // extra ports. Interval configures the persona's churn engine; a zero bound
 // falls back to the command's default. The persona keeps every planned
@@ -104,11 +106,16 @@ type Legacy struct {
 	Cloud            string                `yaml:"cloud"`
 	Networks         int                   `yaml:"networks"`
 	ResizeFlavor     string                `yaml:"resize_flavor"`
+	ColdMigration    *bool                 `yaml:"cold_migration"`
 	VolumesPerServer novascenario.Range    `yaml:"volumes_per_server"`
 	VolumeGiB        novascenario.Range    `yaml:"volume_gib"`
 	PortsPerServer   novascenario.Range    `yaml:"ports_per_server"`
 	Interval         novascenario.Interval `yaml:"interval"`
 }
+
+// ColdMigrates reports whether the persona's servers are cold-migrated: true
+// unless the block sets cold_migration to false.
+func (l Legacy) ColdMigrates() bool { return l.ColdMigration == nil || *l.ColdMigration }
 
 // Lanes holds one block per background lane: the churn of a single service
 // that the service's own chaos command runs, in a churn engine of its own next
