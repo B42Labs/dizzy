@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/B42Labs/dizzy/internal/nova"
+	novaexec "github.com/B42Labs/dizzy/internal/nova/executor"
 	novaplan "github.com/B42Labs/dizzy/internal/nova/plan"
 	"github.com/B42Labs/dizzy/internal/resource"
 	"github.com/B42Labs/dizzy/internal/run"
@@ -301,5 +303,78 @@ func TestNovaRejectsCinderRecord(t *testing.T) {
 	}
 	if _, err := execRoot(t, "nova", "cleanup", "--run", cinderRec); err == nil || !strings.Contains(err.Error(), "service") {
 		t.Errorf("nova cleanup on a cinder record: err = %v, want a service mismatch error", err)
+	}
+}
+
+// TestSetMigrationVerdict confirms the one migration pre-check verdict sets the
+// flag of, and logs one line for, each migration kind the plan schedules, and
+// leaves a plan without migrations alone. The subtests swap the default logger,
+// so they do not run in parallel.
+func TestSetMigrationVerdict(t *testing.T) {
+	server := func(live, cold bool) novaplan.Server {
+		return novaplan.Server{Name: "srv-0001", Networks: []string{"net-0001"}, LiveMigrate: live, ColdMigrate: cold}
+	}
+	const reason = "credentials lack the admin role"
+	base := novaexec.Resolved{ImageID: "img-1", FlavorID: "flv-1"}
+	tests := []struct {
+		name    string
+		servers []novaplan.Server
+		ok      bool
+		want    novaexec.Resolved
+		logs    []string // the expected lines, in order
+	}{
+		{
+			name:    "cold migrations enabled",
+			servers: []novaplan.Server{server(false, true)},
+			ok:      true,
+			want:    novaexec.Resolved{ImageID: "img-1", FlavorID: "flv-1", ColdMigration: true},
+			logs:    []string{`level=INFO msg="cold migration enabled for this run"`},
+		},
+		{
+			name:    "both kinds disabled",
+			servers: []novaplan.Server{server(true, false), server(false, true)},
+			want:    base,
+			logs: []string{
+				`level=WARN msg="live migration disabled for this run" reason="credentials lack the admin role"`,
+				`level=WARN msg="cold migration disabled for this run" reason="credentials lack the admin role"`,
+			},
+		},
+		{
+			name:    "both kinds enabled",
+			servers: []novaplan.Server{server(true, true)},
+			ok:      true,
+			want:    novaexec.Resolved{ImageID: "img-1", FlavorID: "flv-1", LiveMigration: true, ColdMigration: true},
+			logs:    []string{`level=INFO msg="live migration enabled for this run"`, `level=INFO msg="cold migration enabled for this run"`},
+		},
+		{name: "no migration, ok", servers: []novaplan.Server{server(false, false)}, ok: true, want: base},
+		{name: "no migration, not ok", servers: nil, want: base},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{
+				ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+					if a.Key == slog.TimeKey {
+						return slog.Attr{}
+					}
+					return a
+				},
+			})))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			resolved := base
+			setMigrationVerdict(&resolved, &novaplan.Plan{Servers: tc.servers}, tc.ok, reason)
+			if resolved != tc.want {
+				t.Errorf("resolved = %+v, want %+v", resolved, tc.want)
+			}
+			var got []string
+			if out := strings.TrimSpace(logs.String()); out != "" {
+				got = strings.Split(out, "\n")
+			}
+			if strings.Join(got, "|") != strings.Join(tc.logs, "|") {
+				t.Errorf("logs = %q, want %q", got, tc.logs)
+			}
+		})
 	}
 }

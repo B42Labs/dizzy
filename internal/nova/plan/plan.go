@@ -44,7 +44,10 @@ type Network struct {
 // UserData injects a deterministic cloud-config at boot. StopStart is "", "soft"
 // (os-stop then os-start), or "hard" (a hard reboot). Resize resizes it to the
 // plan's ResizeFlavor and confirms the resize. LiveMigrate live-migrates it when
-// the admin pre-check permits. Delete deletes it during the run.
+// the admin pre-check permits. ColdMigrate cold-migrates it when the admin
+// pre-check permits; only the mix generator sets it, for a long-lived persona,
+// and nova apply, nova chaos and Summary ignore it. Delete deletes it during
+// the run.
 type Server struct {
 	Name           string   `json:"name"`
 	BootFromVolume bool     `json:"bootFromVolume,omitempty"`
@@ -54,6 +57,7 @@ type Server struct {
 	StopStart      string   `json:"stopStart,omitempty"`
 	Resize         bool     `json:"resize,omitempty"`
 	LiveMigrate    bool     `json:"liveMigrate,omitempty"`
+	ColdMigrate    bool     `json:"coldMigrate,omitempty"`
 	Delete         bool     `json:"delete,omitempty"`
 }
 
@@ -155,6 +159,17 @@ func (p *Plan) LiveMigrations() int {
 	var n int
 	for _, s := range p.Servers {
 		if s.LiveMigrate {
+			n++
+		}
+	}
+	return n
+}
+
+// ColdMigrations counts the servers the plan cold-migrates.
+func (p *Plan) ColdMigrations() int {
+	var n int
+	for _, s := range p.Servers {
+		if s.ColdMigrate {
 			n++
 		}
 	}
