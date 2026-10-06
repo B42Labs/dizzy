@@ -92,7 +92,7 @@ install:
 run: build
 	./$(BINARY) $(ARGS)
 
-## devstack-osism: Run the small scenario (DEVSTACK_OSISM_SERVICE=neutron|cinder|keystone|nova|glance) against the OSISM testbed, then clean up.
+## devstack-osism: Run the small scenario (DEVSTACK_OSISM_SERVICE=neutron|cinder|keystone|nova|glance|mix; mix needs DEVSTACK_OSISM_CMD=chaos) against the OSISM testbed, then clean up.
 devstack-osism: build
 	@test -f "$(DEVSTACK_OSISM_CLOUDS_FILE)" || { echo "error: clouds file $(DEVSTACK_OSISM_CLOUDS_FILE) not found"; exit 1; }
 	@test -f "$(DEVSTACK_OSISM_CACERT)"      || { echo "error: CA cert $(DEVSTACK_OSISM_CACERT) not found (clouds.yaml 'cacert')"; exit 1; }

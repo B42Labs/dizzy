@@ -11,7 +11,7 @@ For what the knobs actually control, see
 
 ## Run a built-in profile
 
-All fifteen profiles ship a `chaos:` block, so they run with no flags at all:
+All eighteen profiles ship a `chaos:` block, so they run with no flags at all:
 
 ```console
 $ dizzy neutron chaos --scenario scenarios/neutron/small.yaml    # 5m
@@ -19,6 +19,7 @@ $ dizzy cinder chaos  --scenario scenarios/cinder/small.yaml     # 5m
 $ dizzy keystone chaos --scenario scenarios/keystone/small.yaml  # 5m
 $ dizzy nova chaos --scenario scenarios/nova/small.yaml          # 5m
 $ dizzy glance chaos --scenario scenarios/glance/small.yaml      # 5m
+$ dizzy mix chaos --scenario scenarios/mix/small.yaml            # 5m
 ```
 
 The topology is torn down at the end of the run, followed by a leak check.
@@ -127,6 +128,68 @@ $ dizzy neutron chaos --scenario scenarios/neutron/small.yaml --seed 12345
 The whole decision schedule — timings, fan-out, create-versus-delete, which
 resource — replays exactly. The order in which the concurrent cloud calls
 *complete* does not, since that is the cloud's business.
+
+## Mix workloads in one run
+
+`mix chaos` runs several workload personas side by side, each in its own
+project, and ends with one run record. Give each persona a project of its own
+by adding one `clouds.yaml` entry per project. A persona that names no entry
+uses `--os-cloud`:
+
+```yaml
+clouds:
+  soak:                           # the --os-cloud default
+    auth:
+      auth_url: https://keystone.example.com/v3
+      username: soak
+      password: <password>
+      project_name: soak
+      user_domain_name: Default
+      project_domain_name: Default
+    region_name: RegionOne
+  tenant-ci:                      # the CI persona's project
+    auth:
+      auth_url: https://keystone.example.com/v3
+      username: soak-ci
+      password: <password>
+      project_name: soak-ci
+      user_domain_name: Default
+      project_domain_name: Default
+    region_name: RegionOne
+```
+
+Point the CI persona at its entry and run the soak:
+
+```console
+$ dizzy mix chaos --scenario scenarios/mix/small.yaml --os-cloud soak --set personas.ci.cloud=tenant-ci
+```
+
+Every persona's teardown prints its own
+`deleted N resource(s) for run <id>-<persona>` line, and the run ends with one
+leak check across all of them.
+To re-query a run that is still live, or one kept with `--no-cleanup`:
+
+```console
+$ dizzy mix status --run run-<id>.json --os-cloud soak
+```
+
+To reclaim a killed or kept run, pass the record; the record names each
+persona's cloud and identity:
+
+```console
+$ dizzy mix cleanup --run run-<id>.json --os-cloud soak
+```
+
+Without a record, pass the run id together with the scenario and every `--set`
+the run used:
+
+```console
+$ dizzy mix cleanup --run-id <id> --scenario scenarios/mix/small.yaml --os-cloud soak --set personas.ci.cloud=tenant-ci
+```
+
+`--concurrency` and `--max-parallel` bound each persona separately. See
+[Combined runs](../explanation/combined-runs.md) for how the personas share the
+server envelope.
 
 ## Read the results
 

@@ -169,7 +169,7 @@ no ldflags reports `dev`.
 
 ## Get the scenario profiles
 
-`--scenario` takes a **filesystem path**. The fifteen built-in profiles are not
+`--scenario` takes a **filesystem path**. The eighteen built-in profiles are not
 resolvable by name from an installed binary — they live under `scenarios/` in the
 repository. Clone it even if you installed a release binary:
 
