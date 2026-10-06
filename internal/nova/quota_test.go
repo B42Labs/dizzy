@@ -33,6 +33,29 @@ func TestPlanNeeds(t *testing.T) {
 	if n.ram != 3072 {
 		t.Errorf("ram = %d, want 3072", n.ram)
 	}
+	if n.serverGroups != 0 || n.groupMembers != 0 {
+		t.Errorf("serverGroups, groupMembers = %d, %d for a plan without groups, want 0, 0", n.serverGroups, n.groupMembers)
+	}
+}
+
+// TestPlanNeedsServerGroups confirms a plan with server groups needs one
+// server_groups unit per group and as many server_group_members as its
+// largest group has servers.
+func TestPlanNeedsServerGroups(t *testing.T) {
+	p := &plan.Plan{
+		ServerGroups: []plan.ServerGroup{{Name: "grp-0001"}, {Name: "grp-0002"}},
+		Servers: []plan.Server{
+			{Name: "a", Group: "grp-0001"},
+			{Name: "b", Group: "grp-0002"},
+			{Name: "c", Group: "grp-0001"},
+			{Name: "d", Group: "grp-0002"},
+			{Name: "e", Group: "grp-0001"},
+		},
+	}
+	n := planNeeds(p, Flavor{VCPUs: 1, RAM: 512}, Flavor{})
+	if n.serverGroups != 2 || n.groupMembers != 3 {
+		t.Errorf("serverGroups, groupMembers = %d, %d, want 2, 3", n.serverGroups, n.groupMembers)
+	}
 }
 
 func TestCheckQuota(t *testing.T) {
@@ -127,4 +150,47 @@ func TestProjectIDFromToken(t *testing.T) {
 	if id, ok := ProjectID(gc); id != "proj-1" || !ok {
 		t.Errorf("ProjectID = (%q, %v), want (\"proj-1\", true)", id, ok)
 	}
+}
+
+// TestCheckQuotaServerGroups confirms the server-group limits join the
+// itemized error for a plan with groups, count as unlimited when negative, and
+// are not checked for a plan without groups.
+func TestCheckQuotaServerGroups(t *testing.T) {
+	quota := func(groupLimit, groupUsed, memberLimit int) quotasets.QuotaDetailSet {
+		return quotasets.QuotaDetailSet{
+			Instances:          quotasets.QuotaDetail{Limit: 10},
+			Cores:              quotasets.QuotaDetail{Limit: 20},
+			RAM:                quotasets.QuotaDetail{Limit: 51200},
+			ServerGroups:       quotasets.QuotaDetail{Limit: groupLimit, InUse: groupUsed},
+			ServerGroupMembers: quotasets.QuotaDetail{Limit: memberLimit, InUse: 7},
+		}
+	}
+	withGroups := needs{instances: 5, cores: 5, ram: 2560, serverGroups: 2, groupMembers: 3}
+
+	t.Run("over both limits", func(t *testing.T) {
+		err := checkQuota(withGroups, quota(10, 9, 2))
+		if err == nil {
+			t.Fatal("checkQuota() = nil, want error")
+		}
+		for _, want := range []string{
+			"server groups need 2, available 1 (limit 10, used 9)",
+			"server group members need 3 per group, limit 2",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("checkQuota() = %q, want it to contain %q", err.Error(), want)
+			}
+		}
+	})
+
+	t.Run("unlimited", func(t *testing.T) {
+		if err := checkQuota(withGroups, quota(-1, 9, -1)); err != nil {
+			t.Errorf("checkQuota() = %v, want nil", err)
+		}
+	})
+
+	t.Run("plan without groups", func(t *testing.T) {
+		if err := checkQuota(needs{instances: 5, cores: 5, ram: 2560}, quota(10, 12, 0)); err != nil {
+			t.Errorf("checkQuota() = %v, want nil", err)
+		}
+	})
 }

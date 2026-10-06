@@ -5,10 +5,12 @@ package nova
 // usage and aborts a plan that would not fit the remaining headroom with an
 // itemized message before any resource is created; raising the quotas is then
 // the operator's step. It covers only the compute quotas (instances, cores,
-// RAM) the servers consume — the Cinder gigabytes and Neutron port/network
-// quotas the companion resources consume are not pre-checked, so the executor's
-// quota fast-fail is the backstop there. It never auto-raises quotas, which
-// would require admin credentials the tool otherwise never needs.
+// RAM) the servers consume and, for a plan with server groups, the
+// server_groups and server_group_members limits — the Cinder gigabytes and
+// Neutron port/network quotas the companion resources consume are not
+// pre-checked, so the executor's quota fast-fail is the backstop there. It
+// never auto-raises quotas, which would require admin credentials the tool
+// otherwise never needs.
 
 import (
 	"context"
@@ -26,18 +28,23 @@ import (
 // needs is the count of each compute quota-bounded resource an expanded plan
 // requires: the instance count, the total vCPUs, and the total RAM in MB. A
 // resized server counts, per dimension, the larger of its boot and resize
-// flavor, since it holds both at the moment of the resize.
+// flavor, since it holds both at the moment of the resize. serverGroups is the
+// number of planned server groups and groupMembers the largest number of
+// servers that name one group.
 type needs struct {
-	instances int64
-	cores     int64
-	ram       int64
+	instances    int64
+	cores        int64
+	ram          int64
+	serverGroups int64
+	groupMembers int64
 }
 
 // planNeeds counts the compute quota-bounded resources a plan will create. Each
 // server is one instance sized by boot; a resized server is sized by the
 // per-dimension maximum of the boot and resize flavors.
 func planNeeds(p *plan.Plan, boot, resize Flavor) needs {
-	n := needs{instances: int64(len(p.Servers))}
+	n := needs{instances: int64(len(p.Servers)), serverGroups: int64(len(p.ServerGroups))}
+	members := make(map[string]int64)
 	for _, s := range p.Servers {
 		cores, ram := boot.VCPUs, boot.RAM
 		if s.Resize {
@@ -46,13 +53,17 @@ func planNeeds(p *plan.Plan, boot, resize Flavor) needs {
 		}
 		n.cores += int64(cores)
 		n.ram += int64(ram)
+		if s.Group != "" {
+			members[s.Group]++
+			n.groupMembers = max(n.groupMembers, members[s.Group])
+		}
 	}
 	return n
 }
 
 // PrecheckQuota reads the project's compute quotas and returns an itemized error
-// if the plan would exceed the instances, cores, or RAM quota, before any
-// resource is created. It is fail-open only where the read cannot meaningfully
+// if the plan would exceed the instances, cores, or RAM quota, or one of the
+// two server-group limits, before any resource is created. It is fail-open only where the read cannot meaningfully
 // proceed: if the project id cannot be derived from the auth result, or the
 // quota read is denied (a common non-admin 403), it logs a warning and returns
 // nil, leaving the executor's quota fast-fail as the backstop. Any other read
@@ -101,7 +112,10 @@ func ProjectID(gc *gophercloud.ServiceClient) (string, bool) {
 // itemized error naming every dimension that would be exceeded, or nil. Reading
 // the remaining quota rather than the raw limit is what lets a project with
 // pre-existing usage be caught before apply rather than mid-apply. A negative
-// limit means unlimited (the compute convention) and never blocks.
+// limit means unlimited (the compute convention) and never blocks. Only a plan
+// with server groups is checked against the server_groups limit, and against
+// the server_group_members limit alone: Nova counts members per group, so its
+// usage figure says nothing about a new group.
 func checkQuota(need needs, q quotasets.QuotaDetailSet) error {
 	var over []string
 	check := func(name string, want int64, d quotasets.QuotaDetail) {
@@ -117,6 +131,12 @@ func checkQuota(need needs, q quotasets.QuotaDetailSet) error {
 	check("instances", need.instances, q.Instances)
 	check("cores", need.cores, q.Cores)
 	check("ram (MB)", need.ram, q.RAM)
+	if need.serverGroups > 0 {
+		check("server groups", need.serverGroups, q.ServerGroups)
+		if limit := int64(q.ServerGroupMembers.Limit); limit >= 0 && need.groupMembers > limit {
+			over = append(over, fmt.Sprintf("server group members need %d per group, limit %d", need.groupMembers, limit))
+		}
+	}
 
 	if len(over) == 0 {
 		return nil
