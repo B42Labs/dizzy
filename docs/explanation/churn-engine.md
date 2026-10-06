@@ -4,9 +4,10 @@
 burst of creates against an empty project — a real thing to measure, but not the
 thing that breaks clouds.
 
-`chaos` measures the other thing. It runs for a duration, continuously creating
-*and* deleting resources at random, seeded intervals, and reports latency and
-error rates **bucketed over time**. Neutron's agents, Cinder's scheduler and
+`chaos` measures the other thing. It runs for a duration, or with
+`--duration 0` until it is stopped, continuously creating *and* deleting
+resources at random, seeded intervals, and reports latency and error rates
+**bucketed over time**. Neutron's agents, Cinder's scheduler and
 backend garbage collection, Keystone's token machinery: these tend to degrade
 under sustained churn in ways an aggregate over a single build never shows.
 
@@ -115,11 +116,49 @@ through the same bounded worker pool `apply` uses. So a problematic run replays
 its *decision schedule* exactly, while the cloud is free to respond differently.
 See [Determinism](determinism.md).
 
+## Running without an end
+
+`--duration 0` turns the soak into a run that ends only when it is stopped, for
+a lab that stays under load between releases. A run that may last weeks cannot
+hold on to everything until its end the way a short run can, so its state is
+fixed in size:
+
+- The collector adds every API sample to counters and a log-bucket histogram per
+  resource kind instead of storing it. A histogram has at most 2,185 keys however
+  many samples it counts; the price is that run-level percentiles are estimates
+  within 1%.
+- The engine keeps an operation's raw latency only in the time bucket of its
+  decision, and only until that bucket is sealed. Once the scheduler has moved
+  past a bucket and none of its operations is still in flight, the bucket's
+  statistics are computed and the raw data is dropped, so bucket percentiles stay
+  exact.
+- The decision log is not kept. A bounded run keeps it because the determinism
+  tests read it; an unbounded run only counts its creates, deletes and mutates.
+
+The time series is the one part that grows: one bucket per `--bucket-width`, an
+hour by default. Ten equal buckets, as a bounded run has, would each span days
+after a few weeks and hide the degradation they exist to show. No bucket is
+dropped or merged, since the earliest ones are the baseline the later ones are
+compared with.
+
+Every chaos run, bounded or not, rewrites its run record once a minute while it
+goes on, so a killed process or a lost node costs at most about a minute of
+record. The checkpoint
+is taken on the scheduler goroutine, between two ticks. The scheduler owns the
+population state and knows which operations are in flight, so the snapshot sees
+a consistent picture: a create still in flight is left out until it has a cloud
+id, and a resource whose delete is still in flight stays listed. Driving the
+checkpoint from the engine's clock also lets the tests run it in virtual time.
+The cost is that a slow disk delays the next tick by as long as the write takes.
+
 ## Teardown is the default
 
 A churn run tears its resources down at the end of the run **or when
 interrupted**. The run record is written first, then the teardown runs on a
-context that survives the signal, followed by a leak check.
+context that survives the signal, followed by a leak check. For a run with
+`--duration 0` the signal is simply how it ends. Before that, the record on disk
+is a checkpoint at most about a minute old, so even a hard kill leaves
+`cleanup --run` a list to work from.
 
 That ordering is deliberate: the first Ctrl-C should clean up, not abandon. If
 you want to interrupt and inspect what is live, `--no-cleanup` is the explicit

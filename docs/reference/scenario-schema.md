@@ -373,11 +373,12 @@ chaos:                                # the block shipped by scenarios/neutron/m
 
 | Key | Type | Services | Meaning |
 |---|---|---|---|
-| `duration` | duration | all | Total wall-clock runtime |
+| `duration` | duration | all | Total wall-clock runtime. `0` means unset; only `--duration 0` selects a run without an end |
 | `interval.min` / `interval.max` | duration | all | Random delay range drawn per tick |
 | `parallel.max` | int | all | Per-tick fan-out, drawn in `[1, max]`, capped by `--concurrency` |
 | `churn_ratio` | ratio | all | Create bias at equilibrium |
 | `target_fill` | ratio | all | Fraction of the envelope kept populated |
+| `bucket_width` | duration | all | Width of one time bucket of a run with `--duration 0`, at least `1m`. `0` or omitted falls back to `1h`; a bounded run ignores it |
 | `resize_ratio` | ratio | cinder | Probability per step of extending a live volume to its planned target |
 | `token_ratio` | ratio | keystone | Probability per step of issuing a token as a live, assigned user |
 | `lifecycle_ratio` | ratio | nova | Probability per step of mutating a live server (stop/start, resize, or live-migrate) |

@@ -149,7 +149,8 @@ them with no extra flags.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--duration <duration>` | — | Total wall-clock runtime (required, via flag or the `chaos:` block) |
+| `--duration <duration>` | — | Total wall-clock runtime (required, via flag or the `chaos:` block). `0` runs until SIGINT or SIGTERM; only the flag selects this, since `duration: 0` in the block means unset |
+| `--bucket-width <duration>` | `1h` | Width of one time bucket in the series of a run with `--duration 0`, at least `1m`. A bounded run ignores it and keeps ten equal buckets |
 | `--min-interval <duration>` | `200ms` | Minimum random delay between scheduled actions |
 | `--max-interval <duration>` | `3s` | Maximum random delay between scheduled actions |
 | `--max-parallel <n>` | `--concurrency` | Maximum concurrent in-flight churn operations |
@@ -172,6 +173,19 @@ Namespace-specific:
 By default a churn run tears its resources down at the end **or when
 interrupted**, then runs a leak check. `--no-cleanup` is the single opt-out,
 leaving them for an explicit `cleanup`.
+
+With `--duration 0` the signal is the normal end of the run. It writes the final
+run record, tears down and runs the leak check as a bounded run does when its
+duration elapses, and exits 0 when they succeed. With `--no-cleanup` it prints
+`churn complete`.
+
+While it runs, every churn run rewrites `run-<id>.json` once a minute, starting
+one minute after the start, so a killed process or a lost node leaves a record
+at most about a minute old. A run stopped by a signal while operations are still
+in flight rewrites it once more before it waits for them. A record written this
+way carries `"incomplete": true` and its `finishedAt` is the checkpoint time;
+the final record omits the key. A checkpoint that cannot be written logs a
+warning and the run goes on.
 
 ## `monitor`
 
@@ -244,6 +258,17 @@ builder backs all five namespaces, so `dizzy cinder report` and
 - **html** — a self-contained, offline report with inline SVG charts for
   latency, throughput, and error rates; for a churn run, also the per-bucket
   degradation over time.
+
+A record a churn run wrote while it was still running (`"incomplete": true`)
+renders in every format and is marked as follows:
+
+- **table** — a first line `Run incomplete: checkpoint written at <time>`, with
+  the checkpoint time in RFC 3339 UTC, then a blank line and the usual output.
+- **json** — `"incomplete": true` next to `metrics` and `chaos`. A record without
+  a `chaos` object stays the bare metrics object.
+- **csv** — unchanged; the format has no place for a marker.
+- **html** — a yellow `Run incomplete` banner with the checkpoint time instead of
+  `Run completed`. A record that carries an error still shows `Run failed`.
 
 ## `cleanup`
 
