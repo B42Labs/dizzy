@@ -313,6 +313,53 @@ func TestWriteMixStatus(t *testing.T) {
 	})
 }
 
+// TestWriteMixStatusServiceLane confirms a background lane gets the lane
+// heading and only the resources its lane created, and that a failing lane
+// counts among the personas and lanes.
+func TestWriteMixStatusServiceLane(t *testing.T) {
+	rec := &run.Record{Created: []resource.Resource{
+		{Kind: "server", Logical: "srv-0001", ID: "s1", Persona: "ci"},
+		{Kind: "project", Logical: "proj-0001", ID: "p1", Lane: "keystone"},
+	}}
+	serviceStatusLane := func(name string, err error) *mix.Lane {
+		l := statusLane(name, err)
+		l.Service = name
+		return l
+	}
+
+	t.Run("one section per lane", func(t *testing.T) {
+		cmd := &cobra.Command{}
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		lanes := []*mix.Lane{statusLane("ci", nil), serviceStatusLane("keystone", nil), serviceStatusLane("glance", nil)}
+		if err := writeMixStatus(context.Background(), cmd, rec, lanes); err != nil {
+			t.Fatalf("writeMixStatus: %v", err)
+		}
+		sections := strings.Split(out.String(), "\n\n")
+		if len(sections) != 3 {
+			t.Fatalf("output has %d sections, want 3:\n%s", len(sections), out.String())
+		}
+		keystone := strings.Split(strings.TrimSpace(sections[1]), "\n")
+		if len(keystone) != 3 || keystone[0] != "lane keystone (run mix00001-keystone)" || !strings.Contains(keystone[2], "p1") {
+			t.Errorf("keystone section = %q, want its lane heading, the header and its one resource", keystone)
+		}
+		glance := strings.Split(strings.TrimSpace(sections[2]), "\n")
+		if len(glance) != 2 || glance[0] != "lane glance (run mix00001-glance)" || !strings.HasPrefix(glance[1], "LOGICAL") {
+			t.Errorf("glance section = %q, want its lane heading and an empty table", glance)
+		}
+	})
+
+	t.Run("a failing lane", func(t *testing.T) {
+		cmd := &cobra.Command{}
+		cmd.SetOut(&bytes.Buffer{})
+		lanes := []*mix.Lane{statusLane("ci", nil), serviceStatusLane("keystone", errors.New("503"))}
+		err := writeMixStatus(context.Background(), cmd, rec, lanes)
+		if want := "re-querying 1 of 2 personas and lanes failed"; err == nil || err.Error() != want {
+			t.Errorf("writeMixStatus = %v, want %q", err, want)
+		}
+	})
+}
+
 func TestMixCleanupFlagErrors(t *testing.T) {
 	noCloud(t)
 	scenario := writeScenario(t, sampleMixScenarioYAML)
@@ -489,6 +536,48 @@ func TestDeleteLaneResources(t *testing.T) {
 	if out.String() != wantOut {
 		t.Errorf("output = %q, want %q", out.String(), wantOut)
 	}
+}
+
+// TestDeleteLaneResourcesServiceLane confirms a background lane gets only the
+// entries its lane created and a persona only the entries its persona created,
+// that a failing lane is named as a lane and does not stop the lanes after it,
+// and that every lane is cleaned with no entries without a created list.
+func TestDeleteLaneResourcesServiceLane(t *testing.T) {
+	// A persona and a lane of the same name tell the two filters apart.
+	created := []resource.Resource{
+		{Kind: "server", ID: "s1", Persona: "ci"},
+		{Kind: "project", ID: "p1", Lane: "keystone"},
+		{Kind: "server", ID: "s2", Persona: "keystone"},
+		{Kind: "image", ID: "i1", Lane: "glance"},
+	}
+
+	t.Run("filters by lane and by persona", func(t *testing.T) {
+		var log []string
+		boom := errors.New("boom")
+		lanes := []*mix.Lane{
+			(&teardownLane{log: &log}).lane("ci"),
+			(&teardownLane{log: &log, cleanupErr: boom}).serviceLane("keystone"),
+			(&teardownLane{log: &log}).serviceLane("glance"),
+		}
+		err := deleteLaneResources(context.Background(), &bytes.Buffer{}, lanes, created, "cleaning up")
+		if !errors.Is(err, boom) || !strings.Contains(err.Error(), `cleaning up lane "keystone" (run run1234-keystone): boom`) {
+			t.Fatalf("deleteLaneResources = %v, want it to name the failing lane", err)
+		}
+		if want := []string{"cleanup ci s1", "cleanup keystone p1", "cleanup glance i1"}; strings.Join(log, "|") != strings.Join(want, "|") {
+			t.Errorf("calls = %q, want %q", log, want)
+		}
+	})
+
+	t.Run("no created list", func(t *testing.T) {
+		var log []string
+		lanes := []*mix.Lane{(&teardownLane{log: &log}).lane("ci"), (&teardownLane{log: &log}).serviceLane("keystone")}
+		if err := deleteLaneResources(context.Background(), &bytes.Buffer{}, lanes, nil, "cleaning up"); err != nil {
+			t.Fatalf("deleteLaneResources: %v", err)
+		}
+		if want := []string{"cleanup ci ", "cleanup keystone "}; strings.Join(log, "|") != strings.Join(want, "|") {
+			t.Errorf("calls = %q, want %q", log, want)
+		}
+	})
 }
 
 // TestNovaCleanupRejectsMixRecord confirms the service guard keeps nova cleanup

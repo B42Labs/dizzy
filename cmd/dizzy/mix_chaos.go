@@ -265,12 +265,15 @@ func mergeMixChaosConfig(cmd *cobra.Command, opts *globalOptions, s mixscenario.
 
 // buildMixRecord builds the run record of a mix run as of finished, for the
 // checkpoints written while the churn runs and for the final record. Its
-// metrics are the overall collector's, the exact aggregate of every persona,
-// and it has no top-level chaos statistics: each persona carries its own,
-// because the percentiles of separate engines do not merge. Created lists every
-// lane's live resources in lane order, each marked with its persona. A lane
-// without a result yet (a checkpoint before its engine's first snapshot) has
-// its collector's metrics, no chaos statistics and no created entries.
+// metrics are the overall collector's, the exact aggregate of every persona
+// and lane, and it has no top-level chaos statistics: each persona and lane
+// carries its own, because the percentiles of separate engines do not merge.
+// A background lane gets an entry under lanes, every other lane one under
+// personas. Created lists, in lane order, every lane's roots and then its
+// live resources, each marked with the lane for a background lane and with
+// the persona otherwise. A lane without a result yet (a checkpoint before its
+// engine's first snapshot) has its collector's metrics, no chaos statistics
+// and only its roots under created.
 func buildMixRecord(p *mixplan.Plan, lanes []*mix.Lane, results map[string]*chaos.Result, overall *metrics.Collector, runID string, start, finished time.Time) *run.Record {
 	wall := finished.Sub(start)
 	rec := &run.Record{
@@ -286,22 +289,48 @@ func buildMixRecord(p *mixplan.Plan, lanes []*mix.Lane, results map[string]*chao
 		Personas:   make([]run.PersonaStats, 0, len(lanes)),
 	}
 	for _, l := range lanes {
+		r := results[l.Name]
+		addCreated := func(created []resource.Resource) {
+			for _, res := range created {
+				if l.Background() {
+					res.Lane = l.Name
+				} else {
+					res.Persona = l.Name
+				}
+				rec.Created = append(rec.Created, res)
+			}
+		}
+		addCreated(l.Roots)
+		var cs *run.ChaosStats
+		if r != nil {
+			cs = chaosStats(r)
+			addCreated(r.Created)
+		}
+
+		m := l.Collector.Aggregate(wall)
+		if l.Background() {
+			rec.Lanes = append(rec.Lanes, run.LaneStats{
+				Name:      l.Name,
+				RunID:     l.RunID,
+				Cloud:     l.Cloud,
+				ProjectID: l.ProjectID,
+				Scenario:  l.Scenario,
+				Seed:      l.Seed,
+				Metrics:   m,
+				Chaos:     cs,
+			})
+			continue
+		}
 		ps := run.PersonaStats{
 			Name:      l.Name,
 			RunID:     l.RunID,
 			Cloud:     l.Cloud,
 			ProjectID: l.ProjectID,
-			Metrics:   l.Collector.Aggregate(wall),
+			Metrics:   m,
+			Chaos:     cs,
 		}
 		if l.Persona != nil {
 			ps.Share, ps.Servers, ps.Seed = l.Persona.Share, l.Persona.Servers, l.Persona.Seed
-		}
-		if r := results[l.Name]; r != nil {
-			ps.Chaos = chaosStats(r)
-			for _, res := range r.Created {
-				res.Persona = l.Name
-				rec.Created = append(rec.Created, res)
-			}
 		}
 		rec.Personas = append(rec.Personas, ps)
 	}
@@ -314,12 +343,13 @@ func buildMixRecord(p *mixplan.Plan, lanes []*mix.Lane, results map[string]*chao
 // ctx so a first-signal interrupt does not kill the teardown it triggered. A
 // failing lane does not stop the others; when any failed it returns their
 // errors joined and runs no leak check. Otherwise it sums every lane's leak
-// check into the one line nova chaos prints. With --no-cleanup the resources
-// are left in place and the cleanup hint is printed: by record when one was
-// written, else by run id, scenario and every --set the run used, since those
-// name the personas' clouds. Either way it carries the run's --os-cloud, or
-// the $OS_CLOUD it fell back to, the cloud of every persona that names none,
-// and shell-quotes what the operator passed in.
+// check, personas' and background lanes' alike, into the one line nova chaos
+// prints. With --no-cleanup the resources are left in place and the cleanup
+// hint is printed: by record when one was written, else by run id, scenario
+// and every --set the run used, since those name the personas' and lanes'
+// clouds. Either way it carries the run's --os-cloud, or the $OS_CLOUD it fell
+// back to, the cloud of every persona and lane that names none, and
+// shell-quotes what the operator passed in.
 func finishMixChurn(ctx context.Context, cmd *cobra.Command, opts *globalOptions, lanes []*mix.Lane, created []resource.Resource, runID, recordPath, scenarioPath string, sets []string, interrupted, noCleanup bool) error {
 	out := cmd.OutOrStdout()
 	if noCleanup {
@@ -350,7 +380,7 @@ func finishMixChurn(ctx context.Context, cmd *cobra.Command, opts *globalOptions
 	for _, l := range lanes {
 		n, err := l.Leaked(tctx)
 		if err != nil {
-			return fmt.Errorf("leak check for persona %q: %w", l.Name, err)
+			return fmt.Errorf("leak check for %s %q: %w", laneNoun(l), l.Name, err)
 		}
 		leaked += n
 	}

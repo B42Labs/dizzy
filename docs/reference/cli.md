@@ -365,10 +365,10 @@ is empty, and churns its share of `resources.servers` under the identity
 image and flavor and runs the compute quota pre-check against its own plan in
 its own project. For the `gardener` persona, whose plan has server groups, the
 pre-check also counts the groups against the `server_groups` limit and the
-largest group against the `server_group_members` limit. When two personas
-authenticate against the same project, the run logs
-`personas share a project; each quota pre-check saw only its own plan` and goes
-on.
+largest group against the `server_group_members` limit. When two personas or
+lanes authenticate against the same project, the run logs
+`lanes share a project; each quota pre-check saw only its own plan`, with the
+names under `lanes`, and goes on.
 
 A persona whose plan migrates servers, `legacy`, also runs the migration
 pre-check in its own project. Live and cold migration need the admin role and
