@@ -42,8 +42,9 @@ type Resources struct {
 
 // Personas holds one block per workload persona.
 type Personas struct {
-	CI     CI     `yaml:"ci"`
-	Legacy Legacy `yaml:"legacy"`
+	CI       CI       `yaml:"ci"`
+	Gardener Gardener `yaml:"gardener"`
+	Legacy   Legacy   `yaml:"legacy"`
 }
 
 // CI is the CI persona: short-lived servers on one network each, with zero or
@@ -61,6 +62,27 @@ type CI struct {
 	Interval         novascenario.Interval `yaml:"interval"`
 	ChurnRatio       float64               `yaml:"churn_ratio"`
 	TargetFill       float64               `yaml:"target_fill"`
+}
+
+// Gardener is the Gardener persona: Kubernetes clusters as Gardener keeps them
+// on OpenStack. A cluster is one server group, one network, and the worker
+// servers booted into that group on that network, each with one data volume.
+// Once a cluster is complete, its workers are replaced one at a time: a worker
+// is deleted with its volume and booted again under the same name. Share and
+// Cloud mean what they mean for the CI persona. Clusters is the number of
+// clusters the persona's servers are spread over, round-robin, and Policy the
+// policy of every cluster's server group, "anti-affinity" or
+// "soft-anti-affinity". VolumeGiB is the size range of the data volumes.
+// Interval configures the persona's churn engine; a zero bound falls back to
+// the command's default. The persona keeps its clusters whole, so it has no
+// churn ratio or target fill.
+type Gardener struct {
+	Share     float64               `yaml:"share"`
+	Cloud     string                `yaml:"cloud"`
+	Clusters  int                   `yaml:"clusters"`
+	Policy    string                `yaml:"policy"`
+	VolumeGiB novascenario.Range    `yaml:"volume_gib"`
+	Interval  novascenario.Interval `yaml:"interval"`
 }
 
 // Legacy is the Legacy persona: long-lived servers on one network each that
@@ -108,8 +130,9 @@ func Parse(data []byte) (Scenario, error) {
 }
 
 // Validate checks the scenario for semantic consistency, returning an
-// actionable error that names the offending field. It then builds the compute
-// scenario of every persona with a share above 0 and validates it too.
+// actionable error that names the offending field. It then runs the
+// persona-specific checks of every persona with a share above 0, builds its
+// compute scenario and validates it too.
 func (s Scenario) Validate() error {
 	if s.Name == "" {
 		return fmt.Errorf("name must not be empty")
@@ -143,6 +166,9 @@ func (s Scenario) Validate() error {
 	if math.IsNaN(ci.TargetFill) || ci.TargetFill < 0 || ci.TargetFill > 1 {
 		return fmt.Errorf("personas.ci.target_fill must be between 0 and 1, got %v", ci.TargetFill)
 	}
+	if err := validateInterval("personas.gardener.interval", s.Personas.Gardener.Interval); err != nil {
+		return err
+	}
 	if err := validateInterval("personas.legacy.interval", s.Personas.Legacy.Interval); err != nil {
 		return err
 	}
@@ -175,6 +201,11 @@ func (s Scenario) Validate() error {
 		if p.share == 0 {
 			continue
 		}
+		if p.check != nil {
+			if err := p.check(servers[i]); err != nil {
+				return err
+			}
+		}
 		if err := p.nova(servers[i]).Validate(); err != nil {
 			return fmt.Errorf("personas.%s: %w", p.name, err)
 		}
@@ -200,7 +231,7 @@ func validateInterval(key string, iv novascenario.Interval) error {
 // returns an error for an unknown key or a value that does not parse to the
 // field's type.
 func (s *Scenario) Set(key, value string) error {
-	ci, legacy := &s.Personas.CI, &s.Personas.Legacy
+	ci, gardener, legacy := &s.Personas.CI, &s.Personas.Gardener, &s.Personas.Legacy
 	switch key {
 	case "seed":
 		return setInt64(&s.Seed, key, value)
@@ -244,6 +275,24 @@ func (s *Scenario) Set(key, value string) error {
 		return setFloat(&ci.ChurnRatio, key, value)
 	case "personas.ci.target_fill":
 		return setFloat(&ci.TargetFill, key, value)
+	case "personas.gardener.share":
+		return setFloat(&gardener.Share, key, value)
+	case "personas.gardener.cloud":
+		gardener.Cloud = value
+		return nil
+	case "personas.gardener.clusters":
+		return setInt(&gardener.Clusters, key, value)
+	case "personas.gardener.policy":
+		gardener.Policy = value
+		return nil
+	case "personas.gardener.volume_gib.min":
+		return setInt(&gardener.VolumeGiB.Min, key, value)
+	case "personas.gardener.volume_gib.max":
+		return setInt(&gardener.VolumeGiB.Max, key, value)
+	case "personas.gardener.interval.min":
+		return setDuration(&gardener.Interval.Min, key, value)
+	case "personas.gardener.interval.max":
+		return setDuration(&gardener.Interval.Max, key, value)
 	case "personas.legacy.share":
 		return setFloat(&legacy.Share, key, value)
 	case "personas.legacy.cloud":

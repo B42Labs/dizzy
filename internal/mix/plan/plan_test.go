@@ -68,3 +68,24 @@ func TestPersonaLongLivedOmittedWhenFalse(t *testing.T) {
 		}
 	}
 }
+
+// TestPersonaRollingOmittedWhenFalse confirms a persona that is not rolling
+// encodes without a rolling key, so the CI and Legacy entries keep their
+// bytes.
+func TestPersonaRollingOmittedWhenFalse(t *testing.T) {
+	for _, tc := range []struct {
+		persona Persona
+		want    bool
+	}{
+		{Persona{Name: "ci", Servers: 1, Nova: novaPlan(1)}, false},
+		{Persona{Name: "gardener", Servers: 1, Rolling: true, Nova: novaPlan(1)}, true},
+	} {
+		data, err := json.Marshal(tc.persona)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if got := strings.Contains(string(data), `"rolling"`); got != tc.want {
+			t.Errorf("JSON %s has a rolling key = %v, want %v", data, got, tc.want)
+		}
+	}
+}
