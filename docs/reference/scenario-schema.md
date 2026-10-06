@@ -377,7 +377,7 @@ resources:
 
 personas:
   ci:
-    share: 1
+    share: 0.8
     cloud: ""                                 # "" authenticates with --os-cloud
     networks: 2
     volumes_per_server: { min: 0, max: 1 }
@@ -385,6 +385,15 @@ personas:
     interval:           { min: 100ms, max: 1s }
     churn_ratio: 0.5
     target_fill: 0.6
+  legacy:
+    share: 0.2
+    cloud: ""
+    networks: 1
+    resize_flavor: m1.small                   # "" disables resize
+    volumes_per_server: { min: 1, max: 2 }
+    volume_gib:         { min: 1, max: 2 }
+    ports_per_server:   { min: 0, max: 1 }
+    interval:           { min: 10s, max: 1m }
 
 chaos:
   duration: 5m
@@ -394,6 +403,16 @@ chaos:
 The CI persona boots short-lived servers: each on one of the persona's
 networks, with zero or more data volumes, no extra port and no lifecycle
 operation.
+
+The Legacy persona boots long-lived servers: each on one of the persona's
+networks, with its data volumes and extra ports. Its servers, volumes and ports
+are created before anything else and stay until the run's teardown. Each
+mutation of a server runs one of a stop and start, a resize to the other of
+`flavor` and `resize_flavor`, a live migration or a cold migration; each
+mutation of a volume or port detaches it or attaches it again. The two
+migrations need the admin role and two usable compute hosts, and a run without
+them skips both. The block has no `churn_ratio` or `target_fill`, because the
+persona keeps every planned resource.
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -409,16 +428,25 @@ operation.
 | `personas.ci.interval.min` / `personas.ci.interval.max` | duration | Random delay range drawn per tick of the persona's engine; `0` falls back to `200ms` / `3s` |
 | `personas.ci.churn_ratio` | ratio | Create bias of the persona's engine at equilibrium; `0` falls back to `0.5` |
 | `personas.ci.target_fill` | ratio | Fraction of the persona's servers kept populated; `0` falls back to `0.8` |
+| `personas.legacy.share` | float | Share of `resources.servers`, a finite number of at least 0; at least one persona needs a share above 0 |
+| `personas.legacy.cloud` | string | `clouds.yaml` entry the persona authenticates with; empty uses `--os-cloud` |
+| `personas.legacy.networks` | int | Networks the persona's servers are spread over, one per server; at least 1 when the persona has servers |
+| `personas.legacy.resize_flavor` | string | Second flavor the servers alternate with, referenced by name (or id); must differ from `flavor`. Empty disables resize |
+| `personas.legacy.volumes_per_server` | range | Data volumes per server, each detached and attached again |
+| `personas.legacy.volume_gib` | range | Size drawn per data volume; `min >= 1` when `volumes_per_server.max > 0` |
+| `personas.legacy.ports_per_server` | range | Extra ports per server, each detached and attached again |
+| `personas.legacy.interval.min` / `personas.legacy.interval.max` | duration | Random delay range drawn per tick of the persona's engine; `0` falls back to `200ms` / `3s` |
 | `chaos.duration` | duration | Total wall-clock runtime of every persona's engine |
 | `chaos.parallel.max` | int | Per-tick fan-out of each persona's engine, drawn in `[1, max]` |
 | `chaos.bucket_width` | duration | Width of one time bucket of a run with `--duration 0` |
 
 The `--set` keys are `seed`, `image`, `flavor`, `resources.servers`,
 `services` (a comma-separated list; an empty value clears it), and every
-`personas.ci.*` key of the table, with `personas.ci.volumes_per_server.min`,
-`.max` and the like for the ranges and Go duration strings for the interval,
-e.g. `--set personas.ci.interval.max=2s`. The `chaos:` block has no `--set`
-keys; the `mix chaos` flags override it.
+`personas.ci.*` and `personas.legacy.*` key of the table, with
+`personas.ci.volumes_per_server.min`, `.max` and the like for the ranges and Go
+duration strings for the intervals, e.g. `--set personas.ci.interval.max=2s` or
+`--set personas.legacy.resize_flavor=`. The `chaos:` block has no `--set` keys;
+the `mix chaos` flags override it.
 
 ### Shares
 
@@ -438,18 +466,22 @@ scenario and seed always yield the same plan.
 
 ### Profiles
 
-| Profile | `resources.servers` | `personas.ci.networks` | `chaos.duration` |
-|---|---|---|---|
-| `small` | 6 | 2 | 5m |
-| `medium` | 20 | 4 | 30m |
-| `large` | 60 | 8 | 1h |
+| Profile | `resources.servers` | CI servers | Legacy servers | `personas.ci.networks` | `personas.legacy.networks` | `chaos.duration` |
+|---|---|---|---|---|---|---|
+| `small` | 6 | 5 | 1 | 2 | 1 | 5m |
+| `medium` | 20 | 16 | 4 | 4 | 2 | 30m |
+| `large` | 60 | 48 | 12 | 8 | 2 | 1h |
 
-All three set `seed: 42`, `image: cirros`, `flavor: m1.tiny`, `services: []`,
-`chaos.parallel.max: 4`, and give the CI persona `share: 1`, `cloud: ""`,
-`volumes_per_server: { min: 0, max: 1 }`, `volume_gib: { min: 1, max: 2 }`,
-`interval: { min: 100ms, max: 1s }`, `churn_ratio: 0.5` and
-`target_fill: 0.6`. `small` fits Nova's common default quota of 10 instances;
-`medium` and `large` need raised quotas.
+All three set `seed: 42`, `image: cirros`, `flavor: m1.tiny`, `services: []`
+and `chaos.parallel.max: 4`. They give the CI persona `share: 0.8`,
+`cloud: ""`, `volumes_per_server: { min: 0, max: 1 }`,
+`volume_gib: { min: 1, max: 2 }`, `interval: { min: 100ms, max: 1s }`,
+`churn_ratio: 0.5` and `target_fill: 0.6`, and the Legacy persona `share: 0.2`,
+`cloud: ""`, `resize_flavor: m1.small`, `volumes_per_server: { min: 1, max: 2 }`,
+`volume_gib: { min: 1, max: 2 }`, `ports_per_server: { min: 0, max: 1 }` and
+`interval: { min: 10s, max: 1m }`. Each needs the flavor `m1.small` for the
+Legacy persona's resizes. `small` fits Nova's common default quota of 10
+instances; `medium` and `large` need raised quotas.
 
 ## The `chaos:` block
 

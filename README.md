@@ -13,7 +13,7 @@ resources reach, and cleans up after itself. It covers five services today:
 | `dizzy keystone` | Identity | Domains, roles, projects, users, role assignments, scoped token issue |
 | `dizzy nova` | Compute | Server boot (image / volume), stop/start (soft / hard), resize + confirm, live migration, volume & port attach/detach, multi-network, user data |
 | `dizzy glance` | Image | Image create + synthetic data upload, metadata/property churn, visibility transitions (private / shared / community / public), member add/accept/remove, deactivate/reactivate, delete |
-| `dizzy mix` | Combined | Several workload personas side by side, each in its own project, in one churn run; today the CI persona (short-lived servers on one network each, with data volumes) |
+| `dizzy mix` | Combined | Several workload personas side by side, each in its own project, in one churn run: the CI persona (short-lived servers on one network each, with data volumes) and the Legacy persona (long-lived servers that are stopped and started, resized, live- and cold-migrated, and have their volumes and ports detached and re-attached until teardown) |
 
 Every service namespace offers the same five verbs — `generate`, `apply`,
 `chaos`, `monitor`, `cleanup` — plus `status` and `report`. A scenario expands

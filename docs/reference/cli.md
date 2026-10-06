@@ -315,7 +315,9 @@ See [Resource identity and cleanup](../explanation/resource-identity.md).
 `mix` runs several workload personas side by side in one churn run. Each
 persona has its own churn engine, its own cloud project and its own identity,
 and the whole run shares one seed, one run id and one run record. This build
-has one persona, `ci`. See [Combined runs](../explanation/combined-runs.md).
+has two personas: `ci`, whose servers are short-lived, and `legacy`, whose
+servers stay until teardown and are changed in place. See
+[Combined runs](../explanation/combined-runs.md).
 
 | Subcommand | Touches the API | Purpose |
 |---|---|---|
@@ -363,6 +365,16 @@ its own project. When two personas authenticate against the same project, the
 run logs `personas share a project; each quota pre-check saw only its own plan`
 and goes on.
 
+A persona whose plan migrates servers, `legacy`, also runs the migration
+pre-check in its own project. Live and cold migration need the admin role and
+at least two usable compute hosts. Without them the persona logs two warnings,
+each with the `reason` attribute, and runs without migrations:
+
+```text
+level=WARN msg="live migration disabled for this run" reason="credentials lack the admin role"
+level=WARN msg="cold migration disabled for this run" reason="credentials lack the admin role"
+```
+
 | Flag | Default | Description |
 |---|---|---|
 | `--scenario <path>` | — | Path to the mix scenario YAML file (**required**) |
@@ -382,8 +394,9 @@ personas, then the record path:
 
 ```text
 Personas
-NAME  PROJECT                           SHARE  SERVERS  OPS   OK  FAILED    P50   P95   P99
-ci    5c3f1e0a9b2d4e6f8a7b9c0d1e2f3a4b   100%        6  412  410       2  310ms  1.9s  3.2s
+NAME    PROJECT                           SHARE  SERVERS  OPS   OK  FAILED    P50    P95    P99
+ci      5c3f1e0a9b2d4e6f8a7b9c0d1e2f3a4b    80%        5  412  410       2  310ms   1.9s   3.2s
+legacy  9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b    20%        1   96   95       1   2.4s  38.2s  52.1s
 run record written to run-1a2b3c4d.json
 ```
 
@@ -392,6 +405,7 @@ line per persona, and runs one leak check across all of them:
 
 ```text
 deleted 14 resource(s) for run 1a2b3c4d-ci
+deleted 5 resource(s) for run 1a2b3c4d-legacy
 leak check: no run-tagged resources remain
 ```
 
