@@ -43,6 +43,9 @@ type Scenario struct {
 // image. It is a pointer so an omitted key (nil) falls back to the command's
 // default while an explicit lifecycle_ratio: 0 disables mutations — the one knob
 // where 0 reads as an on/off switch rather than a degenerate value.
+//
+// BucketWidth is the width of one time bucket of a run without an end, which
+// only --duration 0 selects; zero means unset, and a bounded run ignores it.
 type Chaos struct {
 	Duration       Duration `yaml:"duration"`
 	Interval       Interval `yaml:"interval"`
@@ -50,6 +53,7 @@ type Chaos struct {
 	ChurnRatio     float64  `yaml:"churn_ratio"`
 	TargetFill     float64  `yaml:"target_fill"`
 	LifecycleRatio *float64 `yaml:"lifecycle_ratio"`
+	BucketWidth    Duration `yaml:"bucket_width"`
 }
 
 // Interval is the random delay range between scheduled churn actions.
@@ -199,6 +203,9 @@ func (c *Chaos) validate() error {
 	}
 	if c.Duration < 0 {
 		return fmt.Errorf("chaos.duration must not be negative, got %s", time.Duration(c.Duration))
+	}
+	if c.BucketWidth < 0 {
+		return fmt.Errorf("chaos.bucket_width must not be negative, got %s", time.Duration(c.BucketWidth))
 	}
 	if c.Interval.Min < 0 {
 		return fmt.Errorf("chaos.interval.min must not be negative, got %s", time.Duration(c.Interval.Min))
