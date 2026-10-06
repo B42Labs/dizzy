@@ -28,7 +28,9 @@ no load balancers (no Octavia).
 Pre-built binaries for **linux/amd64**, **linux/arm64**, and **darwin/arm64**
 are published on the [releases page](https://github.com/B42Labs/dizzy/releases),
 alongside a `checksums.txt`, a cosign signature bundle per file, and
-SPDX/CycloneDX SBOMs.
+SPDX/CycloneDX SBOMs. Releases after `v0.1.0` also publish the container image
+`ghcr.io/b42labs/dizzy:<tag>`; see
+[Use the container image](docs/how-to/install-and-verify.md#use-the-container-image).
 
 ```sh
 VERSION=v0.1.0
@@ -62,8 +64,9 @@ $ dizzy neutron cleanup --run run-<id>.json                    # tear it down
 
 `--scenario` takes a filesystem path, and the fifteen built-in profiles live under
 `scenarios/` in this repository — so clone it even if you installed a release
-binary. The `small` profile fits Neutron's default per-project quotas and runs
-against a fresh project with nothing raised.
+binary; the container image carries them under `/usr/share/dizzy/scenarios`. The
+`small` profile fits Neutron's default per-project quotas and runs against a
+fresh project with nothing raised.
 
 **New here?** Work through [Your first run](docs/tutorial/first-run.md) — it
 takes about ten minutes and leaves nothing behind.
@@ -125,6 +128,7 @@ $ make build     # build ./dizzy
 $ make test      # go test ./...
 $ make lint      # golangci-lint
 $ make fmt       # gofmt
+$ make image     # build the container image (needs docker)
 $ make help      # every target
 ```
 
