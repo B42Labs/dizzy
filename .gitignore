@@ -1,6 +1,9 @@
 # Built binary
 /dizzy
 
+# Linux binaries cross-built for the container image (make image)
+/bin/
+
 # Go test/coverage artifacts
 *.test
 *.out

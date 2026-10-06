@@ -61,11 +61,20 @@ DEVSTACK_C5C3_SERVICE      ?= keystone
 DEVSTACK_C5C3_SCENARIO     ?= scenarios/$(DEVSTACK_C5C3_SERVICE)/small.yaml
 DEVSTACK_C5C3_CMD          ?= apply
 
+# --- Container image ---------------------------------------------------------
+# `make image` cross-builds the two Linux release binaries into bin/ and builds
+# the container image for the host platform; `make image-test` checks that image
+# against the contract in docs/how-to/install-and-verify.md. Override at
+# invocation:
+#   make image IMAGE_TAG=v9.9.9
+IMAGE     ?= ghcr.io/b42labs/dizzy
+IMAGE_TAG ?= dev
+
 .DEFAULT_GOAL := build
 
 .PHONY: help build install run vet lint fmt test tidy clean devstack-osism \
 	otel-up otel-down otel-verify otel-ui otel-grafana devstack-osism-monitor \
-	devstack-c5c3 devstack-c5c3-clouds devstack-c5c3-monitor
+	devstack-c5c3 devstack-c5c3-clouds devstack-c5c3-monitor image image-test
 
 ## help: Show this help.
 help:
@@ -196,6 +205,43 @@ tidy:
 clean:
 	$(GO) clean
 	rm -f $(BINARY)
+	rm -rf bin/
+
+# --- Container image ---------------------------------------------------------
+
+## image: Cross-build the Linux binaries into bin/ and build the container image for the host platform (needs docker).
+# The go build matches the release workflow's build step
+# (.github/workflows/release.yml), so CI tests a binary built like the one the
+# release ships; keep the two in sync.
+image:
+	@command -v docker >/dev/null 2>&1 || { echo "error: docker not found in PATH (required for the container image)"; exit 1; }
+	for arch in amd64 arm64; do \
+		CGO_ENABLED=0 GOOS=linux GOARCH=$$arch $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w -X main.version=$(IMAGE_TAG)" -o bin/dizzy-linux-$$arch $(PKG) || exit 1; \
+	done
+	docker buildx build --load --tag $(IMAGE):$(IMAGE_TAG) .
+
+## image-test: Check the container image against its contract (run 'make image' first).
+# Every check runs even after a failure; the target exits 1 when any failed. The
+# generate check passes --log-level error so a passing run prints exactly the
+# eight ok: lines; dizzy still prints a real error to stderr.
+image-test:
+	@docker image inspect $(IMAGE):$(IMAGE_TAG) >/dev/null \
+		|| { echo "error: image $(IMAGE):$(IMAGE_TAG) not found (run 'make image' first)"; exit 1; }
+	@img="$(IMAGE):$(IMAGE_TAG)"; want="dizzy $(IMAGE_TAG)"; rc=0; \
+	insh() { docker run --rm --entrypoint sh "$$img" -c "$$1"; }; \
+	report() { if [ "$$2" -eq 0 ]; then echo "ok: $$1"; else echo "FAIL: $$1"; rc=1; fi; }; \
+	[ "$$(docker run --rm "$$img" --version)" = "$$want" ]; report version $$?; \
+	[ "$$(insh 'echo "$$(id -u):$$(id -g)"')" = 65534:65534 ] && [ "$$(docker image inspect --format '{{.Config.User}}' "$$img")" = 65534:65534 ]; report user $$?; \
+	[ "$$(docker image inspect --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}}' "$$img")" = '["/usr/local/bin/dizzy"] null' ]; report entrypoint $$?; \
+	insh 'test "$$(pwd)" = /work && touch /work/.probe'; report workdir $$?; \
+	[ "$$(insh 'cp /usr/local/bin/dizzy /work/dizzy && /work/dizzy --version')" = "$$want" ]; report copy $$?; \
+	insh 'test -s /etc/ssl/certs/ca-certificates.crt'; report ca-bundle $$?; \
+	want_p=$$(cd scenarios && find . -type f \( -name '*.yaml' -o -name '*.yml' \) | LC_ALL=C sort); \
+	got_p=$$(insh 'cd /usr/share/dizzy/scenarios && find . -type f | LC_ALL=C sort'); \
+	go_n=$$(insh 'find /usr/share/dizzy -name "*.go" | wc -l' | tr -d ' '); \
+	[ "$$got_p" = "$$want_p" ] && [ "$$go_n" = 0 ]; report profiles $$?; \
+	insh 'for f in /usr/share/dizzy/scenarios/*/*.yaml; do svc=$$(basename "$$(dirname "$$f")"); /usr/local/bin/dizzy --log-level error "$$svc" generate --scenario "$$f" >/dev/null || exit 1; done'; report generate $$?; \
+	exit $$rc
 
 # --- Local OTEL smoke stack -------------------------------------------------
 
