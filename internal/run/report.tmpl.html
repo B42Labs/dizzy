@@ -21,6 +21,7 @@ h2 { font-size: 16px; margin: 28px 0 10px; }
 .banner { padding: 10px 14px; border-radius: 6px; margin: 12px 0; font-weight: 600; }
 .banner.ok { background: #dafbe1; color: #116329; }
 .banner.fail { background: #ffebe9; color: #82071e; }
+.banner.warn { background: #fff8c5; color: #7d4e00; }
 .banner .detail { font-weight: 400; margin-top: 4px; word-break: break-word; }
 .meta { color: var(--muted); }
 .meta b { color: var(--fg); font-weight: 600; }
@@ -67,6 +68,10 @@ svg { max-width: 100%; height: auto; border: 1px solid var(--line); border-radiu
 {{if .Header.Error}}
 <div class="banner fail">Run failed
   <div class="detail">{{.Header.Error}}</div>
+</div>
+{{else if .Header.Incomplete}}
+<div class="banner warn">Run incomplete
+  <div class="detail">checkpoint written at {{.Header.FinishedAt}}; the run was still going or was killed before its final record</div>
 </div>
 {{else}}
 <div class="banner ok">Run completed</div>

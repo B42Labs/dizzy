@@ -77,6 +77,7 @@ type headerView struct {
 	FinishedAt string
 	Wall       string
 	Error      string
+	Incomplete bool
 }
 
 type kpi struct {
@@ -238,6 +239,7 @@ func buildHeader(r *Record) headerView {
 		FinishedAt: r.FinishedAt.UTC().Format(time.RFC3339),
 		Wall:       humanizeDuration(r.Metrics.Wall),
 		Error:      r.Error,
+		Incomplete: r.Incomplete,
 	}
 }
 

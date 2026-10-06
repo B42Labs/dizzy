@@ -187,3 +187,172 @@ func TestWriteJSONChaos(t *testing.T) {
 		t.Errorf("metrics overall attempted = %d, want 3", got.Metrics.Overall.Attempted)
 	}
 }
+
+// incompleteChaosRecord is chaosRecord marked as a mid-run checkpoint, with its
+// checkpoint time in a non-UTC zone so the renderers' UTC conversion shows.
+func incompleteChaosRecord() *Record {
+	r := chaosRecord()
+	r.Incomplete = true
+	r.FinishedAt = time.Date(2026, 6, 24, 12, 1, 30, 0, time.FixedZone("CEST", 2*60*60))
+	return r
+}
+
+// renderAll renders r in all four report formats, failing the test on any
+// renderer error, and returns the outputs keyed by format name.
+func renderAll(t *testing.T, r *Record) map[string]string {
+	t.Helper()
+	out := make(map[string]string)
+	for name, write := range map[string]func(*bytes.Buffer, *Record) error{
+		"table": func(b *bytes.Buffer, r *Record) error { return WriteTable(b, r) },
+		"json":  func(b *bytes.Buffer, r *Record) error { return WriteJSON(b, r) },
+		"csv":   func(b *bytes.Buffer, r *Record) error { return WriteCSV(b, r) },
+		"html":  func(b *bytes.Buffer, r *Record) error { return WriteHTML(b, r) },
+	} {
+		var buf bytes.Buffer
+		if err := write(&buf, r); err != nil {
+			t.Fatalf("rendering %s: %v", name, err)
+		}
+		out[name] = buf.String()
+	}
+	return out
+}
+
+// TestWriteTableIncomplete confirms a checkpoint's table report opens with the
+// incomplete line carrying the checkpoint time in RFC 3339 UTC, and that the
+// rest is exactly the report of the same record when complete.
+func TestWriteTableIncomplete(t *testing.T) {
+	rec := incompleteChaosRecord()
+	var incomplete bytes.Buffer
+	if err := WriteTable(&incomplete, rec); err != nil {
+		t.Fatalf("WriteTable(incomplete): %v", err)
+	}
+	rec.Incomplete = false
+	var complete bytes.Buffer
+	if err := WriteTable(&complete, rec); err != nil {
+		t.Fatalf("WriteTable(complete): %v", err)
+	}
+
+	first, rest, found := strings.Cut(incomplete.String(), "\n\n")
+	if !found {
+		t.Fatalf("incomplete table report has no blank line after the marker:\n%s", incomplete.String())
+	}
+	if want := "Run incomplete: checkpoint written at 2026-06-24T10:01:30Z;"; !strings.HasPrefix(first, want) {
+		t.Errorf("first line = %q, want prefix %q", first, want)
+	}
+	if rest != complete.String() {
+		t.Errorf("incomplete report after the marker differs from the complete report:\n%s\nwant:\n%s", rest, complete.String())
+	}
+	if strings.Contains(complete.String(), "Run incomplete") {
+		t.Error("complete record's table report carries the incomplete marker")
+	}
+}
+
+// TestWriteJSONIncomplete confirms a checkpoint's JSON report adds a top-level
+// "incomplete": true next to metrics and chaos, and a complete record's report
+// has no such key.
+func TestWriteJSONIncomplete(t *testing.T) {
+	keys := func(r *Record) map[string]json.RawMessage {
+		t.Helper()
+		var buf bytes.Buffer
+		if err := WriteJSON(&buf, r); err != nil {
+			t.Fatalf("WriteJSON: %v", err)
+		}
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(buf.Bytes(), &m); err != nil {
+			t.Fatalf("decoding JSON report: %v", err)
+		}
+		return m
+	}
+
+	rec := incompleteChaosRecord()
+	got := keys(rec)
+	if len(got) != 3 || got["metrics"] == nil || got["chaos"] == nil || string(got["incomplete"]) != "true" {
+		t.Errorf("incomplete report keys = %v, want exactly metrics, chaos and incomplete: true", got)
+	}
+
+	rec.Incomplete = false
+	if _, ok := keys(rec)["incomplete"]; ok {
+		t.Error("complete record's JSON report carries an incomplete key")
+	}
+}
+
+// TestWriteCSVIncompleteUnchanged confirms the CSV report, which has no place
+// for a marker, is byte-identical for a checkpoint and a complete record.
+func TestWriteCSVIncompleteUnchanged(t *testing.T) {
+	rec := incompleteChaosRecord()
+	var incomplete, complete bytes.Buffer
+	if err := WriteCSV(&incomplete, rec); err != nil {
+		t.Fatalf("WriteCSV(incomplete): %v", err)
+	}
+	rec.Incomplete = false
+	if err := WriteCSV(&complete, rec); err != nil {
+		t.Fatalf("WriteCSV(complete): %v", err)
+	}
+	if incomplete.String() != complete.String() {
+		t.Errorf("CSV differs for an incomplete record:\n%s\nwant:\n%s", incomplete.String(), complete.String())
+	}
+}
+
+// TestReportIncompleteWithoutChaos confirms an incomplete record without chaos
+// statistics renders in every format: the table and HTML carry the marker,
+// while the JSON stays the bare metrics object with no incomplete key.
+func TestReportIncompleteWithoutChaos(t *testing.T) {
+	rec := sampleRecord()
+	rec.Error = ""
+	rec.Incomplete = true
+	out := renderAll(t, rec)
+
+	if !strings.HasPrefix(out["table"], "Run incomplete: ") {
+		t.Errorf("table report lacks the incomplete marker:\n%s", out["table"])
+	}
+	if !strings.Contains(out["html"], "banner warn") {
+		t.Error("HTML report lacks the incomplete banner")
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(out["json"]), &m); err != nil {
+		t.Fatalf("decoding JSON report: %v", err)
+	}
+	if m["overall"] == nil || m["metrics"] != nil || m["incomplete"] != nil {
+		t.Errorf("JSON report keys = %v, want the bare metrics object", m)
+	}
+}
+
+// TestReportIncompleteWithoutBuckets confirms a checkpoint taken before the
+// first bucket renders in every format with no time-series section.
+func TestReportIncompleteWithoutBuckets(t *testing.T) {
+	rec := incompleteChaosRecord()
+	rec.Chaos.Buckets = nil
+	out := renderAll(t, rec)
+
+	if strings.Contains(out["table"], "Latency and errors over time") {
+		t.Errorf("table report has a time-series section without buckets:\n%s", out["table"])
+	}
+	if strings.Contains(out["html"], "Throughput over time") {
+		t.Error("HTML report has a time-series section without buckets")
+	}
+}
+
+// TestReportManyBuckets confirms a long unbounded run's series (three months
+// of hourly buckets) renders in every format, one table row per bucket.
+func TestReportManyBuckets(t *testing.T) {
+	const n = 2160
+	rec := chaosRecord()
+	rec.Chaos.BucketWidth = time.Hour
+	rec.Chaos.Buckets = make([]ChaosBucket, n)
+	for i := range rec.Chaos.Buckets {
+		rec.Chaos.Buckets[i] = ChaosBucket{
+			Start: time.Duration(i) * time.Hour,
+			Stats: metrics.Stats{Attempted: i % 7, Succeeded: i % 7, Latency: metrics.Latency{Median: time.Duration(i) * time.Millisecond}},
+		}
+	}
+	out := renderAll(t, rec)
+
+	_, series, found := strings.Cut(out["table"], "\nSTART ")
+	if !found {
+		t.Fatalf("table report has no time-series header:\n%s", out["table"])
+	}
+	// The header line ends with the first newline; every later line is a bucket.
+	if got := strings.Count(series, "\n") - 1; got != n {
+		t.Errorf("table report has %d bucket rows, want %d", got, n)
+	}
+}
