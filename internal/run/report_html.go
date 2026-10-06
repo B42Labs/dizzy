@@ -68,6 +68,7 @@ type htmlView struct {
 	Inventory inventoryView
 	Chaos     *chaosView // nil for an apply run
 	Personas  []personaView
+	Lanes     []laneView
 }
 
 // personaView is one persona section of a mix report. Chaos is nil until the
@@ -79,6 +80,16 @@ type personaView struct {
 	Servers int
 	KPIs    []kpi
 	Chaos   *chaosView
+}
+
+// laneView is one background lane section of a mix report. Chaos is nil until
+// the lane's engine produced a snapshot.
+type laneView struct {
+	Name     string
+	Project  string
+	Scenario string
+	KPIs     []kpi
+	Chaos    *chaosView
 }
 
 type headerView struct {
@@ -240,6 +251,7 @@ func buildHTMLView(r *Record) htmlView {
 		v.Chaos = buildChaosView(r.Chaos)
 	}
 	v.Personas = buildPersonaViews(r.Personas)
+	v.Lanes = buildLaneViews(r.Lanes)
 	return v
 }
 
@@ -258,6 +270,25 @@ func buildPersonaViews(ps []PersonaStats) []personaView {
 			pv.Chaos = buildChaosView(p.Chaos)
 		}
 		views = append(views, pv)
+	}
+	return views
+}
+
+// buildLaneViews converts a mix record's background lanes into their
+// sections.
+func buildLaneViews(ls []LaneStats) []laneView {
+	views := make([]laneView, 0, len(ls))
+	for _, l := range ls {
+		lv := laneView{
+			Name:     l.Name,
+			Project:  projectLabel(l.ProjectID),
+			Scenario: l.Scenario,
+			KPIs:     buildKPIs(l.Metrics.Overall),
+		}
+		if l.Chaos != nil {
+			lv.Chaos = buildChaosView(l.Chaos)
+		}
+		views = append(views, lv)
 	}
 	return views
 }

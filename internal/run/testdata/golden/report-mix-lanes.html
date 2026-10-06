@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run report: abcd1234</title>
+<style>
+:root {
+  --fg: #1b1f24; --muted: #5b6570; --line: #d7dde3; --bg: #ffffff;
+  --panel: #f6f8fa; --ok: #2da44e; --fail: #cf222e; --bar: #4493f8;
+  --p50: #8250df; --p99: #bc4c00;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 24px; background: var(--bg); color: var(--fg);
+  font: 14px/1.5 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+}
+h1 { font-size: 20px; margin: 0 0 4px; }
+h2 { font-size: 16px; margin: 28px 0 10px; }
+.muted { color: var(--muted); }
+.banner { padding: 10px 14px; border-radius: 6px; margin: 12px 0; font-weight: 600; }
+.banner.ok { background: #dafbe1; color: #116329; }
+.banner.fail { background: #ffebe9; color: #82071e; }
+.banner.warn { background: #fff8c5; color: #7d4e00; }
+.banner .detail { font-weight: 400; margin-top: 4px; word-break: break-word; }
+.meta { color: var(--muted); }
+.meta b { color: var(--fg); font-weight: 600; }
+.kpis { display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0; }
+.kpi {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px 16px; min-width: 130px;
+}
+.kpi .v { font-size: 22px; font-weight: 700; }
+.kpi .l { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+table { border-collapse: collapse; width: 100%; }
+th, td { padding: 6px 10px; border-bottom: 1px solid var(--line); text-align: right; }
+th:first-child, td:first-child { text-align: left; }
+thead th { color: var(--muted); font-weight: 600; }
+.sortable thead th { cursor: pointer; user-select: none; white-space: nowrap; }
+.sortable thead th::after { content: ""; }
+.sortable thead th.asc::after { content: " \25B2"; }
+.sortable thead th.desc::after { content: " \25BC"; }
+svg { max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.lbl { fill: var(--fg); font-size: 12px; }
+.cap { fill: var(--muted); font-size: 12px; }
+.axis { fill: var(--muted); font-size: 11px; }
+.grid { stroke: var(--line); stroke-width: 1; }
+.lat-line { stroke: var(--muted); stroke-width: 2; }
+.lat-band { fill: var(--bar); }
+.seg-ok { fill: var(--ok); }
+.seg-fail { fill: var(--fail); }
+.bar { fill: var(--bar); }
+.bar-fail { fill: var(--fail); }
+.line-p50 { fill: none; stroke: var(--p50); stroke-width: 1.5; }
+.line-p99 { fill: none; stroke: var(--p99); stroke-width: 1.5; }
+.legend { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+.legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin: 0 4px 0 12px; }
+.toggle { cursor: pointer; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; font: inherit; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.chip { background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; font-size: 13px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+[hidden] { display: none; }
+</style>
+</head>
+<body>
+
+<h1>Run report: abcd1234</h1>
+
+<div class="banner ok">Run completed</div>
+
+
+<p class="meta">
+  <b>scenario</b> medium &nbsp; <b>seed</b> 42 &nbsp;
+  <b>started</b> 2026-06-24T10:00:00Z &nbsp; <b>finished</b> 2026-06-24T10:01:30Z &nbsp;
+  <b>wall</b> 90.00s
+</p>
+
+<div class="kpis">
+
+  <div class="kpi"><div class="v">3</div><div class="l">total ops</div></div>
+
+  <div class="kpi"><div class="v">66.67%</div><div class="l">success rate</div></div>
+
+  <div class="kpi"><div class="v">1</div><div class="l">failed</div></div>
+
+  <div class="kpi"><div class="v">0.02 ops/s</div><div class="l">throughput</div></div>
+
+  <div class="kpi"><div class="v">0ms</div><div class="l">p50 latency</div></div>
+
+  <div class="kpi"><div class="v">0ms</div><div class="l">p99 latency</div></div>
+
+</div>
+
+<h2>Per-type metrics</h2>
+<table class="sortable">
+  <thead><tr><th>type</th><th>ops</th><th>ok</th><th>failed</th><th>success</th><th>ops/s</th><th>min</th><th>mean</th><th>p50</th><th>p90</th><th>p95</th><th>p99</th><th>max</th></tr></thead>
+  <tbody>
+  
+    <tr><td data-sort="network">network</td><td data-sort="1">1</td><td data-sort="1">1</td><td data-sort="0">0</td><td data-sort="100.00">100.00%</td><td data-sort="0.00">0.00</td><td data-sort="1000000000">1.00s</td><td data-sort="0">0ms</td><td data-sort="0">0ms</td><td data-sort="0">0ms</td><td data-sort="0">0ms</td><td data-sort="0">0ms</td><td data-sort="2000000000">2.00s</td></tr>
+  
+    <tr><td data-sort="subnet">subnet</td><td data-sort="1">1</td><td data-sort="1">1</td><td data-sort="0">0</td><td data-sort="100.00">100.00%</td><td data-sort="0.00">0.00</td><td data-sort="0">0ms</td><td data-sort="0">0ms</td><td data-sort="0">0ms</td><td data-sort="0">0ms</td><td data-sort="0">0ms</td><td data-sort="0">0ms</td><td data-sort="0">0ms</td></tr>
+  
+  </tbody>
+</table>
+
+<h2>Latency by type</h2>
+<svg viewBox="0 0 720 60.0" role="img" aria-label="latency range per resource type">
+  
+  <text class="lbl" x="0" y="22.0">network</text>
+  <line class="lat-line" x1="400.0" y1="15.0" x2="650.0" y2="15.0"></line>
+  <rect class="lat-band" x="150.0" y="15.0" width="0.0" height="6" transform="translate(0,-3)"></rect>
+  <text class="cap" x="660" y="22.0">p99 0ms</text>
+  
+  <text class="lbl" x="0" y="46.0">subnet</text>
+  <line class="lat-line" x1="150.0" y1="39.0" x2="150.0" y2="39.0"></line>
+  <rect class="lat-band" x="150.0" y="39.0" width="0.0" height="6" transform="translate(0,-3)"></rect>
+  <text class="cap" x="660" y="46.0">p99 0ms</text>
+  
+</svg>
+<p class="legend">range min–max, band p50–p99. axis max 2.00s.</p>
+
+<h2>Volume by type</h2>
+<svg viewBox="0 0 720 60.0" role="img" aria-label="attempted, succeeded and failed per resource type">
+  
+  <text class="lbl" x="0" y="22.0">network</text>
+  <rect class="seg-ok" x="150.0" y="8.0" width="500.0" height="14"></rect>
+  <rect class="seg-fail" x="650.0" y="8.0" width="0.0" height="14"></rect>
+  <text class="cap" x="660" y="22.0">ok 1 / fail 0</text>
+  
+  <text class="lbl" x="0" y="46.0">subnet</text>
+  <rect class="seg-ok" x="150.0" y="32.0" width="500.0" height="14"></rect>
+  <rect class="seg-fail" x="650.0" y="32.0" width="0.0" height="14"></rect>
+  <text class="cap" x="660" y="46.0">ok 1 / fail 0</text>
+  
+</svg>
+<p class="legend"><span class="sw" style="background:var(--ok)"></span>succeeded<span class="sw" style="background:var(--fail)"></span>failed (total = attempted)</p>
+
+
+<h2>Error breakdown</h2>
+<svg viewBox="0 0 720 36.0" role="img" aria-label="error count by kind">
+  
+  <text class="lbl" x="0" y="22.0">http_500</text>
+  <rect class="bar-fail" x="150" y="8.0" width="500.0" height="14"></rect>
+  <text class="cap" x="660" y="22.0">1</text>
+  
+</svg>
+
+
+
+
+<h2>Created resources (2)</h2>
+<div class="chips">
+
+  <span class="chip">network &times; 1</span>
+
+  <span class="chip">subnet &times; 1</span>
+
+</div>
+<button class="toggle" data-target="inventory-table">Show inventory</button>
+<div id="inventory-table" hidden>
+  <table>
+    <thead><tr><th>kind</th><th>logical</th><th>cloud name</th><th>uuid</th></tr></thead>
+    <tbody>
+    
+      <tr><td>network</td><td>net-0001</td><td>dizzy-abcd1234-net-0001</td><td class="mono">net-id-1</td></tr>
+    
+      <tr><td>subnet</td><td>subnet-0001</td><td>dizzy-abcd1234-subnet-0001</td><td class="mono">sub-id-1</td></tr>
+    
+    </tbody>
+  </table>
+  
+</div>
+
+
+
+<h2>Persona ci</h2>
+<div class="chips">
+  <span class="chip">project proj-ci</span>
+  <span class="chip">share 60%</span>
+  <span class="chip">servers 6</span>
+</div>
+<div class="kpis">
+
+  <div class="kpi"><div class="v">3</div><div class="l">total ops</div></div>
+
+  <div class="kpi"><div class="v">66.67%</div><div class="l">success rate</div></div>
+
+  <div class="kpi"><div class="v">1</div><div class="l">failed</div></div>
+
+  <div class="kpi"><div class="v">0.02 ops/s</div><div class="l">throughput</div></div>
+
+  <div class="kpi"><div class="v">120.00ms</div><div class="l">p50 latency</div></div>
+
+  <div class="kpi"><div class="v">900.00ms</div><div class="l">p99 latency</div></div>
+
+</div>
+<h3>Throughput over time</h3>
+<svg viewBox="0 0 720 184.0" role="img" aria-label="attempted and failed operations per time bucket">
+  <line class="grid" x1="46" y1="160.0" x2="704" y2="160.0"></line>
+  
+  <rect class="bar" x="95.4" y="10.0" width="230.3" height="150.0"></rect>
+  
+  
+  <rect class="bar" x="424.4" y="40.0" width="230.3" height="120.0"></rect>
+  <rect class="bar-fail" x="424.4" y="130.0" width="230.3" height="30.0"></rect>
+  
+  <text class="axis" x="46" y="160.0" dy="16">0ms</text>
+  <text class="axis" x="704" y="160.0" dy="16" text-anchor="end">30.00s</text>
+</svg>
+<p class="legend"><span class="sw" style="background:var(--bar)"></span>attempted<span class="sw" style="background:var(--fail)"></span>failed. axis max 5 ops/bucket.</p>
+
+<h3>Latency over time</h3>
+<svg viewBox="0 0 720 184.0" role="img" aria-label="p50 and p99 latency per time bucket">
+  <line class="grid" x1="46" y1="160.0" x2="704" y2="160.0"></line>
+  <polyline class="line-p50" points="210.5,143.3 539.5,135.0"></polyline>
+  <polyline class="line-p99" points="210.5,126.7 539.5,10.0"></polyline>
+  <text class="axis" x="46" y="160.0" dy="16">0ms</text>
+  <text class="axis" x="704" y="160.0" dy="16" text-anchor="end">30.00s</text>
+</svg>
+<p class="legend"><span class="sw" style="background:var(--p50)"></span>p50<span class="sw" style="background:var(--p99)"></span>p99. axis max 900.00ms.</p>
+
+<h2>Lane keystone</h2>
+<div class="chips">
+  <span class="chip">project proj-admin</span>
+  <span class="chip">scenario small/keystone</span>
+</div>
+<div class="kpis">
+
+  <div class="kpi"><div class="v">4</div><div class="l">total ops</div></div>
+
+  <div class="kpi"><div class="v">100.00%</div><div class="l">success rate</div></div>
+
+  <div class="kpi"><div class="v">0</div><div class="l">failed</div></div>
+
+  <div class="kpi"><div class="v">0.04 ops/s</div><div class="l">throughput</div></div>
+
+  <div class="kpi"><div class="v">50.00ms</div><div class="l">p50 latency</div></div>
+
+  <div class="kpi"><div class="v">300.00ms</div><div class="l">p99 latency</div></div>
+
+</div>
+<h3>Throughput over time</h3>
+<svg viewBox="0 0 720 184.0" role="img" aria-label="attempted and failed operations per time bucket">
+  <line class="grid" x1="46" y1="160.0" x2="704" y2="160.0"></line>
+  
+  <rect class="bar" x="95.4" y="10.0" width="230.3" height="150.0"></rect>
+  
+  
+  <rect class="bar" x="424.4" y="40.0" width="230.3" height="120.0"></rect>
+  <rect class="bar-fail" x="424.4" y="130.0" width="230.3" height="30.0"></rect>
+  
+  <text class="axis" x="46" y="160.0" dy="16">0ms</text>
+  <text class="axis" x="704" y="160.0" dy="16" text-anchor="end">30.00s</text>
+</svg>
+<p class="legend"><span class="sw" style="background:var(--bar)"></span>attempted<span class="sw" style="background:var(--fail)"></span>failed. axis max 5 ops/bucket.</p>
+
+<h3>Latency over time</h3>
+<svg viewBox="0 0 720 184.0" role="img" aria-label="p50 and p99 latency per time bucket">
+  <line class="grid" x1="46" y1="160.0" x2="704" y2="160.0"></line>
+  <polyline class="line-p50" points="210.5,143.3 539.5,135.0"></polyline>
+  <polyline class="line-p99" points="210.5,126.7 539.5,10.0"></polyline>
+  <text class="axis" x="46" y="160.0" dy="16">0ms</text>
+  <text class="axis" x="704" y="160.0" dy="16" text-anchor="end">30.00s</text>
+</svg>
+<p class="legend"><span class="sw" style="background:var(--p50)"></span>p50<span class="sw" style="background:var(--p99)"></span>p99. axis max 900.00ms.</p>
+
+<script>
+"use strict";
+document.querySelectorAll(".toggle").forEach(function (btn) {
+  btn.addEventListener("click", function () {
+    var el = document.getElementById(btn.dataset.target);
+    if (!el) { return; }
+    var hidden = el.hasAttribute("hidden");
+    if (hidden) { el.removeAttribute("hidden"); btn.textContent = "Hide inventory"; }
+    else { el.setAttribute("hidden", ""); btn.textContent = "Show inventory"; }
+  });
+});
+document.querySelectorAll("table.sortable").forEach(function (table) {
+  var headers = table.tHead.rows[0].cells;
+  Array.prototype.forEach.call(headers, function (th, col) {
+    th.addEventListener("click", function () {
+      var asc = !th.classList.contains("asc");
+      Array.prototype.forEach.call(headers, function (h) { h.classList.remove("asc", "desc"); });
+      th.classList.add(asc ? "asc" : "desc");
+      var body = table.tBodies[0];
+      var rows = Array.prototype.slice.call(body.rows);
+      rows.sort(function (a, b) {
+        var x = a.cells[col].dataset.sort, y = b.cells[col].dataset.sort;
+        var nx = parseFloat(x), ny = parseFloat(y);
+        var cmp = (!isNaN(nx) && !isNaN(ny)) ? nx - ny : String(x).localeCompare(String(y));
+        return asc ? cmp : -cmp;
+      });
+      rows.forEach(function (r) { body.appendChild(r); });
+    });
+  });
+});
+</script>
+</body>
+</html>

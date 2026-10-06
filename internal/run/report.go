@@ -27,7 +27,8 @@ var csvHeader = []string{
 // record (a chaos checkpoint) starts with a line saying so and when it was
 // written, then a blank line, then the same output as a complete record. A mix
 // record then gets the persona table and, per persona, a section with its own
-// metrics and churn summary.
+// metrics and churn summary, and after them the lane table and the same
+// section per background lane.
 func WriteTable(w io.Writer, r *Record) error {
 	if r.Incomplete {
 		if _, err := fmt.Fprintf(w, "Run incomplete: checkpoint written at %s; the run was still going or was killed before its final record\n\n",
@@ -43,9 +44,6 @@ func WriteTable(w io.Writer, r *Record) error {
 			return fmt.Errorf("writing chaos report: %w", err)
 		}
 	}
-	if len(r.Personas) == 0 {
-		return nil
-	}
 	if err := WritePersonaTable(w, r.Personas); err != nil {
 		return err
 	}
@@ -56,6 +54,19 @@ func WriteTable(w io.Writer, r *Record) error {
 		if p.Chaos != nil {
 			if err := writeChaosTable(w, p.Chaos); err != nil {
 				return fmt.Errorf("writing persona report: %w", err)
+			}
+		}
+	}
+	if err := WriteLaneTable(w, r.Lanes); err != nil {
+		return err
+	}
+	for _, l := range r.Lanes {
+		if _, err := fmt.Fprintf(w, "\nLane %s\n%s", l.Name, l.Metrics.Summary()); err != nil {
+			return fmt.Errorf("writing lane report: %w", err)
+		}
+		if l.Chaos != nil {
+			if err := writeChaosTable(w, l.Chaos); err != nil {
+				return fmt.Errorf("writing lane report: %w", err)
 			}
 		}
 	}
@@ -71,22 +82,56 @@ func WritePersonaTable(w io.Writer, ps []PersonaStats) error {
 		return nil
 	}
 	rows := [][]string{{"NAME", "PROJECT", "SHARE", "SERVERS", "OPS", "OK", "FAILED", "P50", "P95", "P99"}}
-	// The labels, NAME and PROJECT, are left-aligned and the numbers right-aligned.
-	leftAlign := []bool{true, true, false, false, false, false, false, false, false, false}
 	for _, p := range ps {
-		o := p.Metrics.Overall
-		row := []string{p.Name, projectLabel(p.ProjectID), sharePercent(p.Share), strconv.Itoa(p.Servers),
-			strconv.Itoa(o.Attempted), strconv.Itoa(o.Succeeded), strconv.Itoa(o.Failed)}
-		for _, d := range []time.Duration{o.Latency.Median, o.Latency.P95, o.Latency.P99} {
-			if o.Attempted == 0 {
-				row = append(row, "-")
-			} else {
-				row = append(row, d.Round(time.Millisecond).String())
-			}
-		}
-		rows = append(rows, row)
+		row := []string{p.Name, projectLabel(p.ProjectID), sharePercent(p.Share), strconv.Itoa(p.Servers)}
+		rows = append(rows, append(row, statsCells(p.Metrics.Overall)...))
 	}
+	// The labels, NAME and PROJECT, are left-aligned and the numbers right-aligned.
+	if err := writeStatsTable(w, "Personas", rows, 2); err != nil {
+		return fmt.Errorf("writing persona table: %w", err)
+	}
+	return nil
+}
 
+// WriteLaneTable renders one row per background lane of a mix run: its name,
+// project, scenario, operation counts and latency percentiles, under the
+// alignment and "-" rules of WritePersonaTable. It writes nothing for an empty
+// list.
+func WriteLaneTable(w io.Writer, ls []LaneStats) error {
+	if len(ls) == 0 {
+		return nil
+	}
+	rows := [][]string{{"NAME", "PROJECT", "SCENARIO", "OPS", "OK", "FAILED", "P50", "P95", "P99"}}
+	for _, l := range ls {
+		row := []string{l.Name, projectLabel(l.ProjectID), l.Scenario}
+		rows = append(rows, append(row, statsCells(l.Metrics.Overall)...))
+	}
+	// The labels, NAME, PROJECT and SCENARIO, are left-aligned and the numbers
+	// right-aligned.
+	if err := writeStatsTable(w, "Lanes", rows, 3); err != nil {
+		return fmt.Errorf("writing lane table: %w", err)
+	}
+	return nil
+}
+
+// statsCells renders the operation counts and the p50, p95 and p99 latencies
+// of a persona or lane, with "-" for the latencies when it attempted nothing.
+func statsCells(o metrics.Stats) []string {
+	cells := []string{strconv.Itoa(o.Attempted), strconv.Itoa(o.Succeeded), strconv.Itoa(o.Failed)}
+	for _, d := range []time.Duration{o.Latency.Median, o.Latency.P95, o.Latency.P99} {
+		if o.Attempted == 0 {
+			cells = append(cells, "-")
+		} else {
+			cells = append(cells, d.Round(time.Millisecond).String())
+		}
+	}
+	return cells
+}
+
+// writeStatsTable writes a blank line, title and rows as an aligned table:
+// the first labels columns left-aligned, the others right-aligned, two spaces
+// apart. It returns the writer's error unwrapped.
+func writeStatsTable(w io.Writer, title string, rows [][]string, labels int) error {
 	widths := make([]int, len(rows[0]))
 	for _, row := range rows {
 		for i, cell := range row {
@@ -94,13 +139,13 @@ func WritePersonaTable(w io.Writer, ps []PersonaStats) error {
 		}
 	}
 	var b strings.Builder
-	b.WriteString("\nPersonas\n")
+	b.WriteString("\n" + title + "\n")
 	for _, row := range rows {
 		for i, cell := range row {
 			if i > 0 {
 				b.WriteString("  ")
 			}
-			if leftAlign[i] {
+			if i < labels {
 				fmt.Fprintf(&b, "%-*s", widths[i], cell)
 			} else {
 				fmt.Fprintf(&b, "%*s", widths[i], cell)
@@ -108,10 +153,8 @@ func WritePersonaTable(w io.Writer, ps []PersonaStats) error {
 		}
 		b.WriteString("\n")
 	}
-	if _, err := io.WriteString(w, b.String()); err != nil {
-		return fmt.Errorf("writing persona table: %w", err)
-	}
-	return nil
+	_, err := io.WriteString(w, b.String())
+	return err
 }
 
 // writeChaosTable renders the churn counters, the population summary, and a
@@ -161,7 +204,8 @@ func formatBucketErrors(errs []metrics.ErrorCount) string {
 	return strings.Join(parts, ", ")
 }
 
-// projectLabel renders a persona's project for the reports, "-" when unknown.
+// projectLabel renders a persona's or lane's project for the reports, "-"
+// when unknown.
 func projectLabel(id string) string {
 	if id == "" {
 		return "-"
@@ -178,8 +222,8 @@ func sharePercent(share float64) string {
 // report format. A churn run additionally carries its chaos statistics under a
 // "chaos" key, and "incomplete": true when the record is a mid-run checkpoint;
 // an apply run (Chaos nil) marshals just the metrics aggregate, so its JSON
-// shape is unchanged. A mix run carries its "services", when it has any, and
-// its "personas" next to the overall metrics.
+// shape is unchanged. A mix run carries its "services", when it has any, its
+// "personas" and its "lanes", when it has any, next to the overall metrics.
 func WriteJSON(w io.Writer, r *Record) error {
 	var payload any = r.Metrics
 	switch {
@@ -188,8 +232,9 @@ func WriteJSON(w io.Writer, r *Record) error {
 			Metrics    metrics.Aggregate `json:"metrics"`
 			Services   []string          `json:"services,omitempty"`
 			Personas   []PersonaStats    `json:"personas"`
+			Lanes      []LaneStats       `json:"lanes,omitempty"`
 			Incomplete bool              `json:"incomplete,omitempty"`
-		}{Metrics: r.Metrics, Services: r.Services, Personas: r.Personas, Incomplete: r.Incomplete}
+		}{Metrics: r.Metrics, Services: r.Services, Personas: r.Personas, Lanes: r.Lanes, Incomplete: r.Incomplete}
 	case r.Chaos != nil:
 		payload = struct {
 			Metrics    metrics.Aggregate `json:"metrics"`
@@ -211,7 +256,8 @@ func WriteJSON(w io.Writer, r *Record) error {
 // WriteCSV renders the run's per-type and overall metrics as CSV, one row per
 // resource type plus a leading overall row. A mix run appends, per persona, an
 // overall row labelled <persona>/overall and one row per type labelled
-// <persona>/<type>.
+// <persona>/<type>, and then the same rows per background lane, labelled
+// <lane>/overall and <lane>/<type>.
 func WriteCSV(w io.Writer, r *Record) error {
 	cw := csv.NewWriter(w)
 	if err := cw.Write(csvHeader); err != nil {
@@ -226,18 +272,32 @@ func WriteCSV(w io.Writer, r *Record) error {
 		}
 	}
 	for _, p := range r.Personas {
-		if err := cw.Write(statsRow(p.Name+"/overall", p.Metrics.Overall)); err != nil {
-			return fmt.Errorf("writing csv row: %w", err)
+		if err := writeBreakdownRows(cw, p.Name, p.Metrics); err != nil {
+			return err
 		}
-		for _, s := range p.Metrics.ByType {
-			if err := cw.Write(statsRow(p.Name+"/"+s.Type, s)); err != nil {
-				return fmt.Errorf("writing csv row: %w", err)
-			}
+	}
+	for _, l := range r.Lanes {
+		if err := writeBreakdownRows(cw, l.Name, l.Metrics); err != nil {
+			return err
 		}
 	}
 	cw.Flush()
 	if err := cw.Error(); err != nil {
 		return fmt.Errorf("flushing csv report: %w", err)
+	}
+	return nil
+}
+
+// writeBreakdownRows writes the overall row of one persona or lane, labelled
+// <name>/overall, and one row per type, labelled <name>/<type>.
+func writeBreakdownRows(cw *csv.Writer, name string, m metrics.Aggregate) error {
+	if err := cw.Write(statsRow(name+"/overall", m.Overall)); err != nil {
+		return fmt.Errorf("writing csv row: %w", err)
+	}
+	for _, s := range m.ByType {
+		if err := cw.Write(statsRow(name+"/"+s.Type, s)); err != nil {
+			return fmt.Errorf("writing csv row: %w", err)
+		}
 	}
 	return nil
 }
