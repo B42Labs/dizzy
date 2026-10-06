@@ -33,7 +33,7 @@ func (s Scenario) personas() []persona {
 	return []persona{
 		{name: "ci", share: s.Personas.CI.Share, nova: s.ciNova},
 		{name: "gardener", share: s.Personas.Gardener.Share, rolling: true, nova: s.gardenerNova, check: s.gardenerCheck, shape: s.gardenerShape},
-		{name: "legacy", share: s.Personas.Legacy.Share, longLived: true, coldMigrate: true, nova: s.legacyNova},
+		{name: "legacy", share: s.Personas.Legacy.Share, longLived: true, coldMigrate: s.Personas.Legacy.ColdMigrates(), nova: s.legacyNova},
 	}
 }
 
@@ -124,8 +124,9 @@ func (s Scenario) gardenerShape(np *novaplan.Plan) {
 // servers on one network each, spread over the persona's networks, with its
 // data volumes and extra ports. Every server is stop/started (soft),
 // live-migrated and, when the block names a resize flavor, resized, and every
-// volume and port is detached. Generate marks every server for cold migration
-// on top, an operation the compute scenario has no ratio for.
+// volume and port is detached. Unless the block turns cold migration off,
+// Generate marks every server for it on top, an operation the compute
+// scenario has no ratio for.
 func (s Scenario) legacyNova(servers int) novascenario.Scenario {
 	legacy := s.Personas.Legacy
 	d := novascenario.Distribution{
