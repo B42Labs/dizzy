@@ -100,7 +100,9 @@ not-yet-resized volume to its planned target. `--token-ratio` is the probability
 of issuing a scoped token as a live, assigned user. Set either to `0` to disable.
 
 Each resource instance is mutated at most once per lifetime, and re-armed when it
-is deleted and recreated.
+is deleted and recreated. The exception is the `mix` Legacy persona: its
+servers, volumes and ports are never deleted and are changed again and again
+(see [Mix workloads in one run](#mix-workloads-in-one-run)).
 
 ## Keep the resources for inspection
 
@@ -156,13 +158,32 @@ clouds:
       user_domain_name: Default
       project_domain_name: Default
     region_name: RegionOne
+  tenant-legacy:                  # the Legacy persona's project
+    auth:
+      auth_url: https://keystone.example.com/v3
+      username: soak-legacy
+      password: <password>
+      project_name: soak-legacy
+      user_domain_name: Default
+      project_domain_name: Default
+    region_name: RegionOne
 ```
 
-Point the CI persona at its entry and run the soak:
+Point each persona at its entry and run the soak:
 
 ```console
-$ dizzy mix chaos --scenario scenarios/mix/small.yaml --os-cloud soak --set personas.ci.cloud=tenant-ci
+$ dizzy mix chaos --scenario scenarios/mix/small.yaml --os-cloud soak \
+    --set personas.ci.cloud=tenant-ci --set personas.legacy.cloud=tenant-legacy
 ```
+
+The Legacy persona's servers stay for the whole run and are stopped and
+started, resized between `flavor` and `resize_flavor`, and live- and
+cold-migrated; their volumes and ports are detached and attached again. The
+migrations need the admin role in the persona's project and two usable compute
+hosts. Without them the run logs `live migration disabled for this run` and
+`cold migration disabled for this run` and goes on without migrations. The
+resizes need the flavor `resize_flavor` names, `m1.small` in the bundled
+profiles; `--set personas.legacy.resize_flavor=` turns them off instead.
 
 Every persona's teardown prints its own
 `deleted N resource(s) for run <id>-<persona>` line, and the run ends with one
@@ -184,7 +205,8 @@ Without a record, pass the run id together with the scenario and every `--set`
 the run used:
 
 ```console
-$ dizzy mix cleanup --run-id <id> --scenario scenarios/mix/small.yaml --os-cloud soak --set personas.ci.cloud=tenant-ci
+$ dizzy mix cleanup --run-id <id> --scenario scenarios/mix/small.yaml --os-cloud soak \
+    --set personas.ci.cloud=tenant-ci --set personas.legacy.cloud=tenant-legacy
 ```
 
 `--concurrency` and `--max-parallel` bound each persona separately. See

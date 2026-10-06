@@ -8,15 +8,17 @@ error rate of a soak rises, the useful question is which of these patterns
 caused it.
 
 `mix chaos` runs several such patterns, called **personas**, side by side in
-one run and keeps them apart in the results. This build ships one persona,
-`ci`. This page explains how the combined run is put together and why.
+one run and keeps them apart in the results. This build ships two personas:
+`ci`, whose servers live for minutes, and `legacy`, whose servers live for the
+whole run and are changed in place. This page explains how the combined run is
+put together and why.
 
 ## One engine per persona
 
 The [churn engine](churn-engine.md) takes its interval, churn ratio and target
-fill as settings of the whole engine. A CI persona churns fast and keeps its
-envelope half full; a legacy persona would hold steady and rarely delete. One
-engine cannot run at two tempos, so every persona gets an engine of its own,
+fill as settings of the whole engine. The CI persona churns fast and keeps its
+envelope half full; the Legacy persona holds every resource and never deletes.
+One engine cannot run at two tempos, so every persona gets an engine of its own,
 called a **lane**, with its own config, its own node graph and its own seed.
 
 The lanes start together, run concurrently and stop together: they share the
@@ -28,6 +30,53 @@ A persona's seed is the run seed XOR the FNV-64a hash of the persona's name,
 the derivation Glance uses for its payloads. The whole run therefore replays
 from one seed, and two personas never draw the same schedule. See
 [Determinism and reproducibility](determinism.md).
+
+## Servers that stay
+
+A server that lives for minutes never reaches the state in which a long-lived
+workload fails. Defects in resize, migration and attachment handling often
+depend on history: the fifth resize of one server, a migration after several
+detach and attach cycles, a port attached again to a server that has moved
+twice. The Legacy persona builds that history by keeping its servers for the
+whole run and changing them in place.
+
+One node property of the churn engine makes this possible. A **pinned** node is
+never a delete candidate, and the engine creates the absent pinned nodes whose
+parents exist before it draws anything else, so the Legacy population exists
+from the first ticks on and stays until the teardown. A pinned node is also
+exempt from the engine's rule that an instance is mutated at most once in its
+lifetime, since it has only the one. Every node of the Legacy graph is pinned.
+The lane runs with a mutate probability of 1, so once its resources exist, every
+step is a mutation.
+
+A mutation of a kept server runs one operation: a stop and start, a resize, a
+live migration or a cold migration. The operation is drawn per mutation,
+uniformly among the operations enabled for that server, from a generator
+seeded with the persona seed XOR the FNV-64a hash of the server name. The
+engine runs one node's mutations one after another in decision order, so the
+n-th mutation of a server always gets the n-th draw, and the engine's decision
+log says only `mutate`. Both migrations need the admin role and two usable
+compute hosts, and the pre-check turns them off without these. An empty
+`resize_flavor` turns resize off. Stop and start is always on.
+
+The changes alternate instead of repeating, so the run stays inside what the
+quota pre-check validated. A resize goes to `resize_flavor` while the server is
+on `flavor` and back to `flavor` afterwards, and the pre-check already sizes a
+resized server by the larger of its two flavors. A data volume or port is
+detached by one mutation and attached again by the next, so it stays one
+resource however often it moves. A toggle changes its state only when its step
+succeeded, so a failed resize, detach or attach is tried again in the same
+direction. A step whose wait gave up may still finish in the cloud, so the
+retry can find the change already made: an attach of a volume or port that is
+already attached counts as done, and a resize to the flavor the server already
+has turns around to the other flavor.
+
+A kept server whose boot failed is not replaced. The engine marks a node present
+when it decides to create it, so it never schedules that create again, and it
+skips the node's later mutations. Replacing the server would make the engine
+read an operation's outcome, and the schedule would stop being a function of
+scenario, seed and settings. The failure shows as a failed create, and the
+persona runs with one server fewer.
 
 ## Shares divide servers
 

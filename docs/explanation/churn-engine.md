@@ -30,6 +30,15 @@ So the engine never issues a dependency-violating call of its own making. A
 subnet is not created before its network. A network with live subnets is not a
 delete candidate. A security group with live ports keeps existing.
 
+A node can also be **pinned**. A pinned node is never a delete candidate, so
+once created it stays until the caller's teardown, and so do its parents, since
+they keep a present dependent. The engine creates the absent pinned nodes whose
+parents are present before it draws anything else, one per decision, so a
+pinned population exists from the first ticks on. A graph without a pinned node
+never reaches that draw and keeps the schedule it had before pinned nodes
+existed. The Legacy persona of `mix chaos` pins every node of its graph; see
+[Combined runs](combined-runs.md#servers-that-stay).
+
 This generalizes across services for free. Cinder volumes have no parents;
 snapshots are parented on their source volume. The invariant therefore gives the
 right lifecycle without a line of Cinder-specific lifecycle code: a snapshot only
@@ -104,6 +113,14 @@ server runs its planned lifecycle once, an image runs its planned lifecycle once
 week-long soak's gigabyte consumption inside the envelope that the quota
 pre-check validated (the sum of planned final sizes), rather than growing without
 bound.
+
+A pinned node is exempt from that bound: it is never deleted, so it has a single
+lifetime, and the engine may draw its mutation any number of times in it. Each
+of those mutations still waits for the node's previous operation, so they run
+one after another in decision order. Only the Legacy persona of `mix chaos` pins
+nodes, and its changes alternate (a resize goes to the other flavor, a detached
+volume or port is attached again), so its population stays inside the envelope
+however often it changes.
 
 ## Determinism
 
