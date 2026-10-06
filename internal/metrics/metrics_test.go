@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
@@ -232,4 +233,74 @@ func slicePath(typ reflect.Type, path string, seen map[reflect.Type]bool) string
 		}
 	}
 	return ""
+}
+
+// TestChildRecordsIntoParent confirms a sample and a readiness record on a
+// child collector show in the child's aggregate and in its parent's.
+func TestChildRecordsIntoParent(t *testing.T) {
+	parent := NewCollector()
+	child := parent.Child()
+	child.Record(Sample{Type: "server", Duration: ms(10), Success: false, ErrKind: "quota"})
+	child.RecordReadiness(Readiness{Type: "server", Duration: ms(5), OK: true})
+
+	for name, c := range map[string]*Collector{"child": child, "parent": parent} {
+		agg := c.Aggregate(time.Second)
+		if agg.Overall.Attempted != 1 || agg.Overall.Failed != 1 {
+			t.Errorf("%s overall = %+v, want 1 attempted, 1 failed", name, agg.Overall)
+		}
+		if len(agg.Errors) != 1 || agg.Errors[0] != (ErrorCount{Kind: "quota", Count: 1}) {
+			t.Errorf("%s errors = %+v, want quota=1", name, agg.Errors)
+		}
+		if len(agg.Readiness) != 1 || agg.Readiness[0].Count != 1 {
+			t.Errorf("%s readiness = %+v, want one server record", name, agg.Readiness)
+		}
+	}
+}
+
+// TestParentDoesNotRecordIntoChild confirms recording flows only upward: a
+// sample on the parent leaves its child empty.
+func TestParentDoesNotRecordIntoChild(t *testing.T) {
+	parent := NewCollector()
+	child := parent.Child()
+	parent.Record(Sample{Type: "server", Duration: ms(10), Success: true})
+	parent.RecordReadiness(Readiness{Type: "server", Duration: ms(5), OK: true})
+
+	if a, _, _ := child.Snapshot(); a != 0 {
+		t.Errorf("child attempted = %d, want 0", a)
+	}
+	if agg := child.Aggregate(time.Second); agg.Readiness != nil {
+		t.Errorf("child readiness = %+v, want none", agg.Readiness)
+	}
+	if a, _, _ := parent.Snapshot(); a != 1 {
+		t.Errorf("parent attempted = %d, want 1", a)
+	}
+}
+
+// TestChildrenConcurrentRecord records from 100 goroutines on each of two
+// children of one parent; run under -race it also proves the forwarding is
+// free of data races.
+func TestChildrenConcurrentRecord(t *testing.T) {
+	parent := NewCollector()
+	children := []*Collector{parent.Child(), parent.Child()}
+
+	var wg sync.WaitGroup
+	for _, c := range children {
+		for i := 0; i < 100; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				c.Record(Sample{Type: "server", Duration: ms(i), Success: true})
+			}()
+		}
+	}
+	wg.Wait()
+
+	if got := parent.Aggregate(time.Second).Overall.Attempted; got != 200 {
+		t.Errorf("parent attempted = %d, want 200", got)
+	}
+	for i, c := range children {
+		if a, _, _ := c.Snapshot(); a != 100 {
+			t.Errorf("child %d attempted = %d, want 100", i, a)
+		}
+	}
 }

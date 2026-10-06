@@ -42,13 +42,15 @@ type Readiness struct {
 
 // Collector accumulates samples and readiness records from concurrent workers
 // into fixed-size per-group state, so its memory does not grow with the number
-// of samples. Its zero value is not usable; construct it with NewCollector.
+// of samples. Its zero value is not usable; construct it with NewCollector or
+// Child.
 type Collector struct {
-	mu        sync.Mutex // guards overall, byType, errors and readiness
+	mu        sync.Mutex // guards overall, byType, errors and readiness; parent is set once and never changes
 	overall   group
 	byType    map[string]*group
 	errors    map[string]int
 	readiness map[string]*group
+	parent    *Collector
 }
 
 // group accumulates the records of one stats group: the overall group, the
@@ -68,11 +70,20 @@ func NewCollector() *Collector {
 	}
 }
 
+// Child returns an empty Collector whose Record and RecordReadiness also record
+// into c, so c holds the exact aggregate of all its children. Samples recorded
+// on c directly do not reach the child.
+func (c *Collector) Child() *Collector {
+	child := NewCollector()
+	child.parent = c
+	return child
+}
+
 // Record adds one API-call sample to the overall group, to its type's group,
-// and, when it carries an ErrKind, to the error tally.
+// and, when it carries an ErrKind, to the error tally. A child collector then
+// records the sample into its parent, after releasing its own lock.
 func (c *Collector) Record(s Sample) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.overall.add(s.Success, s.Duration)
 	g, ok := c.byType[s.Type]
 	if !ok {
@@ -83,18 +94,26 @@ func (c *Collector) Record(s Sample) {
 	if s.ErrKind != "" {
 		c.errors[s.ErrKind]++
 	}
+	c.mu.Unlock()
+	if c.parent != nil {
+		c.parent.Record(s)
+	}
 }
 
-// RecordReadiness adds one time-to-ready record to its type's group.
+// RecordReadiness adds one time-to-ready record to its type's group. A child
+// collector then records it into its parent, after releasing its own lock.
 func (c *Collector) RecordReadiness(r Readiness) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	g, ok := c.readiness[r.Type]
 	if !ok {
 		g = &group{}
 		c.readiness[r.Type] = g
 	}
 	g.add(r.OK, r.Duration)
+	c.mu.Unlock()
+	if c.parent != nil {
+		c.parent.RecordReadiness(r)
+	}
 }
 
 // Snapshot returns the live counts accumulated so far: the total number of
