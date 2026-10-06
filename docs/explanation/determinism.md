@@ -86,3 +86,10 @@ complete, for the same reason `apply`'s isn't. So a problematic churn run replay
 its decision schedule exactly, even though the cloud's responses may interleave
 differently. In practice that is the useful half: the schedule is what you want
 to reproduce, and the interleaving is what you were testing.
+
+A kept server of the `mix` Legacy persona adds one draw of its own. Each of its
+mutations picks one of its enabled operations, a stop and start, a resize, a
+live or a cold migration, from a generator seeded with the persona seed XOR the
+FNV-64a hash of the server name. The engine runs one server's mutations in
+decision order, so the n-th mutation of a server always gets the n-th draw, and
+the operations a server goes through replay with the schedule.
