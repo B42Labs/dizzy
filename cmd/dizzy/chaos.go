@@ -24,13 +24,19 @@ import (
 
 // Built-in defaults for the chaos knobs, used when neither the scenario chaos
 // block nor a flag supplies a value. There is no default duration: it must be
-// set by the chaos block or the --duration flag.
+// set by the chaos block or the --duration flag. The bucket width applies only
+// to an unbounded run (--duration 0).
 const (
 	defaultChaosMinInterval = 200 * time.Millisecond
 	defaultChaosMaxInterval = 3 * time.Second
 	defaultChaosChurnRatio  = 0.5
 	defaultChaosTargetFill  = 0.8
+	defaultChaosBucketWidth = time.Hour
 )
+
+// chaosCheckpointInterval is how often a running chaos command rewrites its run
+// record, so a killed process leaves a record at most about this old.
+const chaosCheckpointInterval = time.Minute
 
 // chaosFlags holds the dedicated chaos flag values; whether each one overrides
 // the scenario block is decided by cmd.Flags().Changed.
@@ -41,14 +47,17 @@ type chaosFlags struct {
 	maxParallel int
 	churnRatio  float64
 	targetFill  float64
+	bucketWidth time.Duration
 }
 
 // newChaosCmd builds "neutron chaos": a random churn/soak run that, for a
-// configured duration, continuously creates and deletes Neutron resources at
-// random intervals and parallelism, bounded by the scenario as the spatial
-// envelope. It authenticates, pre-checks quota against the full plan, runs the
-// churn, records the run, and — whether it completed or was interrupted, unless
-// --no-cleanup — tears the topology down by tag and reports any leak.
+// configured duration or until it is stopped (--duration 0), continuously
+// creates and deletes Neutron resources at random intervals and parallelism,
+// bounded by the scenario as the spatial envelope. It authenticates, pre-checks
+// quota against the full plan, runs the churn while rewriting its run record
+// every chaosCheckpointInterval, records the run, and — whether it completed or
+// was interrupted, unless --no-cleanup — tears the topology down by tag and
+// reports any leak.
 func newChaosCmd(opts *globalOptions) *cobra.Command {
 	var (
 		scenarioPath    string
@@ -135,44 +144,51 @@ func newChaosCmd(opts *globalOptions) *cobra.Command {
 			}
 
 			slog.Info("starting churn run", "run", runID, "scenario", p.Scenario,
-				"duration", cfg.Duration, "minInterval", cfg.MinInterval, "maxInterval", cfg.MaxInterval,
+				"duration", chaosDurationLabel(cfg), "minInterval", cfg.MinInterval, "maxInterval", cfg.MaxInterval,
 				"maxParallel", cfg.MaxParallel, "concurrency", cfg.Concurrency)
 
 			start := time.Now()
-			hb := startHeartbeat(ctx, "churn in progress", collectorSnapshot(collector, start, "duration", cfg.Duration))
+			// buildRecord builds the run record as of finished, for the
+			// checkpoints written while the churn runs and for the final record.
+			buildRecord := func(r *chaos.Result, finished time.Time) *run.Record {
+				return &run.Record{
+					RunID:      runID,
+					Service:    "neutron",
+					Scenario:   p.Scenario,
+					Seed:       p.Seed,
+					StartedAt:  start,
+					FinishedAt: finished,
+					Created:    r.Created,
+					Metrics:    collector.Aggregate(finished.Sub(start)),
+					Chaos:      chaosStats(r),
+				}
+			}
+			cfg.CheckpointInterval = chaosCheckpointInterval
+			cfg.OnCheckpoint = chaosCheckpoint(".", buildRecord)
+
+			hb := startHeartbeat(ctx, "churn in progress", collectorSnapshot(collector, start, "duration", chaosDurationLabel(cfg)))
 			result, runErr := chaos.Run(ctx, nodes, p.Seed, cfg, chaos.RealClock{})
 			hb.stop()
 			finished := time.Now()
 			if runErr != nil {
 				return fmt.Errorf("running churn (run %s): %w", runID, runErr)
 			}
-			wall := finished.Sub(start)
-			agg := collector.Aggregate(wall)
+			rec := buildRecord(result, finished)
 
 			// A churn run is a single iteration: export the same per-iteration
 			// summary metrics from the pre-teardown aggregate, mirroring the run
 			// record. An interrupted run counts as a failed iteration.
-			tel.RecordIteration(ctx, wall, ctx.Err() == nil)
-			tel.RecordIterationOperations(ctx, agg.Overall.Attempted, agg.Overall.Succeeded, agg.Overall.Failed)
+			interrupted := chaosInterrupted(ctx, cfg)
+			tel.RecordIteration(ctx, rec.Metrics.Wall, !interrupted)
+			tel.RecordIterationOperations(ctx, rec.Metrics.Overall.Attempted, rec.Metrics.Overall.Succeeded, rec.Metrics.Overall.Failed)
 
-			if _, err := fmt.Fprint(cmd.OutOrStdout(), agg.Summary()); err != nil {
+			if _, err := fmt.Fprint(cmd.OutOrStdout(), rec.Metrics.Summary()); err != nil {
 				return fmt.Errorf("writing metrics: %w", err)
 			}
 
 			// Persist the run record before teardown so the resources still live
 			// stay reclaimable (by tag, and address scopes by id) even if teardown
 			// fails partway or the operator wants to inspect them.
-			rec := &run.Record{
-				RunID:      runID,
-				Service:    "neutron",
-				Scenario:   p.Scenario,
-				Seed:       p.Seed,
-				StartedAt:  start,
-				FinishedAt: finished,
-				Created:    result.Created,
-				Metrics:    agg,
-				Chaos:      chaosStats(result),
-			}
 			recordPath, werr := run.Write(".", rec)
 			if werr != nil {
 				slog.Error("writing run record failed; clean up by run id", "run", runID, "error", werr)
@@ -180,14 +196,15 @@ func newChaosCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("writing output: %w", err)
 			}
 
-			return finishChurn(ctx, cmd, client, runID, recordPath, result.Created, ctx.Err() != nil, noCleanup, opts.timeout)
+			return finishChurn(ctx, cmd, client, runID, recordPath, rec.Created, interrupted, noCleanup, opts.timeout)
 		},
 	}
 
 	flags := cmd.Flags()
 	flags.StringVar(&scenarioPath, "scenario", "", "path to the scenario YAML file (required)")
 	flags.StringArrayVar(&sets, "set", nil, "override a scenario value, e.g. --set resources.networks=200 (repeatable)")
-	flags.DurationVar(&f.duration, "duration", 0, "total wall-clock runtime of the churn (required via flag or the scenario chaos block)")
+	flags.DurationVar(&f.duration, "duration", 0, "total wall-clock runtime of the churn; 0 runs until interrupted (required via flag or the scenario chaos block)")
+	flags.DurationVar(&f.bucketWidth, "bucket-width", defaultChaosBucketWidth, "width of one time bucket in an unbounded run's time series, at least 1m")
 	flags.DurationVar(&f.minInterval, "min-interval", defaultChaosMinInterval, "minimum random delay between scheduled actions")
 	flags.DurationVar(&f.maxInterval, "max-interval", defaultChaosMaxInterval, "maximum random delay between scheduled actions")
 	flags.IntVar(&f.maxParallel, "max-parallel", 0, "maximum concurrent in-flight churn operations (default: --concurrency)")
@@ -204,7 +221,8 @@ func newChaosCmd(opts *globalOptions) *cobra.Command {
 // mergeChaosConfig builds the churn config from three layers, lowest precedence
 // first: built-in defaults, the scenario's chaos block (each non-zero field), and
 // the dedicated flags (each one explicitly set). A zero field in the chaos block
-// falls back to the default; to set a field to zero use the flag.
+// falls back to the default; to set a field to zero use the flag. That is how
+// the unbounded mode is selected: --duration 0 given as a flag, never the block.
 func mergeChaosConfig(cmd *cobra.Command, opts *globalOptions, s scenario.Scenario, f chaosFlags) chaos.Config {
 	cfg := chaos.Config{
 		MinInterval: defaultChaosMinInterval,
@@ -213,6 +231,7 @@ func mergeChaosConfig(cmd *cobra.Command, opts *globalOptions, s scenario.Scenar
 		ChurnRatio:  defaultChaosChurnRatio,
 		TargetFill:  defaultChaosTargetFill,
 		Concurrency: opts.concurrency,
+		BucketWidth: defaultChaosBucketWidth,
 	}
 
 	if c := s.Chaos; c != nil {
@@ -234,10 +253,17 @@ func mergeChaosConfig(cmd *cobra.Command, opts *globalOptions, s scenario.Scenar
 		if c.TargetFill > 0 {
 			cfg.TargetFill = c.TargetFill
 		}
+		if c.BucketWidth > 0 {
+			cfg.BucketWidth = time.Duration(c.BucketWidth)
+		}
 	}
 
 	if cmd.Flags().Changed("duration") {
 		cfg.Duration = f.duration
+		cfg.Unbounded = f.duration == 0
+	}
+	if cmd.Flags().Changed("bucket-width") {
+		cfg.BucketWidth = f.bucketWidth
 	}
 	if cmd.Flags().Changed("min-interval") {
 		cfg.MinInterval = f.minInterval
@@ -330,17 +356,52 @@ func leakCheck(ctx context.Context, c executor.Cleaner, runID string) (int, erro
 // chaosStats maps the engine result onto the persisted run-record schema.
 func chaosStats(r *chaos.Result) *run.ChaosStats {
 	cs := &run.ChaosStats{
-		Creates:    r.Creates,
-		Deletes:    r.Deletes,
-		Mutates:    r.Mutates,
-		Cycles:     r.Cycles,
-		PopMin:     r.PopMin,
-		PopMax:     r.PopMax,
-		PopMean:    r.PopMean,
-		TargetFill: r.TargetFill,
+		Creates:     r.Creates,
+		Deletes:     r.Deletes,
+		Mutates:     r.Mutates,
+		Cycles:      r.Cycles,
+		PopMin:      r.PopMin,
+		PopMax:      r.PopMax,
+		PopMean:     r.PopMean,
+		TargetFill:  r.TargetFill,
+		BucketWidth: r.BucketWidth,
 	}
 	for _, b := range r.Buckets {
 		cs.Buckets = append(cs.Buckets, run.ChaosBucket{Start: b.Start, Stats: b.Stats, Errors: b.Errors})
 	}
 	return cs
+}
+
+// chaosCheckpoint returns the engine's checkpoint callback for a chaos command:
+// it builds the run record as of now from the engine's snapshot, marks it
+// incomplete, and writes it to dir over the previous one. A failed write is
+// logged as a warning and the run goes on, since the previous record stays on
+// disk and the next checkpoint tries again. It writes nothing to stdout.
+func chaosCheckpoint(dir string, build func(r *chaos.Result, finished time.Time) *run.Record) func(*chaos.Result) {
+	return func(r *chaos.Result) {
+		rec := build(r, time.Now())
+		rec.Incomplete = true
+		path, err := run.Write(dir, rec)
+		if err != nil {
+			slog.Warn("writing run record checkpoint failed; the run continues", "run", rec.RunID, "error", err)
+			return
+		}
+		slog.Debug("run record checkpoint written", "run", rec.RunID, "path", path)
+	}
+}
+
+// chaosInterrupted reports whether a chaos run was interrupted, which counts as
+// a failed iteration: a bounded run whose context was cancelled before its
+// duration elapsed. The stop signal is the normal end of an unbounded run.
+func chaosInterrupted(ctx context.Context, cfg chaos.Config) bool {
+	return ctx.Err() != nil && !cfg.Unbounded
+}
+
+// chaosDurationLabel is the duration a chaos command logs: "unbounded" for a
+// run without an end, the configured duration otherwise.
+func chaosDurationLabel(cfg chaos.Config) any {
+	if cfg.Unbounded {
+		return "unbounded"
+	}
+	return cfg.Duration
 }

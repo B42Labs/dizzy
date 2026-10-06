@@ -48,12 +48,13 @@ func TestCinderChaosRequiresDuration(t *testing.T) {
 }
 
 func TestCinderChaosDurationFlagOverridesBlock(t *testing.T) {
-	// The chaos block sets a valid 1m duration; --duration 0s overrides it,
+	// The chaos block sets a valid 1m duration; --duration -1s overrides it,
 	// producing an invalid merged duration — proving the flag wins over the block.
+	// (--duration 0 would select an unbounded run instead.)
 	path := writeScenario(t, cinderChaosScenarioYAML)
-	_, err := execRoot(t, "cinder", "chaos", "--scenario", path, "--duration", "0s")
+	_, err := execRoot(t, "cinder", "chaos", "--scenario", path, "--duration", "-1s")
 	if err == nil {
-		t.Fatal("cinder chaos with --duration 0s overriding the block: expected error, got nil")
+		t.Fatal("cinder chaos with --duration -1s overriding the block: expected error, got nil")
 	}
 	if !strings.Contains(err.Error(), "duration") {
 		t.Errorf("error %q does not mention the duration", err.Error())
@@ -250,5 +251,40 @@ func TestCinderChaosWithValidConfigRequiresCloud(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "block storage client") {
 		t.Errorf("error %q does not mention block storage client creation", err.Error())
+	}
+}
+
+// TestCinderChaosMergeDurationAndBucketWidth proves --duration 0 given as a flag
+// selects the unbounded mode while the block's duration never does, and that
+// the bucket width falls back to 1h unless the block or the flag sets it.
+func TestCinderChaosMergeDurationAndBucketWidth(t *testing.T) {
+	for _, tc := range chaosModeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := cinderscenario.Parse([]byte(sampleCinderScenarioYAML + "\n" + tc.block))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			opts := &globalOptions{concurrency: 8}
+			cmd := newCinderChaosCmd(opts)
+			cfg := mergeCinderChaosConfig(cmd, opts, s, setChaosFlags(t, cmd, tc.flags), defaultChaosResizeRatio)
+			checkChaosMode(t, cfg, tc.wantUnbounded, tc.wantDuration, tc.wantWidth)
+		})
+	}
+}
+
+func TestCinderChaosDurationZeroReachesCloud(t *testing.T) {
+	// --duration 0 over a block duration selects an unbounded run: the merged
+	// config validates and the run proceeds to authenticate, failing only at
+	// client creation with no reachable cloud.
+	t.Setenv("OS_CLOUD", "")
+	t.Setenv("OS_CLIENT_CONFIG_FILE", "/nonexistent/clouds.yaml")
+
+	path := writeScenario(t, cinderChaosScenarioYAML)
+	_, err := execRoot(t, "cinder", "chaos", "--scenario", path, "--duration", "0")
+	if err == nil {
+		t.Fatal("cinder chaos --duration 0 without a cloud: expected a client-creation failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "block storage client") {
+		t.Errorf("cinder chaos --duration 0 failed before reaching cloud auth: %q", err.Error())
 	}
 }

@@ -199,3 +199,38 @@ func TestFinishNovaChurnNoCleanupSkipsTeardown(t *testing.T) {
 		})
 	}
 }
+
+// TestNovaChaosMergeDurationAndBucketWidth proves --duration 0 given as a flag
+// selects the unbounded mode while the block's duration never does, and that
+// the bucket width falls back to 1h unless the block or the flag sets it.
+func TestNovaChaosMergeDurationAndBucketWidth(t *testing.T) {
+	for _, tc := range chaosModeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := novascenario.Parse([]byte(sampleNovaScenarioYAML + "\n" + tc.block))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			opts := &globalOptions{concurrency: 8}
+			cmd := newNovaChaosCmd(opts)
+			cfg := mergeNovaChaosConfig(cmd, opts, s, setChaosFlags(t, cmd, tc.flags), defaultChaosLifecycleRatio)
+			checkChaosMode(t, cfg, tc.wantUnbounded, tc.wantDuration, tc.wantWidth)
+		})
+	}
+}
+
+func TestNovaChaosDurationZeroReachesCloud(t *testing.T) {
+	// --duration 0 over a block duration selects an unbounded run: the merged
+	// config validates and the run proceeds to authenticate, failing only at
+	// client creation with no reachable cloud.
+	t.Setenv("OS_CLOUD", "")
+	t.Setenv("OS_CLIENT_CONFIG_FILE", "/nonexistent/clouds.yaml")
+
+	path := writeScenario(t, novaChaosScenarioYAML)
+	_, err := execRoot(t, "nova", "chaos", "--scenario", path, "--duration", "0")
+	if err == nil {
+		t.Fatal("nova chaos --duration 0 without a cloud: expected a client-creation failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "compute clients") {
+		t.Errorf("nova chaos --duration 0 failed before reaching cloud auth: %q", err.Error())
+	}
+}

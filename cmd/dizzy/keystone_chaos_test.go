@@ -224,3 +224,38 @@ func TestKeystoneChaosWithValidConfigRequiresCloud(t *testing.T) {
 		t.Errorf("error %q does not mention identity client creation", err.Error())
 	}
 }
+
+// TestKeystoneChaosMergeDurationAndBucketWidth proves --duration 0 given as a flag
+// selects the unbounded mode while the block's duration never does, and that
+// the bucket width falls back to 1h unless the block or the flag sets it.
+func TestKeystoneChaosMergeDurationAndBucketWidth(t *testing.T) {
+	for _, tc := range chaosModeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := keystonescenario.Parse([]byte(sampleKeystoneScenarioYAML + "\n" + tc.block))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			opts := &globalOptions{concurrency: 8}
+			cmd := newKeystoneChaosCmd(opts)
+			cfg := mergeKeystoneChaosConfig(cmd, opts, s, setChaosFlags(t, cmd, tc.flags), defaultChaosTokenRatio)
+			checkChaosMode(t, cfg, tc.wantUnbounded, tc.wantDuration, tc.wantWidth)
+		})
+	}
+}
+
+func TestKeystoneChaosDurationZeroReachesCloud(t *testing.T) {
+	// --duration 0 over a block duration selects an unbounded run: the merged
+	// config validates and the run proceeds to authenticate, failing only at
+	// client creation with no reachable cloud.
+	t.Setenv("OS_CLOUD", "")
+	t.Setenv("OS_CLIENT_CONFIG_FILE", "/nonexistent/clouds.yaml")
+
+	path := writeScenario(t, keystoneChaosScenarioYAML)
+	_, err := execRoot(t, "keystone", "chaos", "--scenario", path, "--duration", "0")
+	if err == nil {
+		t.Fatal("keystone chaos --duration 0 without a cloud: expected a client-creation failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "identity client") {
+		t.Errorf("keystone chaos --duration 0 failed before reaching cloud auth: %q", err.Error())
+	}
+}

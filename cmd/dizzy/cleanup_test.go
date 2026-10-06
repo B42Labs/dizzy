@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/B42Labs/dizzy/internal/neutron"
 	"github.com/B42Labs/dizzy/internal/run"
@@ -71,5 +74,41 @@ func TestCleanupRequiresCloud(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "network client") {
 		t.Errorf("error %q does not mention network client creation", err.Error())
+	}
+}
+
+// TestWarnUnreclaimable confirms cleanup warns that address scopes will be left
+// behind when it has no run record or only a mid-run checkpoint, and stays
+// quiet for a final record.
+func TestWarnUnreclaimable(t *testing.T) {
+	tests := []struct {
+		name string
+		rec  *run.Record
+		want string // the warning's message, or empty for none
+	}{
+		{name: "no record", want: "cleaning up by id without a run record"},
+		{name: "checkpoint record", rec: &run.Record{RunID: "r1", Incomplete: true, FinishedAt: time.Unix(60, 0)}, want: "run record is a mid-run checkpoint"},
+		{name: "final record", rec: &run.Record{RunID: "r1"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			warnUnreclaimable("r1", tc.rec)
+
+			got := logs.String()
+			if tc.want == "" {
+				if got != "" {
+					t.Errorf("logged %q, want nothing", got)
+				}
+				return
+			}
+			if strings.Count(got, "level=WARN") != 1 || !strings.Contains(got, tc.want) {
+				t.Errorf("logged %q, want one warning containing %q", got, tc.want)
+			}
+		})
 	}
 }
