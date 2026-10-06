@@ -183,13 +183,16 @@ func mixLaneConfigs(cmd *cobra.Command, opts *globalOptions, s mixscenario.Scena
 // width, max parallel, concurrency and classifier) is the same for every
 // persona. For ci the block sets the interval, churn ratio and target fill,
 // and the mutate probability stays 0, since a CI server has no lifecycle
-// operation. For legacy the block sets the interval. A long-lived persona runs
-// with target fill 1, since it keeps every planned resource, and mutate
-// probability 1, since its graph of pinned nodes only mutates once the creates
-// are done; its churn ratio keeps the default, which such a graph never
-// consults. A zero scenario value falls back to the default; --duration 0
-// given as a flag selects the unbounded mode. A persona this build does not
-// define is an error.
+// operation. For gardener and legacy the block sets the interval. A long-lived
+// persona runs with target fill 1, since it keeps every planned resource, and
+// mutate probability 1, since its graph of pinned nodes only mutates once the
+// creates are done; its churn ratio keeps the default, which such a graph never
+// consults. A rolling persona runs with target fill 1, since it keeps its
+// clusters whole; its churn ratio and mutate probability keep their defaults,
+// since a graph of pinned and rolling nodes never draws a mutation and never
+// reaches the create bias. A zero scenario value falls back to the default;
+// --duration 0 given as a flag selects the unbounded mode. A persona this
+// build does not define is an error.
 func mergeMixChaosConfig(cmd *cobra.Command, opts *globalOptions, s mixscenario.Scenario, f chaosFlags, ps *mixplan.Persona) (chaos.Config, error) {
 	cfg := chaos.Config{
 		MinInterval: defaultChaosMinInterval,
@@ -213,6 +216,8 @@ func mergeMixChaosConfig(cmd *cobra.Command, opts *globalOptions, s mixscenario.
 		if ci.TargetFill > 0 {
 			cfg.TargetFill = ci.TargetFill
 		}
+	case "gardener":
+		interval = s.Personas.Gardener.Interval
 	case "legacy":
 		interval = s.Personas.Legacy.Interval
 	default:
@@ -221,6 +226,10 @@ func mergeMixChaosConfig(cmd *cobra.Command, opts *globalOptions, s mixscenario.
 	// A graph of pinned nodes only mutates once its creates are done.
 	if ps.LongLived {
 		cfg.TargetFill, cfg.ResizeRatio = 1, 1
+	}
+	// A rolling persona keeps its envelope full.
+	if ps.Rolling {
+		cfg.TargetFill = 1
 	}
 	if interval.Min > 0 {
 		cfg.MinInterval = time.Duration(interval.Min)

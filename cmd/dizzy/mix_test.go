@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -502,8 +503,8 @@ func TestBuildPersonaNodes(t *testing.T) {
 				t.Fatalf("built %d nodes, want 3", len(nodes))
 			}
 			for _, n := range nodes {
-				if n.Pinned != longLived {
-					t.Errorf("node %q pinned = %v, want %v", n.Key, n.Pinned, longLived)
+				if n.Pinned != longLived || n.Roll != "" {
+					t.Errorf("node %q pinned = %v, roll = %q, want %v and none", n.Key, n.Pinned, n.Roll, longLived)
 				}
 			}
 		})
@@ -514,6 +515,221 @@ func TestBuildPersonaNodes(t *testing.T) {
 			_, err := buildPersonaNodes(&mixplan.Persona{Name: "x", LongLived: longLived, Nova: p}, c, novaexec.Resolved{}, time.Minute)
 			if err == nil || !strings.HasPrefix(err.Error(), "invalid plan:") {
 				t.Errorf("buildPersonaNodes = %v, want an error starting with %q", err, "invalid plan:")
+			}
+		})
+	}
+}
+
+// TestBuildPersonaNodesRolling confirms a rolling persona's lane gets the
+// rolling graph, whose workers and their volumes carry their group as the Roll
+// value, and an invalid compute plan the builder's error.
+func TestBuildPersonaNodesRolling(t *testing.T) {
+	plan := func() *novaplan.Plan {
+		return &novaplan.Plan{
+			Networks:     []novaplan.Network{{Name: "net-0001", Subnet: "sub-0001", CIDR: "10.0.1.0/24"}},
+			ServerGroups: []novaplan.ServerGroup{{Name: "grp-0001", Policy: novaplan.PolicySoftAntiAffinity}},
+			Servers:      []novaplan.Server{{Name: "srv-0001", Networks: []string{"net-0001"}, Group: "grp-0001"}},
+			Volumes:      []novaplan.Volume{{Name: "vol-0001", SizeGiB: 1, Server: "srv-0001"}},
+		}
+	}
+	var c *nova.Client // the builder only captures the client in its closures
+	nodes, err := buildPersonaNodes(&mixplan.Persona{Name: "gardener", Rolling: true, Nova: plan()}, c, novaexec.Resolved{}, time.Minute)
+	if err != nil {
+		t.Fatalf("buildPersonaNodes: %v", err)
+	}
+	roll := map[string]string{}
+	for _, n := range nodes {
+		roll[n.Key] = n.Roll
+	}
+	if want := map[string]string{"grp-0001": "", "net-0001": "", "srv-0001": "grp-0001", "vol-0001": "grp-0001"}; !reflect.DeepEqual(roll, want) {
+		t.Errorf("roll values = %v, want %v", roll, want)
+	}
+
+	p := plan()
+	p.Servers[0].Networks = []string{"ghost"}
+	_, err = buildPersonaNodes(&mixplan.Persona{Name: "gardener", Rolling: true, Nova: p}, c, novaexec.Resolved{}, time.Minute)
+	if err == nil || !strings.HasPrefix(err.Error(), "invalid plan:") {
+		t.Errorf("buildPersonaNodes = %v, want an error starting with %q", err, "invalid plan:")
+	}
+}
+
+// laneCleaner is an in-memory novaexec.Cleaner and novaexec.ServerGroupCleaner
+// for the lane teardown tests: it lists the servers and server groups still
+// live, deletes from that live set, and logs every call in order. The other
+// kinds list empty.
+type laneCleaner struct {
+	servers, groups             []resource.Resource
+	serverListErr, groupListErr error
+	live                        map[string]bool
+	calls                       []string
+}
+
+func newLaneCleaner(servers, groups []resource.Resource) *laneCleaner {
+	c := &laneCleaner{servers: servers, groups: groups, live: map[string]bool{}}
+	for _, r := range append(append([]resource.Resource(nil), servers...), groups...) {
+		c.live[r.ID] = true
+	}
+	return c
+}
+
+func (c *laneCleaner) stillLive(list []resource.Resource) []resource.Resource {
+	var out []resource.Resource
+	for _, r := range list {
+		if c.live[r.ID] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (c *laneCleaner) ListServersByMetadata(context.Context, string) ([]resource.Resource, error) {
+	c.calls = append(c.calls, "list servers")
+	if c.serverListErr != nil {
+		return nil, c.serverListErr
+	}
+	return c.stillLive(c.servers), nil
+}
+func (c *laneCleaner) ListVolumesByMetadata(context.Context, string) ([]resource.Resource, error) {
+	c.calls = append(c.calls, "list volumes")
+	return nil, nil
+}
+func (c *laneCleaner) ListByTag(_ context.Context, kind resource.Kind, _ string) ([]resource.Resource, error) {
+	c.calls = append(c.calls, "list "+string(kind))
+	return nil, nil
+}
+func (c *laneCleaner) DeleteNetworkPorts(context.Context, string) (int, error) { return 0, nil }
+func (c *laneCleaner) Delete(_ context.Context, r resource.Resource) error {
+	c.calls = append(c.calls, "delete "+r.ID)
+	c.live[r.ID] = false
+	return nil
+}
+func (c *laneCleaner) WaitForGone(context.Context, resource.Resource) error { return nil }
+func (c *laneCleaner) ListServerGroupsByName(context.Context, string) ([]resource.Resource, error) {
+	c.calls = append(c.calls, "list server groups")
+	if c.groupListErr != nil {
+		return nil, c.groupListErr
+	}
+	return c.stillLive(c.groups), nil
+}
+
+// TestLaneCleanup confirms a lane's teardown deletes its server groups after
+// the last call of novaexec.Cleanup and counts both, that a failing cleanup
+// still deletes the server groups, and that a failing server group sweep comes
+// back with the count of both and its error.
+func TestLaneCleanup(t *testing.T) {
+	servers := []resource.Resource{{Kind: nova.KindServer, ID: "s1"}}
+	groups := []resource.Resource{{Kind: nova.KindServerGroup, ID: "g1"}}
+
+	t.Run("servers then groups", func(t *testing.T) {
+		c := newLaneCleaner(servers, groups)
+		n, err := laneCleanup(context.Background(), c, c, "run1-gardener", nil, time.Second)
+		if n != 2 || err != nil {
+			t.Fatalf("laneCleanup = %d, %v, want 2, nil", n, err)
+		}
+		tail := len(c.calls) - 2
+		if tail < 1 || !reflect.DeepEqual(c.calls[tail:], []string{"list server groups", "delete g1"}) ||
+			slices.Contains(c.calls[:tail], "list server groups") || !slices.Contains(c.calls[:tail], "list subnet") {
+			t.Errorf("calls = %v, want every cleanup call before the server group calls", c.calls)
+		}
+	})
+
+	t.Run("cleanup fails", func(t *testing.T) {
+		c := newLaneCleaner(servers, groups)
+		c.serverListErr = errors.New("listing servers by metadata: boom")
+		n, err := laneCleanup(context.Background(), c, c, "run1-gardener", nil, time.Second)
+		if n != 1 || !errors.Is(err, c.serverListErr) {
+			t.Errorf("laneCleanup = %d, %v, want 1 (the group) and the cleanup error", n, err)
+		}
+		if !slices.Contains(c.calls, "delete g1") {
+			t.Errorf("calls = %v, want the server group deleted", c.calls)
+		}
+	})
+
+	t.Run("server groups fail", func(t *testing.T) {
+		c := newLaneCleaner(servers, groups)
+		c.groupListErr = errors.New("listing server groups by name: boom")
+		n, err := laneCleanup(context.Background(), c, c, "run1-gardener", nil, time.Second)
+		if n != 1 || !errors.Is(err, c.groupListErr) {
+			t.Errorf("laneCleanup = %d, %v, want 1 (the server) and the group error", n, err)
+		}
+	})
+}
+
+// TestLaneLeaked confirms a lane's leak check adds the server groups left to
+// the resources novaLeakCheck counts, wraps a failing group listing, and
+// returns a failing novaLeakCheck unchanged without listing server groups.
+func TestLaneLeaked(t *testing.T) {
+	servers := []resource.Resource{{Kind: nova.KindServer, ID: "s1"}}
+	groups := []resource.Resource{{Kind: nova.KindServerGroup, ID: "g1"}, {Kind: nova.KindServerGroup, ID: "g2"}}
+
+	t.Run("servers and groups left", func(t *testing.T) {
+		c := newLaneCleaner(servers, groups)
+		if n, err := laneLeaked(context.Background(), c, c, "run1-gardener"); n != 3 || err != nil {
+			t.Errorf("laneLeaked = %d, %v, want 3, nil", n, err)
+		}
+	})
+
+	t.Run("group listing fails", func(t *testing.T) {
+		c := newLaneCleaner(servers, groups)
+		c.groupListErr = errors.New("boom")
+		n, err := laneLeaked(context.Background(), c, c, "run1-gardener")
+		if want := "leak check listing server groups: boom"; n != 1 || err == nil || err.Error() != want {
+			t.Errorf("laneLeaked = %d, %v, want 1 and %q", n, err, want)
+		}
+	})
+
+	t.Run("server listing fails", func(t *testing.T) {
+		c := newLaneCleaner(servers, groups)
+		c.serverListErr = errors.New("boom")
+		_, want := novaLeakCheck(context.Background(), c, "run1-gardener")
+		c.calls = nil
+		n, err := laneLeaked(context.Background(), c, c, "run1-gardener")
+		if n != 0 || err == nil || err.Error() != want.Error() || !errors.Is(err, c.serverListErr) {
+			t.Errorf("laneLeaked = %d, %v, want 0 and %v", n, err, want)
+		}
+		if slices.Contains(c.calls, "list server groups") {
+			t.Errorf("calls = %v, want no server group listing", c.calls)
+		}
+	})
+}
+
+// blockingGroupCleaner mimics a wedged compute API: both calls block until
+// their context is done.
+type blockingGroupCleaner struct{}
+
+func (blockingGroupCleaner) ListServerGroupsByName(ctx context.Context, _ string) ([]resource.Resource, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (blockingGroupCleaner) Delete(ctx context.Context, _ resource.Resource) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestServerGroupTimeoutCleanerBoundsCalls confirms both calls of the server
+// group cleaner return the deadline error on a context without a deadline,
+// rather than blocking on a wedged call.
+func TestServerGroupTimeoutCleanerBoundsCalls(t *testing.T) {
+	tc := serverGroupTimeoutCleaner{inner: blockingGroupCleaner{}, opTimeout: 10 * time.Millisecond}
+	for name, call := range map[string]func() error{
+		"list": func() error {
+			_, err := tc.ListServerGroupsByName(context.Background(), "run1-gardener")
+			return err
+		},
+		"delete": func() error {
+			return tc.Delete(context.Background(), resource.Resource{Kind: nova.KindServerGroup, ID: "g1"})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			done := make(chan error, 1)
+			go func() { done <- call() }()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Errorf("err = %v, want context.DeadlineExceeded", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("the call did not return; serverGroupTimeoutCleaner failed to bound it")
 			}
 		})
 	}

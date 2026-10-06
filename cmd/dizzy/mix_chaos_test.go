@@ -118,10 +118,11 @@ func TestMixChaosHelpListsFlags(t *testing.T) {
 }
 
 // The plan personas of the config merge tests, as the mix generator emits
-// them: ci churns, and legacy is long-lived.
+// them: ci churns, gardener rolls, and legacy is long-lived.
 var (
-	ciPersona     = mixplan.Persona{Name: "ci"}
-	legacyPersona = mixplan.Persona{Name: "legacy", LongLived: true}
+	ciPersona       = mixplan.Persona{Name: "ci"}
+	gardenerPersona = mixplan.Persona{Name: "gardener", Rolling: true}
+	legacyPersona   = mixplan.Persona{Name: "legacy", LongLived: true}
 )
 
 // mergeFor runs mergeMixChaosConfig for ps and fails the test on an error.
@@ -255,6 +256,38 @@ func TestMergeMixChaosConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("gardener values", func(t *testing.T) {
+		s := parseMix(t, mixChaosScenarioYAML, "personas.gardener.interval.min=10s", "personas.gardener.interval.max=1m")
+		opts := &globalOptions{concurrency: 8}
+		cfg := mergeFor(t, newMixChaosCmd(opts), opts, s, chaosFlags{}, gardenerPersona)
+		if cfg.MinInterval != 10*time.Second || cfg.MaxInterval != time.Minute {
+			t.Errorf("interval = %s-%s, want the gardener block's 10s-1m", cfg.MinInterval, cfg.MaxInterval)
+		}
+		if cfg.TargetFill != 1 || cfg.ResizeRatio != 0 || cfg.ChurnRatio != defaultChaosChurnRatio || cfg.Classify == nil {
+			t.Errorf("merged config = %+v, want target fill 1, resize ratio 0, the default churn ratio and a classifier", cfg)
+		}
+	})
+
+	t.Run("gardener zero bounds fall back to the defaults", func(t *testing.T) {
+		for name, sets := range map[string][]string{
+			"both zero":    nil,
+			"only min set": {"personas.gardener.interval.min=1s"},
+		} {
+			t.Run(name, func(t *testing.T) {
+				s := parseMix(t, sampleMixScenarioYAML, sets...)
+				opts := &globalOptions{concurrency: 5}
+				cfg := mergeFor(t, newMixChaosCmd(opts), opts, s, chaosFlags{}, gardenerPersona)
+				wantMin := 200 * time.Millisecond
+				if sets != nil {
+					wantMin = time.Second
+				}
+				if cfg.MinInterval != wantMin || cfg.MaxInterval != 3*time.Second {
+					t.Errorf("interval = %s-%s, want %s-3s", cfg.MinInterval, cfg.MaxInterval, wantMin)
+				}
+			})
+		}
+	})
+
 	t.Run("run-wide values are the same for both personas", func(t *testing.T) {
 		s := parseMix(t, mixChaosScenarioYAML)
 		opts := &globalOptions{concurrency: 8}
@@ -294,8 +327,10 @@ func TestMergeMixChaosConfig(t *testing.T) {
 // only persona. Every lane checkpoints.
 func TestMixLaneConfigs(t *testing.T) {
 	type lane struct{ resizeRatio, targetFill float64 }
-	ci, legacy := lane{0, 0.6}, lane{1, 1}
+	ci, gardener, legacy := lane{0, 0.6}, lane{0, 1}, lane{1, 1}
 	legacySets := []string{"personas.legacy.share=1", "personas.legacy.networks=1"}
+	gardenerSets := []string{"personas.gardener.share=1", "personas.gardener.clusters=1",
+		"personas.gardener.policy=soft-anti-affinity", "personas.gardener.volume_gib.min=1", "personas.gardener.volume_gib.max=1"}
 	tests := []struct {
 		name string
 		sets []string
@@ -303,6 +338,7 @@ func TestMixLaneConfigs(t *testing.T) {
 	}{
 		{"ci and legacy", legacySets, []lane{ci, legacy}},
 		{"legacy alone", append([]string{"personas.ci.share=0"}, legacySets...), []lane{legacy}},
+		{"ci, gardener and legacy", append(append([]string{"resources.servers=6"}, gardenerSets...), legacySets...), []lane{ci, gardener, legacy}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -335,7 +371,9 @@ func TestMixLaneConfigs(t *testing.T) {
 // <runID>-<persona>, which mix chaos tags the resources with and mix cleanup
 // --run-id finds them by, and under the cloud its scenario block names.
 func TestPlanLaneInputs(t *testing.T) {
-	s := parseMix(t, sampleMixScenarioYAML, "personas.ci.cloud=tenant-ci",
+	s := parseMix(t, sampleMixScenarioYAML, "personas.ci.cloud=tenant-ci", "resources.servers=6",
+		"personas.gardener.share=1", "personas.gardener.clusters=1", "personas.gardener.policy=anti-affinity",
+		"personas.gardener.volume_gib.min=1", "personas.gardener.volume_gib.max=1", "personas.gardener.cloud=tenant-gardener",
 		"personas.legacy.share=1", "personas.legacy.networks=1", "personas.legacy.cloud=tenant-legacy")
 	p, err := s.Generate()
 	if err != nil {
@@ -347,11 +385,12 @@ func TestPlanLaneInputs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planLaneInputs: %v", err)
 	}
-	if len(inputs) != 2 {
-		t.Fatalf("got %d lane inputs, want 2", len(inputs))
+	if len(inputs) != 3 {
+		t.Fatalf("got %d lane inputs, want 3", len(inputs))
 	}
 	for i, want := range []struct{ name, runID, cloud string }{
 		{"ci", "run1234-ci", "tenant-ci"},
+		{"gardener", "run1234-gardener", "tenant-gardener"},
 		{"legacy", "run1234-legacy", "tenant-legacy"},
 	} {
 		if in := inputs[i]; in.name != want.name || in.runID != want.runID || in.cloud != want.cloud || in.persona != nil || in.overall != overall {
@@ -361,8 +400,8 @@ func TestPlanLaneInputs(t *testing.T) {
 }
 
 func TestMixPersonaCloud(t *testing.T) {
-	s := parseMix(t, sampleMixScenarioYAML, "personas.ci.cloud=tenant-ci", "personas.legacy.cloud=tenant-legacy")
-	for name, want := range map[string]string{"ci": "tenant-ci", "legacy": "tenant-legacy"} {
+	s := parseMix(t, sampleMixScenarioYAML, "personas.ci.cloud=tenant-ci", "personas.gardener.cloud=tenant-gardener", "personas.legacy.cloud=tenant-legacy")
+	for name, want := range map[string]string{"ci": "tenant-ci", "gardener": "tenant-gardener", "legacy": "tenant-legacy"} {
 		if got, err := mixPersonaCloud(s, name); err != nil || got != want {
 			t.Errorf("mixPersonaCloud(%s) = %q, %v, want %q", name, got, err, want)
 		}
