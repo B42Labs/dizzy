@@ -87,6 +87,19 @@ func TestValidateRejectsMalformedPlans(t *testing.T) {
 			mutate:  func(p *Plan) { p.Ports[0].Server = "srv-0001"; p.Ports[0].Network = "net-0002" },
 			wantSub: "not one of server",
 		},
+		{
+			name:    "server group with another policy",
+			mutate:  func(p *Plan) { p.ServerGroups = []ServerGroup{{Name: "grp-0001", Policy: "affinity"}} },
+			wantSub: `server group "grp-0001" has policy "affinity", want "anti-affinity" or "soft-anti-affinity"`,
+		},
+		{
+			name: "server references unknown server group",
+			mutate: func(p *Plan) {
+				p.ServerGroups = []ServerGroup{{Name: "grp-0001", Policy: PolicySoftAntiAffinity}}
+				p.Servers[0].Group = "grp-0009"
+			},
+			wantSub: `server "srv-0001" references unknown server group "grp-0009"`,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -170,6 +183,50 @@ func TestServerColdMigrateOmittedWhenFalse(t *testing.T) {
 		}
 		if got := strings.Contains(string(data), `"coldMigrate"`); got != tc.want {
 			t.Errorf("JSON %s has a coldMigrate key = %v, want %v", data, got, tc.want)
+		}
+	}
+}
+
+// TestValidateServerGroups confirms a plan whose servers boot into planned
+// groups of either policy validates, as does one without groups.
+func TestValidateServerGroups(t *testing.T) {
+	p := validPlan()
+	p.ServerGroups = []ServerGroup{
+		{Name: "grp-0001", Policy: PolicyAntiAffinity},
+		{Name: "grp-0002", Policy: PolicySoftAntiAffinity},
+	}
+	p.Servers[0].Group, p.Servers[1].Group = "grp-0001", "grp-0002"
+	if err := p.Validate(); err != nil {
+		t.Errorf("Validate() with server groups = %v, want nil", err)
+	}
+	if err := validPlan().Validate(); err != nil {
+		t.Errorf("Validate() without server groups = %v, want nil", err)
+	}
+}
+
+// TestServerGroupKeysOmittedWhenEmpty confirms a plan without server groups
+// and a server without a group encode without the serverGroups and group
+// keys, so the plans of every existing scenario keep their bytes.
+func TestServerGroupKeysOmittedWhenEmpty(t *testing.T) {
+	data, err := json.Marshal(validPlan())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{`"serverGroups"`, `"group"`} {
+		if strings.Contains(string(data), key) {
+			t.Errorf("JSON %s has the key %s, want none", data, key)
+		}
+	}
+
+	p := validPlan()
+	p.ServerGroups = []ServerGroup{{Name: "grp-0001", Policy: PolicyAntiAffinity}}
+	p.Servers[0].Group = "grp-0001"
+	if data, err = json.Marshal(p); err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{`"serverGroups"`, `"group":"grp-0001"`} {
+		if !strings.Contains(string(data), key) {
+			t.Errorf("JSON %s lacks %s", data, key)
 		}
 	}
 }

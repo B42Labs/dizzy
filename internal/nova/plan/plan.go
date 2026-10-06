@@ -17,16 +17,27 @@ import (
 // the by-name references resolved against the target cloud at apply time. The
 // slices enumerate every server and its companion networks, volumes, and ports.
 // Cross-resource references are by logical name, resolved by Validate.
+// ServerGroups lists the server groups the servers boot into; only the mix
+// generator sets it, for the Gardener persona, and nova apply, the novascenario
+// generator and Summary ignore it.
 type Plan struct {
-	Scenario     string    `json:"scenario"`
-	Seed         int64     `json:"seed"`
-	Image        string    `json:"image"`
-	Flavor       string    `json:"flavor"`
-	ResizeFlavor string    `json:"resizeFlavor,omitempty"`
-	Networks     []Network `json:"networks"`
-	Servers      []Server  `json:"servers"`
-	Volumes      []Volume  `json:"volumes"`
-	Ports        []Port    `json:"ports"`
+	Scenario     string        `json:"scenario"`
+	Seed         int64         `json:"seed"`
+	Image        string        `json:"image"`
+	Flavor       string        `json:"flavor"`
+	ResizeFlavor string        `json:"resizeFlavor,omitempty"`
+	Networks     []Network     `json:"networks"`
+	ServerGroups []ServerGroup `json:"serverGroups,omitempty"`
+	Servers      []Server      `json:"servers"`
+	Volumes      []Volume      `json:"volumes"`
+	Ports        []Port        `json:"ports"`
+}
+
+// ServerGroup is a Nova server group dizzy creates for its servers. Policy is
+// PolicyAntiAffinity or PolicySoftAntiAffinity.
+type ServerGroup struct {
+	Name   string `json:"name"`
+	Policy string `json:"policy"`
 }
 
 // Network is a tenant network dizzy creates for its servers, together with the
@@ -46,13 +57,16 @@ type Network struct {
 // plan's ResizeFlavor and confirms the resize. LiveMigrate live-migrates it when
 // the admin pre-check permits. ColdMigrate cold-migrates it when the admin
 // pre-check permits; only the mix generator sets it, for a long-lived persona,
-// and nova apply, nova chaos and Summary ignore it. Delete deletes it during
-// the run.
+// and nova apply, nova chaos and Summary ignore it. Group names the server
+// group it boots into; only the mix generator sets it, for the Gardener
+// persona, and nova apply, the novascenario generator and Summary ignore it.
+// Delete deletes it during the run.
 type Server struct {
 	Name           string   `json:"name"`
 	BootFromVolume bool     `json:"bootFromVolume,omitempty"`
 	RootVolumeGiB  int      `json:"rootVolumeGiB,omitempty"`
 	Networks       []string `json:"networks"`
+	Group          string   `json:"group,omitempty"`
 	UserData       bool     `json:"userData,omitempty"`
 	StopStart      string   `json:"stopStart,omitempty"`
 	Resize         bool     `json:"resize,omitempty"`
@@ -85,13 +99,33 @@ const (
 	StopStartHard = "hard"
 )
 
-// Validate checks the plan graph for well-formedness: every server references at
-// least one known network, a boot-from-volume server has a positive root size, a
-// server marked for resize has a resize flavor, every volume references a known
-// server with a positive size, and every port references a known server and a
-// known network that is one of that server's networks. It returns an error
-// naming the first offending resource.
+// Server group policies.
+const (
+	PolicyAntiAffinity     = "anti-affinity"
+	PolicySoftAntiAffinity = "soft-anti-affinity"
+)
+
+// ValidPolicy reports whether p is a server group policy a plan may use.
+func ValidPolicy(p string) bool {
+	return p == PolicyAntiAffinity || p == PolicySoftAntiAffinity
+}
+
+// Validate checks the plan graph for well-formedness: every server group has
+// one of the two anti-affinity policies, every server references at least one
+// known network and at most one known server group, a boot-from-volume server
+// has a positive root size, a server marked for resize has a resize flavor,
+// every volume references a known server with a positive size, and every port
+// references a known server and a known network that is one of that server's
+// networks. It returns an error naming the first offending resource.
 func (p *Plan) Validate() error {
+	groups := make(map[string]bool, len(p.ServerGroups))
+	for _, g := range p.ServerGroups {
+		if !ValidPolicy(g.Policy) {
+			return fmt.Errorf("server group %q has policy %q, want %q or %q", g.Name, g.Policy, PolicyAntiAffinity, PolicySoftAntiAffinity)
+		}
+		groups[g.Name] = true
+	}
+
 	networks := make(map[string]bool, len(p.Networks))
 	for _, n := range p.Networks {
 		networks[n.Name] = true
@@ -108,6 +142,9 @@ func (p *Plan) Validate() error {
 				return fmt.Errorf("server %q references unknown network %q", s.Name, net)
 			}
 			member[net] = true
+		}
+		if s.Group != "" && !groups[s.Group] {
+			return fmt.Errorf("server %q references unknown server group %q", s.Name, s.Group)
 		}
 		if s.BootFromVolume && s.RootVolumeGiB < 1 {
 			return fmt.Errorf("server %q boots from volume but has root size %d GiB, want at least 1", s.Name, s.RootVolumeGiB)
