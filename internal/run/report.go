@@ -25,7 +25,9 @@ var csvHeader = []string{
 // summary and the per-time-bucket latency/error table after the standard
 // metrics; an apply run (Chaos nil) renders exactly as before. An incomplete
 // record (a chaos checkpoint) starts with a line saying so and when it was
-// written, then a blank line, then the same output as a complete record.
+// written, then a blank line, then the same output as a complete record. A mix
+// record then gets the persona table and, per persona, a section with its own
+// metrics and churn summary.
 func WriteTable(w io.Writer, r *Record) error {
 	if r.Incomplete {
 		if _, err := fmt.Fprintf(w, "Run incomplete: checkpoint written at %s; the run was still going or was killed before its final record\n\n",
@@ -40,6 +42,78 @@ func WriteTable(w io.Writer, r *Record) error {
 		if err := writeChaosTable(w, r.Chaos); err != nil {
 			return fmt.Errorf("writing chaos report: %w", err)
 		}
+	}
+	if len(r.Personas) == 0 {
+		return nil
+	}
+	if err := WritePersonaTable(w, r.Personas); err != nil {
+		return err
+	}
+	for _, p := range r.Personas {
+		if _, err := fmt.Fprintf(w, "\nPersona %s\n%s", p.Name, p.Metrics.Summary()); err != nil {
+			return fmt.Errorf("writing persona report: %w", err)
+		}
+		if p.Chaos != nil {
+			if err := writeChaosTable(w, p.Chaos); err != nil {
+				return fmt.Errorf("writing persona report: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// WritePersonaTable renders one row per persona of a mix run: its name,
+// project, share as a whole percentage, servers, operation counts and latency
+// percentiles. An empty project shows as "-", and so does the latency of a
+// persona without operations. It writes nothing for an empty list.
+func WritePersonaTable(w io.Writer, ps []PersonaStats) error {
+	if len(ps) == 0 {
+		return nil
+	}
+	rows := [][]string{{"NAME", "PROJECT", "SHARE", "SERVERS", "OPS", "OK", "FAILED", "P50", "P95", "P99"}}
+	// The labels, NAME and PROJECT, are left-aligned and the numbers right-aligned.
+	leftAlign := []bool{true, true, false, false, false, false, false, false, false, false}
+	for _, p := range ps {
+		project := p.ProjectID
+		if project == "" {
+			project = "-"
+		}
+		o := p.Metrics.Overall
+		row := []string{p.Name, project, fmt.Sprintf("%.0f%%", p.Share*100), strconv.Itoa(p.Servers),
+			strconv.Itoa(o.Attempted), strconv.Itoa(o.Succeeded), strconv.Itoa(o.Failed)}
+		for _, d := range []time.Duration{o.Latency.Median, o.Latency.P95, o.Latency.P99} {
+			if o.Attempted == 0 {
+				row = append(row, "-")
+			} else {
+				row = append(row, d.Round(time.Millisecond).String())
+			}
+		}
+		rows = append(rows, row)
+	}
+
+	widths := make([]int, len(rows[0]))
+	for _, row := range rows {
+		for i, cell := range row {
+			widths[i] = max(widths[i], len(cell))
+		}
+	}
+	var b strings.Builder
+	b.WriteString("\nPersonas\n")
+	for _, row := range rows {
+		for i, cell := range row {
+			if i > 0 {
+				b.WriteString("  ")
+			}
+			if leftAlign[i] {
+				fmt.Fprintf(&b, "%-*s", widths[i], cell)
+			} else {
+				fmt.Fprintf(&b, "%*s", widths[i], cell)
+			}
+		}
+		b.WriteString("\n")
+	}
+	if _, err := io.WriteString(w, b.String()); err != nil {
+		return fmt.Errorf("writing persona table: %w", err)
 	}
 	return nil
 }
@@ -95,10 +169,19 @@ func formatBucketErrors(errs []metrics.ErrorCount) string {
 // report format. A churn run additionally carries its chaos statistics under a
 // "chaos" key, and "incomplete": true when the record is a mid-run checkpoint;
 // an apply run (Chaos nil) marshals just the metrics aggregate, so its JSON
-// shape is unchanged.
+// shape is unchanged. A mix run carries its "services", when it has any, and
+// its "personas" next to the overall metrics.
 func WriteJSON(w io.Writer, r *Record) error {
 	var payload any = r.Metrics
-	if r.Chaos != nil {
+	switch {
+	case len(r.Personas) > 0:
+		payload = struct {
+			Metrics    metrics.Aggregate `json:"metrics"`
+			Services   []string          `json:"services,omitempty"`
+			Personas   []PersonaStats    `json:"personas"`
+			Incomplete bool              `json:"incomplete,omitempty"`
+		}{Metrics: r.Metrics, Services: r.Services, Personas: r.Personas, Incomplete: r.Incomplete}
+	case r.Chaos != nil:
 		payload = struct {
 			Metrics    metrics.Aggregate `json:"metrics"`
 			Chaos      *ChaosStats       `json:"chaos"`
@@ -117,7 +200,9 @@ func WriteJSON(w io.Writer, r *Record) error {
 }
 
 // WriteCSV renders the run's per-type and overall metrics as CSV, one row per
-// resource type plus a leading overall row.
+// resource type plus a leading overall row. A mix run appends, per persona, an
+// overall row labelled <persona>/overall and one row per type labelled
+// <persona>/<type>.
 func WriteCSV(w io.Writer, r *Record) error {
 	cw := csv.NewWriter(w)
 	if err := cw.Write(csvHeader); err != nil {
@@ -129,6 +214,16 @@ func WriteCSV(w io.Writer, r *Record) error {
 	for _, s := range r.Metrics.ByType {
 		if err := cw.Write(statsRow(s.Type, s)); err != nil {
 			return fmt.Errorf("writing csv row: %w", err)
+		}
+	}
+	for _, p := range r.Personas {
+		if err := cw.Write(statsRow(p.Name+"/overall", p.Metrics.Overall)); err != nil {
+			return fmt.Errorf("writing csv row: %w", err)
+		}
+		for _, s := range p.Metrics.ByType {
+			if err := cw.Write(statsRow(p.Name+"/"+s.Type, s)); err != nil {
+				return fmt.Errorf("writing csv row: %w", err)
+			}
 		}
 	}
 	cw.Flush()

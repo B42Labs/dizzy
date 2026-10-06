@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -354,5 +355,198 @@ func TestReportManyBuckets(t *testing.T) {
 	// The header line ends with the first newline; every later line is a bucket.
 	if got := strings.Count(series, "\n") - 1; got != n {
 		t.Errorf("table report has %d bucket rows, want %d", got, n)
+	}
+}
+
+// mixRecord builds a mix record with two personas: ci, with a project, churn
+// buckets and a server type, and legacy, with no project, no operations and
+// no churn statistics yet.
+func mixRecord() *Record {
+	r := sampleRecord()
+	r.Service = "mix"
+	r.Error = ""
+	ci := chaosRecord().Chaos
+	r.Personas = []PersonaStats{
+		{
+			Name: "ci", RunID: "abcd1234-ci", Cloud: "tenant-ci", ProjectID: "proj-ci",
+			Share: 0.6, Servers: 6, Seed: 7,
+			Metrics: metrics.Aggregate{
+				Wall: 90 * time.Second,
+				Overall: metrics.Stats{Attempted: 3, Succeeded: 2, Failed: 1, Throughput: 0.02,
+					Latency: metrics.Latency{Median: 120 * time.Millisecond, P95: 800 * time.Millisecond, P99: 900 * time.Millisecond}},
+				ByType: []metrics.Stats{{Type: "server", Attempted: 3, Succeeded: 2, Failed: 1}},
+			},
+			Chaos: ci,
+		},
+		{Name: "legacy", RunID: "abcd1234-legacy", Share: 0.4, Servers: 4, Seed: 9},
+	}
+	return r
+}
+
+// failingWriter fails every write with errWrite.
+type failingWriter struct{}
+
+var errWrite = errors.New("disk full")
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errWrite }
+
+func TestWritePersonaTableEmpty(t *testing.T) {
+	for name, ps := range map[string][]PersonaStats{"nil": nil, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := WritePersonaTable(&buf, ps); err != nil {
+				t.Fatalf("WritePersonaTable: %v", err)
+			}
+			if buf.Len() != 0 {
+				t.Errorf("WritePersonaTable wrote %q, want nothing", buf.String())
+			}
+		})
+	}
+}
+
+// TestWritePersonaTableRows confirms the table opens with a blank line and its
+// title, and that each row carries the persona's project ("-" when unknown),
+// whole-percent share, servers, counts and latencies ("-" without operations).
+func TestWritePersonaTableRows(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WritePersonaTable(&buf, mixRecord().Personas); err != nil {
+		t.Fatalf("WritePersonaTable: %v", err)
+	}
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	if len(lines) != 5 || lines[0] != "" || lines[1] != "Personas" {
+		t.Fatalf("table = %q, want a blank line, the title, a header and two rows", buf.String())
+	}
+	want := [][]string{
+		{"NAME", "PROJECT", "SHARE", "SERVERS", "OPS", "OK", "FAILED", "P50", "P95", "P99"},
+		{"ci", "proj-ci", "60%", "6", "3", "2", "1", "120ms", "800ms", "900ms"},
+		{"legacy", "-", "40%", "4", "0", "0", "0", "-", "-", "-"},
+	}
+	for i, w := range want {
+		if got := strings.Fields(lines[i+2]); !reflect.DeepEqual(got, w) {
+			t.Errorf("row %d = %q, want %q", i, got, w)
+		}
+	}
+}
+
+func TestWritePersonaTableWriteError(t *testing.T) {
+	err := WritePersonaTable(failingWriter{}, mixRecord().Personas)
+	if !errors.Is(err, errWrite) {
+		t.Fatalf("WritePersonaTable error = %v, want it to wrap the writer's error", err)
+	}
+	if !strings.HasPrefix(err.Error(), "writing persona table: ") {
+		t.Errorf("error %q does not start with %q", err, "writing persona table: ")
+	}
+}
+
+// TestWriteTableMix confirms a mix record's table report carries the persona
+// table and one section per persona, with the churn summary only for the
+// persona that has churn statistics.
+func TestWriteTableMix(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteTable(&buf, mixRecord()); err != nil {
+		t.Fatalf("WriteTable: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"\nPersonas\n", "\nPersona ci\nRun metrics", "\nPersona legacy\nRun metrics", "Churn summary", "target fill 0.80"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("mix table report missing %q:\n%s", want, out)
+		}
+	}
+	if got := strings.Count(out, "Churn summary"); got != 1 {
+		t.Errorf("mix table report has %d churn summaries, want 1 (only ci has churn statistics):\n%s", got, out)
+	}
+	if !strings.HasPrefix(out, sampleRecord().Metrics.Summary()) {
+		t.Errorf("mix table report does not start with the overall metrics:\n%s", out)
+	}
+}
+
+// TestWriteJSONMix confirms a mix record's JSON report keeps the overall
+// metrics at .metrics.overall, carries the personas, omits services when the
+// record has none, and marks a checkpoint incomplete.
+func TestWriteJSONMix(t *testing.T) {
+	decode := func(t *testing.T, r *Record) map[string]json.RawMessage {
+		t.Helper()
+		var buf bytes.Buffer
+		if err := WriteJSON(&buf, r); err != nil {
+			t.Fatalf("WriteJSON: %v", err)
+		}
+		var got map[string]json.RawMessage
+		if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+			t.Fatalf("report JSON does not decode: %v", err)
+		}
+		return got
+	}
+
+	t.Run("complete without services", func(t *testing.T) {
+		got := decode(t, mixRecord())
+		var m struct {
+			Overall metrics.Stats `json:"overall"`
+		}
+		if err := json.Unmarshal(got["metrics"], &m); err != nil || m.Overall.Attempted != 3 {
+			t.Errorf(".metrics.overall = %+v (err %v), want attempted 3", m.Overall, err)
+		}
+		var ps []PersonaStats
+		if err := json.Unmarshal(got["personas"], &ps); err != nil || len(ps) != 2 || ps[0].Name != "ci" {
+			t.Errorf(".personas = %+v (err %v), want ci first of two", ps, err)
+		}
+		for _, key := range []string{"services", "incomplete", "chaos"} {
+			if _, ok := got[key]; ok {
+				t.Errorf("report JSON carries %q although the record has none", key)
+			}
+		}
+	})
+
+	t.Run("services and checkpoint", func(t *testing.T) {
+		r := mixRecord()
+		r.Services = []string{"octavia"}
+		r.Incomplete = true
+		got := decode(t, r)
+		if string(got["services"]) == "" || !strings.Contains(string(got["services"]), "octavia") {
+			t.Errorf(".services = %s, want [\"octavia\"]", got["services"])
+		}
+		if string(got["incomplete"]) != "true" {
+			t.Errorf(".incomplete = %s, want true", got["incomplete"])
+		}
+	})
+}
+
+// TestWriteCSVMix confirms a mix record's CSV keeps the header and appends
+// the per-persona rows after the overall ones.
+func TestWriteCSVMix(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteCSV(&buf, mixRecord()); err != nil {
+		t.Fatalf("WriteCSV: %v", err)
+	}
+	records, err := csv.NewReader(&buf).ReadAll()
+	if err != nil {
+		t.Fatalf("parsing csv: %v", err)
+	}
+	if !reflect.DeepEqual(records[0], csvHeader) {
+		t.Errorf("header = %v, want %v", records[0], csvHeader)
+	}
+	var labels []string
+	for _, rec := range records[1:] {
+		labels = append(labels, rec[0])
+	}
+	want := []string{"overall", "network", "subnet", "ci/overall", "ci/server", "legacy/overall"}
+	if !reflect.DeepEqual(labels, want) {
+		t.Errorf("row labels = %v, want %v", labels, want)
+	}
+}
+
+// TestReportEmptyPersonasRendersAsNone confirms an empty, non-nil persona list
+// renders exactly like no personas at all in every format.
+func TestReportEmptyPersonasRendersAsNone(t *testing.T) {
+	for name, build := range map[string]func() *Record{"apply": sampleRecord, "chaos": chaosRecord} {
+		t.Run(name, func(t *testing.T) {
+			empty := build()
+			empty.Personas = []PersonaStats{}
+			want, got := renderAll(t, build()), renderAll(t, empty)
+			for format := range want {
+				if got[format] != want[format] {
+					t.Errorf("%s report with an empty persona list differs from one without personas", format)
+				}
+			}
+		})
 	}
 }
