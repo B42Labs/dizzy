@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/B42Labs/dizzy/internal/metrics"
 	"github.com/B42Labs/dizzy/internal/resource"
 )
 
@@ -383,5 +384,89 @@ func TestRunMutateSkipsNotReadyCreate(t *testing.T) {
 	}
 	if f.mutates != 0 {
 		t.Errorf("%d mutations reached the cloud for volumes that never became ready, want 0", f.mutates)
+	}
+}
+
+// blockingNode is a single parentless node whose create signals started and
+// then waits for release before returning a resource with a cloud id.
+func blockingNode(started chan<- struct{}, release <-chan struct{}) Node {
+	return Node{
+		Key: "vol-0", Kind: resource.Kind("volume"),
+		Create: func(context.Context, map[string]string) (resource.Resource, error) {
+			started <- struct{}{}
+			<-release
+			return resource.Resource{Kind: "volume", Logical: "vol-0", ID: "id-0"}, nil
+		},
+		Delete: func(context.Context, map[string]string, resource.Resource) error { return nil },
+	}
+}
+
+// TestSlotStaysOpenWhileOperationInFlight confirms a bucket is not sealed while
+// one of its operations is still running, even after the scheduler has moved
+// on to the next bucket: the late outcome lands in the bucket of its decision
+// offset, and the next advance seals it.
+func TestSlotStaysOpenWhileOperationInFlight(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	e := newEngine([]Node{blockingNode(started, release)}, 7, validConfig(), newFakeClock())
+	ctx := context.Background()
+	width := validConfig().Duration / bucketCount
+
+	e.res.advance(0)
+	e.dispatchCreate(ctx, 0, 0)
+	<-started
+
+	e.res.advance(width + width/2) // the scheduler is in bucket 1 now
+	if e.res.slots[0].sealed {
+		t.Fatal("bucket 0 was sealed while its create was still in flight")
+	}
+
+	close(release)
+	<-e.states[0].create.done
+	if got := e.res.buckets()[0].Stats.Attempted; got != 1 {
+		t.Errorf("bucket 0 attempted = %d after the create finished, want 1", got)
+	}
+	if got := e.res.buckets()[1].Stats.Attempted; got != 0 {
+		t.Errorf("bucket 1 attempted = %d, want 0: the outcome belongs to its decision bucket", got)
+	}
+
+	e.res.advance(width + width/2)
+	if s := e.res.slots[0]; !s.sealed || s.latencies != nil {
+		t.Errorf("bucket 0 sealed=%v latencies=%v after the next advance, want sealed with no raw data", s.sealed, s.latencies)
+	}
+	if got := e.res.buckets()[0].Stats.Attempted; got != 1 {
+		t.Errorf("sealed bucket 0 attempted = %d, want 1", got)
+	}
+}
+
+// TestPanicCountsInDecisionBucket confirms a panicking operation is counted as
+// one failed operation of kind "panic" in the bucket of its decision offset,
+// and that it no longer counts as in flight once it is done.
+func TestPanicCountsInDecisionBucket(t *testing.T) {
+	node := Node{
+		Key: "vol-0", Kind: resource.Kind("volume"),
+		Create: func(context.Context, map[string]string) (resource.Resource, error) {
+			panic("malformed response")
+		},
+		Delete: func(context.Context, map[string]string, resource.Resource) error { return nil },
+	}
+	e := newEngine([]Node{node}, 7, validConfig(), newFakeClock())
+	offset := 3 * validConfig().Duration / bucketCount
+
+	e.res.advance(offset)
+	e.dispatchCreate(context.Background(), 0, offset)
+	<-e.states[0].create.done
+
+	b := e.res.buckets()[3]
+	if b.Stats.Attempted != 1 || b.Stats.Failed != 1 {
+		t.Errorf("bucket 3 stats = %+v, want 1 attempted / 1 failed", b.Stats)
+	}
+	if want := []metrics.ErrorCount{{Kind: "panic", Count: 1}}; !reflect.DeepEqual(b.Errors, want) {
+		t.Errorf("bucket 3 errors = %+v, want %+v", b.Errors, want)
+	}
+	e.res.mu.Lock()
+	inFlight := e.res.slots[3].inFlight
+	e.res.mu.Unlock()
+	if inFlight != 0 {
+		t.Errorf("bucket 3 in-flight count = %d after the panic, want 0", inFlight)
 	}
 }

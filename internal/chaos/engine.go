@@ -218,24 +218,149 @@ type outcome struct {
 	errKind string
 }
 
-// results accumulates operation outcomes and the completed-cycle count from the
-// concurrent operation tasks.
-type results struct {
-	mu       sync.Mutex
-	outcomes []outcome
-	cycles   int
+// slot gathers the outcomes of the operations whose decision offset falls in
+// one time bucket. Until it is sealed it holds their raw latencies, success
+// count and error tally, plus the number of those operations still in flight;
+// once sealed it holds only the finished Bucket.
+type slot struct {
+	latencies []time.Duration
+	succeeded int
+	errs      map[string]int
+	inFlight  int
+	sealed    bool
+	bucket    Bucket
 }
 
+// results accumulates operation outcomes, one slot per time bucket, and the
+// completed-cycle count from the concurrent operation tasks. A bounded run has
+// bucketCount slots of Duration/bucketCount from the start, and an offset past
+// the last slot lands in it. advance seals a slot once the scheduler's offset
+// has moved past it and none of its operations is in flight: offsets only
+// grow, so a sealed slot receives nothing more and its raw data is released.
+type results struct {
+	mu     sync.Mutex // guards slots, open and cycles
+	width  time.Duration
+	fixed  bool // the slot count is fixed and the last slot takes later offsets
+	slots  []slot
+	open   int // the lowest index of a slot not yet sealed
+	cycles int
+}
+
+// newResults builds the bucket slots for cfg.
+func newResults(cfg Config) *results {
+	width := cfg.Duration / bucketCount
+	if width <= 0 {
+		width = 1 // a sub-bucketCount duration: collapse to unit-width buckets
+	}
+	return &results{width: width, fixed: true, slots: make([]slot, bucketCount)}
+}
+
+// index maps a decision offset onto its slot. The caller holds mu.
+func (r *results) index(offset time.Duration) int {
+	i := int(offset / r.width)
+	if i < 0 {
+		i = 0
+	}
+	if r.fixed && i >= len(r.slots) {
+		i = len(r.slots) - 1
+	}
+	return i
+}
+
+// advance moves the series to the scheduler's current offset. The scheduler
+// calls it once per tick, before the tick's operations start. It seals every
+// slot below the current one whose operations have all finished: sealing
+// computes the slot's Bucket and releases its raw latencies and error tally.
+func (r *results) advance(offset time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cur := r.index(offset)
+	for i := r.open; i < cur; i++ {
+		if s := &r.slots[i]; !s.sealed && s.inFlight == 0 {
+			s.bucket = r.bucket(i)
+			s.sealed = true
+			s.latencies, s.errs = nil, nil
+		}
+	}
+	for r.open < cur && r.slots[r.open].sealed {
+		r.open++
+	}
+}
+
+// begin counts an operation decided at offset as in flight, so its slot stays
+// open until the operation ends. The scheduler calls it after advance has run
+// for that offset.
+func (r *results) begin(offset time.Duration) {
+	r.mu.Lock()
+	r.slots[r.index(offset)].inFlight++
+	r.mu.Unlock()
+}
+
+// end counts an operation decided at offset as finished, after any outcome it
+// has was added.
+func (r *results) end(offset time.Duration) {
+	r.mu.Lock()
+	r.slots[r.index(offset)].inFlight--
+	r.mu.Unlock()
+}
+
+// add stores one completed operation's outcome in the slot of its decision
+// offset.
 func (r *results) add(o outcome) {
 	r.mu.Lock()
-	r.outcomes = append(r.outcomes, o)
-	r.mu.Unlock()
+	defer r.mu.Unlock()
+	s := &r.slots[r.index(o.offset)]
+	s.latencies = append(s.latencies, o.latency)
+	if o.success {
+		s.succeeded++
+		return
+	}
+	if s.errs == nil {
+		s.errs = make(map[string]int)
+	}
+	s.errs[o.errKind]++
 }
 
 func (r *results) cycle() {
 	r.mu.Lock()
 	r.cycles++
 	r.mu.Unlock()
+}
+
+// buckets returns one Bucket per slot: a sealed slot's stored Bucket, or one
+// computed on the spot, without sealing, for a slot still open.
+func (r *results) buckets() []Bucket {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.slots) == 0 {
+		return nil
+	}
+	out := make([]Bucket, len(r.slots))
+	for i := range r.slots {
+		out[i] = r.bucket(i)
+	}
+	return out
+}
+
+// bucket summarizes slot i, exposing latency and error degradation over time
+// rather than only an aggregate. The caller holds mu.
+func (r *results) bucket(i int) Bucket {
+	s := &r.slots[i]
+	if s.sealed {
+		return s.bucket
+	}
+	attempted := len(s.latencies)
+	return Bucket{
+		Start: time.Duration(i) * r.width,
+		Stats: metrics.Stats{
+			Attempted:  attempted,
+			Succeeded:  s.succeeded,
+			Failed:     attempted - s.succeeded,
+			Throughput: float64(s.succeeded) / r.width.Seconds(),
+			Latency:    metrics.ComputeLatency(s.latencies),
+		},
+		Errors: sortedErrorCounts(s.errs),
+	}
 }
 
 // engine drives one churn run. The fields above the divider are immutable after
@@ -314,7 +439,7 @@ func newEngine(nodes []Node, seed int64, cfg Config, clk Clock) *engine {
 		mutable:  mutable,
 		sem:      make(chan struct{}, limit),
 		pending:  make(chan struct{}, limit),
-		res:      &results{},
+		res:      newResults(cfg),
 		states:   make([]nodeState, len(nodes)),
 	}
 }
@@ -334,6 +459,7 @@ func (e *engine) run(ctx context.Context) *Result {
 			break // context cancelled
 		}
 		offset := e.clk.Now().Sub(start)
+		e.res.advance(offset)
 		fanout := 1 + e.rng.Intn(e.cfg.MaxParallel)
 		for i := 0; i < fanout; i++ {
 			e.step(ctx, offset)
@@ -657,6 +783,11 @@ func (e *engine) parentOps(idx int, deps *[]*op) (keys []string, ops []*op) {
 // operation, and lets the wait group, pending pool, and done channel release as
 // usual. Any concurrency slot acquired in work is released by work's own defer
 // during the unwind.
+//
+// The operation counts as in flight in the bucket of its decision offset from
+// launch until after its outcome, a panic's included, is recorded and before
+// done closes, so the bucket is not sealed while the operation can still add
+// to it.
 func (e *engine) launch(ctx context.Context, o *op, offset time.Duration, work func()) {
 	acquired := false
 	select {
@@ -664,6 +795,7 @@ func (e *engine) launch(ctx context.Context, o *op, offset time.Duration, work f
 		acquired = true
 	case <-ctx.Done():
 	}
+	e.res.begin(offset)
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
@@ -671,6 +803,7 @@ func (e *engine) launch(ctx context.Context, o *op, offset time.Duration, work f
 		if acquired {
 			defer func() { <-e.pending }()
 		}
+		defer e.res.end(offset) // runs after the recover below has recorded a panic
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Error("chaos operation panicked; recording it as a failed operation",
@@ -751,9 +884,8 @@ func (e *engine) result() *Result {
 
 	e.res.mu.Lock()
 	r.Cycles = e.res.cycles
-	outcomes := append([]outcome(nil), e.res.outcomes...)
 	e.res.mu.Unlock()
-	r.Buckets = e.buckets(outcomes)
+	r.Buckets = e.res.buckets()
 	return r
 }
 
@@ -775,55 +907,6 @@ func (e *engine) liveResources() []resource.Resource {
 		}
 	}
 	return live
-}
-
-// buckets distributes outcomes into equal-width time buckets over the run's
-// duration and summarizes each, exposing latency and error degradation over
-// time rather than only an aggregate.
-func (e *engine) buckets(outcomes []outcome) []Bucket {
-	width := e.cfg.Duration / bucketCount
-	if width <= 0 {
-		width = 1 // a sub-bucketCount duration: collapse to unit-width buckets
-	}
-
-	durs := make([][]time.Duration, bucketCount)
-	succeeded := make([]int, bucketCount)
-	errs := make([]map[string]int, bucketCount)
-	for i := range errs {
-		errs[i] = make(map[string]int)
-	}
-	for _, o := range outcomes {
-		b := int(o.offset / width)
-		if b >= bucketCount {
-			b = bucketCount - 1
-		}
-		if b < 0 {
-			b = 0
-		}
-		durs[b] = append(durs[b], o.latency)
-		if o.success {
-			succeeded[b]++
-		} else {
-			errs[b][o.errKind]++
-		}
-	}
-
-	buckets := make([]Bucket, bucketCount)
-	for i := range buckets {
-		attempted := len(durs[i])
-		buckets[i] = Bucket{
-			Start: time.Duration(i) * width,
-			Stats: metrics.Stats{
-				Attempted:  attempted,
-				Succeeded:  succeeded[i],
-				Failed:     attempted - succeeded[i],
-				Throughput: float64(succeeded[i]) / width.Seconds(),
-				Latency:    metrics.ComputeLatency(durs[i]),
-			},
-			Errors: sortedErrorCounts(errs[i]),
-		}
-	}
-	return buckets
 }
 
 // parentOpFailed reports whether any parent's create op failed or produced no
