@@ -205,6 +205,16 @@ hosts. Without them the run logs `live migration disabled for this run` and
 resizes need the flavor `resize_flavor` names, `m1.small` in the bundled
 profiles; `--set personas.legacy.resize_flavor=` turns them off instead.
 
+On a cloud that can live-migrate a server and cannot cold-migrate it, add
+`--set personas.legacy.cold_migration=false`. Nova's libvirt driver reaches the
+destination host of a cold migration over ssh by default
+(`[libvirt] remote_filesystem_transport`), so a cloud whose compute hosts have
+no ssh client fails every cold migration. The run then logs
+`cold migration disabled for this run` at info level and draws each server's
+mutations from the operations that remain. A resize to another host moves the
+disk the same way, so such a cloud usually needs
+`--set personas.legacy.resize_flavor=` as well.
+
 To churn images and identities in the same run, switch on the Glance and
 Keystone lanes. Each runs its service's bundled `small` profile in an engine
 of its own, under the identity `<id>-glance` or `<id>-keystone`. The Keystone

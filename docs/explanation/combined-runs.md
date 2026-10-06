@@ -59,8 +59,10 @@ seeded with the persona seed XOR the FNV-64a hash of the server name. The
 engine runs one node's mutations one after another in decision order, so the
 n-th mutation of a server always gets the n-th draw, and the engine's decision
 log says only `mutate`. Both migrations need the admin role and two usable
-compute hosts, and the pre-check turns them off without these. An empty
-`resize_flavor` turns resize off. Stop and start is always on.
+compute hosts, and the pre-check turns them off without these.
+`cold_migration: false` in the Legacy block turns cold migration off and
+leaves live migration to the pre-check. An empty `resize_flavor` turns resize
+off. Stop and start is always on.
 
 The changes alternate instead of repeating, so the run stays inside what the
 quota pre-check validated. A resize goes to `resize_flavor` while the server is
