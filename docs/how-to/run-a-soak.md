@@ -158,6 +158,15 @@ clouds:
       user_domain_name: Default
       project_domain_name: Default
     region_name: RegionOne
+  tenant-gardener:                # the Gardener persona's project
+    auth:
+      auth_url: https://keystone.example.com/v3
+      username: soak-gardener
+      password: <password>
+      project_name: soak-gardener
+      user_domain_name: Default
+      project_domain_name: Default
+    region_name: RegionOne
   tenant-legacy:                  # the Legacy persona's project
     auth:
       auth_url: https://keystone.example.com/v3
@@ -173,8 +182,19 @@ Point each persona at its entry and run the soak:
 
 ```console
 $ dizzy mix chaos --scenario scenarios/mix/small.yaml --os-cloud soak \
-    --set personas.ci.cloud=tenant-ci --set personas.legacy.cloud=tenant-legacy
+    --set personas.ci.cloud=tenant-ci --set personas.gardener.cloud=tenant-gardener \
+    --set personas.legacy.cloud=tenant-legacy
 ```
+
+The Gardener persona's workers boot into server groups with the
+`soft-anti-affinity` policy in the bundled profiles, so a cluster boots on a
+lab with fewer compute hosts than it has workers. To make the scheduler put
+every worker of a cluster on a host of its own, add
+`--set personas.gardener.policy=anti-affinity`; a worker it cannot place then
+shows as a failed create, and a later replacement of that worker tries again.
+The project needs room for one server group per cluster in its
+`server_groups` quota; the quota pre-check stops the run before it creates
+anything when it lacks it.
 
 The Legacy persona's servers stay for the whole run and are stopped and
 started, resized between `flavor` and `resize_flavor`, and live- and
@@ -206,7 +226,8 @@ the run used:
 
 ```console
 $ dizzy mix cleanup --run-id <id> --scenario scenarios/mix/small.yaml --os-cloud soak \
-    --set personas.ci.cloud=tenant-ci --set personas.legacy.cloud=tenant-legacy
+    --set personas.ci.cloud=tenant-ci --set personas.gardener.cloud=tenant-gardener \
+    --set personas.legacy.cloud=tenant-legacy
 ```
 
 `--concurrency` and `--max-parallel` bound each persona separately. See

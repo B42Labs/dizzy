@@ -39,6 +39,19 @@ never reaches that draw and keeps the schedule it had before pinned nodes
 existed. The Legacy persona of `mix chaos` pins every node of its graph; see
 [Combined runs](combined-runs.md#servers-that-stay).
 
+A node can also be **rolling**. Nodes that carry the same `Roll` value form a
+rolling set, and a root of the set is a rolling node none of whose parents is
+in it. The engine creates absent rolling nodes first, as it does pinned ones,
+and deletes a rolling node only in a roll: once every node of the set is
+present, a root is a delete candidate whatever its dependents, and drawing it
+deletes the root's present descendants, children before parents, and the root
+last, in one step. The steps that follow create them again. Every delete of a
+roll waits for every earlier operation of the set, so the cloud sees the
+replacements of one set one after another. A graph without a rolling node
+never takes these branches. The Gardener persona of `mix chaos` makes each
+cluster a rolling set; see
+[Combined runs](combined-runs.md#clusters-that-roll).
+
 This generalizes across services for free. Cinder volumes have no parents;
 snapshots are parented on their source volume. The invariant therefore gives the
 right lifecycle without a line of Cinder-specific lifecycle code: a snapshot only

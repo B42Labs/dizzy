@@ -35,7 +35,11 @@ Neutron **tags**. Nova's server-list API cannot filter on metadata server-side,
 so server discovery lists the project's servers and filters client-side on the
 metadata dizzy itself wrote. A **boot-from-volume root volume** is Nova-created
 with delete-on-termination and carries no dizzy identity of its own; it dies with
-its server, so cleanup reaches it through the server delete.
+its server, so cleanup reaches it through the server delete. **Server groups**
+carry neither metadata nor tags, so identity lives in the name prefix
+`dizzy-<runid>-`, the Keystone handle. Only the `mix` Gardener persona creates
+them, so only the `mix` teardown and `mix cleanup` look for them, after the
+persona's other resources.
 
 **Glance has first-class image tags.** Images carry the same two keys —
 `dizzy:run=<id>` and `dizzy:type=image` — as Glance image tags, set atomically at

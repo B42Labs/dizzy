@@ -93,3 +93,8 @@ live or a cold migration, from a generator seeded with the persona seed XOR the
 FNV-64a hash of the server name. The engine runs one server's mutations in
 decision order, so the n-th mutation of a server always gets the n-th draw, and
 the operations a server goes through replay with the schedule.
+
+A roll of the `mix` Gardener persona draws only its root, the worker to
+replace. The deletes of the worker's volume and the worker that follow are
+fixed by the graph, and the engine decides them without waiting for the cloud,
+so the whole replacement is part of the schedule and replays with it.
