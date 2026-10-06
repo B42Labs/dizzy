@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	mixplan "github.com/B42Labs/dizzy/internal/mix/plan"
 	novaplan "github.com/B42Labs/dizzy/internal/nova/plan"
 	novascenario "github.com/B42Labs/dizzy/internal/nova/scenario"
 )
@@ -438,6 +439,82 @@ func TestLegacyWithoutResizeFlavor(t *testing.T) {
 	if strings.Contains(data, `"resizeFlavor"`) || !strings.Contains(data, `"volumes": []`) || !strings.Contains(data, `"ports": []`) {
 		t.Errorf("legacy compute plan = %s, want no resizeFlavor and empty volumes and ports", data)
 	}
+}
+
+// TestLegacyWithoutColdMigration confirms cold_migration: false removes the
+// cold migration from every Legacy server and changes nothing else in the
+// plan, that cold_migration: true generates the plan of an omitted key, and
+// that a Legacy persona without a server drops out with the key false.
+func TestLegacyWithoutColdMigration(t *testing.T) {
+	on, off := true, false
+	generate := func(t *testing.T, cold *bool, share float64) *mixplan.Plan {
+		t.Helper()
+		s := smallScenario()
+		s.Resources.Servers = 40
+		s.Personas.Legacy.ColdMigration = cold
+		s.Personas.Legacy.Share = share
+		p, err := s.Generate(LaneScenarios{})
+		if err != nil {
+			t.Fatalf("Generate(): %v", err)
+		}
+		return p
+	}
+	legacyOf := func(p *mixplan.Plan) *novaplan.Plan {
+		for _, ps := range p.Personas {
+			if ps.Name == "legacy" {
+				return ps.Nova
+			}
+		}
+		return nil
+	}
+
+	t.Run("off", func(t *testing.T) {
+		p := generate(t, &off, 0.2)
+		np := legacyOf(p)
+		if np == nil || len(np.Servers) == 0 {
+			t.Fatalf("plan has no legacy server: %+v", p.Personas)
+		}
+		for _, srv := range np.Servers {
+			if srv.ColdMigrate || !srv.LiveMigrate || !srv.Resize || srv.StopStart != "soft" {
+				t.Errorf("server %+v, want soft stop/start, resize and live migration without cold migration", srv)
+			}
+		}
+		if got := np.ColdMigrations(); got != 0 {
+			t.Errorf("ColdMigrations() = %d, want 0", got)
+		}
+		if got, want := np.LiveMigrations(), len(np.Servers); got != want {
+			t.Errorf("LiveMigrations() = %d, want %d", got, want)
+		}
+		if bytes.Contains(marshal(t, p), []byte(`"coldMigrate"`)) {
+			t.Error(`plan with cold_migration: false contains "coldMigrate"`)
+		}
+	})
+
+	t.Run("off equals the default without coldMigrate", func(t *testing.T) {
+		def := generate(t, nil, 0.2)
+		np := legacyOf(def)
+		if np == nil || len(np.Servers) == 0 {
+			t.Fatalf("default plan has no legacy server: %+v", def.Personas)
+		}
+		for i := range np.Servers {
+			np.Servers[i].ColdMigrate = false
+		}
+		if got, want := marshal(t, generate(t, &off, 0.2)), marshal(t, def); !bytes.Equal(got, want) {
+			t.Errorf("plan with cold_migration: false differs from the default plan without coldMigrate:\n%s\nwant:\n%s", got, want)
+		}
+	})
+
+	t.Run("true equals omitted", func(t *testing.T) {
+		if got, want := marshal(t, generate(t, &on, 0.2)), marshal(t, generate(t, nil, 0.2)); !bytes.Equal(got, want) {
+			t.Errorf("plan with cold_migration: true differs from the plan without the key:\n%s\nwant:\n%s", got, want)
+		}
+	})
+
+	t.Run("off without a legacy server", func(t *testing.T) {
+		if p := generate(t, &off, 0); legacyOf(p) != nil {
+			t.Errorf("personas = %+v, want no legacy persona with share 0", p.Personas)
+		}
+	})
 }
 
 // TestGenerateLegacyOnly confirms a scenario whose CI and Gardener shares are

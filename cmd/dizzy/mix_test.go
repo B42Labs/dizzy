@@ -206,6 +206,55 @@ func TestMixGenerateSmallProfile(t *testing.T) {
 	}
 }
 
+// TestMixGenerateColdMigrationOff confirms --set
+// personas.legacy.cold_migration=false on the shipped small profile plans no
+// cold migration, keeps the live migration of every Legacy server, and leaves
+// the personas and their server counts as they are without the override.
+func TestMixGenerateColdMigrationOff(t *testing.T) {
+	data, err := scenarios.Files.ReadFile("mix/small.yaml")
+	if err != nil {
+		t.Fatalf("reading shipped profile: %v", err)
+	}
+	path := writeScenario(t, string(data))
+
+	def, err := execRoot(t, "mix", "generate", "--scenario", path)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	off, err := execRoot(t, "mix", "generate", "--scenario", path, "--set", "personas.legacy.cold_migration=false")
+	if err != nil {
+		t.Fatalf("generate --set personas.legacy.cold_migration=false: %v", err)
+	}
+	if !strings.Contains(def, `"coldMigrate"`) {
+		t.Fatal(`the small profile plans no "coldMigrate" without the override`)
+	}
+	if strings.Contains(off, `"coldMigrate"`) {
+		t.Error(`plan with the override contains "coldMigrate"`)
+	}
+
+	personasOf := func(out string) []string {
+		var got []string
+		for _, ps := range decodeMixPlan(t, out).Personas {
+			got = append(got, fmt.Sprintf("%s %d", ps.Name, ps.Servers))
+			if ps.Name != "legacy" {
+				continue
+			}
+			if len(ps.Nova.Servers) == 0 {
+				t.Error("the legacy persona plans no server")
+			}
+			for _, srv := range ps.Nova.Servers {
+				if !srv.LiveMigrate {
+					t.Errorf("legacy server %s does not live-migrate", srv.Name)
+				}
+			}
+		}
+		return got
+	}
+	if got, want := personasOf(off), personasOf(def); !reflect.DeepEqual(got, want) {
+		t.Errorf("personas with the override = %v, want %v", got, want)
+	}
+}
+
 // TestMixGenerateLane confirms switching on a lane of the shipped small
 // profile with --set adds it to the plan, under the lane's scenario name.
 func TestMixGenerateLane(t *testing.T) {
