@@ -35,21 +35,29 @@ performs a **leak check**, listing any resource still carrying the run tag after
 the topology should be gone.
 
 A `mix` record renders the overall metrics as above, the exact aggregate of
-every persona, and then a section per persona. It has no merged time series,
-because the percentiles of separate engines cannot be merged.
+every persona and lane, then a section per persona, and then a section per
+background lane when the run had any. It has no merged time series, because
+the percentiles of separate engines cannot be merged.
 
 - **table**: a `Personas` table with one row per persona (name, project or
   `-`, share as a whole percentage, servers, operations, ok, failed, p50, p95,
   p99), then per persona a `Persona <name>` section with its own metrics and
+  churn summary. A record with lanes continues with a `Lanes` table with one
+  row per lane (name, project or `-`, scenario, operations, ok, failed, p50,
+  p95, p99), then per lane a `Lane <name>` section with its own metrics and
   churn summary.
-- **json**: `{"metrics": …, "services": […], "personas": […]}`, with
-  `.metrics.overall` as for every other record. `services` is omitted when
-  empty and `"incomplete": true` is added on a checkpoint.
+- **json**: `{"metrics": …, "services": […], "personas": […], "lanes": […]}`,
+  with `.metrics.overall` as for every other record. `services` and `lanes`
+  are omitted when empty and `"incomplete": true` is added on a checkpoint.
 - **csv**: the same header, with a `<persona>/overall` row and one
-  `<persona>/<kind>` row per resource kind appended for each persona.
+  `<persona>/<kind>` row per resource kind appended for each persona, and then
+  a `<lane>/overall` row and one `<lane>/<kind>` row per resource kind for each
+  lane.
 - **html**: after the overall sections, one section per persona with its
   project, share and servers, its KPI tiles, and its throughput and latency
-  charts over time. A persona without churn statistics yet shows no charts.
+  charts over time, then one `Lane <name>` section per lane with its project
+  and scenario, its KPI tiles and the same two charts. A persona or lane
+  without churn statistics yet shows no charts.
 
 ## OpenTelemetry export
 
@@ -83,13 +91,16 @@ These identify one installation across time.
 |---|---|
 | `service.name` | `dizzy` (semantic convention; constant) |
 | `service.version` | The build version |
-| `cloud` | The `--os-cloud` name; for a `mix` persona, the `clouds.yaml` entry it authenticated with |
-| `scenario` | The scenario name |
+| `cloud` | The `--os-cloud` name; for a `mix` persona or lane, the `clouds.yaml` entry it authenticated with |
+| `scenario` | The scenario name; for a `mix` lane, the name of its plan, e.g. `small/keystone` |
 | `service` | `neutron`, `cinder`, `keystone`, `nova`, `glance`, or `mix` |
 | `persona` | `mix` only; the persona name, `ci`, `gardener` or `legacy` |
+| `lane` | `mix` only; the background lane name, `cinder`, `glance`, `keystone` or `neutron`. A resource carries `persona` or `lane`, never both |
 
-`mix chaos` exports one OTLP resource per persona, so each persona's series stay
-apart and carry the persona's own iteration counts.
+`mix chaos` exports one OTLP resource per persona and one per lane, so each
+persona's and lane's series stay apart and carry their own iteration counts.
+A lane's series carry `service=mix` and the `kind` values of the service it
+churns.
 
 `service` is a bespoke attribute, deliberately distinct from the semantic
 `service.name`. It keeps the iteration-level series — which carry no `kind` — 

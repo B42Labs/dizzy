@@ -11,8 +11,9 @@ when the run ends. A consumer must check `incomplete` before it treats a
 a checkpoint as a finished run. `monitor` writes one per iteration only with
 `--keep-run-records`, since in a long loop they accumulate unboundedly.
 
-`mix chaos` writes one record for all of its personas, with `service: "mix"`, a
-`personas` array instead of a top-level `chaos` object, and checkpoints it the
+`mix chaos` writes one record for all of its personas and background lanes,
+with `service: "mix"`, a `personas` array and, when the run had lanes, a
+`lanes` array instead of a top-level `chaos` object, and checkpoints it the
 same way.
 
 ## Top level
@@ -29,9 +30,10 @@ same way.
 | `error` | string | Present only when the run failed |
 | `metrics` | object | Aggregate metrics; see below |
 | `volumeType` | string | Cinder only; the resolved volume type, for provenance |
-| `chaos` | object | Churn runs only; see below. Absent on a `mix` record, whose personas carry their own |
+| `chaos` | object | Churn runs only; see below. Absent on a `mix` record, whose personas and lanes carry their own |
 | `services` | array of strings | `mix` only; the opt-in services bound to the personas. Omitted when empty |
 | `personas` | array | `mix` only; one entry per persona; see below |
+| `lanes` | array | `mix` only; one entry per background lane; see below. Omitted when the run had none |
 | `incomplete` | bool | `true` on a record `chaos` wrote while still running; `finishedAt` is then the checkpoint time and `metrics.wall` the time elapsed so far. Omitted on a final record |
 
 ## `created[]`
@@ -46,9 +48,12 @@ is the same whichever service produced it.
 | `name` | string | The applied cloud name, e.g. `dizzy-a1b2c3d4-net-0001` |
 | `id` | string | The service's UUID |
 | `persona` | string | `mix` only; the persona that created the resource |
+| `lane` | string | `mix` only; the background lane that created the resource. An entry carries `persona` or `lane`, never both |
 
 On a `mix` record the list holds every persona's resources, persona by persona,
-and an empty run writes `"created": []`.
+and then every lane's, lane by lane, each lane with the resources it created
+before its engine started (the Keystone lane's domains and roles) first. An
+empty run writes `"created": []`.
 
 This list is `cleanup`'s belt-and-suspenders handle. It is the *only* handle for
 resources that cannot be discovered by tag — Neutron address scopes, and Keystone
@@ -128,7 +133,8 @@ the full width. A record written before the first tick has no buckets.
 ## `personas[]`
 
 Present only on a `mix` record: one entry per persona, in the order the run ran
-them. The top-level `metrics` are the exact aggregate of every persona's.
+them. The top-level `metrics` are the exact aggregate of every persona and
+lane.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -145,6 +151,26 @@ them. The top-level `metrics` are the exact aggregate of every persona's.
 There is no time series merged across personas: the percentiles of separate
 engines cannot be merged from their bucket statistics, so each persona carries
 its own `chaos.buckets`.
+
+## `lanes[]`
+
+Present only on a `mix` record of a run with background lanes: one entry per
+lane, in the order the run ran them. A lane has no share and no servers.
+
+| Field | Type | Notes |
+|---|---|---|
+| `name` | string | Lane name, the service it churned: `cinder`, `glance`, `keystone` or `neutron` |
+| `runID` | string | The identity the lane's resources carry, `<runID>-<name>`; `mix cleanup --run` deletes by it |
+| `cloud` | string | The `clouds.yaml` entry the scenario named for the lane. Omitted when the lane used `--os-cloud` |
+| `projectID` | string | The project the lane authenticated against. Omitted when the token did not name one |
+| `scenario` | string | The name of the lane's plan, `<scenario>/<name>`, e.g. `small/keystone` |
+| `seed` | int | The seed the lane's plan was expanded from |
+| `metrics` | object | The lane's own aggregate metrics, shaped like the top-level `metrics` |
+| `chaos` | object | The lane's churn statistics, shaped like [`chaos`](#chaos). Omitted in a checkpoint written before the lane's engine produced its first snapshot |
+
+The entry records no resolved volume type, privilege tier or external network:
+the scenario and the `--set` values of the run state them, and `mix cleanup`
+needs none of them.
 
 ## Stability
 
