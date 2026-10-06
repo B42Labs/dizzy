@@ -26,11 +26,14 @@ import (
 // newMixChaosCmd builds "mix chaos": the combined churn run. It starts one
 // churn engine per persona of the plan, each authenticated with the clouds.yaml
 // entry its scenario block names and churning its share of the server envelope
-// under the identity <runID>-<persona>, all under one seed and one run id. It
-// rewrites one run record with a per-persona breakdown every
-// chaosCheckpointInterval while it runs, records the run, and, unless
-// --no-cleanup, tears every persona's resources down by identity and reports
-// any leak. It mirrors "nova chaos" without the per-persona knob flags, which
+// under the identity <runID>-<persona>, and one per enabled background lane,
+// churning its service's plan under the identity <runID>-<lane>, all under one
+// seed and one run id. Every lane is built and pre-checked before anything is
+// created; then the lanes that need it provision what their engine starts
+// from. It rewrites one run record with a per-persona and per-lane breakdown
+// every chaosCheckpointInterval while it runs, records the run, and, unless
+// --no-cleanup, tears every lane's resources down by identity and reports any
+// leak. It mirrors "nova chaos" without the per-persona knob flags, which
 // --set covers.
 func newMixChaosCmd(opts *globalOptions) *cobra.Command {
 	var (
@@ -42,9 +45,9 @@ func newMixChaosCmd(opts *globalOptions) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "chaos",
-		Short: "Run one randomized churn engine per persona, each in its own project",
+		Short: "Run one randomized churn engine per persona and per enabled lane",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			s, p, err := buildMixPlanFromFlags(cmd, opts, scenarioPath, sets)
+			s, ls, p, err := buildMixPlanFromFlags(cmd, opts, scenarioPath, sets)
 			if err != nil {
 				return err
 			}
@@ -57,8 +60,12 @@ func newMixChaosCmd(opts *globalOptions) *cobra.Command {
 			}
 			// Duration and unbounded mode are run-wide, so the first persona's
 			// config stands for the run in the heartbeat and the iteration
-			// outcome.
+			// outcome, and every background lane takes them from it.
 			runCfg := cfgs[0]
+			laneCfgs, err := mixServiceLaneConfigs(cmd, opts, ls, f, p, runCfg)
+			if err != nil {
+				return err
+			}
 
 			// Two-phase shutdown, as in nova chaos: the first Ctrl-C / SIGTERM
 			// cancels the run so every engine stops and the teardown below runs,
@@ -95,10 +102,24 @@ func newMixChaosCmd(opts *globalOptions) *cobra.Command {
 				}
 				lanes = append(lanes, l)
 			}
+			for i, in := range planServiceLaneInputs(s, runID, overall) {
+				in.lane, in.cfg = &p.Lanes[i], laneCfgs[i]
+				l, err := buildServiceLane(ctx, opts, in)
+				if err != nil {
+					return err
+				}
+				lanes = append(lanes, l)
+			}
 			warnSharedProjects(lanes)
 
+			// Every lane passed its pre-checks and nothing exists yet: only now
+			// do the lanes that need it create what their engine starts from.
+			if err := provisionLanes(ctx, lanes); err != nil {
+				return err
+			}
+
 			for _, l := range lanes {
-				slog.Info("starting churn run", "run", l.RunID, "persona", l.Name, "scenario", p.Scenario,
+				slog.Info("starting churn run", "run", l.RunID, laneNoun(l), l.Name, "scenario", p.Scenario,
 					"duration", chaosDurationLabel(l.Config), "minInterval", l.Config.MinInterval, "maxInterval", l.Config.MaxInterval,
 					"maxParallel", l.Config.MaxParallel, "concurrency", l.Config.Concurrency)
 			}
@@ -117,20 +138,17 @@ func newMixChaosCmd(opts *globalOptions) *cobra.Command {
 			}
 			rec := build(results, finished)
 
-			// Each persona's churn is one iteration of its own telemetry
-			// resource; an interrupted run counts as a failed iteration.
 			interrupted := chaosInterrupted(ctx, runCfg)
-			for i, l := range lanes {
-				m := rec.Personas[i].Metrics
-				l.Telemetry.RecordIteration(ctx, m.Wall, !interrupted)
-				l.Telemetry.RecordIterationOperations(ctx, m.Overall.Attempted, m.Overall.Succeeded, m.Overall.Failed)
-			}
+			recordLaneIterations(ctx, lanes, finished.Sub(start), interrupted)
 
 			out := cmd.OutOrStdout()
 			if _, err := fmt.Fprint(out, rec.Metrics.Summary()); err != nil {
 				return fmt.Errorf("writing metrics: %w", err)
 			}
 			if err := run.WritePersonaTable(out, rec.Personas); err != nil {
+				return err
+			}
+			if err := run.WriteLaneTable(out, rec.Lanes); err != nil {
 				return err
 			}
 
@@ -150,8 +168,8 @@ func newMixChaosCmd(opts *globalOptions) *cobra.Command {
 	flags.StringArrayVar(&sets, "set", nil, "override a scenario value, e.g. --set personas.ci.cloud=tenant-ci (repeatable)")
 	flags.DurationVar(&f.duration, "duration", 0, "total wall-clock runtime of the churn; 0 runs until interrupted (required via flag or the scenario chaos block)")
 	flags.DurationVar(&f.bucketWidth, "bucket-width", defaultChaosBucketWidth, "width of one time bucket in an unbounded run's time series, at least 1m")
-	flags.IntVar(&f.maxParallel, "max-parallel", 0, "maximum concurrent in-flight churn operations of each persona (default: --concurrency)")
-	flags.BoolVar(&noCleanup, "no-cleanup", false, "leave every persona's resources in place — at the end of the run or on interrupt — instead of tearing them down by identity")
+	flags.IntVar(&f.maxParallel, "max-parallel", 0, "maximum concurrent in-flight churn operations of each persona and lane (default: --concurrency)")
+	flags.BoolVar(&noCleanup, "no-cleanup", false, "leave every persona's and lane's resources in place — at the end of the run or on interrupt — instead of tearing them down by identity")
 	// MarkFlagRequired only fails for an unknown flag; "scenario" was just added.
 	_ = cmd.MarkFlagRequired("scenario")
 
@@ -335,6 +353,17 @@ func buildMixRecord(p *mixplan.Plan, lanes []*mix.Lane, results map[string]*chao
 		rec.Personas = append(rec.Personas, ps)
 	}
 	return rec
+}
+
+// recordLaneIterations records each persona's and lane's churn as one
+// iteration of its own telemetry resource, from the lane's own collector over
+// wall; an interrupted run counts as a failed iteration.
+func recordLaneIterations(ctx context.Context, lanes []*mix.Lane, wall time.Duration, interrupted bool) {
+	for _, l := range lanes {
+		m := l.Collector.Aggregate(wall)
+		l.Telemetry.RecordIteration(ctx, m.Wall, !interrupted)
+		l.Telemetry.RecordIterationOperations(ctx, m.Overall.Attempted, m.Overall.Succeeded, m.Overall.Failed)
+	}
 }
 
 // finishMixChurn applies the teardown policy to every lane. Unless --no-cleanup

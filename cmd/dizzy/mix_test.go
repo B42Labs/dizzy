@@ -528,6 +528,49 @@ func TestMixRecordRefusesAnotherProject(t *testing.T) {
 	}
 }
 
+// TestMixLaneCloudFromRecord confirms mix status and mix cleanup build a
+// record's background lanes, each with the cloud the record names for it,
+// also for a record without a persona.
+func TestMixLaneCloudFromRecord(t *testing.T) {
+	tenantClouds(t, "http://127.0.0.1:1/v3")
+	path, err := run.Write(t.TempDir(), &run.Record{
+		RunID: "mix00001", Service: "mix", Created: []resource.Resource{{Kind: "project", ID: "p1", Lane: "keystone"}},
+		Lanes: []run.LaneStats{{Name: "keystone", RunID: "mix00001-keystone", Cloud: "nope", Scenario: "small/keystone"}},
+	})
+	if err != nil {
+		t.Fatalf("writing mix record: %v", err)
+	}
+	for _, sub := range []string{"status", "cleanup"} {
+		t.Run(sub, func(t *testing.T) {
+			_, err := execRoot(t, "mix", sub, "--run", path)
+			if want := `creating identity client for lane "keystone":`; err == nil || !strings.Contains(err.Error(), want) {
+				t.Errorf("mix %s = %v, want an error containing %q", sub, err, want)
+			}
+		})
+	}
+}
+
+// TestMixCleanupByRunIDBuildsLanes confirms mix cleanup --run-id builds the
+// background lanes the scenario enables after its personas, each with the
+// cloud its block names, also a lane whose scenario file is gone since the
+// run: cleanup needs only the lane's name and cloud.
+func TestMixCleanupByRunIDBuildsLanes(t *testing.T) {
+	tenantClouds(t, fakeKeystone(t, "proj-ci"))
+	scenario := writeScenario(t, sampleMixScenarioYAML)
+	for name, lane := range map[string]string{
+		"on a profile":                    "lanes.glance.profile=small",
+		"on a scenario file that is gone": "lanes.glance.scenario=" + filepath.Join(t.TempDir(), "gone.yaml"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := execRoot(t, "mix", "cleanup", "--run-id", "x", "--scenario", scenario, "--set", "personas.ci.cloud=tenant-ci",
+				"--set", "lanes.glance.enabled=true", "--set", lane, "--set", "lanes.glance.cloud=nope")
+			if want := `creating image client for lane "glance": parsing clouds.yaml:`; err == nil || !strings.HasPrefix(err.Error(), want) {
+				t.Errorf("mix cleanup --run-id = %v, want an error starting with %q", err, want)
+			}
+		})
+	}
+}
+
 func TestRecordLaneInputs(t *testing.T) {
 	overall := metrics.NewCollector()
 	rec := &run.Record{Personas: []run.PersonaStats{{Name: "ci", RunID: "mix00001-ci", Cloud: "tenant-ci", ProjectID: "proj-ci"}}}

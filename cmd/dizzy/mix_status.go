@@ -16,15 +16,16 @@ import (
 )
 
 // newMixStatusCmd builds "mix status", which loads a mix run record,
-// authenticates every persona against the cloud the record names for it, and
-// re-queries the live state of the resources each persona created, printing
-// one table per persona. A resource that no longer exists shows as "gone".
+// authenticates every persona and background lane against the cloud the record
+// names for it, and re-queries the live state of the resources each created,
+// printing one table per persona and lane. A resource that no longer exists
+// shows as "gone".
 func newMixStatusCmd(opts *globalOptions) *cobra.Command {
 	var runPath string
 
 	cmd := &cobra.Command{
 		Use:   "status",
-		Short: "Re-query the current state of a mix run's resources, per persona",
+		Short: "Re-query the current state of a mix run's resources, per persona and lane",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			rec, err := run.Load(runPath)
 			if err != nil {
@@ -41,7 +42,8 @@ func newMixStatusCmd(opts *globalOptions) *cobra.Command {
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 
-			lanes, err := buildCleanupLanes(ctx, opts, recordLaneInputs(rec, metrics.NewCollector()))
+			overall := metrics.NewCollector()
+			lanes, err := buildCleanupLanes(ctx, opts, recordLaneInputs(rec, overall), recordServiceLaneInputs(rec, overall))
 			if err != nil {
 				return err
 			}

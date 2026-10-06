@@ -14,12 +14,14 @@ import (
 	"github.com/B42Labs/dizzy/internal/resource"
 )
 
-// newMixCleanupCmd builds "mix cleanup", which deletes every persona's
-// resources of a mix run, each in the project of the cloud the persona ran
-// under and strictly by the persona's identity. It is idempotent. With --run
-// the personas, their clouds and identities come from the run record, whose
-// created list also serves as a handle. With --run-id they come from the
-// scenario the run used, which --scenario (and --set) must name again.
+// newMixCleanupCmd builds "mix cleanup", which deletes every persona's and
+// background lane's resources of a mix run, each in the project of the cloud
+// it ran under and strictly by its identity. It is idempotent. With --run the
+// personas and lanes, their clouds and identities come from the run record,
+// whose created list also serves as a handle. With --run-id they come from the
+// scenario the run used, which --scenario (and --set) must name again; the
+// lane scenarios it names are not read. Before deleting it warns about what
+// the Neutron and Keystone lanes may leave behind.
 func newMixCleanupCmd(opts *globalOptions) *cobra.Command {
 	var (
 		runPath      string
@@ -30,7 +32,7 @@ func newMixCleanupCmd(opts *globalOptions) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "cleanup",
-		Short: "Delete every persona's resources of a mix run, by identity",
+		Short: "Delete every persona's and lane's resources of a mix run, by identity",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if runPath != "" && runID == "" && scenarioPath != "" {
 				return errors.New("--scenario is only used with --run-id")
@@ -48,32 +50,35 @@ func newMixCleanupCmd(opts *globalOptions) *cobra.Command {
 
 			overall := metrics.NewCollector()
 			var (
-				inputs  []mixLaneInput
-				created []resource.Resource
+				inputs   []mixLaneInput
+				services []serviceLaneInput
+				created  []resource.Resource
 			)
 			if rec != nil {
 				if err := mix.CheckServices(rec.Services); err != nil {
 					return err
 				}
-				inputs, created = recordLaneInputs(rec, overall), rec.Created
+				inputs, services, created = recordLaneInputs(rec, overall), recordServiceLaneInputs(rec, overall), rec.Created
 			} else {
-				s, p, err := buildMixPlanFromFlags(cmd, opts, scenarioPath, sets)
+				s, p, err := buildMixPersonaPlanFromFlags(cmd, opts, scenarioPath, sets)
 				if err != nil {
 					return err
 				}
 				if inputs, err = planLaneInputs(s, p, id, overall); err != nil {
 					return err
 				}
+				services = planServiceLaneInputs(s, id, overall)
 			}
 
 			// Stop cleanly on Ctrl-C / SIGTERM, like apply.
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 
-			lanes, err := buildCleanupLanes(ctx, opts, inputs)
+			lanes, err := buildCleanupLanes(ctx, opts, inputs, services)
 			if err != nil {
 				return err
 			}
+			warnLaneUnreclaimable(lanes, rec)
 
 			hb := startHeartbeat(ctx, "cleanup in progress", collectorSnapshot(overall, time.Now()))
 			defer hb.stop()
