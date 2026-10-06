@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -132,12 +133,22 @@ func buildMixLane(ctx context.Context, opts *globalOptions, in mixLaneInput) (_ 
 	if err != nil {
 		return nil, fmt.Errorf("persona %q: %w", in.name, err)
 	}
-	nodes, err := novagraph.Build(in.persona.Nova, client, resolved, opts.timeout)
+	nodes, err := buildPersonaNodes(in.persona, client, resolved, opts.timeout)
 	if err != nil {
 		return nil, fmt.Errorf("building churn graph for persona %q: %w", in.name, err)
 	}
 	l.Nodes, l.Seed, l.Config = nodes, in.persona.Seed, in.cfg
 	return l, nil
+}
+
+// buildPersonaNodes builds the churn graph of a persona's lane: the long-lived
+// graph, whose nodes stay until teardown and are mutated repeatedly, for a
+// long-lived persona, and the graph nova chaos churns otherwise.
+func buildPersonaNodes(ps *mixplan.Persona, c novagraph.Nova, r novaexec.Resolved, opTimeout time.Duration) ([]chaos.Node, error) {
+	if ps.LongLived {
+		return novagraph.BuildLongLived(ps.Nova, c, r, opTimeout)
+	}
+	return novagraph.Build(ps.Nova, c, r, opTimeout)
 }
 
 // warnSharedProjects logs one warning for every project two or more lanes
@@ -169,6 +180,8 @@ func mixPersonaCloud(s mixscenario.Scenario, name string) (string, error) {
 	switch name {
 	case "ci":
 		return s.Personas.CI.Cloud, nil
+	case "legacy":
+		return s.Personas.Legacy.Cloud, nil
 	default:
 		return "", fmt.Errorf("persona %q is not defined by this build of dizzy", name)
 	}
