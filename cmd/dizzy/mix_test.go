@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -144,7 +145,8 @@ func TestMixGenerateErrors(t *testing.T) {
 }
 
 // TestMixGenerateSmallProfile runs mix generate on the shipped small profile
-// twice and checks the output is byte-identical and has the documented shape.
+// twice and checks the output is byte-identical and has the documented shape,
+// and that --set personas.legacy.share=0 gives the CI persona every server.
 func TestMixGenerateSmallProfile(t *testing.T) {
 	data, err := scenarios.Files.ReadFile("mix/small.yaml")
 	if err != nil {
@@ -164,16 +166,32 @@ func TestMixGenerateSmallProfile(t *testing.T) {
 		t.Error("two runs of mix generate on the small profile differ")
 	}
 
-	p := decodeMixPlan(t, first)
-	if len(p.Personas) != 1 {
-		t.Fatalf("plan has %d personas, want 1", len(p.Personas))
+	type persona struct {
+		name      string
+		servers   int
+		share     float64
+		longLived bool
 	}
-	ci := p.Personas[0]
-	if ci.Name != "ci" || ci.Servers != 6 || ci.Share != 1 || len(ci.Nova.Servers) != 6 {
-		t.Errorf("persona = %s with %d servers, share %v and %d planned, want ci, 6, 1, 6", ci.Name, ci.Servers, ci.Share, len(ci.Nova.Servers))
+	personasOf := func(out string) []persona {
+		var got []persona
+		for _, ps := range decodeMixPlan(t, out).Personas {
+			if len(ps.Nova.Servers) != ps.Servers {
+				t.Errorf("persona %s plans %d servers, want its share %d", ps.Name, len(ps.Nova.Servers), ps.Servers)
+			}
+			got = append(got, persona{ps.Name, ps.Servers, ps.Share, ps.LongLived})
+		}
+		return got
 	}
-	if ci.Nova.Servers[0].Name != "srv-0001" || ci.Nova.Servers[5].Name != "srv-0006" {
-		t.Errorf("servers run %s..%s, want srv-0001..srv-0006", ci.Nova.Servers[0].Name, ci.Nova.Servers[5].Name)
+	if got, want := personasOf(first), []persona{{"ci", 5, 0.8, false}, {"legacy", 1, 0.2, true}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("personas = %+v, want %+v", got, want)
+	}
+
+	ciOnly, err := execRoot(t, "mix", "generate", "--scenario", path, "--set", "personas.legacy.share=0")
+	if err != nil {
+		t.Fatalf("generate --set personas.legacy.share=0: %v", err)
+	}
+	if got, want := personasOf(ciOnly), []persona{{"ci", 6, 1, false}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("personas with the legacy share 0 = %+v, want %+v", got, want)
 	}
 }
 
