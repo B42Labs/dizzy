@@ -12,6 +12,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2"
 
 	"github.com/B42Labs/dizzy/internal/metrics"
+	novaplan "github.com/B42Labs/dizzy/internal/nova/plan"
 	"github.com/B42Labs/dizzy/internal/resource"
 )
 
@@ -186,4 +187,74 @@ func TestIsSameFlavor(t *testing.T) {
 	if IsSameFlavor(nil) {
 		t.Error("IsSameFlavor(nil) = true, want false")
 	}
+}
+
+// TestCreateServerSchedulerHint verifies a server with a group id boots with
+// the group scheduler hint, a server without one with a body free of any
+// hint, and that a group id that is not a UUID fails before any request.
+func TestCreateServerSchedulerHint(t *testing.T) {
+	const groupID = "3f2a8c1e-5b7d-4e9a-8c6f-1a2b3c4d5e6f"
+	srv := novaplan.Server{Name: "srv-0001", Networks: []string{"net-0001"}}
+	boot := BootSpec{ImageID: "img-1", FlavorID: "flv-1", NetworkIDs: []string{"net-id-1"}}
+
+	tests := []struct {
+		name     string
+		groupID  string
+		wantHint bool
+	}{
+		{name: "with group", groupID: groupID, wantHint: true},
+		{name: "without group"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var body string
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/servers" {
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+				data, _ := io.ReadAll(r.Body)
+				body = string(data)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte(`{"server":{"id":"srv-id-1"}}`))
+			}))
+			defer ts.Close()
+
+			b := boot
+			b.GroupID = tc.groupID
+			if _, err := testComputeClient(ts).CreateServer(context.Background(), srv, b); err != nil {
+				t.Fatalf("CreateServer = %v, want nil", err)
+			}
+			hint := `"os:scheduler_hints":{"group":"` + groupID + `"}`
+			if got := strings.Contains(body, hint); got != tc.wantHint {
+				t.Errorf("body %s carries %s = %v, want %v", body, hint, got, tc.wantHint)
+			}
+			if !tc.wantHint && strings.Contains(body, "os:scheduler_hints") {
+				t.Errorf("body %s carries os:scheduler_hints, want none", body)
+			}
+		})
+	}
+
+	t.Run("group id not a UUID", func(t *testing.T) {
+		requests := 0
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			requests++
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer ts.Close()
+
+		b := boot
+		b.GroupID = "not-a-uuid"
+		_, err := testComputeClient(ts).CreateServer(context.Background(), srv, b)
+		if want := `creating server "srv-0001":`; err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Fatalf("CreateServer = %v, want an error starting with %q", err, want)
+		}
+		var invalid gophercloud.ErrInvalidInput
+		if !errors.As(err, &invalid) {
+			t.Errorf("CreateServer = %v, want it to wrap gophercloud.ErrInvalidInput", err)
+		}
+		if requests != 0 {
+			t.Errorf("CreateServer sent %d requests, want 0", requests)
+		}
+	})
 }
