@@ -43,7 +43,7 @@ func TestMixSubcommandsRegistered(t *testing.T) {
 	if mix == nil {
 		t.Fatal("mix command not registered on root")
 	}
-	for _, name := range []string{"generate", "report"} {
+	for _, name := range []string{"generate", "chaos", "report"} {
 		if findSubcommand(mix, name) == nil {
 			t.Errorf("mix subcommand %q not registered", name)
 		}
