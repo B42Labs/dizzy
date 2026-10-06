@@ -67,6 +67,18 @@ type htmlView struct {
 	Readiness []readyRow
 	Inventory inventoryView
 	Chaos     *chaosView // nil for an apply run
+	Personas  []personaView
+}
+
+// personaView is one persona section of a mix report. Chaos is nil until the
+// persona's engine produced a snapshot.
+type personaView struct {
+	Name    string
+	Project string
+	Share   string
+	Servers int
+	KPIs    []kpi
+	Chaos   *chaosView
 }
 
 type headerView struct {
@@ -227,7 +239,27 @@ func buildHTMLView(r *Record) htmlView {
 	if r.Chaos != nil {
 		v.Chaos = buildChaosView(r.Chaos)
 	}
+	v.Personas = buildPersonaViews(r.Personas)
 	return v
+}
+
+// buildPersonaViews converts a mix record's personas into their sections.
+func buildPersonaViews(ps []PersonaStats) []personaView {
+	views := make([]personaView, 0, len(ps))
+	for _, p := range ps {
+		pv := personaView{
+			Name:    p.Name,
+			Project: projectLabel(p.ProjectID),
+			Share:   sharePercent(p.Share),
+			Servers: p.Servers,
+			KPIs:    buildKPIs(p.Metrics.Overall),
+		}
+		if p.Chaos != nil {
+			pv.Chaos = buildChaosView(p.Chaos)
+		}
+		views = append(views, pv)
+	}
+	return views
 }
 
 func buildHeader(r *Record) headerView {

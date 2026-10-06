@@ -74,12 +74,8 @@ func WritePersonaTable(w io.Writer, ps []PersonaStats) error {
 	// The labels, NAME and PROJECT, are left-aligned and the numbers right-aligned.
 	leftAlign := []bool{true, true, false, false, false, false, false, false, false, false}
 	for _, p := range ps {
-		project := p.ProjectID
-		if project == "" {
-			project = "-"
-		}
 		o := p.Metrics.Overall
-		row := []string{p.Name, project, fmt.Sprintf("%.0f%%", p.Share*100), strconv.Itoa(p.Servers),
+		row := []string{p.Name, projectLabel(p.ProjectID), sharePercent(p.Share), strconv.Itoa(p.Servers),
 			strconv.Itoa(o.Attempted), strconv.Itoa(o.Succeeded), strconv.Itoa(o.Failed)}
 		for _, d := range []time.Duration{o.Latency.Median, o.Latency.P95, o.Latency.P99} {
 			if o.Attempted == 0 {
@@ -163,6 +159,19 @@ func formatBucketErrors(errs []metrics.ErrorCount) string {
 		parts = append(parts, fmt.Sprintf("%s=%d", e.Kind, e.Count))
 	}
 	return strings.Join(parts, ", ")
+}
+
+// projectLabel renders a persona's project for the reports, "-" when unknown.
+func projectLabel(id string) string {
+	if id == "" {
+		return "-"
+	}
+	return id
+}
+
+// sharePercent renders a persona's normalized share as a whole percentage.
+func sharePercent(share float64) string {
+	return fmt.Sprintf("%.0f%%", share*100)
 }
 
 // WriteJSON renders the run's metrics as indented JSON, the machine-readable

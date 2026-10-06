@@ -241,3 +241,57 @@ func TestWriteHTMLIncompleteBanner(t *testing.T) {
 		})
 	}
 }
+
+// TestWriteHTMLGoldenMix locks the rendered HTML for a mix record: the overall
+// sections, then one section per persona with its chips and KPIs, and the
+// time-series charts for the persona that has churn buckets.
+func TestWriteHTMLGoldenMix(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteHTML(&buf, mixRecord()); err != nil {
+		t.Fatalf("WriteHTML: %v", err)
+	}
+	checkGolden(t, "report-mix.html", buf.Bytes())
+}
+
+// TestWriteHTMLPersonaWithoutChaos confirms a persona with no churn statistics
+// renders its heading, chips and KPIs and no chart, while the persona with
+// buckets gets both charts.
+func TestWriteHTMLPersonaWithoutChaos(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteHTML(&buf, mixRecord()); err != nil {
+		t.Fatalf("WriteHTML: %v", err)
+	}
+	out := buf.String()
+	ci := strings.Index(out, "<h2>Persona ci</h2>")
+	legacy := strings.Index(out, "<h2>Persona legacy</h2>")
+	end := strings.Index(out, "<script>")
+	if ci < 0 || legacy < ci || end < legacy {
+		t.Fatalf("persona sections missing or out of order (ci %d, legacy %d, script %d)", ci, legacy, end)
+	}
+	ciSection, legacySection := out[ci:legacy], out[legacy:end]
+	if got := strings.Count(ciSection, "<svg"); got != 2 {
+		t.Errorf("ci section has %d charts, want 2", got)
+	}
+	for _, want := range []string{"project -", "share 40%", "servers 4", "total ops"} {
+		if !strings.Contains(legacySection, want) {
+			t.Errorf("legacy section lacks %q:\n%s", want, legacySection)
+		}
+	}
+	if strings.Contains(legacySection, "<svg") {
+		t.Errorf("legacy section without churn statistics renders a chart:\n%s", legacySection)
+	}
+}
+
+// TestWriteHTMLEscapesPersonaName confirms a persona name carrying a script
+// payload is HTML-escaped.
+func TestWriteHTMLEscapesPersonaName(t *testing.T) {
+	rec := mixRecord()
+	rec.Personas[0].Name = "<script>alert(1)</script>"
+	var buf bytes.Buffer
+	if err := WriteHTML(&buf, rec); err != nil {
+		t.Fatalf("WriteHTML: %v", err)
+	}
+	if strings.Contains(buf.String(), "<script>alert(1)</script>") {
+		t.Error("persona name rendered without escaping (XSS)")
+	}
+}
