@@ -36,6 +36,25 @@ func TestNeutronSubcommandsRegistered(t *testing.T) {
 	}
 }
 
+// TestMixSubcommandsRegistered confirms the mix namespace carries its
+// subcommands and no apply or monitor, since a persona is a behavior over time.
+func TestMixSubcommandsRegistered(t *testing.T) {
+	mix := findSubcommand(newRootCmd(), "mix")
+	if mix == nil {
+		t.Fatal("mix command not registered on root")
+	}
+	for _, name := range []string{"generate", "report"} {
+		if findSubcommand(mix, name) == nil {
+			t.Errorf("mix subcommand %q not registered", name)
+		}
+	}
+	for _, name := range []string{"apply", "monitor"} {
+		if findSubcommand(mix, name) != nil {
+			t.Errorf("mix subcommand %q registered, want none", name)
+		}
+	}
+}
+
 func TestGlobalFlagsRegistered(t *testing.T) {
 	flags := newRootCmd().PersistentFlags()
 	for _, name := range []string{"os-cloud", "concurrency", "timeout", "seed", "log-level", "otel"} {
