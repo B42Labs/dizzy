@@ -44,7 +44,7 @@ type Record struct {
 	VolumeType string `json:"volumeType,omitempty"`
 	// Chaos holds the churn-specific statistics of a soak/chaos run. It is nil
 	// for an apply run, so an apply record's shape is unchanged. It is also nil
-	// for a mix run, whose churn statistics are per persona.
+	// for a mix run, whose churn statistics are per persona and lane.
 	Chaos *ChaosStats `json:"chaos,omitempty"`
 	// Services lists the opt-in services a mix run bound to its personas. It is
 	// omitted when empty.
@@ -52,6 +52,9 @@ type Record struct {
 	// Personas holds one entry per workload persona of a mix run, in the order
 	// the run ran them. It is omitted for every other run.
 	Personas []PersonaStats `json:"personas,omitempty"`
+	// Lanes holds one entry per background lane of a mix run, in the order the
+	// run ran them. It is omitted when the run had none.
+	Lanes []LaneStats `json:"lanes,omitempty"`
 	// Incomplete marks a checkpoint a chaos run wrote while it was still
 	// running: the run was still going or was killed before its final record.
 	// FinishedAt is then the checkpoint time. The final write omits the key.
@@ -98,6 +101,24 @@ type PersonaStats struct {
 	ProjectID string            `json:"projectID,omitempty"`
 	Share     float64           `json:"share"`
 	Servers   int               `json:"servers"`
+	Seed      int64             `json:"seed"`
+	Metrics   metrics.Aggregate `json:"metrics"`
+	Chaos     *ChaosStats       `json:"chaos,omitempty"`
+}
+
+// LaneStats is one background lane of a mix run, the churn of a single
+// service. Name is the service, and RunID the identity its resources carry,
+// the run id suffixed with the lane name. Cloud and ProjectID mean what they
+// mean for a persona. Scenario and Seed are the name and seed of the lane's
+// plan. Metrics and Chaos are the lane's own aggregate and churn statistics;
+// Chaos is nil in a checkpoint written before the lane's engine produced a
+// snapshot.
+type LaneStats struct {
+	Name      string            `json:"name"`
+	RunID     string            `json:"runID"`
+	Cloud     string            `json:"cloud,omitempty"`
+	ProjectID string            `json:"projectID,omitempty"`
+	Scenario  string            `json:"scenario"`
 	Seed      int64             `json:"seed"`
 	Metrics   metrics.Aggregate `json:"metrics"`
 	Chaos     *ChaosStats       `json:"chaos,omitempty"`

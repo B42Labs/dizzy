@@ -137,6 +137,26 @@ func TestBuildResourceAttributes(t *testing.T) {
 		if _, ok := res.Set().Value(attribute.Key("persona")); ok {
 			t.Error("persona attribute present despite an empty Config.Persona")
 		}
+		if _, ok := res.Set().Value(attribute.Key("lane")); ok {
+			t.Error("lane attribute present despite an empty Config.Lane")
+		}
+	})
+
+	t.Run("lane present for a background lane", func(t *testing.T) {
+		res, err := buildResource(Config{Cloud: "admin", Scenario: "small/keystone", Service: "mix", Lane: "keystone"})
+		if err != nil {
+			t.Fatalf("buildResource: %v", err)
+		}
+		set := res.Set()
+		for k, want := range map[string]string{"service": "mix", "lane": "keystone", "scenario": "small/keystone"} {
+			got, ok := set.Value(attribute.Key(k))
+			if !ok || got.AsString() != want {
+				t.Errorf("resource attribute %q = %q (present=%v), want %q", k, got.AsString(), ok, want)
+			}
+		}
+		if _, ok := set.Value(attribute.Key("persona")); ok {
+			t.Error("persona attribute present for a background lane")
+		}
 	})
 }
 
