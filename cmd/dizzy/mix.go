@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 
 	"github.com/spf13/cobra"
@@ -17,6 +19,7 @@ import (
 	"github.com/B42Labs/dizzy/internal/nova"
 	novaexec "github.com/B42Labs/dizzy/internal/nova/executor"
 	"github.com/B42Labs/dizzy/internal/resource"
+	"github.com/B42Labs/dizzy/internal/run"
 	"github.com/B42Labs/dizzy/internal/telemetry"
 )
 
@@ -34,7 +37,9 @@ func newMixCmd(opts *globalOptions) *cobra.Command {
 	cmd.AddCommand(
 		newMixGenerateCmd(opts),
 		newMixChaosCmd(opts),
+		newMixStatusCmd(opts),
 		newReportCmd(opts),
+		newMixCleanupCmd(opts),
 	)
 
 	return cmd
@@ -42,11 +47,14 @@ func newMixCmd(opts *globalOptions) *cobra.Command {
 
 // mixLaneInput is what buildMixLane binds a lane from. runID is the lane
 // identity, "<runID>-<name>". cloud is the clouds.yaml entry the scenario names
-// for the persona, empty for the --os-cloud fallback. persona is nil for the
-// cleanup-only lanes of status and cleanup, which need neither cfg nor
+// for the persona, empty for the --os-cloud fallback. project is the project a
+// run record says the persona ran in, empty without one; buildMixLane refuses
+// a lane whose cloud authenticates against another project. persona is nil for
+// the cleanup-only lanes of status and cleanup, which need neither cfg nor
 // scenario. Each lane's client records into a child of overall.
 type mixLaneInput struct {
 	name, cloud, runID, scenario string
+	project                      string
 	persona                      *mixplan.Persona
 	cfg                          chaos.Config
 	overall                      *metrics.Collector
@@ -93,6 +101,12 @@ func buildMixLane(ctx context.Context, opts *globalOptions, in mixLaneInput) (_ 
 	client.SetTelemetry(tel)
 	cleaner := novaTimeoutCleaner{client, opts.timeout}
 	projectID, _ := nova.ProjectID(cs.Compute)
+	// Discovery is project-scoped, so in another project it finds nothing and
+	// the recorded ids are 404s that count as deleted: refuse instead.
+	if in.project != "" && projectID != "" && projectID != in.project {
+		return nil, fmt.Errorf("persona %q authenticated against project %s, but the run record says it ran in project %s; authenticate with the cloud the run used",
+			in.name, projectID, in.project)
+	}
 
 	l := &mix.Lane{
 		Name:      in.name,
@@ -186,4 +200,55 @@ func resourcesOfPersona(created []resource.Resource, name string) []resource.Res
 		}
 	}
 	return out
+}
+
+// recordLaneInputs returns the cleanup-only lane input of every persona of a
+// mix record, under the cloud, identity and project the record names.
+func recordLaneInputs(rec *run.Record, overall *metrics.Collector) []mixLaneInput {
+	inputs := make([]mixLaneInput, 0, len(rec.Personas))
+	for _, ps := range rec.Personas {
+		inputs = append(inputs, mixLaneInput{name: ps.Name, cloud: ps.Cloud, runID: ps.RunID, project: ps.ProjectID, overall: overall})
+	}
+	return inputs
+}
+
+// buildCleanupLanes builds one cleanup-only lane per input.
+func buildCleanupLanes(ctx context.Context, opts *globalOptions, inputs []mixLaneInput) ([]*mix.Lane, error) {
+	lanes := make([]*mix.Lane, 0, len(inputs))
+	for _, in := range inputs {
+		l, err := buildMixLane(ctx, opts, in)
+		if err != nil {
+			return nil, err
+		}
+		lanes = append(lanes, l)
+	}
+	return lanes, nil
+}
+
+// deleteLaneResources runs every lane's Cleanup with the entries of created
+// its persona made, in lane order, and prints how many each deleted under its
+// identity. A failing lane does not stop the others; their errors come back
+// joined, each naming the persona after action ("tearing down", "cleaning
+// up").
+func deleteLaneResources(ctx context.Context, out io.Writer, lanes []*mix.Lane, created []resource.Resource, action string) error {
+	var errs []error
+	for _, l := range lanes {
+		deleted, err := l.Cleanup(ctx, resourcesOfPersona(created, l.Name))
+		if _, werr := fmt.Fprintf(out, "deleted %d resource(s) for run %s\n", deleted, l.RunID); werr != nil {
+			return fmt.Errorf("writing output: %w", werr)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s persona %q (run %s): %w", action, l.Name, l.RunID, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// observeFunc adapts a lane's Observe handle to the observer the status table
+// drives.
+type observeFunc func(ctx context.Context, r resource.Resource) (string, bool, error)
+
+// Observe reports r's live state through f.
+func (f observeFunc) Observe(ctx context.Context, r resource.Resource) (string, bool, error) {
+	return f(ctx, r)
 }
