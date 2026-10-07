@@ -2,6 +2,7 @@ package glance
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"net/http"
@@ -27,6 +28,63 @@ func testClient(ts *httptest.Server) *Client {
 
 func imageRes(id string) resource.Resource {
 	return resource.Resource{Kind: KindImage, Logical: "img-0001", Name: "dizzy-run0-img-0001", ID: id}
+}
+
+// TestUploadImageDataResendsWholePayloadAfterReauth asserts an upload answered
+// with 401 is repeated after re-authentication with the whole payload, not the
+// drained remainder of the first attempt. Glance's auth middleware rejects an
+// expired token from the headers alone, so the 401 may arrive while the
+// transport is still sending the first attempt's body.
+func TestUploadImageDataResendsWholePayloadAfterReauth(t *testing.T) {
+	const sizeMiB, seed = 8, 7
+	want := sha256.Sum256(readAll(t, payloadReader(seed, sizeMiB<<20)))
+	tests := []struct {
+		name     string
+		readBody bool // the server reads the whole first attempt before its 401
+	}{
+		{"401 after the body was read", true},
+		{"401 before the body was read", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var puts int
+			var got [sha256.Size]byte
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPut || r.URL.Path != "/images/img1/file" {
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+				puts++
+				if r.Header.Get("X-Auth-Token") == "tok-1" {
+					if tc.readBody {
+						_, _ = io.Copy(io.Discard, r.Body)
+					}
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				h := sha256.New()
+				_, _ = io.Copy(h, r.Body)
+				h.Sum(got[:0])
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer ts.Close()
+			pc := &gophercloud.ProviderClient{TokenID: "tok-1"}
+			pc.ReauthFunc = func(context.Context) error {
+				pc.SetToken("tok-2")
+				return nil
+			}
+			c := New(&gophercloud.ServiceClient{ProviderClient: pc, Endpoint: ts.URL + "/"}, "run0", metrics.NewCollector())
+
+			if err := c.UploadImageData(context.Background(), imageRes("img1"), sizeMiB, seed); err != nil {
+				t.Fatalf("UploadImageData: %v", err)
+			}
+			if puts != 2 {
+				t.Errorf("uploads received = %d, want 2", puts)
+			}
+			if got != want {
+				t.Error("repeated upload differs from the payload")
+			}
+		})
+	}
 }
 
 // TestDeactivateReactivateHitTheActionEndpoints confirms the hand-rolled raw
