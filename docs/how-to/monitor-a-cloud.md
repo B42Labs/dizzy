@@ -100,8 +100,10 @@ $ dizzy keystone monitor --scenario scenarios/keystone/small.yaml --otel
 
 `cinder monitor` resolves the volume type and pre-checks the Cinder quotas once
 at startup, so a misconfiguration fails before the loop begins. Each iteration
-re-authenticates, so token expiry over a multi-day loop fails one iteration
-rather than dead-looping.
+authenticates its own client, so an unhealthy Keystone fails one iteration
+rather than dead-looping. When `clouds.yaml` holds credentials, a token that
+expires during an iteration is renewed on the first 401, as in a
+[churn soak](run-a-soak.md#set-the-duration).
 
 `keystone monitor` resolves the privilege tier once at startup for the same
 reason. Its cross-run orphan sweep is **opt-in** via `--reclaim-orphans` and off
