@@ -41,8 +41,8 @@ import (
 // ports-and-adapters seam to the cloud — *nova.Client satisfies it in production
 // and a fake satisfies it in tests. It mirrors the apply executor's Nova seam
 // plus the DeleteNetworkPorts the network churn deletes need, the
-// ColdMigrateServer and WaitForPortDetached the long-lived graph needs, and the
-// CreateServerGroup the server group nodes need.
+// ColdMigrateServer the long-lived graph needs, the WaitForPortDetached every
+// port detach needs, and the CreateServerGroup the server group nodes need.
 type Nova interface {
 	CreateServerGroup(ctx context.Context, g novaplan.ServerGroup) (resource.Resource, error)
 	CreateNetwork(ctx context.Context, n novaplan.Network) (resource.Resource, error)
@@ -609,10 +609,17 @@ func createPort(ctx context.Context, opTimeout time.Duration, c Nova, pt novapla
 	return res, nil
 }
 
-// deletePort detaches a port from its server and deletes it, waiting it to be
-// gone.
+// deletePort detaches a port from its server, waits until the server no
+// longer has it, and deletes it, waiting for it to be gone. The wait also
+// covers the server's own addresses: a live migration that mutateServer starts
+// next reads them, and fails while they still list the port. A failed wait
+// returns before the delete, so the port stays and the failure surfaces as a
+// failed port delete.
 func deletePort(ctx context.Context, opTimeout time.Duration, c Nova, res, server resource.Resource) error {
 	if err := detach(ctx, opTimeout, func(ctx context.Context) error { return c.DetachPort(ctx, server, res) }); err != nil {
+		return err
+	}
+	if err := waitPortDetached(ctx, opTimeout, c, server, res); err != nil {
 		return err
 	}
 	return deleteGone(ctx, opTimeout, c, res)
