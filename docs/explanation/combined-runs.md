@@ -69,12 +69,15 @@ quota pre-check validated. A resize goes to `resize_flavor` while the server is
 on `flavor` and back to `flavor` afterwards, and the pre-check already sizes a
 resized server by the larger of its two flavors. A data volume or port is
 detached by one mutation and attached again by the next, so it stays one
-resource however often it moves. A toggle changes its state only when its step
-succeeded, so a failed resize, detach or attach is tried again in the same
-direction. A step whose wait gave up may still finish in the cloud, so the
-retry can find the change already made: an attach of a volume or port that is
-already attached counts as done, and a resize to the flavor the server already
-has turns around to the other flavor.
+resource however often it moves. A port detach waits until the server itself
+no longer lists the port's addresses, because Nova's interface view clears
+before the compute host's network info cache does, and a live migration
+started in between fails with `No valid host was found`. A toggle changes its
+state only when its step succeeded, so a failed resize, detach or attach is
+tried again in the same direction. A step whose wait gave up may still finish
+in the cloud, so the retry can find the change already made: an attach of a
+volume or port that is already attached counts as done, and a resize to the
+flavor the server already has turns around to the other flavor.
 
 A kept server whose boot failed is not replaced. The engine marks a node present
 when it decides to create it, so it never schedules that create again, and it
