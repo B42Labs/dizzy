@@ -1,63 +1,150 @@
 package nova
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gophercloud/gophercloud/v2"
+
+	"github.com/B42Labs/dizzy/internal/metrics"
 	"github.com/B42Labs/dizzy/internal/resource"
 )
 
-// TestWaitForPortDetached verifies the wait returns on the first 404 of the
-// interface attachment, polls through a 200 and a 500, and gives up with the
-// context's error while the port stays attached.
+// testComputeNetworkClient builds a Client whose Nova (compute) and Neutron
+// (network) service calls both hit ts and record into m. The port detach wait
+// reads both services, so its interface, server, and port paths land on one
+// handler.
+func testComputeNetworkClient(ts *httptest.Server, m *metrics.Collector) *Client {
+	gc := &gophercloud.ServiceClient{
+		ProviderClient: &gophercloud.ProviderClient{},
+		Endpoint:       ts.URL + "/",
+	}
+	return New(gc, gc, nil, "run0", m)
+}
+
+// TestWaitForPortDetached verifies the wait polls the interface attachment
+// until a 404, then the server until its addresses no longer carry the port's
+// MAC or any of its fixed IPs read from Neutron; that a port gone from Neutron
+// or a server gone ends it, that errors are polled again, that it gives up
+// with the context's error, and that it records no metrics sample. A path
+// whose script is empty must not be requested. The cases run serially because
+// one of them reads the process-wide default logger.
 func TestWaitForPortDetached(t *testing.T) {
 	srv := resource.Resource{Kind: KindServer, ID: "srv-1", Logical: "srv-0001"}
 	port := resource.Resource{Kind: KindPort, ID: "port-1", Logical: "port-0001"}
 	attached := `{"interfaceAttachment":{"port_id":"port-1","port_state":"ACTIVE"}}`
+	neutronPort := `{"port":{"id":"port-1","mac_address":"fa:16:3e:aa:bb:cc","fixed_ips":[{"subnet_id":"sub-1","ip_address":"10.0.0.5"},{"subnet_id":"sub-6","ip_address":"fd00::5"}]}}`
+	addresses := map[string]string{
+		"carrying":     `{"net":[{"addr":"10.0.0.5","version":4,"OS-EXT-IPS-MAC:mac_addr":"fa:16:3e:aa:bb:cc","OS-EXT-IPS:type":"fixed"}]}`,
+		"by-ip":        `{"net":[{"addr":"10.0.0.5","version":4,"OS-EXT-IPS:type":"fixed"}]}`,
+		"by-second-ip": `{"net":[{"addr":"fd00::5","version":6,"OS-EXT-IPS:type":"fixed"}]}`,
+		"unrelated":    `{"net":[{"addr":"10.0.0.9","version":4,"OS-EXT-IPS-MAC:mac_addr":"fa:16:3e:00:00:01","OS-EXT-IPS:type":"fixed"}]}`,
+		"empty":        `{}`,
+	}
+	ok := []int{http.StatusOK}
+	notFound := []int{http.StatusNotFound}
 
 	tests := []struct {
-		name      string
-		answers   []int // status per GET; the last one repeats
-		timeout   time.Duration
-		wantErr   error
-		wantCalls int32 // 0 skips the check
+		name    string
+		iface   []int    // status per interface GET; the last one repeats
+		neutron []int    // status per Neutron port GET; the last one repeats
+		server  []string // per server GET, a status or a key of addresses; the last one repeats
+		timeout time.Duration
+		wantErr error
+		// calls per path; 0 skips the check
+		wantIface, wantNeutron, wantServer int32
+		wantLog                            string // a line the wait logs, "" for none
 	}{
-		{name: "first answer is a 404", answers: []int{http.StatusNotFound}, timeout: 5 * time.Second, wantCalls: 1},
-		{name: "polls through a 200 and a 500", answers: []int{http.StatusOK, http.StatusInternalServerError, http.StatusNotFound}, timeout: 5 * time.Second, wantCalls: 3},
-		{name: "still attached at the deadline", answers: []int{http.StatusOK}, timeout: 300 * time.Millisecond, wantErr: context.DeadlineExceeded},
+		{name: "first answer is a 404", iface: notFound, neutron: ok, server: []string{"empty"}, timeout: 5 * time.Second, wantIface: 1, wantNeutron: 1, wantServer: 1},
+		{name: "polls through a 200 and a 500", iface: []int{http.StatusOK, http.StatusInternalServerError, http.StatusNotFound}, neutron: ok, server: []string{"empty"}, timeout: 5 * time.Second, wantIface: 3},
+		{name: "still attached at the deadline", iface: ok, timeout: 300 * time.Millisecond, wantErr: context.DeadlineExceeded},
+		{name: "addresses still carry the port by MAC", iface: notFound, neutron: ok, server: []string{"carrying", "carrying", "empty"}, timeout: 5 * time.Second, wantServer: 3},
+		{name: "addresses carry the port by fixed IP only", iface: notFound, neutron: ok, server: []string{"by-ip", "empty"}, timeout: 5 * time.Second, wantServer: 2},
+		{name: "addresses carry the port by its second fixed IP", iface: notFound, neutron: ok, server: []string{"by-second-ip", "empty"}, timeout: 5 * time.Second, wantServer: 2},
+		{name: "another port's address does not hold the wait", iface: notFound, neutron: ok, server: []string{"unrelated"}, timeout: 5 * time.Second, wantServer: 1},
+		{name: "addresses never drop the port", iface: notFound, neutron: ok, server: []string{"carrying"}, timeout: 300 * time.Millisecond, wantErr: context.DeadlineExceeded},
+		{name: "the Neutron port is gone", iface: notFound, neutron: notFound, timeout: 5 * time.Second, wantNeutron: 1,
+			wantLog: `level=INFO msg="port gone from Neutron; nothing left to wait for" port=port-0001 id=port-1`},
+		{name: "a Neutron error is polled again", iface: notFound, neutron: []int{http.StatusInternalServerError, http.StatusOK}, server: []string{"empty"}, timeout: 5 * time.Second, wantNeutron: 2, wantServer: 1},
+		{name: "the server is gone", iface: notFound, neutron: ok, server: []string{"404"}, timeout: 5 * time.Second, wantServer: 1},
+		{name: "a server error is polled again", iface: notFound, neutron: ok, server: []string{"500", "empty"}, timeout: 5 * time.Second, wantServer: 2},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			var calls atomic.Int32
+			var logs bytes.Buffer
+			if tc.wantLog != "" {
+				prev := slog.Default()
+				slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+				t.Cleanup(func() { slog.SetDefault(prev) })
+			}
+
+			var ifaceCalls, neutronCalls, serverCalls atomic.Int32
+			// next counts a call and returns its index into a script of n
+			// entries, the last entry repeating.
+			next := func(calls *atomic.Int32, n int) int { return min(int(calls.Add(1))-1, n-1) }
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodGet || r.URL.Path != "/servers/srv-1/os-interface/port-1" {
-					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
-				}
-				n := int(calls.Add(1)) - 1
-				status := tc.answers[min(n, len(tc.answers)-1)]
 				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(status)
-				if status == http.StatusOK {
-					_, _ = w.Write([]byte(attached))
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/servers/srv-1/os-interface/port-1" && len(tc.iface) > 0:
+					status := tc.iface[next(&ifaceCalls, len(tc.iface))]
+					w.WriteHeader(status)
+					if status == http.StatusOK {
+						_, _ = w.Write([]byte(attached))
+					}
+				case r.Method == http.MethodGet && r.URL.Path == "/ports/port-1" && len(tc.neutron) > 0:
+					status := tc.neutron[next(&neutronCalls, len(tc.neutron))]
+					w.WriteHeader(status)
+					if status == http.StatusOK {
+						_, _ = w.Write([]byte(neutronPort))
+					}
+				case r.Method == http.MethodGet && r.URL.Path == "/servers/srv-1" && len(tc.server) > 0:
+					answer := tc.server[next(&serverCalls, len(tc.server))]
+					if status, err := strconv.Atoi(answer); err == nil {
+						w.WriteHeader(status)
+						return
+					}
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(`{"server":{"id":"srv-1","status":"ACTIVE","addresses":` + addresses[answer] + `}}`))
+				default:
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusInternalServerError)
 				}
 			}))
 			t.Cleanup(ts.Close)
 
+			m := metrics.NewCollector()
 			ctx, cancel := context.WithTimeout(context.Background(), tc.timeout)
 			defer cancel()
-			err := testComputeClient(ts).WaitForPortDetached(ctx, srv, port)
+			err := testComputeNetworkClient(ts, m).WaitForPortDetached(ctx, srv, port)
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("WaitForPortDetached = %v, want %v", err, tc.wantErr)
 			}
-			if tc.wantCalls != 0 && calls.Load() != tc.wantCalls {
-				t.Errorf("polled %d times, want %d", calls.Load(), tc.wantCalls)
+			for _, c := range []struct {
+				path        string
+				calls, want int32
+			}{
+				{"interface", ifaceCalls.Load(), tc.wantIface},
+				{"Neutron port", neutronCalls.Load(), tc.wantNeutron},
+				{"server", serverCalls.Load(), tc.wantServer},
+			} {
+				if c.want != 0 && c.calls != c.want {
+					t.Errorf("polled the %s %d times, want %d", c.path, c.calls, c.want)
+				}
+			}
+			if attempted, _, _ := m.Snapshot(); attempted != 0 {
+				t.Errorf("recorded %d samples, want none", attempted)
+			}
+			if tc.wantLog != "" && !strings.Contains(logs.String(), tc.wantLog) {
+				t.Errorf("logs lack %s:\n%s", tc.wantLog, logs.String())
 			}
 		})
 	}

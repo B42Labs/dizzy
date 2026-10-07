@@ -10,6 +10,7 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/attachinterfaces"
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/ports"
 
 	novaplan "github.com/B42Labs/dizzy/internal/nova/plan"
@@ -65,27 +66,75 @@ func (c *Client) DetachPort(ctx context.Context, server, port resource.Resource)
 	return nil
 }
 
-// WaitForPortDetached polls the server's interface attachment of the port
-// until Nova no longer has it (a 404). DetachPort returns once Nova accepted
-// the detach, not once it is done, so a re-attach must wait here first. Every
-// other answer, an error other than a 404 included, is polled again with the
-// backoff WaitForGone uses: the caller's context is the only bound, and it
-// returns ctx.Err() when that ends first. It records no metrics sample.
+// WaitForPortDetached waits until the server no longer has the port, both in
+// Nova's interface view and in the server's own addresses. DetachPort returns
+// once Nova accepted the detach, not once it is done, so a re-attach or a move
+// of the server must wait here first. It polls the server's interface
+// attachment of the port until Nova answers 404. That view clears when Neutron
+// clears the port's device_id, which precedes the compute host's refresh of
+// the instance's network info cache, the view Nova's own move operations read.
+// So it then reads the port's MAC and fixed IPs from Neutron, since the
+// attachment that carried them is gone, and polls the server until its
+// addresses no longer carry them. A Neutron 404 ends the wait, as nothing is
+// left to match and the next attach of the port fails on its own. A server 404
+// ends it too, as the interface poll ends on the 404 Nova answers for a
+// deleted server. Every other answer, an error other than a 404 included, is
+// polled again with the backoff WaitForGone uses, carried across the steps:
+// the caller's context is the only bound, and it returns ctx.Err() when that
+// ends first. It records no metrics sample.
 func (c *Client) WaitForPortDetached(ctx context.Context, server, port resource.Resource) error {
 	backoff := 200 * time.Millisecond
-	for {
-		if _, err := attachinterfaces.Get(ctx, c.compute, server.ID, port.ID).Extract(); IsNotFound(err) {
-			return nil
-		}
-
+	pause := func() error {
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-
 		if backoff = time.Duration(float64(backoff) * 1.5); backoff > 2*time.Second {
 			backoff = 2 * time.Second
+		}
+		return nil
+	}
+
+	for {
+		if _, err := attachinterfaces.Get(ctx, c.compute, server.ID, port.ID).Extract(); IsNotFound(err) {
+			break
+		}
+		if werr := pause(); werr != nil {
+			return werr
+		}
+	}
+
+	var mac string
+	var ips []string
+	for {
+		p, err := ports.Get(ctx, c.network, port.ID).Extract()
+		if IsNotFound(err) {
+			slog.Info("port gone from Neutron; nothing left to wait for", "port", port.Logical, "id", port.ID)
+			return nil
+		}
+		if err == nil {
+			mac = p.MACAddress
+			for _, ip := range p.FixedIPs {
+				ips = append(ips, ip.IPAddress)
+			}
+			break
+		}
+		if werr := pause(); werr != nil {
+			return werr
+		}
+	}
+
+	for {
+		s, err := servers.Get(ctx, c.compute, server.ID).Extract()
+		if IsNotFound(err) {
+			return nil
+		}
+		if err == nil && !addressesCarry(s.Addresses, mac, ips) {
+			return nil
+		}
+		if werr := pause(); werr != nil {
+			return werr
 		}
 	}
 }
