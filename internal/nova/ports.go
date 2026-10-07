@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
@@ -86,4 +88,34 @@ func (c *Client) WaitForPortDetached(ctx context.Context, server, port resource.
 			backoff = 2 * time.Second
 		}
 	}
+}
+
+// addressesCarry reports whether a server's addresses still list the port
+// with mac and ips. Nova keys addresses by network name, and each value is a
+// list of entries with the keys addr, version, OS-EXT-IPS-MAC:mac_addr and
+// OS-EXT-IPS:type. An entry matches by its MAC under a case-insensitive
+// compare, when mac is not empty, or by an addr that is one of ips. A floating
+// IP of the port is a "floating" entry with the port's MAC, so it matches by
+// MAC. Values and entries of another shape are skipped, and an empty mac with
+// no ips matches nothing.
+func addressesCarry(addresses map[string]any, mac string, ips []string) bool {
+	for _, v := range addresses {
+		list, ok := v.([]any)
+		if !ok {
+			continue
+		}
+		for _, e := range list {
+			entry, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			if got, ok := entry["OS-EXT-IPS-MAC:mac_addr"].(string); ok && mac != "" && strings.EqualFold(got, mac) {
+				return true
+			}
+			if addr, ok := entry["addr"].(string); ok && slices.Contains(ips, addr) {
+				return true
+			}
+		}
+	}
+	return false
 }

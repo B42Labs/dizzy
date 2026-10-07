@@ -120,3 +120,45 @@ func TestAttachPort(t *testing.T) {
 		})
 	}
 }
+
+// TestAddressesCarry verifies a server's addresses carry a port by its MAC in
+// any case or by one of its fixed IPs, and that unrelated entries, entries of
+// another shape, and an empty MAC without fixed IPs match nothing.
+func TestAddressesCarry(t *testing.T) {
+	const mac = "fa:16:3e:aa:bb:cc"
+	ips := []string{"10.0.0.5"}
+	carrying := map[string]any{"addr": "10.0.0.5", "version": float64(4), "OS-EXT-IPS-MAC:mac_addr": mac, "OS-EXT-IPS:type": "fixed"}
+	byMAC := map[string]any{"addr": "10.0.0.7", "version": float64(4), "OS-EXT-IPS-MAC:mac_addr": mac, "OS-EXT-IPS:type": "fixed"}
+	upper := map[string]any{"addr": "10.0.0.7", "version": float64(4), "OS-EXT-IPS-MAC:mac_addr": "FA:16:3E:AA:BB:CC", "OS-EXT-IPS:type": "fixed"}
+	byIP := map[string]any{"addr": "10.0.0.5", "version": float64(4)}
+	unrelated := map[string]any{"addr": "10.0.0.9", "version": float64(4), "OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:00:00:01", "OS-EXT-IPS:type": "fixed"}
+	macOnly := map[string]any{"OS-EXT-IPS-MAC:mac_addr": mac}
+	emptyMAC := map[string]any{"OS-EXT-IPS-MAC:mac_addr": ""}
+
+	tests := []struct {
+		name      string
+		addresses map[string]any
+		mac       string
+		ips       []string
+		want      bool
+	}{
+		{name: "nil map", mac: mac, ips: ips},
+		{name: "empty map", addresses: map[string]any{}, mac: mac, ips: ips},
+		{name: "an entry matching by MAC", addresses: map[string]any{"net": []any{byMAC}}, mac: mac, ips: ips, want: true},
+		{name: "an entry matching by MAC in upper case", addresses: map[string]any{"net": []any{upper}}, mac: mac, ips: ips, want: true},
+		{name: "an entry matching by fixed IP without a MAC key", addresses: map[string]any{"net": []any{byIP}}, mac: mac, ips: ips, want: true},
+		{name: "an unrelated entry", addresses: map[string]any{"net": []any{unrelated}}, mac: mac, ips: ips},
+		{name: "a network value that is not a slice", addresses: map[string]any{"net": "10.0.0.5"}, mac: mac, ips: ips},
+		{name: "an entry that is not a map", addresses: map[string]any{"net": []any{"10.0.0.5"}}, mac: mac, ips: ips},
+		{name: "an empty mac against an entry carrying only a MAC", addresses: map[string]any{"net": []any{macOnly}}, ips: ips},
+		{name: "an empty mac against an entry with an empty MAC", addresses: map[string]any{"net": []any{emptyMAC}}, ips: ips},
+		{name: "an empty mac and no ips against a carrying entry", addresses: map[string]any{"net": []any{carrying}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := addressesCarry(tc.addresses, tc.mac, tc.ips); got != tc.want {
+				t.Errorf("addressesCarry = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
