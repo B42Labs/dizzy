@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -313,6 +314,86 @@ func TestIssueTokenRecordsOperationAndReadiness(t *testing.T) {
 	if id, _ := project["id"].(string); id != "pid1" {
 		t.Errorf("auth scope project id = %q, want pid1", id)
 	}
+}
+
+// TestIssueTokenNeverReauthenticates confirms a 401 on the created user's token
+// request is that request's own failure: the admin client does not
+// re-authenticate and repeat it, which would hide a password that has not
+// replicated yet.
+func TestIssueTokenNeverReauthenticates(t *testing.T) {
+	var posts int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/auth/tokens") {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		posts++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"code":401,"title":"Unauthorized","message":"The request you have made requires authentication."}}`)
+	}))
+	defer ts.Close()
+
+	c, _ := testClient(ts)
+	var reauths int
+	c.gc.ReauthFunc = func(context.Context) error {
+		reauths++
+		return nil
+	}
+	err := c.IssueToken(context.Background(), keystoneplan.TokenIssue{User: "user-0001", Project: "proj-0001"}, "did1", "s3cret", "pid1")
+	if got := errKind(err); got != "http_401" {
+		t.Errorf("errKind(%v) = %q, want http_401", err, got)
+	}
+	if posts != 1 {
+		t.Errorf("token requests = %d, want 1", posts)
+	}
+	if reauths != 0 {
+		t.Errorf("admin re-authentications = %d, want 0", reauths)
+	}
+	if c.gc.ReauthFunc == nil {
+		t.Error("IssueToken cleared the admin client's ReauthFunc")
+	}
+}
+
+// TestIssueTokenDuringAdminReauth confirms token issues are safe while another
+// worker's 401 re-authenticates the shared admin client, since the chaos graph
+// issues tokens concurrently with other admin requests. The race detector
+// reports an unguarded read of the admin token.
+func TestIssueTokenDuringAdminReauth(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Subject-Token", "tok-123")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"token":{"expires_at":"2030-01-01T00:00:00Z"}}`)
+	}))
+	defer ts.Close()
+
+	c, _ := testClient(ts)
+	c.gc.UseTokenLock()
+	c.gc.ReauthFunc = func(context.Context) error {
+		c.gc.SetToken("tok-2")
+		return nil
+	}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = c.gc.Reauthenticate(context.Background(), "")
+			}
+		}
+	}()
+	for range 20 {
+		if err := c.IssueToken(context.Background(), keystoneplan.TokenIssue{User: "user-0001", Project: "proj-0001"}, "did1", "s3cret", "pid1"); err != nil {
+			t.Errorf("IssueToken: %v", err)
+		}
+	}
+	close(stop)
+	wg.Wait()
 }
 
 // TestDisableDomainRecordsUpdate confirms disabling a domain issues a PATCH with
