@@ -12,11 +12,9 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/config/clouds"
 )
 
-// NewNetworkClient authenticates against the cloud described in clouds.yaml and
-// returns a NetworkV2 (Neutron) service client. When cloudName is empty the
-// cloud is selected from the OS_CLOUD environment variable, following the
-// standard clouds.yaml search paths.
-func NewNetworkClient(ctx context.Context, cloudName string) (*gophercloud.ServiceClient, error) {
+// newProvider parses the clouds.yaml entry for cloudName (or $OS_CLOUD when
+// empty) and authenticates one provider client.
+func newProvider(ctx context.Context, cloudName string) (*gophercloud.ProviderClient, gophercloud.EndpointOpts, error) {
 	var parseOpts []clouds.ParseOption
 	if cloudName != "" {
 		parseOpts = append(parseOpts, clouds.WithCloudName(cloudName))
@@ -24,12 +22,25 @@ func NewNetworkClient(ctx context.Context, cloudName string) (*gophercloud.Servi
 
 	authOptions, endpointOptions, tlsConfig, err := clouds.Parse(parseOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("parsing clouds.yaml: %w", err)
+		return nil, gophercloud.EndpointOpts{}, fmt.Errorf("parsing clouds.yaml: %w", err)
 	}
 
 	provider, err := gcconfig.NewProviderClient(ctx, authOptions, gcconfig.WithTLSConfig(tlsConfig))
 	if err != nil {
-		return nil, fmt.Errorf("creating provider client: %w", err)
+		return nil, gophercloud.EndpointOpts{}, fmt.Errorf("creating provider client: %w", err)
+	}
+
+	return provider, endpointOptions, nil
+}
+
+// NewNetworkClient authenticates against the cloud described in clouds.yaml and
+// returns a NetworkV2 (Neutron) service client. When cloudName is empty the
+// cloud is selected from the OS_CLOUD environment variable, following the
+// standard clouds.yaml search paths.
+func NewNetworkClient(ctx context.Context, cloudName string) (*gophercloud.ServiceClient, error) {
+	provider, endpointOptions, err := newProvider(ctx, cloudName)
+	if err != nil {
+		return nil, err
 	}
 
 	client, err := openstack.NewNetworkV2(provider, endpointOptions)
@@ -45,19 +56,9 @@ func NewNetworkClient(ctx context.Context, cloudName string) (*gophercloud.Servi
 // the cloud is selected from the OS_CLOUD environment variable, following the
 // standard clouds.yaml search paths.
 func NewBlockStorageClient(ctx context.Context, cloudName string) (*gophercloud.ServiceClient, error) {
-	var parseOpts []clouds.ParseOption
-	if cloudName != "" {
-		parseOpts = append(parseOpts, clouds.WithCloudName(cloudName))
-	}
-
-	authOptions, endpointOptions, tlsConfig, err := clouds.Parse(parseOpts...)
+	provider, endpointOptions, err := newProvider(ctx, cloudName)
 	if err != nil {
-		return nil, fmt.Errorf("parsing clouds.yaml: %w", err)
-	}
-
-	provider, err := gcconfig.NewProviderClient(ctx, authOptions, gcconfig.WithTLSConfig(tlsConfig))
-	if err != nil {
-		return nil, fmt.Errorf("creating provider client: %w", err)
+		return nil, err
 	}
 
 	client, err := openstack.NewBlockStorageV3(provider, endpointOptions)
@@ -73,19 +74,9 @@ func NewBlockStorageClient(ctx context.Context, cloudName string) (*gophercloud.
 // cloud is selected from the OS_CLOUD environment variable, following the
 // standard clouds.yaml search paths.
 func NewIdentityClient(ctx context.Context, cloudName string) (*gophercloud.ServiceClient, error) {
-	var parseOpts []clouds.ParseOption
-	if cloudName != "" {
-		parseOpts = append(parseOpts, clouds.WithCloudName(cloudName))
-	}
-
-	authOptions, endpointOptions, tlsConfig, err := clouds.Parse(parseOpts...)
+	provider, endpointOptions, err := newProvider(ctx, cloudName)
 	if err != nil {
-		return nil, fmt.Errorf("parsing clouds.yaml: %w", err)
-	}
-
-	provider, err := gcconfig.NewProviderClient(ctx, authOptions, gcconfig.WithTLSConfig(tlsConfig))
-	if err != nil {
-		return nil, fmt.Errorf("creating provider client: %w", err)
+		return nil, err
 	}
 
 	client, err := openstack.NewIdentityV3(provider, endpointOptions)
@@ -101,19 +92,9 @@ func NewIdentityClient(ctx context.Context, cloudName string) (*gophercloud.Serv
 // is selected from the OS_CLOUD environment variable, following the standard
 // clouds.yaml search paths.
 func NewImageClient(ctx context.Context, cloudName string) (*gophercloud.ServiceClient, error) {
-	var parseOpts []clouds.ParseOption
-	if cloudName != "" {
-		parseOpts = append(parseOpts, clouds.WithCloudName(cloudName))
-	}
-
-	authOptions, endpointOptions, tlsConfig, err := clouds.Parse(parseOpts...)
+	provider, endpointOptions, err := newProvider(ctx, cloudName)
 	if err != nil {
-		return nil, fmt.Errorf("parsing clouds.yaml: %w", err)
-	}
-
-	provider, err := gcconfig.NewProviderClient(ctx, authOptions, gcconfig.WithTLSConfig(tlsConfig))
-	if err != nil {
-		return nil, fmt.Errorf("creating provider client: %w", err)
+		return nil, err
 	}
 
 	client, err := openstack.NewImageV2(provider, endpointOptions)
@@ -146,19 +127,9 @@ const novaMicroversion = "2.25"
 // the cloud is selected from the OS_CLOUD environment variable, following the
 // standard clouds.yaml search paths.
 func NewComputeStack(ctx context.Context, cloudName string) (*ComputeStack, error) {
-	var parseOpts []clouds.ParseOption
-	if cloudName != "" {
-		parseOpts = append(parseOpts, clouds.WithCloudName(cloudName))
-	}
-
-	authOptions, endpointOptions, tlsConfig, err := clouds.Parse(parseOpts...)
+	provider, endpointOptions, err := newProvider(ctx, cloudName)
 	if err != nil {
-		return nil, fmt.Errorf("parsing clouds.yaml: %w", err)
-	}
-
-	provider, err := gcconfig.NewProviderClient(ctx, authOptions, gcconfig.WithTLSConfig(tlsConfig))
-	if err != nil {
-		return nil, fmt.Errorf("creating provider client: %w", err)
+		return nil, err
 	}
 
 	compute, err := openstack.NewComputeV2(provider, endpointOptions)
