@@ -1,5 +1,14 @@
 // Package config builds authenticated OpenStack service clients from the
 // standard clouds.yaml configuration.
+//
+// When the clouds.yaml entry holds credentials rather than a pre-issued token,
+// every client re-authenticates on a 401 and repeats the request once. A
+// request with a raw body must therefore pass an io.ReadSeeker, which
+// gophercloud rewinds before the repeat; a plain io.Reader is resent drained.
+// net/http may still read the first attempt after its 401 returned, so the body
+// must also be an io.Closer whose rewind waits for the transport's Close. A
+// request whose 401 is its own outcome, such as authenticating as another user,
+// must go through a copy of the client whose ProviderClient has no ReauthFunc.
 package config
 
 import (
@@ -13,7 +22,7 @@ import (
 )
 
 // newProvider parses the clouds.yaml entry for cloudName (or $OS_CLOUD when
-// empty) and authenticates one provider client.
+// empty), enables re-authentication, and authenticates one provider client.
 func newProvider(ctx context.Context, cloudName string) (*gophercloud.ProviderClient, gophercloud.EndpointOpts, error) {
 	var parseOpts []clouds.ParseOption
 	if cloudName != "" {
@@ -24,6 +33,13 @@ func newProvider(ctx context.Context, cloudName string) (*gophercloud.ProviderCl
 	if err != nil {
 		return nil, gophercloud.EndpointOpts{}, fmt.Errorf("parsing clouds.yaml: %w", err)
 	}
+
+	// A request answered with 401 authenticates again with the clouds.yaml
+	// credentials and is repeated once, so a run may outlive its token. An entry
+	// that authenticates with a pre-issued token cannot obtain a fresh one, and
+	// gophercloud refuses re-authentication for an unscoped token outright, so
+	// such an entry keeps its single token.
+	authOptions.AllowReauth = authOptions.TokenID == ""
 
 	provider, err := gcconfig.NewProviderClient(ctx, authOptions, gcconfig.WithTLSConfig(tlsConfig))
 	if err != nil {
