@@ -229,6 +229,66 @@ func TestBuildIgnoresColdMigrate(t *testing.T) {
 	}
 }
 
+// TestDeletePortWaitsForDetach confirms the churn graph's port delete waits
+// until the server no longer has the port before it deletes it, and that a
+// failed wait returns before the delete.
+func TestDeletePortWaitsForDetach(t *testing.T) {
+	// setup creates net-0001, srv-0001 and port-0001 with their parents' ids
+	// and returns a function that deletes the port the way the engine would.
+	setup := func(t *testing.T, f *fakeNova) func() error {
+		t.Helper()
+		nodes, err := Build(churnPlan(), f, novaexec.Resolved{}, time.Minute)
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		ctx := context.Background()
+		net, err := nodeByKey(t, nodes, "net-0001").Create(ctx, nil)
+		if err != nil {
+			t.Fatalf("creating net-0001: %v", err)
+		}
+		srv, err := nodeByKey(t, nodes, "srv-0001").Create(ctx, map[string]string{"net-0001": net.ID})
+		if err != nil {
+			t.Fatalf("creating srv-0001: %v", err)
+		}
+		ids := map[string]string{"srv-0001": srv.ID, "net-0001": net.ID}
+		portNode := nodeByKey(t, nodes, "port-0001")
+		port, err := portNode.Create(ctx, ids)
+		if err != nil {
+			t.Fatalf("creating port-0001: %v", err)
+		}
+		return func() error { return portNode.Delete(ctx, ids, port) }
+	}
+	wantLog := []string{"attach", "detach", "wait-detached"}
+
+	t.Run("waits for the detach before the delete", func(t *testing.T) {
+		f := newFakeNova()
+		if err := setup(t, f)(); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		if got := logOf(f, f.attachLog, "port-0001"); !reflect.DeepEqual(got, wantLog) {
+			t.Errorf("calls = %v, want %v", got, wantLog)
+		}
+		if got := f.deletesBy[nova.KindPort]; got != 1 {
+			t.Errorf("port deletes = %d, want 1", got)
+		}
+	})
+
+	t.Run("a failed wait leaves the port undeleted", func(t *testing.T) {
+		f := newFakeNova()
+		del := setup(t, f)
+		f.failNext["WaitForPortDetached"] = []error{context.DeadlineExceeded}
+		if err := del(); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Delete with a failing wait = %v, want %v", err, context.DeadlineExceeded)
+		}
+		if got := logOf(f, f.attachLog, "port-0001"); !reflect.DeepEqual(got, wantLog) {
+			t.Errorf("calls = %v, want %v", got, wantLog)
+		}
+		if got := f.deletesBy[nova.KindPort]; got != 0 {
+			t.Errorf("port deletes = %d, want 0", got)
+		}
+	})
+}
+
 // keptServer is a plan of the one server srv-0001 with the operations of s,
 // a detachable volume vol-0001 and a detachable port port-0001.
 func keptServer(s novaplan.Server) *novaplan.Plan {
