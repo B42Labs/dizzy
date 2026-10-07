@@ -33,6 +33,14 @@ overrides the scenario's `chaos:` block:
 $ dizzy neutron chaos --scenario scenarios/neutron/medium.yaml --duration 2h
 ```
 
+A run may outlive the cloud's token lifetime (Keystone's `[token] expiration`,
+one hour by default). When a request answers 401, the client authenticates
+again with the `clouds.yaml` credentials and repeats the request once, so the
+duration does not depend on the token lifetime. A `clouds.yaml` entry that
+authenticates with a pre-issued `token` cannot do this and fails once that token
+expires. If Keystone itself rejects the new authentication, the operation fails
+with `Unable to re-authenticate:` and is counted under error kind `other`.
+
 ## Run until stopped
 
 To keep a lab under load until you stop it, pass `--duration 0`:
