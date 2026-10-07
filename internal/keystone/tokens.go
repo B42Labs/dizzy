@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
 
 	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
@@ -20,15 +21,18 @@ import (
 // The latency is recorded twice: once as the token/create operation sample and
 // once as a time-to-ready sample (kind=token), the natural fit for the
 // synchronous-create service's otherwise-unused readiness instrument. The
-// underlying tokens.Create omits the X-Auth-Token header and mutates no client
-// state, so issuing as the created user through the admin's identity client is
-// side-effect-free.
+// request carries the admin token, which Keystone ignores for a token create,
+// and goes through a copy of the admin's identity client that never
+// re-authenticates (noReauth). It mutates no client state, so issuing as the
+// created user through the admin's identity client is side-effect-free, and a
+// 401 is the created user's own failure rather than a retry after the admin
+// re-authenticated.
 func (c *Client) IssueToken(ctx context.Context, t keystoneplan.TokenIssue, userDomainID, password, projectID string) error {
 	name := resourceName(c.runID, t.User)
 	var d time.Duration
 	err := c.timed(ctx, string(KindToken), "create", func(ctx context.Context) error {
 		start := time.Now()
-		_, issueErr := tokens.Create(ctx, c.gc, &tokens.AuthOptions{
+		_, issueErr := tokens.Create(ctx, noReauth(c.gc), &tokens.AuthOptions{
 			Username:    name,
 			DomainID:    userDomainID,
 			Password:    password,
@@ -46,4 +50,17 @@ func (c *Client) IssueToken(ctx context.Context, t keystoneplan.TokenIssue, user
 		return fmt.Errorf("issuing token for user %q on project %s: %w", t.User, projectID, err)
 	}
 	return nil
+}
+
+// noReauth returns a copy of gc whose provider client never re-authenticates,
+// so a 401 on a request sent through it is the request's own failure. The copy
+// carries the admin's HTTP client, user agent and token. The token is read under
+// the admin's token lock, since another worker's 401 may re-authenticate the
+// shared admin client concurrently.
+func noReauth(gc *gophercloud.ServiceClient) *gophercloud.ServiceClient {
+	pc := &gophercloud.ProviderClient{HTTPClient: gc.HTTPClient, UserAgent: gc.UserAgent}
+	pc.CopyTokenFrom(gc.ProviderClient)
+	sc := *gc
+	sc.ProviderClient = pc
+	return &sc
 }
