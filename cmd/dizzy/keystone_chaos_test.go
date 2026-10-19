@@ -146,9 +146,9 @@ func TestFinishKeystoneChurnTearsDownOnInterrupt(t *testing.T) {
 			var out bytes.Buffer
 			cmd.SetOut(&out)
 
-			err := finishKeystoneChurn(ctx, cmd, c, "run1234", "run-run1234.json", created, tc.interrupted, false, time.Second)
+			err := finishKeystoneTeardown(ctx, "churn", cmd, c, "run1234", "run-run1234.json", created, tc.interrupted, false, time.Second)
 			if err != nil {
-				t.Fatalf("finishKeystoneChurn: %v", err)
+				t.Fatalf("finishKeystoneTeardown: %v", err)
 			}
 			if c.sawCancelled {
 				t.Error("teardown ran with a cancelled context; it must run on context.WithoutCancel")
@@ -190,9 +190,9 @@ func TestFinishKeystoneChurnNoCleanupSkipsTeardown(t *testing.T) {
 			var out bytes.Buffer
 			cmd.SetOut(&out)
 
-			err := finishKeystoneChurn(context.Background(), cmd, c, "run1234", "run-run1234.json", nil, tc.interrupted, true, time.Second)
+			err := finishKeystoneTeardown(context.Background(), "churn", cmd, c, "run1234", "run-run1234.json", nil, tc.interrupted, true, time.Second)
 			if err != nil {
-				t.Fatalf("finishKeystoneChurn: %v", err)
+				t.Fatalf("finishKeystoneTeardown: %v", err)
 			}
 			if c.calls != 0 {
 				t.Errorf("cleaner was called %d times; --no-cleanup must leave everything in place", c.calls)

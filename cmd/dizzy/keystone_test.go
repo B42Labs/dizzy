@@ -130,7 +130,7 @@ func TestKeystoneSubcommandsRegistered(t *testing.T) {
 	if ks == nil {
 		t.Fatal("keystone command not registered on root")
 	}
-	for _, name := range []string{"generate", "apply", "status", "report", "cleanup"} {
+	for _, name := range []string{"generate", "apply", "pressure", "status", "report", "cleanup"} {
 		t.Run(name, func(t *testing.T) {
 			if findSubcommand(ks, name) == nil {
 				t.Errorf("keystone subcommand %q not registered", name)
