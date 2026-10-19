@@ -159,7 +159,7 @@ func newKeystoneChaosCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("writing output: %w", err)
 			}
 
-			return finishKeystoneChurn(ctx, cmd, client, runID, recordPath, rec.Created, interrupted, noCleanup, opts.timeout)
+			return finishKeystoneTeardown(ctx, "churn", cmd, client, runID, recordPath, rec.Created, interrupted, noCleanup, opts.timeout)
 		},
 	}
 
@@ -258,18 +258,22 @@ func mergeKeystoneChaosConfig(cmd *cobra.Command, opts *globalOptions, s keyston
 	return cfg
 }
 
-// finishKeystoneChurn applies the teardown policy. Unless --no-cleanup is set,
-// the run — whether it completed or was interrupted — tears the identity
-// resources down by name prefix (each op bounded by opTimeout) and runs a leak
-// check; teardown and the leak check run on a context.WithoutCancel of ctx so a
-// first-signal interrupt does not kill the teardown it triggered. With
-// --no-cleanup the resources are left in place and the cleanup hint is printed.
-func finishKeystoneChurn(ctx context.Context, cmd *cobra.Command, c keystoneexec.Cleaner, runID, recordPath string, created []resource.Resource, interrupted, noCleanup bool, opTimeout time.Duration) error {
+// finishKeystoneTeardown applies the teardown policy of a keystone run that
+// keeps its resources until it ends, the churn of keystone chaos and the load
+// of keystone pressure. mode names the run in the two --no-cleanup messages
+// ("churn" or "pressure"), so the two verbs share one teardown. Unless
+// --no-cleanup is set, the run — whether it completed or was interrupted —
+// tears the identity resources down by name prefix (each op bounded by
+// opTimeout) and runs a leak check; teardown and the leak check run on a
+// context.WithoutCancel of ctx so a first-signal interrupt does not kill the
+// teardown it triggered. With --no-cleanup the resources are left in place and
+// the cleanup hint is printed.
+func finishKeystoneTeardown(ctx context.Context, mode string, cmd *cobra.Command, c keystoneexec.Cleaner, runID, recordPath string, created []resource.Resource, interrupted, noCleanup bool, opTimeout time.Duration) error {
 	out := cmd.OutOrStdout()
 	if noCleanup {
-		reason := "churn complete"
+		reason := mode + " complete"
 		if interrupted {
-			reason = "churn interrupted"
+			reason = mode + " interrupted"
 		}
 		hint := "--run-id " + runID
 		if recordPath != "" {
