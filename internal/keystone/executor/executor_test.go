@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -463,5 +465,126 @@ func TestApplyConcurrencyBound(t *testing.T) {
 	}
 	if f.maxInFlight != concurrency {
 		t.Errorf("max in-flight %d did not reach concurrency %d", f.maxInFlight, concurrency)
+	}
+}
+
+// countKinds tallies resources by kind.
+func countKinds(rs []resource.Resource) map[resource.Kind]int {
+	n := make(map[resource.Kind]int)
+	for _, r := range rs {
+		n[r.Kind]++
+	}
+	return n
+}
+
+// TestProvisionReturnsIDsAndPasswords confirms Provision runs the first three
+// stages and no token issue: IDs holds one cloud id per project and user (the
+// ids the fake returned), Passwords one entry per user (the password the user
+// was created with), Bindings the roots, and Created exactly what Apply records
+// for the same plan. A single worker makes the fake's ids deterministic so two
+// fresh fakes hand out the same ones.
+func TestProvisionReturnsIDsAndPasswords(t *testing.T) {
+	p := fullPlan()
+	f := newFake()
+	prov, err := Provision(context.Background(), f, p, keystone.TierAdmin, adminRes(), 1, time.Minute)
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+
+	if len(prov.IDs) != len(p.Projects)+len(p.Users) {
+		t.Errorf("IDs has %d entries, want %d (one per project and user): %v", len(prov.IDs), len(p.Projects)+len(p.Users), prov.IDs)
+	}
+	for _, r := range prov.Created {
+		if r.Kind != keystone.KindProject && r.Kind != keystone.KindUser {
+			continue
+		}
+		if r.ID == "" || prov.IDs[r.Logical] != r.ID {
+			t.Errorf("IDs[%q] = %q, want the fake's id %q", r.Logical, prov.IDs[r.Logical], r.ID)
+		}
+	}
+
+	if len(prov.Passwords) != len(p.Users) {
+		t.Errorf("Passwords has %d entries, want %d (one per user)", len(prov.Passwords), len(p.Users))
+	}
+	for _, u := range p.Users {
+		if pw := prov.Passwords[u.Name]; pw == "" || pw != f.userPassword[u.Name] {
+			t.Errorf("Passwords[%q] = %q, want the create-time password %q", u.Name, pw, f.userPassword[u.Name])
+		}
+	}
+
+	if prov.Bindings.Domains["dom-0001"] == "" || len(prov.Bindings.Roles) != len(p.Roles) {
+		t.Errorf("Bindings = %+v, want the created domain and both roles", prov.Bindings)
+	}
+
+	for _, op := range f.opOrder {
+		if op == "token" {
+			t.Errorf("Provision issued a token; tokens belong to the caller (ops %v)", f.opOrder)
+		}
+	}
+
+	applied, err := Apply(context.Background(), newFake(), p, keystone.TierAdmin, adminRes(), 1, time.Minute)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if !slices.Equal(prov.Created, applied.Created) {
+		t.Errorf("Provision created %v, want what Apply records %v", prov.Created, applied.Created)
+	}
+}
+
+// TestProvisionPartialOnForbidden confirms a 403 on a stage-3 grant stops
+// Provision with an error matching keystone.ErrForbidden and a non-nil result
+// holding the roots, projects and users created so far, their ids and the
+// users' passwords, so the caller can record and tear them down. A single
+// worker grants user-0001's assignment before the denied one.
+func TestProvisionPartialOnForbidden(t *testing.T) {
+	p := fullPlan()
+	f := newFake()
+	f.forbid["assign:user-0002"] = true
+
+	prov, err := Provision(context.Background(), f, p, keystone.TierAdmin, adminRes(), 1, time.Minute)
+	if !errors.Is(err, keystone.ErrForbidden) {
+		t.Fatalf("Provision error = %v, want one matching keystone.ErrForbidden", err)
+	}
+	if prov == nil {
+		t.Fatal("Provision returned a nil result with its error")
+	}
+
+	got := countKinds(prov.Created)
+	want := map[resource.Kind]int{
+		keystone.KindDomain:     1,
+		keystone.KindRole:       2,
+		keystone.KindProject:    2,
+		keystone.KindUser:       2,
+		keystone.KindAssignment: 1,
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("created kinds = %v, want %v", got, want)
+	}
+	if len(prov.IDs) != len(p.Projects)+len(p.Users) {
+		t.Errorf("IDs has %d entries, want %d", len(prov.IDs), len(p.Projects)+len(p.Users))
+	}
+	if len(prov.Passwords) != len(p.Users) {
+		t.Errorf("Passwords has %d entries, want %d", len(prov.Passwords), len(p.Users))
+	}
+	if n := f.attempts["assign:user-0002"]; n != 1 {
+		t.Errorf("forbidden grant attempted %d times, want 1 (no retry)", n)
+	}
+}
+
+// TestProvisionRootFailureReturnsResult confirms a failure in the first stage
+// still returns a non-nil, empty result whose maps are safe to read.
+func TestProvisionRootFailureReturnsResult(t *testing.T) {
+	f := newFake()
+	f.forbid["dom-0001"] = true
+
+	prov, err := Provision(context.Background(), f, fullPlan(), keystone.TierAdmin, adminRes(), 4, time.Minute)
+	if !errors.Is(err, keystone.ErrForbidden) {
+		t.Fatalf("Provision error = %v, want one matching keystone.ErrForbidden", err)
+	}
+	if prov == nil {
+		t.Fatal("Provision returned a nil result with its error")
+	}
+	if len(prov.Created) != 0 || len(prov.IDs) != 0 || prov.IDs == nil || prov.Passwords == nil {
+		t.Errorf("result = %+v, want nothing created and non-nil empty maps", prov)
 	}
 }
