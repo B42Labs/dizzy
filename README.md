@@ -21,6 +21,10 @@ deterministically into a plan; applying that plan produces a run record you can
 re-query, report on, and tear down by tag. `dizzy mix` offers `generate`,
 `chaos`, `status`, `report` and `cleanup`.
 
+`dizzy keystone` additionally offers `pressure`, a closed-loop load on
+Keystone's token validation, revocation and role-listing path for a lab cloud;
+see [Pressure mode](docs/explanation/pressure-mode.md).
+
 It is **not** a correctness suite like Tempest. It measures latency, error
 rates, and state convergence under load. The two are complementary. It creates
 no load balancers (no Octavia).
@@ -103,6 +107,7 @@ matches what you are doing right now.
 - [Scenario, plan, and run](docs/explanation/scenario-plan-run.md)
 - [Determinism and reproducibility](docs/explanation/determinism.md)
 - [The churn engine](docs/explanation/churn-engine.md)
+- [Pressure mode](docs/explanation/pressure-mode.md)
 - [Resource identity and cleanup](docs/explanation/resource-identity.md)
 - [Combined runs](docs/explanation/combined-runs.md)
 - [Keystone's privilege model](docs/explanation/privilege-model.md)

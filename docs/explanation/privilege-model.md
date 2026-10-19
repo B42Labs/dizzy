@@ -8,11 +8,27 @@ operation: creating a domain is admin-only, creating a user is not. A tool that
 just started calling APIs would discover this as a wall of 403s halfway through a
 run, having already created half a topology.
 
-So `keystone apply`, `chaos`, and `monitor` each run a **read-only privilege
-pre-check** before the first write, classify the caller, and fail fast if the
-credentials cannot do what the plan needs. Structurally this occupies the slot
-that the quota pre-check occupies for Neutron and Cinder — and it *replaces* it,
-because Keystone has no default per-resource quotas to check.
+So `keystone apply`, `chaos`, `monitor`, and `pressure` each run a **read-only
+privilege pre-check** before the first write, classify the caller, and fail fast
+if the credentials cannot do what the plan needs. Structurally this occupies the
+slot that the quota pre-check occupies for Neutron and Cinder — and it
+*replaces* it, because Keystone has no default per-resource quotas to check.
+
+`pressure` accepts the admin tier only. Validating and revoking other users'
+tokens and listing their role assignments are admin operations in Keystone's
+default policy, and a tier that cannot run three of its five operations would
+measure something else. It classifies the caller only with `--privilege auto`;
+`--privilege admin` asserts the tier without the classification call. A
+caller classified as a domain manager fails before any write, and
+`--privilege domain-manager` fails before any API call:
+
+```console
+$ dizzy keystone pressure --scenario scenarios/keystone/small.yaml --privilege domain-manager
+error: keystone pressure needs the admin tier: validating and revoking other users' tokens and listing their role assignments are admin operations; the caller resolved to tier "domain-manager"
+```
+
+`--domain` and `--roles` have no effect on `pressure`; a non-default value of
+either logs a warning.
 
 ## Two tiers
 

@@ -17,6 +17,9 @@ same verbs.
 `neutron` additionally has `list-networks` (an auth smoke test) and `verify` (a
 stub that returns "not implemented yet").
 
+`keystone` additionally has `pressure`, a closed-loop load on Keystone's token
+validation, revocation and role listings; see [`pressure`](#pressure).
+
 A sixth namespace, `mix`, runs several workload personas side by side in one
 churn run. It has its own subset of the verbs; see
 [The `mix` namespace](#the-mix-namespace).
@@ -41,13 +44,14 @@ switch it on, so a globally exported `OTEL_EXPORTER_OTLP_ENDPOINT` does not
 change the behavior of a command run without `--otel`. See
 [Metrics](metrics.md).
 
-Progress output from `apply`, `chaos`, and `cleanup` goes to stderr at `info`
-level, so `--log-level warn` silences it while keeping warnings and errors. The
-metrics summary and the run-record path always go to stdout.
+Progress output from `apply`, `chaos`, `pressure`, and `cleanup` goes to stderr
+at `info` level, so `--log-level warn` silences it while keeping warnings and
+errors. The metrics summary and the run-record path always go to stdout.
 
 ## Scenario flags
 
-Accepted by `generate`, `apply`, `chaos`, and `monitor` in every namespace.
+Accepted by `generate`, `apply`, `chaos`, and `monitor` in every namespace, and
+by `keystone pressure`.
 
 | Flag | Description |
 |---|---|
@@ -191,6 +195,191 @@ way carries `"incomplete": true` and its `finishedAt` is the checkpoint time;
 the final record omits the key. A checkpoint that cannot be written logs a
 warning and the run goes on.
 
+## `pressure`
+
+`keystone` only. Runs a closed-loop load against Keystone's token validation,
+revocation and role-listing path: a fixed number of workers each send one
+request after another, with no pause in between, for the whole duration. The
+churn of `chaos` never reaches this path, because its only token operation is
+a password login. See [Pressure mode](../explanation/pressure-mode.md).
+
+> **Run `pressure` on a lab, never on a shared cloud.** Every `revoke` is a
+> real revocation event, and on Keystone 2026.2 each one flushes the token
+> validation cache for every user of that Keystone, not only for the run's own
+> users. The verb belongs on a lab or on the
+> [`devstack-c5c3`](../how-to/run-against-devstack-c5c3.md) stack.
+
+A `pressure:` block in the scenario YAML sets the duration, the bucket width,
+the workers, the token pool, the churn users and the mix; the flags override
+it. Every built-in Keystone profile ships such a block, so `pressure` runs them
+with no extra flags. See
+[The `pressure:` block](scenario-schema.md#the-pressure-block).
+
+| Flag | Default | Description |
+|---|---|---|
+| `--scenario <path>` | — | Path to the Keystone scenario YAML file (**required**) |
+| `--set <key>=<value>` | — | Override one scenario value; repeatable. Takes the Keystone scenario's keys; the `pressure:` block has none |
+| `--duration <duration>` | — | Total wall-clock runtime of the workers (required, via flag or the `pressure:` block). `0` runs until SIGINT or SIGTERM; only the flag selects this, since `duration: 0` in the block means unset |
+| `--bucket-width <duration>` | `1h` | Width of one time bucket in the series of a run with `--duration 0`, at least `1m`. A bounded run keeps ten equal buckets of a tenth of its duration, but a value under `1m` still fails, e.g. `pressure bucket-width must be at least 1m0s, got 30s` |
+| `--workers <n>` | `16` | Closed-loop workers, 1 to 1024. `0` takes the block's value or the default |
+| `--tokens <n>` | `100` | Size of the token pool. `0` takes the block's value or the default |
+| `--churn-users <n>` | `1` | Users reserved for `grant_churn`, taken from the end of the plan; they never enter the token pool. Reserved only when `grant_churn` has a positive weight; `0` reserves none and then needs a `grant_churn` weight of `0`. A negative value fails with `--churn-users must not be negative, got -1` |
+| `--mix <operation>=<weight>` | see below | Weight of one operation; repeatable |
+| `--no-cleanup` | off | Leave resources in place at the end of the run, on interrupt *and* after a failed setup |
+| `--privilege auto\|admin\|domain-manager` | `auto` | Privilege tier. `auto` classifies the caller's token, `admin` asserts the admin tier without classifying it, and `domain-manager` fails before any API call. Only the admin tier runs |
+| `--domain <name>` | the token's domain | Without effect, since only the admin tier runs. Setting it logs `--domain and --roles are ignored: keystone pressure runs in the admin tier only` |
+| `--roles <csv>` | `member,reader` | Without effect, since only the admin tier runs. A value other than the default logs the same warning as `--domain` |
+
+A worker draws each operation with probability its weight divided by the sum
+of the weights, so a weight of `0` switches an operation off. Each `--mix`
+sets one weight and leaves the others at the block's value or the default;
+when two `--mix` values name the same operation, the later one wins.
+
+| Operation | Default weight | What one draw sends |
+|---|---|---|
+| `validate` | `60` | `GET /v3/auth/tokens` with the admin token as `X-Auth-Token` and a pool token as `X-Subject-Token`, the request keystonemiddleware makes on a cache miss |
+| `effective` | `5` | For the user of a pool token: `GET /v3/role_assignments?user.id=<id>&effective=true`, then `GET /v3/users/<id>/projects`, then `GET /v3/auth/projects` sent with the pool token. The first error ends the draw |
+| `revoke` | `2` | Takes a token out of the pool and sends `DELETE /v3/auth/tokens` with it as `X-Subject-Token`, then a password login (`POST /v3/auth/tokens`) for the same user and project, whose token goes back into the pool. The login runs even when the revocation failed. The draw succeeds only when both calls do |
+| `grant_churn` | `2` | Unassigns one of the churn users' role assignments (`DELETE /v3/projects/<project>/users/<user>/roles/<role>`, or `/v3/domains/<domain>/...` for a domain-scoped one) and assigns it again with a `PUT` to the same path, so Keystone's assignment caches keep being invalidated. The `PUT` runs even when the `DELETE` failed, and the draw fails with the first error. One worker at a time churns a given assignment |
+| `issue` | `1` | A password login (`POST /v3/auth/tokens`) for the user and project of a pool token, whose new token replaces it. The old token is not revoked, so the draw measures the login alone. When the login fails, the old token goes back into the pool |
+| `probe` | `0` | Parsed; this build rejects a positive weight |
+| `bad_token` | `0` | Parsed; this build rejects a positive weight |
+
+Every draw is one sample under its operation's name, whatever calls it made:
+a `revoke` sample covers the revocation and the reissue together. No operation
+retries, so a failed call is a failed sample. When the reissue of a `revoke`
+fails, the pool shrinks by one and the run logs the warning
+`token pool shrank; a reissue failed`; a draw that finds the pool empty fails
+as `pool-empty`. The error breakdown labels a failure
+`canceled`, `timeout`, `forbidden`, `not-found`, `transient` (a 500, 502, 503,
+504 or 429), `other` (any other failure, a 400 or a 501 among them) or
+`pool-empty`.
+
+The command rejects what this build does not run before it makes any API call:
+
+```console
+$ dizzy keystone pressure --scenario scenarios/keystone/small.yaml --mix probe=1
+error: pressure mix weight "probe" is not supported by this build; supported operations: validate, effective, revoke, grant_churn, issue
+```
+
+`bad_token` fails the same way, a block with a positive `propagation.every`
+fails with `pressure.propagation is not supported by this build`, and a mix
+whose weights are all `0` fails with
+`pressure mix: every weight is 0; at least one operation needs a positive weight`.
+A `--mix` value that is not `<operation>=<weight>`, names an unknown operation
+or carries a weight that is not a non-negative integer fails with an error
+that starts with `--mix:`, e.g. `--mix: unknown operation "nope"`. Without a
+duration from the flag or the block, the command fails with
+`pressure duration must be set and positive, got 0s`.
+
+A run goes through these steps:
+
+1. **Privilege pre-check.** With `--privilege auto`, the read-only pre-check
+   of `apply` classifies the caller's token; `--privilege admin` asserts the
+   admin tier and skips the classification. Only the admin tier runs:
+   validating and revoking other users' tokens and listing their role
+   assignments are admin operations in Keystone's default policy. A detected
+   domain-manager tier fails before any write, and `--privilege domain-manager`
+   fails before any API call:
+
+   ```console
+   $ dizzy keystone pressure --scenario scenarios/keystone/small.yaml --privilege domain-manager
+   error: keystone pressure needs the admin tier: validating and revoking other users' tokens and listing their role assignments are admin operations; the caller resolved to tier "domain-manager"
+   ```
+
+2. **Provisioning.** Creates the plan's domains, roles, projects, users and
+   role assignments exactly as `apply` does, without `apply`'s token stage.
+3. **Priming the token pool.** Issues `--tokens` project-scoped tokens, round
+   robin over the distinct `(user, project)` pairs of the plan's
+   project-scoped role assignments in plan order, leaving out the churn users.
+   Each issue is a password login, which Keystone spends about 175 ms on in
+   bcrypt, with at most `--concurrency` issues in flight: 1000 tokens at the
+   default `--concurrency 8` take about 22 s before the first worker starts.
+   The first failed issue stops the priming, e.g.
+   `priming token pool (3 of 7 issued): …`.
+4. **The workers** run for the duration, or with `--duration 0` until SIGINT
+   or SIGTERM. A draw in flight when the run ends finishes or times out on
+   its own, and the run waits for it.
+5. **Results.** Prints the metrics summary and the `Pressure` table to stdout,
+   writes `run-<id>.json` with a `pressure` object and prints
+   `run record written to run-<id>.json`. See
+   [What `report` renders](metrics.md#what-report-renders).
+6. **Teardown and leak check**, as for `chaos`: prints
+   `deleted <n> resource(s) for run <id>`, then
+   `leak check: no run-named resources remain` or
+   `leak check: <n> run-named resource(s) still present after teardown`.
+
+**The token pool.** A draw that needs a token picks one from the pool at
+random. The pool lives in process memory only: no token and no password
+reaches the run record, the logs or a checkpoint, so a killed run cannot
+resume its pool. A refresher re-issues every pool token that comes within a
+margin of its expiry, the smaller of 5 minutes and a quarter of the token
+lifetime, so a run longer than the lifetime keeps a valid pool. The lifetime
+is that of the first pool token. The refresher looks every half margin, with
+at most `--concurrency` issues in flight, and swaps a new token in only after
+its issue succeeded; a failed issue keeps the old token until the next look.
+When the first pool token reports no usable expiry, the refresher does not
+start and the run logs a warning. The issues of the priming and of the
+refresher count as `token` calls in the metrics summary and are no pressure
+operation.
+
+After provisioning and before the priming, the command checks the plan
+against the options, and each failure goes through the setup-failure path
+below:
+
+- `pressure needs at least one project-scoped assignment outside the churn users to issue pool tokens from; the plan has none`
+- `pressure.churn_users (<n>) must leave at least one user outside the churn set; the plan has <m> users`,
+  while `grant_churn` has a positive weight
+- `pressure grant_churn needs the churn users to hold at least one assignment; the last <n> user(s) of the plan hold none`,
+  while `grant_churn` has a positive weight, so a run with `--churn-users 0`
+  needs a `grant_churn` weight of `0`
+
+**Global flags.** `--concurrency` bounds the provisioning, the priming of the
+pool and the refresher, not the workers; `--workers` sets their number.
+`--timeout` bounds each draw of a worker, all of its calls together, each
+issue of the priming and the refresher, and each provisioning and teardown
+call. `--seed` overrides the scenario seed, which also seeds the workers'
+generators. `--otel` exports the client's calls, among them `token`/`validate`
+and `token`/`revoke`; see [Metrics](metrics.md).
+
+**End of the run.** By default the run tears its resources down at the end or
+when interrupted, then runs the leak check, as `chaos` does. With
+`--duration 0` the signal is the normal end of the run. `--no-cleanup` leaves
+the resources in place and prints the hint to reclaim them, with
+`pressure interrupted; …` after an interrupt of a bounded run:
+
+```text
+pressure complete; resources left in place — reclaim with: keystone cleanup --run run-1a2b3c4d.json
+```
+
+When the run record could not be written, the hint names `--run-id <id>`
+instead of `--run`.
+
+A failure before the workers start, while provisioning, checking the plan
+against the options or priming the pool, first writes a record with `error`
+set and the resources created so far and prints its path. It then tears
+those resources down and prints `deleted <n> resource(s) for run <id>`, with
+no leak check, or with `--no-cleanup` prints
+`pressure setup failed; resources left in place — reclaim with: keystone cleanup --run run-<id>.json`.
+The command exits non-zero with an error that names the step and the run id:
+
+| Step | Error |
+|---|---|
+| Provisioning | `provisioning plan (run <id>): …` |
+| Checking the plan against the options | `building pressure set (run <id>): …` |
+| Priming | `starting pressure run (run <id>): priming token pool (<n> of <m> issued): …` |
+
+A teardown that fails partway appends
+`; teardown incomplete after deleting <n> resource(s): …` and the
+`keystone cleanup` hint to the error.
+
+While the workers run, the command rewrites `run-<id>.json` once a minute,
+starting one minute after the workers start, marked `"incomplete": true`, as
+`chaos` does. It writes no checkpoint during provisioning or priming, and
+none once the workers stop, a signal included; the final record follows once
+the draws in flight have returned. A checkpoint that cannot be written logs a
+warning and the run goes on.
+
 ## `monitor`
 
 Repeats the single-shot pipeline — pre-flight sweep → `apply` → `cleanup` —
@@ -261,15 +450,19 @@ builder backs all six namespaces, so `dizzy cinder report` and
 - **csv** — one row per resource kind plus an overall row.
 - **html** — a self-contained, offline report with inline SVG charts for
   latency, throughput, and error rates; for a churn run, also the per-bucket
-  degradation over time.
+  degradation over time; for a `keystone pressure` run, a `Pressure` section
+  with a throughput and a latency chart over time per operation.
 
-A record a churn run wrote while it was still running (`"incomplete": true`)
-renders in every format and is marked as follows:
+A record a churn or pressure run wrote while it was still running
+(`"incomplete": true`) renders in every format and is marked as follows:
 
 - **table** — a first line `Run incomplete: checkpoint written at <time>`, with
   the checkpoint time in RFC 3339 UTC, then a blank line and the usual output.
-- **json** — `"incomplete": true` next to `metrics` and `chaos`. A record without
-  a `chaos` object stays the bare metrics object.
+- **json** — `"incomplete": true` next to `metrics` and `chaos` for a
+  single-service churn run, next to `metrics` and `pressure` for a pressure
+  run, and next to `metrics` and `personas` (with `services` and `lanes` when
+  present) for a `mix chaos` run. An `apply` or `monitor` record stays the
+  bare metrics object; neither command writes a checkpoint.
 - **csv** — unchanged; the format has no place for a marker.
 - **html** — a yellow `Run incomplete` banner with the checkpoint time instead of
   `Run completed`. A record that carries an error still shows `Run failed`.

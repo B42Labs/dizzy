@@ -15,6 +15,7 @@ resources:  { … }    # fixed counts
 distribution: { … }  # ranges and ratios drawn per resource
 topology:   { … }    # neutron only
 chaos:      { … }    # optional; consumed only by the `chaos` command
+pressure:   { … }    # keystone only; optional; consumed only by `keystone pressure`
 ```
 
 A `{ min: <int>, max: <int> }` **range** is drawn once per resource, inclusive at
@@ -175,6 +176,11 @@ distribution:
   assignments_per_user:           { min: 1, max: 3 }
   domain_scoped_assignment_ratio: 0.1
   users_issuing_tokens_ratio:     0.5
+
+pressure:          # read only by `keystone pressure`; see "The pressure: block"
+  duration: 5m
+  workers:  8
+  tokens:   20
 ```
 
 | Key | Type | Meaning |
@@ -192,23 +198,30 @@ distribution:
 `resources.projects`: each turn of the deal cycles to the next domain and assigns
 a batch drawn from the range.
 
+The optional `pressure:` block configures `keystone pressure` and takes no part
+in the plan; see [The `pressure:` block](#the-pressure-block).
+`users_issuing_tokens_ratio` has no effect on a pressure run, which skips the
+plan's token issues and fills its token pool from the project-scoped role
+assignments instead.
+
 **Passwords are never in the plan or the run record.** Each user's password is
-derived deterministically from `(seed, logical name)` at apply time and held only
-in memory for the token-issue step, so runs stay reproducible without persisting
-a credential.
+a random value generated when the run creates the users and held only in
+memory, for the token-issue step and, in `keystone pressure`, for the token
+pool, so the plan stays reproducible without persisting a credential.
 
 ### Profiles
 
 Expanded counts at each profile's shipped seed:
 
-| Profile | Domains | Roles | Projects | Users | Assignments | Token issues | Chaos duration |
-|---|---|---|---|---|---|---|---|
-| `small` | 1 | 2 | 5 | 10 | 21 | 3 | 5m |
-| `medium` | 2 | 3 | 20 | 50 | 90 | 25 | 30m |
-| `large` | 3 | 4 | 50 | 150 | 296 | 78 | 1h |
+| Profile | Domains | Roles | Projects | Users | Assignments | Token issues | Chaos duration | Pressure |
+|---|---|---|---|---|---|---|---|---|
+| `small` | 1 | 2 | 5 | 10 | 21 | 3 | 5m | 5m, 8 workers, 20 tokens |
+| `medium` | 2 | 3 | 20 | 50 | 90 | 25 | 30m | 30m, 32 workers, 200 tokens |
+| `large` | 3 | 4 | 50 | 150 | 296 | 78 | 1h | 1h, 128 workers, 1000 tokens |
 
 `small` keeps a single domain so it stays runnable in domain-manager mode.
 `medium` and `large` declare more than one domain and are therefore admin-only.
+`keystone pressure` runs every profile, `small` included, in admin mode only.
 See [Keystone's privilege model](../explanation/privilege-model.md).
 
 ## Nova
@@ -627,3 +640,67 @@ them with no flags at all. A mix scenario's block holds only `duration`,
 are set per persona. A background lane of a mix run reads its own scenario's
 block instead; see [Lanes](#lanes). See [The churn engine](../explanation/churn-engine.md) for
 what `churn_ratio` and `target_fill` actually control.
+
+## The `pressure:` block
+
+Keystone only, optional, and read only by `keystone pressure`. Every other
+`keystone` command and the `keystone` lane of a mix run parse and validate it
+but use none of its values, and it takes no part in the plan. It sets the
+closed-loop load the workers put on the scenario's identity resources. The
+`keystone pressure` flags override its values; an omitted key falls back to
+the command's default.
+
+```yaml
+pressure:            # duration, workers and tokens of scenarios/keystone/small.yaml
+  duration: 5m       # runtime of the workers; the only hard stop besides Ctrl-C
+  workers: 8         # closed-loop workers
+  tokens: 20         # token pool, issued before the first worker starts
+  churn_users: 1     # users reserved for grant_churn, from the end of the plan
+  mix:               # an omitted key keeps its default; 0 switches it off
+    validate:    60
+    effective:    5
+    revoke:       2
+    grant_churn:  2
+    issue:        1
+    probe:        0  # parsed; a positive weight is rejected by this build
+    bad_token:    0  # parsed; a positive weight is rejected by this build
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `duration` | duration | Total wall-clock runtime of the workers. `0` or omitted means unset; only `--duration 0` selects a run without an end |
+| `workers` | int | Closed-loop workers; the merged value must lie between 1 and 1024. `0` or omitted falls back to `16` |
+| `tokens` | int | Size of the token pool. `0` or omitted falls back to `100` |
+| `churn_users` | int | Users reserved for `grant_churn`, taken from the end of the plan; they never enter the token pool. Reserved only when `grant_churn` has a positive weight. Omitted falls back to `1`; `0` reserves none and then needs a `grant_churn` weight of `0` |
+| `mix.validate` | int | Weight of `validate`. Omitted falls back to `60` |
+| `mix.effective` | int | Weight of `effective`. Omitted falls back to `5` |
+| `mix.revoke` | int | Weight of `revoke`. Omitted falls back to `2` |
+| `mix.grant_churn` | int | Weight of `grant_churn`. Omitted falls back to `2` |
+| `mix.issue` | int | Weight of `issue`. Omitted falls back to `1` |
+| `mix.probe` | int | Parsed and rejected when positive, until later work delivers the operation. Omitted falls back to `0` |
+| `mix.bad_token` | int | Parsed and rejected when positive, until later work delivers the operation. Omitted falls back to `0` |
+| `propagation.every` | duration | Parsed and rejected when positive, until later work delivers the propagation probe. It is the one key without a flag |
+| `bucket_width` | duration | Width of one time bucket of a run with `--duration 0`, at least `1m`. `0` or omitted falls back to `1h`. A bounded run keeps ten equal buckets of a tenth of its duration, but a value under `1m` still fails |
+
+A worker draws an operation with probability its weight divided by the sum of
+the weights. A mix whose merged weights are all `0` fails with
+`pressure mix: every weight is 0; at least one operation needs a positive weight`.
+A positive `probe` or `bad_token` weight fails before any API call with
+`pressure mix weight "probe" is not supported by this build; supported operations: validate, effective, revoke, grant_churn, issue`,
+naming the weight, and a positive `propagation.every` with
+`pressure.propagation is not supported by this build`. The same block with
+`probe: 0`, `bad_token: 0` and no `propagation` runs.
+
+A negative value fails validation with a message that names its key, e.g.
+`pressure.workers must not be negative, got -1`,
+`pressure.mix.revoke must not be negative, got -1` or
+`pressure.propagation.every must not be negative, got -1s`. An unknown key
+in the block fails parsing, as everywhere in a scenario.
+
+All three Keystone profiles carry a `pressure:` block with `duration`,
+`workers` and `tokens` (see [Keystone](#keystone)), so `keystone pressure`
+runs any of them with no flags. None sets `churn_users`, `mix`, `propagation`
+or `bucket_width`. The block has no `--set` keys; the `keystone pressure`
+flags override it. See [`pressure`](cli.md#pressure) for what each operation
+sends and [Pressure mode](../explanation/pressure-mode.md) for why the load
+is built this way.
