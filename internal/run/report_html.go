@@ -66,9 +66,32 @@ type htmlView struct {
 	Errors    *barChart // nil when the run had no errors
 	Readiness []readyRow
 	Inventory inventoryView
-	Chaos     *chaosView // nil for an apply run
+	Chaos     *chaosView    // nil for an apply run
+	Pressure  *pressureView // nil for every run but a pressure run
 	Personas  []personaView
 	Lanes     []laneView
+}
+
+// pressureView is the pressure section of a report: the run's settings and
+// revocations as chips, the per-operation table, and one pair of time-series
+// charts per operation.
+type pressureView struct {
+	Workers     int
+	Tokens      int
+	ChurnUsers  int
+	Revocations int
+	Mix         string
+	Columns     []string
+	PerType     []typeRow
+	Series      []pressureSeries
+}
+
+// pressureSeries is the time series of one pressure operation. Chart carries
+// only HasBuckets, Volume and Latency, the fields the seriesCharts template
+// reads; its churn counters stay zero.
+type pressureSeries struct {
+	Name  string
+	Chart chaosView
 }
 
 // personaView is one persona section of a mix report. Chaos is nil until the
@@ -233,13 +256,17 @@ type tsBar struct {
 	HasFail bool
 }
 
+// perTypeColumns names the columns of the per-type table in the order
+// buildPerType fills them.
+var perTypeColumns = []string{"type", "ops", "ok", "failed", "success", "ops/s", "min", "mean", "p50", "p90", "p95", "p99", "max"}
+
 // buildHTMLView converts a record into the render-ready view model.
 func buildHTMLView(r *Record) htmlView {
 	m := r.Metrics
 	v := htmlView{
 		Header:    buildHeader(r),
 		KPIs:      buildKPIs(m.Overall),
-		Columns:   []string{"type", "ops", "ok", "failed", "success", "ops/s", "min", "mean", "p50", "p90", "p95", "p99", "max"},
+		Columns:   perTypeColumns,
 		PerType:   buildPerType(m.ByType),
 		Latency:   buildLatencyChart(m.ByType),
 		Volume:    buildVolumeChart(m.ByType),
@@ -249,6 +276,9 @@ func buildHTMLView(r *Record) htmlView {
 	}
 	if r.Chaos != nil {
 		v.Chaos = buildChaosView(r.Chaos)
+	}
+	if r.Pressure != nil {
+		v.Pressure = buildPressureView(r.Pressure)
 	}
 	v.Personas = buildPersonaViews(r.Personas)
 	v.Lanes = buildLaneViews(r.Lanes)
@@ -497,6 +527,53 @@ func buildChaosView(c *ChaosStats) *chaosView {
 		v.Latency = buildBucketLatency(c.Buckets)
 	}
 	return v
+}
+
+// buildPressureView converts a pressure run's statistics into its section:
+// the chips, the per-operation table in the columns of the per-type table
+// with "operation" in place of "type", and per operation, in the order of
+// Operations.ByType, the time-series charts of that operation's buckets.
+func buildPressureView(p *PressureStats) *pressureView {
+	v := &pressureView{
+		Workers:     p.Workers,
+		Tokens:      p.Tokens,
+		ChurnUsers:  p.ChurnUsers,
+		Revocations: p.Revocations,
+		Mix:         formatPressureMix(p.Mix),
+		Columns:     append([]string{"operation"}, perTypeColumns[1:]...),
+		PerType:     buildPerType(p.Operations.ByType),
+		Series:      make([]pressureSeries, 0, len(p.Operations.ByType)),
+	}
+	for _, s := range p.Operations.ByType {
+		buckets := operationBuckets(p.Buckets, s.Type)
+		chart := chaosView{HasBuckets: len(buckets) > 0}
+		if chart.HasBuckets {
+			chart.Volume = buildBucketVolume(buckets)
+			chart.Latency = buildBucketLatency(buckets)
+		}
+		v.Series = append(v.Series, pressureSeries{Name: s.Type, Chart: chart})
+	}
+	return v
+}
+
+// operationBuckets converts a pressure run's buckets into the series of one
+// operation in the shape the bucket chart builders take: per bucket its start
+// and the operation's stats in it, zero when the operation has no entry in
+// that bucket. The error breakdown is recorded per bucket, not per operation,
+// so Errors stays empty.
+func operationBuckets(buckets []PressureBucket, op string) []ChaosBucket {
+	series := make([]ChaosBucket, 0, len(buckets))
+	for _, b := range buckets {
+		cb := ChaosBucket{Start: b.Start}
+		for _, s := range b.Operations.ByType {
+			if s.Type == op {
+				cb.Stats = s
+				break
+			}
+		}
+		series = append(series, cb)
+	}
+	return series
 }
 
 func buildBucketVolume(buckets []ChaosBucket) tsChart {

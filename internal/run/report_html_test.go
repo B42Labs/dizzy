@@ -361,3 +361,171 @@ func TestWriteHTMLEscapesLaneName(t *testing.T) {
 		t.Error("lane heading lacks the escaped name")
 	}
 }
+
+// TestWriteHTMLGoldenPressure locks the rendered HTML for a pressure record:
+// the pressure section with its chips and per-operation table after the
+// inventory, and one heading with both time-series charts per operation.
+func TestWriteHTMLGoldenPressure(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteHTML(&buf, pressureRecord()); err != nil {
+		t.Fatalf("WriteHTML: %v", err)
+	}
+	checkGolden(t, "report-pressure.html", buf.Bytes())
+
+	out := buf.String()
+	if !strings.Contains(out, "<h2>Pressure</h2>") {
+		t.Error("pressure report lacks the pressure heading")
+	}
+	for _, op := range []string{"revoke", "validate"} {
+		heading := "<h2>Pressure: " + op + "</h2>"
+		if got := strings.Count(out, heading); got != 1 {
+			t.Fatalf("pressure report has %d %q headings, want 1", got, heading)
+		}
+		series := out[strings.Index(out, heading)+len(heading):]
+		if end := strings.Index(series, "<h2"); end >= 0 {
+			series = series[:end]
+		} else {
+			series = series[:strings.Index(series, "<script>")]
+		}
+		if got := strings.Count(series, "<svg"); got != 2 {
+			t.Errorf("%s series has %d charts, want 2", op, got)
+		}
+	}
+}
+
+// pressureSection returns the pressure section of a rendered report, from its
+// heading up to the script, or "" when the report has none.
+func pressureSection(out string) string {
+	start := strings.Index(out, "<h2>Pressure</h2>")
+	if start < 0 {
+		return ""
+	}
+	return out[start:strings.Index(out, "<script>")]
+}
+
+// TestWriteHTMLPressureSection confirms the pressure section's chips, with
+// the churn users only when the run reserved any, and its sortable table with
+// "operation" as the first column and one row per operation.
+func TestWriteHTMLPressureSection(t *testing.T) {
+	tests := []struct {
+		name       string
+		churnUsers int
+		want       []string
+		notWant    []string
+	}{
+		{"with churn users", 1,
+			[]string{"workers 4", "token pool 3", "churn users 1", "mix revoke=1, validate=9", "revocations 3"}, nil},
+		{"without churn users", 0,
+			[]string{"workers 4", "token pool 3", "mix revoke=1, validate=9", "revocations 3"}, []string{"churn users"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := pressureRecord()
+			rec.Pressure.ChurnUsers = tc.churnUsers
+			var buf bytes.Buffer
+			if err := WriteHTML(&buf, rec); err != nil {
+				t.Fatalf("WriteHTML: %v", err)
+			}
+			section := pressureSection(buf.String())
+			for _, s := range tc.want {
+				if !strings.Contains(section, `<span class="chip">`+s+`</span>`) {
+					t.Errorf("pressure section lacks the chip %q:\n%s", s, section)
+				}
+			}
+			for _, s := range tc.notWant {
+				if strings.Contains(section, s) {
+					t.Errorf("pressure section unexpectedly has %q:\n%s", s, section)
+				}
+			}
+			if !strings.Contains(section, `<table class="sortable">`) || !strings.Contains(section, "<thead><tr><th>operation</th><th>ops</th>") {
+				t.Errorf("pressure section lacks the sortable operation table:\n%s", section)
+			}
+			for _, op := range []string{"revoke", "validate"} {
+				if !strings.Contains(section, `<tr><td data-sort="`+op+`">`+op+`</td>`) {
+					t.Errorf("pressure table lacks the %s row:\n%s", op, section)
+				}
+			}
+		})
+	}
+}
+
+// TestWriteHTMLApplyOmitsPressure confirms the pressure section appears only
+// for a pressure record: an apply and a chaos report have no pressure heading.
+func TestWriteHTMLApplyOmitsPressure(t *testing.T) {
+	for name, build := range map[string]func() *Record{"apply": sampleRecord, "chaos": chaosRecord} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := WriteHTML(&buf, build()); err != nil {
+				t.Fatalf("WriteHTML: %v", err)
+			}
+			if strings.Contains(buf.String(), "<h2>Pressure") {
+				t.Errorf("%s report unexpectedly contains a pressure heading", name)
+			}
+		})
+	}
+}
+
+// TestWriteHTMLPressureWithoutBuckets confirms a pressure record without
+// buckets, a checkpoint taken before the first one, renders the chips and the
+// table and no per-operation heading or chart.
+func TestWriteHTMLPressureWithoutBuckets(t *testing.T) {
+	rec := pressureRecord()
+	rec.Pressure.Buckets = nil
+	var buf bytes.Buffer
+	if err := WriteHTML(&buf, rec); err != nil {
+		t.Fatalf("WriteHTML: %v", err)
+	}
+	out := buf.String()
+	section := pressureSection(out)
+	if section == "" {
+		t.Fatal("pressure report without buckets lacks the pressure section")
+	}
+	for _, want := range []string{`<span class="chip">workers 4</span>`, `<span class="chip">revocations 3</span>`, `<td data-sort="validate">validate</td>`} {
+		if !strings.Contains(section, want) {
+			t.Errorf("pressure section lacks %q:\n%s", want, section)
+		}
+	}
+	if strings.Contains(out, "Pressure: ") {
+		t.Error("pressure report without buckets has a per-operation heading")
+	}
+	if strings.Contains(section, "<svg") {
+		t.Errorf("pressure section without buckets renders a chart:\n%s", section)
+	}
+}
+
+// TestWriteHTMLPressureZeroOperationBucket confirms an operation without an
+// entry in a bucket charts that bucket as zero rather than skipping it, so
+// every operation's series has one point per bucket.
+func TestWriteHTMLPressureZeroOperationBucket(t *testing.T) {
+	p := pressureRecord().Pressure
+	p.Buckets[1].Operations.ByType = p.Buckets[1].Operations.ByType[1:] // no revoke in the second bucket
+	series := operationBuckets(p.Buckets, "revoke")
+	if len(series) != 2 {
+		t.Fatalf("revoke series has %d buckets, want 2", len(series))
+	}
+	if series[0].Start != 0 || series[0].Stats.Attempted != 2 {
+		t.Errorf("first revoke bucket = %+v, want start 0 and 2 attempted", series[0])
+	}
+	if series[1].Start != time.Minute || series[1].Stats != (metrics.Stats{}) {
+		t.Errorf("second revoke bucket = %+v, want start 1m and zero stats", series[1])
+	}
+}
+
+// TestWriteHTMLEscapesPressureOperation confirms an operation name carrying
+// markup is HTML-escaped in the table and the series heading.
+func TestWriteHTMLEscapesPressureOperation(t *testing.T) {
+	rec := pressureRecord()
+	const name = "<script>alert(1)</script>"
+	rec.Pressure.Operations.ByType[0].Type = name
+	rec.Pressure.Buckets[0].Operations.ByType[0].Type = name
+	var buf bytes.Buffer
+	if err := WriteHTML(&buf, rec); err != nil {
+		t.Fatalf("WriteHTML: %v", err)
+	}
+	if strings.Contains(buf.String(), name) {
+		t.Error("operation name rendered without escaping (XSS)")
+	}
+	if !strings.Contains(buf.String(), "<h2>Pressure: &lt;script&gt;alert(1)&lt;/script&gt;</h2>") {
+		t.Error("series heading lacks the escaped operation name")
+	}
+}
