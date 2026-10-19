@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/B42Labs/dizzy/internal/metrics"
 )
@@ -23,12 +24,13 @@ var csvHeader = []string{
 // WriteTable renders the run's metrics as the compact human-readable summary,
 // the default report format. For a churn run it appends the churn-specific
 // summary and the per-time-bucket latency/error table after the standard
-// metrics; an apply run (Chaos nil) renders exactly as before. An incomplete
-// record (a chaos checkpoint) starts with a line saying so and when it was
-// written, then a blank line, then the same output as a complete record. A mix
-// record then gets the persona table and, per persona, a section with its own
-// metrics and churn summary, and after them the lane table and the same
-// section per background lane.
+// metrics; an apply run (Chaos nil) renders exactly as before. A pressure run
+// appends the pressure tables of WritePressureTable after them. An incomplete
+// record (a chaos or pressure checkpoint) starts with a line saying so and
+// when it was written, then a blank line, then the same output as a complete
+// record. A mix record then gets the persona table and, per persona, a
+// section with its own metrics and churn summary, and after them the lane
+// table and the same section per background lane.
 func WriteTable(w io.Writer, r *Record) error {
 	if r.Incomplete {
 		if _, err := fmt.Fprintf(w, "Run incomplete: checkpoint written at %s; the run was still going or was killed before its final record\n\n",
@@ -42,6 +44,11 @@ func WriteTable(w io.Writer, r *Record) error {
 	if r.Chaos != nil {
 		if err := writeChaosTable(w, r.Chaos); err != nil {
 			return fmt.Errorf("writing chaos report: %w", err)
+		}
+	}
+	if r.Pressure != nil {
+		if err := WritePressureTable(w, r.Pressure); err != nil {
+			return err
 		}
 	}
 	if err := WritePersonaTable(w, r.Personas); err != nil {
@@ -132,26 +139,41 @@ func statsCells(o metrics.Stats) []string {
 // the first labels columns left-aligned, the others right-aligned, two spaces
 // apart. It returns the writer's error unwrapped.
 func writeStatsTable(w io.Writer, title string, rows [][]string, labels int) error {
+	left := make([]bool, len(rows[0]))
+	for i := range min(labels, len(left)) {
+		left[i] = true
+	}
+	return writeAlignedTable(w, title, rows, left)
+}
+
+// writeAlignedTable writes a blank line, title and rows as an aligned table,
+// two spaces between columns: column i is left-aligned when left[i] is true
+// and right-aligned otherwise. Widths count runes, as fmt pads by runes, so a
+// cell such as "350µs" lines up with an ASCII one. Trailing spaces, which a
+// row with empty last cells would leave, are cut from every line. It returns
+// the writer's error unwrapped.
+func writeAlignedTable(w io.Writer, title string, rows [][]string, left []bool) error {
 	widths := make([]int, len(rows[0]))
 	for _, row := range rows {
 		for i, cell := range row {
-			widths[i] = max(widths[i], len(cell))
+			widths[i] = max(widths[i], utf8.RuneCountInString(cell))
 		}
 	}
-	var b strings.Builder
+	var b, line strings.Builder
 	b.WriteString("\n" + title + "\n")
 	for _, row := range rows {
+		line.Reset()
 		for i, cell := range row {
 			if i > 0 {
-				b.WriteString("  ")
+				line.WriteString("  ")
 			}
-			if i < labels {
-				fmt.Fprintf(&b, "%-*s", widths[i], cell)
+			if left[i] {
+				fmt.Fprintf(&line, "%-*s", widths[i], cell)
 			} else {
-				fmt.Fprintf(&b, "%*s", widths[i], cell)
+				fmt.Fprintf(&line, "%*s", widths[i], cell)
 			}
 		}
-		b.WriteString("\n")
+		b.WriteString(strings.TrimRight(line.String(), " ") + "\n")
 	}
 	_, err := io.WriteString(w, b.String())
 	return err
@@ -204,6 +226,101 @@ func formatBucketErrors(errs []metrics.ErrorCount) string {
 	return strings.Join(parts, ", ")
 }
 
+// WritePressureTable renders the statistics of a pressure run: a block with
+// the workers, the token pool size, the churn users (only when the run
+// reserved any), the mix and the revocations; a table with one row per
+// operation; and, when the run has time buckets, a table with one row for
+// each bucket as a whole, carrying its cumulative revocations and its error
+// breakdown, followed by one row per operation of that bucket. The error
+// breakdown is recorded per bucket, not per operation, so the operation rows
+// leave those two cells empty. Latencies are rounded to the microsecond,
+// because the token path moves in sub-millisecond steps, and show as "-" for
+// a row without operations. It writes nothing for nil.
+func WritePressureTable(w io.Writer, p *PressureStats) error {
+	if p == nil {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString("\nPressure\n")
+	fmt.Fprintf(&b, "  workers:     %d\n", p.Workers)
+	fmt.Fprintf(&b, "  token pool:  %d\n", p.Tokens)
+	if p.ChurnUsers != 0 {
+		fmt.Fprintf(&b, "  churn users: %d\n", p.ChurnUsers)
+	}
+	fmt.Fprintf(&b, "  mix:         %s\n", formatPressureMix(p.Mix))
+	fmt.Fprintf(&b, "  revocations: %d\n", p.Revocations)
+
+	rows := [][]string{{"OPERATION", "OPS", "OK", "FAILED", "OPS/S", "MIN", "MEAN", "P50", "P90", "P95", "P99", "MAX"}}
+	for _, s := range p.Operations.ByType {
+		row := []string{s.Type, strconv.Itoa(s.Attempted), strconv.Itoa(s.Succeeded), strconv.Itoa(s.Failed),
+			fmt.Sprintf("%.1f", s.Throughput)}
+		rows = append(rows, append(row, microCells(s,
+			s.Latency.Min, s.Latency.Mean, s.Latency.Median, s.Latency.P90, s.Latency.P95, s.Latency.P99, s.Latency.Max)...))
+	}
+	// Only OPERATION is a label; every other column is a number.
+	if err := writeStatsTable(&b, "Operations", rows, 1); err != nil {
+		return fmt.Errorf("writing pressure table: %w", err)
+	}
+
+	if len(p.Buckets) > 0 {
+		rows := [][]string{{"START", "OPERATION", "OPS", "OK", "FAILED", "P50", "P99", "REVOCATIONS", "ERRORS"}}
+		for _, bk := range p.Buckets {
+			start := bk.Start.Round(time.Millisecond).String()
+			rows = append(rows, pressureBucketRow(start, "all", bk.Operations.Overall,
+				strconv.Itoa(bk.Revocations), formatBucketErrors(bk.Operations.Errors)))
+			for _, s := range bk.Operations.ByType {
+				rows = append(rows, pressureBucketRow(start, s.Type, s, "", ""))
+			}
+		}
+		// START, OPERATION and ERRORS are labels; the others are numbers.
+		left := []bool{true, true, false, false, false, false, false, false, true}
+		if err := writeAlignedTable(&b, "Latency and errors over time", rows, left); err != nil {
+			return fmt.Errorf("writing pressure table: %w", err)
+		}
+	}
+
+	if _, err := io.WriteString(w, b.String()); err != nil {
+		return fmt.Errorf("writing pressure table: %w", err)
+	}
+	return nil
+}
+
+// pressureBucketRow renders one row of the pressure bucket table: the
+// bucket's start, the operation label, the operation counts, the p50 and p99
+// latencies, and the revocations and errors cells as given.
+func pressureBucketRow(start, label string, s metrics.Stats, revocations, errs string) []string {
+	row := []string{start, label, strconv.Itoa(s.Attempted), strconv.Itoa(s.Succeeded), strconv.Itoa(s.Failed)}
+	row = append(row, microCells(s, s.Latency.Median, s.Latency.P99)...)
+	return append(row, revocations, errs)
+}
+
+// microCells renders latencies of s rounded to the microsecond, or "-" for
+// each when s attempted nothing, so an empty row does not read as "0s".
+func microCells(s metrics.Stats, ds ...time.Duration) []string {
+	cells := make([]string, 0, len(ds))
+	for _, d := range ds {
+		if s.Attempted == 0 {
+			cells = append(cells, "-")
+		} else {
+			cells = append(cells, d.Round(time.Microsecond).String())
+		}
+	}
+	return cells
+}
+
+// formatPressureMix renders a pressure run's mix as "operation=weight" pairs
+// in the record's order, or "-" when it is empty.
+func formatPressureMix(mix []PressureWeight) string {
+	if len(mix) == 0 {
+		return "-"
+	}
+	parts := make([]string, 0, len(mix))
+	for _, m := range mix {
+		parts = append(parts, m.Operation+"="+strconv.Itoa(m.Weight))
+	}
+	return strings.Join(parts, ", ")
+}
+
 // projectLabel renders a persona's or lane's project for the reports, "-"
 // when unknown.
 func projectLabel(id string) string {
@@ -222,8 +339,10 @@ func sharePercent(share float64) string {
 // report format. A churn run additionally carries its chaos statistics under a
 // "chaos" key, and "incomplete": true when the record is a mid-run checkpoint;
 // an apply run (Chaos nil) marshals just the metrics aggregate, so its JSON
-// shape is unchanged. A mix run carries its "services", when it has any, its
-// "personas" and its "lanes", when it has any, next to the overall metrics.
+// shape is unchanged. A pressure run carries its statistics under a
+// "pressure" key in the same way. A mix run carries its "services", when it
+// has any, its "personas" and its "lanes", when it has any, next to the
+// overall metrics.
 func WriteJSON(w io.Writer, r *Record) error {
 	var payload any = r.Metrics
 	switch {
@@ -235,6 +354,12 @@ func WriteJSON(w io.Writer, r *Record) error {
 			Lanes      []LaneStats       `json:"lanes,omitempty"`
 			Incomplete bool              `json:"incomplete,omitempty"`
 		}{Metrics: r.Metrics, Services: r.Services, Personas: r.Personas, Lanes: r.Lanes, Incomplete: r.Incomplete}
+	case r.Pressure != nil:
+		payload = struct {
+			Metrics    metrics.Aggregate `json:"metrics"`
+			Pressure   *PressureStats    `json:"pressure"`
+			Incomplete bool              `json:"incomplete,omitempty"`
+		}{Metrics: r.Metrics, Pressure: r.Pressure, Incomplete: r.Incomplete}
 	case r.Chaos != nil:
 		payload = struct {
 			Metrics    metrics.Aggregate `json:"metrics"`
@@ -254,10 +379,13 @@ func WriteJSON(w io.Writer, r *Record) error {
 }
 
 // WriteCSV renders the run's per-type and overall metrics as CSV, one row per
-// resource type plus a leading overall row. A mix run appends, per persona, an
-// overall row labelled <persona>/overall and one row per type labelled
-// <persona>/<type>, and then the same rows per background lane, labelled
-// <lane>/overall and <lane>/<type>.
+// resource type plus a leading overall row. A pressure run appends one row per
+// operation labelled pressure/<operation> and then, per time bucket, one row
+// per operation of that bucket labelled pressure@<start>/<operation>; the
+// cumulative revocations have no column in the fixed header. A mix run
+// appends, per persona, an overall row labelled <persona>/overall and one row
+// per type labelled <persona>/<type>, and then the same rows per background
+// lane, labelled <lane>/overall and <lane>/<type>.
 func WriteCSV(w io.Writer, r *Record) error {
 	cw := csv.NewWriter(w)
 	if err := cw.Write(csvHeader); err != nil {
@@ -269,6 +397,11 @@ func WriteCSV(w io.Writer, r *Record) error {
 	for _, s := range r.Metrics.ByType {
 		if err := cw.Write(statsRow(s.Type, s)); err != nil {
 			return fmt.Errorf("writing csv row: %w", err)
+		}
+	}
+	if r.Pressure != nil {
+		if err := writePressureRows(cw, r.Pressure); err != nil {
+			return err
 		}
 	}
 	for _, p := range r.Personas {
@@ -284,6 +417,27 @@ func WriteCSV(w io.Writer, r *Record) error {
 	cw.Flush()
 	if err := cw.Error(); err != nil {
 		return fmt.Errorf("flushing csv report: %w", err)
+	}
+	return nil
+}
+
+// writePressureRows writes one row per operation of a pressure run, labelled
+// pressure/<operation>, and then, per time bucket, one row per operation of
+// that bucket, labelled pressure@<start>/<operation> with start in
+// time.Duration notation.
+func writePressureRows(cw *csv.Writer, p *PressureStats) error {
+	for _, s := range p.Operations.ByType {
+		if err := cw.Write(statsRow("pressure/"+s.Type, s)); err != nil {
+			return fmt.Errorf("writing csv row: %w", err)
+		}
+	}
+	for _, bk := range p.Buckets {
+		prefix := "pressure@" + bk.Start.String() + "/"
+		for _, s := range bk.Operations.ByType {
+			if err := cw.Write(statsRow(prefix+s.Type, s)); err != nil {
+				return fmt.Errorf("writing csv row: %w", err)
+			}
+		}
 	}
 	return nil
 }

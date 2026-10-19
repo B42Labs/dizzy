@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/B42Labs/dizzy/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // chaosRecord builds a record carrying churn statistics, including a bucket with
@@ -696,5 +698,354 @@ func TestReportEmptyPersonasRendersAsNone(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// pressureRecord builds the record of an unbounded keystone pressure run with
+// two operations, validate and revoke, over two one-minute buckets, with a
+// failed operation and an error kind in each bucket and the revocations
+// cumulative across the buckets (1, then 3), so the pressure report paths
+// have realistic data. Its latencies sit below a millisecond for validate, as
+// a token validation does.
+func pressureRecord() *Record {
+	return &Record{
+		RunID:      "press001",
+		Service:    "keystone",
+		Scenario:   "small",
+		Seed:       42,
+		StartedAt:  time.Date(2026, 6, 24, 10, 0, 0, 0, time.UTC),
+		FinishedAt: time.Date(2026, 6, 24, 10, 2, 0, 0, time.UTC),
+		Created: []resource.Resource{
+			{Kind: "project", Logical: "project-0001", Name: "dizzy-press001-project-0001", ID: "proj-id-1"},
+			{Kind: "user", Logical: "user-0001", Name: "dizzy-press001-user-0001", ID: "user-id-1"},
+		},
+		Metrics: metrics.Aggregate{
+			Wall:    2 * time.Minute,
+			Overall: metrics.Stats{Attempted: 46, Succeeded: 44, Failed: 2, Throughput: 0.38},
+			ByType: []metrics.Stats{
+				{Type: "project", Attempted: 1, Succeeded: 1, Latency: metrics.Latency{Min: 40 * time.Millisecond, Median: 40 * time.Millisecond, Max: 40 * time.Millisecond}},
+				{Type: "token", Attempted: 45, Succeeded: 43, Failed: 2, Latency: metrics.Latency{Min: 180 * time.Microsecond, Median: 400 * time.Microsecond, Max: 180 * time.Millisecond}},
+			},
+			Errors: []metrics.ErrorCount{{Kind: "http_404", Count: 1}, {Kind: "timeout", Count: 1}},
+		},
+		Pressure: &PressureStats{
+			Workers:    4,
+			Tokens:     3,
+			ChurnUsers: 1,
+			Mix:        []PressureWeight{{Operation: "revoke", Weight: 1}, {Operation: "validate", Weight: 9}},
+			Operations: metrics.Aggregate{
+				Wall:    90 * time.Second,
+				Overall: metrics.Stats{Attempted: 40, Succeeded: 38, Failed: 2, Throughput: 0.44},
+				ByType: []metrics.Stats{
+					{Type: "revoke", Attempted: 4, Succeeded: 3, Failed: 1, Throughput: 0.04, Latency: metrics.Latency{
+						Min: 2 * time.Millisecond, Mean: 3500 * time.Microsecond, Median: 3 * time.Millisecond,
+						P90: 5 * time.Millisecond, P95: 5 * time.Millisecond, P99: 5 * time.Millisecond, Max: 5 * time.Millisecond}},
+					{Type: "validate", Attempted: 36, Succeeded: 35, Failed: 1, Throughput: 0.4, Latency: metrics.Latency{
+						Min: 180 * time.Microsecond, Mean: 420 * time.Microsecond, Median: 350 * time.Microsecond,
+						P90: 700 * time.Microsecond, P95: 900 * time.Microsecond, P99: 1200 * time.Microsecond, Max: 1500 * time.Microsecond}},
+				},
+				Errors: []metrics.ErrorCount{{Kind: "http_404", Count: 1}, {Kind: "timeout", Count: 1}},
+			},
+			Revocations: 3,
+			Buckets: []PressureBucket{
+				{
+					Start: 0,
+					Operations: metrics.Aggregate{
+						Wall:    time.Minute,
+						Overall: metrics.Stats{Attempted: 22, Succeeded: 21, Failed: 1, Latency: metrics.Latency{Median: 360 * time.Microsecond, P99: 4 * time.Millisecond}},
+						ByType: []metrics.Stats{
+							{Type: "revoke", Attempted: 2, Succeeded: 1, Failed: 1, Latency: metrics.Latency{Median: 3 * time.Millisecond, P99: 4 * time.Millisecond}},
+							{Type: "validate", Attempted: 20, Succeeded: 20, Latency: metrics.Latency{Median: 340 * time.Microsecond, P99: 1100 * time.Microsecond}},
+						},
+						Errors: []metrics.ErrorCount{{Kind: "http_404", Count: 1}},
+					},
+					Revocations: 1,
+				},
+				{
+					Start: time.Minute,
+					Operations: metrics.Aggregate{
+						Wall:    time.Minute,
+						Overall: metrics.Stats{Attempted: 18, Succeeded: 17, Failed: 1, Latency: metrics.Latency{Median: 380 * time.Microsecond, P99: 5 * time.Millisecond}},
+						ByType: []metrics.Stats{
+							{Type: "revoke", Attempted: 2, Succeeded: 2, Latency: metrics.Latency{Median: 4 * time.Millisecond, P99: 5 * time.Millisecond}},
+							{Type: "validate", Attempted: 16, Succeeded: 15, Failed: 1, Latency: metrics.Latency{Median: 370 * time.Microsecond, P99: 1200 * time.Microsecond}},
+						},
+						Errors: []metrics.ErrorCount{{Kind: "timeout", Count: 1}},
+					},
+					Revocations: 3,
+				},
+			},
+			BucketWidth: time.Minute,
+		},
+	}
+}
+
+// TestWritePressureTable confirms the pressure block lists the settings and
+// the revocations, that the operation table carries one row per operation
+// with its latencies rounded to the microsecond, and that the bucket table
+// gives each bucket an "all" row with its cumulative revocations and error
+// breakdown followed by one row per operation with those two cells empty.
+func TestWritePressureTable(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WritePressureTable(&buf, pressureRecord().Pressure); err != nil {
+		t.Fatalf("WritePressureTable: %v", err)
+	}
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	wantHead := []string{
+		"",
+		"Pressure",
+		"  workers:     4",
+		"  token pool:  3",
+		"  churn users: 1",
+		"  mix:         revoke=1, validate=9",
+		"  revocations: 3",
+		"",
+		"Operations",
+	}
+	if len(lines) < len(wantHead) || !reflect.DeepEqual(lines[:len(wantHead)], wantHead) {
+		t.Fatalf("pressure block = %q, want it to start with %q", lines, wantHead)
+	}
+	rest := lines[len(wantHead):]
+	wantOps := [][]string{
+		{"OPERATION", "OPS", "OK", "FAILED", "OPS/S", "MIN", "MEAN", "P50", "P90", "P95", "P99", "MAX"},
+		{"revoke", "4", "3", "1", "0.0", "2ms", "3.5ms", "3ms", "5ms", "5ms", "5ms", "5ms"},
+		{"validate", "36", "35", "1", "0.4", "180µs", "420µs", "350µs", "700µs", "900µs", "1.2ms", "1.5ms"},
+	}
+	wantBuckets := [][]string{
+		{"START", "OPERATION", "OPS", "OK", "FAILED", "P50", "P99", "REVOCATIONS", "ERRORS"},
+		{"0s", "all", "22", "21", "1", "360µs", "4ms", "1", "http_404=1"},
+		{"0s", "revoke", "2", "1", "1", "3ms", "4ms"},
+		{"0s", "validate", "20", "20", "0", "340µs", "1.1ms"},
+		{"1m0s", "all", "18", "17", "1", "380µs", "5ms", "3", "timeout=1"},
+		{"1m0s", "revoke", "2", "2", "0", "4ms", "5ms"},
+		{"1m0s", "validate", "16", "15", "1", "370µs", "1.2ms"},
+	}
+	if want := len(wantOps) + 2 + len(wantBuckets); len(rest) != want {
+		t.Fatalf("pressure tables have %d lines, want %d:\n%s", len(rest), want, buf.String())
+	}
+	for i, w := range wantOps {
+		if got := strings.Fields(rest[i]); !reflect.DeepEqual(got, w) {
+			t.Errorf("operation row %d = %q, want %q", i, got, w)
+		}
+	}
+	if rest[len(wantOps)] != "" || rest[len(wantOps)+1] != "Latency and errors over time" {
+		t.Errorf("bucket table title = %q, want a blank line and %q", rest[len(wantOps):len(wantOps)+2], "Latency and errors over time")
+	}
+	buckets := rest[len(wantOps)+2:]
+	for i, w := range wantBuckets {
+		if got := strings.Fields(buckets[i]); !reflect.DeepEqual(got, w) {
+			t.Errorf("bucket row %d = %q, want %q", i, got, w)
+		}
+		if strings.HasSuffix(buckets[i], " ") {
+			t.Errorf("bucket row %d %q ends in a space", i, buckets[i])
+		}
+	}
+	// A microsecond cell holds a two-byte rune; the columns still line up.
+	if a, b := strings.Index(rest[1], "3.5ms"), strings.Index(rest[2], "420µs"); a < 0 || b < 0 ||
+		len([]rune(rest[1][:a])) != len([]rune(rest[2][:b])) {
+		t.Errorf("MEAN column is not aligned across %q and %q", rest[1], rest[2])
+	}
+}
+
+// TestWritePressureTableEdges confirms the pressure block omits the churn
+// users line when the run reserved none, renders an empty mix as "-", shows
+// "-" for the latencies of an operation that attempted nothing, writes no
+// bucket table without buckets, and writes nothing at all for nil.
+func TestWritePressureTableEdges(t *testing.T) {
+	var none bytes.Buffer
+	if err := WritePressureTable(&none, nil); err != nil {
+		t.Fatalf("WritePressureTable(nil): %v", err)
+	}
+	if none.Len() != 0 {
+		t.Errorf("WritePressureTable(nil) wrote %q, want nothing", none.String())
+	}
+
+	p := &PressureStats{
+		Workers: 16, Tokens: 100,
+		Operations: metrics.Aggregate{ByType: []metrics.Stats{{Type: "issue"}}},
+	}
+	var buf bytes.Buffer
+	if err := WritePressureTable(&buf, p); err != nil {
+		t.Fatalf("WritePressureTable: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "churn users:") {
+		t.Errorf("pressure block shows churn users although the run reserved none:\n%s", out)
+	}
+	if !strings.Contains(out, "\n  mix:         -\n") {
+		t.Errorf("pressure block does not render an empty mix as \"-\":\n%s", out)
+	}
+	if strings.Contains(out, "Latency and errors over time") {
+		t.Errorf("pressure block has a bucket table without buckets:\n%s", out)
+	}
+	want := []string{"issue", "0", "0", "0", "0.0", "-", "-", "-", "-", "-", "-", "-"}
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	if got := strings.Fields(lines[len(lines)-1]); !reflect.DeepEqual(got, want) {
+		t.Errorf("operation row without operations = %q, want %q", got, want)
+	}
+}
+
+func TestWritePressureTableWriteError(t *testing.T) {
+	err := WritePressureTable(failingWriter{}, pressureRecord().Pressure)
+	if !errors.Is(err, errWrite) {
+		t.Fatalf("WritePressureTable error = %v, want it to wrap the writer's error", err)
+	}
+	if !strings.HasPrefix(err.Error(), "writing pressure table: ") {
+		t.Errorf("error %q does not start with %q", err, "writing pressure table: ")
+	}
+}
+
+// TestWriteTablePressure confirms a pressure record's table report carries
+// the metrics summary first and then the pressure block, its token pool, a
+// validate row and the second bucket's "all" row with the cumulative
+// revocations, and that an incomplete pressure record starts with the
+// incomplete line followed by the complete report.
+func TestWriteTablePressure(t *testing.T) {
+	rec := pressureRecord()
+	var buf bytes.Buffer
+	if err := WriteTable(&buf, rec); err != nil {
+		t.Fatalf("WriteTable: %v", err)
+	}
+	out := buf.String()
+	if !strings.HasPrefix(out, rec.Metrics.Summary()+"\nPressure\n") {
+		t.Errorf("table report does not start with the metrics summary followed by the pressure block:\n%s", out)
+	}
+	for _, want := range []string{"token pool:  3", "Latency and errors over time"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("table report missing %q:\n%s", want, out)
+		}
+	}
+	var validate, all bool
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) > 0 && f[0] == "validate" {
+			validate = true
+		}
+		if len(f) == 9 && f[0] == "1m0s" && f[1] == "all" && f[7] == "3" {
+			all = true
+		}
+	}
+	if !validate {
+		t.Errorf("table report has no validate operation row:\n%s", out)
+	}
+	if !all {
+		t.Errorf("table report has no \"all\" row for the 1m0s bucket with 3 cumulative revocations:\n%s", out)
+	}
+	if strings.Contains(out, "Churn summary") {
+		t.Errorf("pressure table report carries a churn summary:\n%s", out)
+	}
+
+	rec.Incomplete = true
+	var incomplete bytes.Buffer
+	if err := WriteTable(&incomplete, rec); err != nil {
+		t.Fatalf("WriteTable(incomplete): %v", err)
+	}
+	first, rest, found := strings.Cut(incomplete.String(), "\n\n")
+	if !found || !strings.HasPrefix(first, "Run incomplete: checkpoint written at 2026-06-24T10:02:00Z;") {
+		t.Errorf("incomplete pressure report starts with %q, want the incomplete line", first)
+	}
+	if rest != out {
+		t.Errorf("incomplete pressure report after the marker differs from the complete report:\n%s\nwant:\n%s", rest, out)
+	}
+}
+
+// TestWriteJSONPressure confirms a pressure record's JSON report carries
+// exactly the metrics and pressure keys, plus "incomplete": true for a
+// checkpoint, and no chaos key, and that the pressure object decodes back to
+// the record's statistics.
+func TestWriteJSONPressure(t *testing.T) {
+	tests := []struct {
+		name       string
+		incomplete bool
+		want       []string
+	}{
+		{"complete", false, []string{"metrics", "pressure"}},
+		{"checkpoint", true, []string{"incomplete", "metrics", "pressure"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := pressureRecord()
+			rec.Incomplete = tc.incomplete
+			var buf bytes.Buffer
+			if err := WriteJSON(&buf, rec); err != nil {
+				t.Fatalf("WriteJSON: %v", err)
+			}
+			var got map[string]json.RawMessage
+			if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+				t.Fatalf("report JSON does not decode: %v", err)
+			}
+			keys := make([]string, 0, len(got))
+			for k := range got {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			if !reflect.DeepEqual(keys, tc.want) {
+				t.Errorf("report JSON keys = %v, want %v", keys, tc.want)
+			}
+			if tc.incomplete && string(got["incomplete"]) != "true" {
+				t.Errorf(".incomplete = %s, want true", got["incomplete"])
+			}
+			var p PressureStats
+			if err := json.Unmarshal(got["pressure"], &p); err != nil {
+				t.Fatalf("decoding .pressure: %v", err)
+			}
+			if !reflect.DeepEqual(&p, rec.Pressure) {
+				t.Errorf(".pressure = %+v, want %+v", p, rec.Pressure)
+			}
+		})
+	}
+}
+
+// TestWriteCSVPressure confirms a pressure record's CSV keeps the header and
+// appends, after the per-type rows, one row per operation and then one per
+// bucket and operation, labelled with the bucket start in duration notation.
+func TestWriteCSVPressure(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteCSV(&buf, pressureRecord()); err != nil {
+		t.Fatalf("WriteCSV: %v", err)
+	}
+	records, err := csv.NewReader(&buf).ReadAll()
+	if err != nil {
+		t.Fatalf("parsing csv: %v", err)
+	}
+	if !reflect.DeepEqual(records[0], csvHeader) {
+		t.Errorf("header = %v, want %v", records[0], csvHeader)
+	}
+	var labels []string
+	for _, rec := range records[1:] {
+		labels = append(labels, rec[0])
+	}
+	want := []string{
+		"overall", "project", "token",
+		"pressure/revoke", "pressure/validate",
+		"pressure@0s/revoke", "pressure@0s/validate",
+		"pressure@1m0s/revoke", "pressure@1m0s/validate",
+	}
+	if !reflect.DeepEqual(labels, want) {
+		t.Errorf("row labels = %v, want %v", labels, want)
+	}
+	// pressure@0s/validate: 20 attempted, 20 succeeded, p50 0.340 ms.
+	if row := records[7]; row[1] != "20" || row[2] != "20" || row[7] != "0.340" {
+		t.Errorf("pressure@0s/validate row = %v, want attempted 20, succeeded 20, median 0.340", row)
+	}
+}
+
+// TestReportPressureWithoutBuckets confirms a pressure checkpoint taken
+// before the first bucket renders in every format with no time-series
+// section.
+func TestReportPressureWithoutBuckets(t *testing.T) {
+	rec := pressureRecord()
+	rec.Incomplete = true
+	rec.Pressure.Buckets = nil
+	out := renderAll(t, rec)
+
+	if strings.Contains(out["table"], "Latency and errors over time") {
+		t.Errorf("table report has a time-series section without buckets:\n%s", out["table"])
+	}
+	if strings.Contains(out["csv"], "pressure@") {
+		t.Errorf("CSV report has bucket rows without buckets:\n%s", out["csv"])
+	}
+	if !strings.Contains(out["csv"], "pressure/validate") {
+		t.Errorf("CSV report lacks the operation rows:\n%s", out["csv"])
 	}
 }

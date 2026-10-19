@@ -196,6 +196,32 @@ svg { max-width: 100%; height: auto; border: 1px solid var(--line); border-radiu
 <p class="legend"><span class="sw" style="background:var(--p50)"></span>p50<span class="sw" style="background:var(--p99)"></span>p99. axis max {{.Chaos.Latency.AxisMax}}.</p>
 {{end}}
 {{end}}
+{{- if .Pressure}}
+
+<h2>Pressure</h2>
+<div class="chips">
+  <span class="chip">workers {{.Pressure.Workers}}</span>
+  <span class="chip">token pool {{.Pressure.Tokens}}</span>
+{{- if .Pressure.ChurnUsers}}
+  <span class="chip">churn users {{.Pressure.ChurnUsers}}</span>
+{{- end}}
+  <span class="chip">mix {{.Pressure.Mix}}</span>
+  <span class="chip">revocations {{.Pressure.Revocations}}</span>
+</div>
+<table class="sortable">
+  <thead><tr>{{range .Pressure.Columns}}<th>{{.}}</th>{{end}}</tr></thead>
+  <tbody>
+  {{range .Pressure.PerType}}
+    <tr>{{range .Cells}}<td data-sort="{{.Sort}}">{{.Text}}</td>{{end}}</tr>
+  {{end}}
+  </tbody>
+</table>
+{{- range .Pressure.Series}}{{if .Chart.HasBuckets}}
+
+<h2>Pressure: {{.Name}}</h2>
+{{- template "seriesCharts" .Chart}}
+{{- end}}{{end}}
+{{- end}}
 {{- range .Personas}}
 
 <h2>Persona {{.Name}}</h2>

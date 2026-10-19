@@ -357,3 +357,78 @@ func TestRecordOmitsPersonaKeys(t *testing.T) {
 		}
 	}
 }
+
+// TestRecordRoundTripWithPressure confirms a pressure record's statistics,
+// including the mix, the per-operation aggregate and the buckets with their
+// cumulative revocations, survive a write/load round trip intact, under a
+// top-level "pressure" key.
+func TestRecordRoundTripWithPressure(t *testing.T) {
+	rec := pressureRecord()
+
+	path, err := Write(t.TempDir(), rec)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading record: %v", err)
+	}
+	if !bytes.Contains(data, []byte(`"pressure"`)) {
+		t.Errorf("pressure record carries no pressure key:\n%s", data)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !reflect.DeepEqual(rec, loaded) {
+		t.Errorf("pressure round-trip mismatch:\n got %+v\nwant %+v", loaded, rec)
+	}
+}
+
+// TestRecordOmitsPressureKey confirms the record of an apply run carries no
+// pressure key, so its shape is unchanged, and that a record without one
+// loads with Pressure nil.
+func TestRecordOmitsPressureKey(t *testing.T) {
+	path, err := Write(t.TempDir(), sampleRecord())
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading record: %v", err)
+	}
+	for _, key := range []string{`"pressure"`, `"churnUsers"`, `"revocations"`} {
+		if bytes.Contains(data, []byte(key)) {
+			t.Errorf("apply record carries %s although it is unset:\n%s", key, data)
+		}
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.Pressure != nil {
+		t.Errorf("record without a pressure key loaded with Pressure %+v, want nil", loaded.Pressure)
+	}
+}
+
+// TestPressureRecordOmitsOptionalKeys confirms a bounded pressure run that
+// reserved no churn users writes neither churnUsers nor bucketWidth.
+func TestPressureRecordOmitsOptionalKeys(t *testing.T) {
+	rec := pressureRecord()
+	rec.Pressure.ChurnUsers = 0
+	rec.Pressure.BucketWidth = 0
+
+	path, err := Write(t.TempDir(), rec)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading record: %v", err)
+	}
+	for _, key := range []string{`"churnUsers"`, `"bucketWidth"`} {
+		if bytes.Contains(data, []byte(key)) {
+			t.Errorf("pressure record carries %s although it is unset:\n%s", key, data)
+		}
+	}
+}

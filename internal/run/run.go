@@ -2,9 +2,9 @@
 // metrics. A record (run-<id>.json) captures the created resource IDs, the run's
 // provenance and timing, the aggregated metrics, and any apply error, so a run
 // can be reported on, re-checked (status), or cleaned up (cleanup) after the
-// process that produced it has exited. A chaos run also rewrites its record
-// periodically while it runs, marked incomplete, so a killed process or a lost
-// node still leaves a recent record.
+// process that produced it has exited. A chaos or pressure run also rewrites
+// its record periodically while it runs, marked incomplete, so a killed
+// process or a lost node still leaves a recent record.
 package run
 
 import (
@@ -55,9 +55,14 @@ type Record struct {
 	// Lanes holds one entry per background lane of a mix run, in the order the
 	// run ran them. It is omitted when the run had none.
 	Lanes []LaneStats `json:"lanes,omitempty"`
-	// Incomplete marks a checkpoint a chaos run wrote while it was still
-	// running: the run was still going or was killed before its final record.
-	// FinishedAt is then the checkpoint time. The final write omits the key.
+	// Pressure holds the statistics of a keystone pressure run. It is nil for
+	// every other run, so their records carry no pressure key, and a record
+	// written before pressure runs existed loads with it nil.
+	Pressure *PressureStats `json:"pressure,omitempty"`
+	// Incomplete marks a checkpoint a chaos or pressure run wrote while it was
+	// still running: the run was still going or was killed before its final
+	// record. FinishedAt is then the checkpoint time. The final write omits
+	// the key.
 	Incomplete bool `json:"incomplete,omitempty"`
 }
 
@@ -131,6 +136,52 @@ type ChaosBucket struct {
 	Start  time.Duration        `json:"start"`
 	Stats  metrics.Stats        `json:"stats"`
 	Errors []metrics.ErrorCount `json:"errors,omitempty"`
+}
+
+// PressureStats holds the statistics of a closed-loop pressure run, persisted
+// next to the standard metrics: the worker count, the token pool size, the
+// users reserved for role churn, the operation mix, the per-operation
+// aggregate, the revocations the run made and per-time-bucket statistics. The
+// schema lives here, not in the pressure package, so the read-side commands
+// can render it without importing the engine. The percentiles in Operations
+// and in every bucket are the metrics collector's estimates within 1%.
+type PressureStats struct {
+	Workers int `json:"workers"`
+	Tokens  int `json:"tokens"`
+	// ChurnUsers is the number of users reserved for the grant_churn
+	// operation. It is omitempty and 0 when the run reserved none.
+	ChurnUsers int `json:"churnUsers,omitempty"`
+	// Mix lists every operation with a positive weight, sorted by operation
+	// name.
+	Mix []PressureWeight `json:"mix"`
+	// Operations aggregates the run's samples, one ByType entry per operation
+	// name.
+	Operations metrics.Aggregate `json:"operations"`
+	// Revocations counts the revoke operations of the run that succeeded.
+	Revocations int              `json:"revocations"`
+	Buckets     []PressureBucket `json:"buckets,omitempty"`
+	// BucketWidth is the fixed width of every time bucket of an unbounded run.
+	// It is omitempty and 0 for a bounded run, whose ten buckets divide its
+	// duration equally.
+	BucketWidth time.Duration `json:"bucketWidth,omitempty"`
+}
+
+// PressureWeight is one operation of a pressure run's mix: a worker draws the
+// operation with probability Weight divided by the sum of the weights.
+type PressureWeight struct {
+	Operation string `json:"operation"`
+	Weight    int    `json:"weight"`
+}
+
+// PressureBucket is one time slice of a pressure run: the operations whose
+// start offset fell within it, aggregated per operation, so a latency change
+// over the run is visible next to the revocations that had accumulated by
+// then. Revocations is cumulative: the revocations that succeeded in this
+// bucket and every earlier one.
+type PressureBucket struct {
+	Start       time.Duration     `json:"start"`
+	Operations  metrics.Aggregate `json:"operations"`
+	Revocations int               `json:"revocations"`
 }
 
 // Write marshals r as indented JSON and writes it to dir as run-<id>.json,
