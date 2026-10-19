@@ -34,6 +34,36 @@ are exact. A run that ends with teardown also
 performs a **leak check**, listing any resource still carrying the run tag after
 the topology should be gone.
 
+A `keystone pressure` record renders the metrics as above, by resource kind,
+then a `Pressure` section with the workers' draws by operation: one sample per
+draw, whatever calls it made. Its percentiles, per operation and per bucket,
+are estimates within 1%, unlike a churn run's exact bucket percentiles. The
+token path moves in sub-millisecond steps, so the table rounds its latencies
+to the microsecond.
+
+- **table**: a `Pressure` block with the lines `workers:`, `token pool:`,
+  `churn users:` (only when the run reserved any), `mix:` and
+  `revocations:`; an `Operations` table with one row per operation drawn and
+  the columns `OPERATION`, `OPS`, `OK`, `FAILED`, `OPS/S`, `MIN`, `MEAN`,
+  `P50`, `P90`, `P95`, `P99` and `MAX`; and a `Latency and errors over time`
+  table with the columns `START`, `OPERATION`, `OPS`, `OK`, `FAILED`, `P50`,
+  `P99`, `REVOCATIONS` and `ERRORS`. Per bucket, an `all` row carries the
+  bucket's cumulative revocations and its error kinds as `kind=count` pairs
+  (`-` for none), followed by one row per operation drawn in the bucket with
+  those two cells empty. `START` is rounded to the millisecond, and a row
+  without operations shows `-` for its latencies.
+- **json**: `{"metrics": …, "pressure": …}`, with `"incomplete": true` added
+  on a checkpoint.
+- **csv**: the same header, with one row per operation labelled
+  `pressure/<operation>` and then, per bucket, one row per operation labelled
+  `pressure@<start>/<operation>`, e.g. `pressure@1m0s/validate`, appended
+  after the per-kind rows. The cumulative revocations have no column; the
+  other formats carry them.
+- **html**: after the overall sections, a `Pressure` section with the
+  settings and the revocations and the per-operation table, then per
+  operation a `Pressure: <operation>` section with its throughput and latency
+  charts over time. A record without buckets shows no charts.
+
 A `mix` record renders the overall metrics as above, the exact aggregate of
 every persona and lane, then a section per persona, and then a section per
 background lane when the run had any. It has no merged time series, because
@@ -127,7 +157,7 @@ Every value set is bounded.
 | Attribute | Values |
 |---|---|
 | `kind` | **neutron:** `address-scope`, `subnet-pool`, `network`, `subnet`, `router`, `router-interface`, `security-group`, `security-group-rule`, `port`, `floating-ip` — **cinder:** `volume`, `snapshot` — **keystone:** `domain`, `project`, `user`, `role`, `role_assignment`, `token` — **nova:** `server`, `network`, `subnet`, `port`, `volume`, `server_group` (only the `mix` Gardener persona creates server groups) — **glance:** `image` |
-| `operation` | `create`, `delete`, `get`, `list`, `tag`, `attach`, `detach`, `extend` (cinder resize), `update` (keystone domain disable-before-delete; glance property churn), `stop`, `start`, `reboot`, `resize`, `confirm-resize`, `live-migrate`, `cold-migrate` (nova server lifecycle; `cold-migrate` only for the `mix` Legacy persona), `upload`, `visibility`, `deactivate`, `reactivate`, `member-add`, `member-accept`, `member-remove` (glance image lifecycle) |
+| `operation` | `create`, `delete`, `get`, `list`, `tag`, `attach`, `detach`, `extend` (cinder resize), `update` (keystone domain disable-before-delete; glance property churn), `validate`, `revoke` (keystone token validation and revocation; `keystone pressure` only), `stop`, `start`, `reboot`, `resize`, `confirm-resize`, `live-migrate`, `cold-migrate` (nova server lifecycle; `cold-migrate` only for the `mix` Legacy persona), `upload`, `visibility`, `deactivate`, `reactivate`, `member-add`, `member-accept`, `member-remove` (glance image lifecycle) |
 | `outcome` | `success`, `error`, `timeout` for an operation; `success`, `timeout` for time-to-ready; `success`, `failure` for an iteration |
 | `result` | `attempted`, `succeeded`, `failed` |
 | `error.kind` | `quota`, `timeout`, `canceled`, `other`, `http_<status>` for the statuses the service returns, `http_other` for the rest |
@@ -142,6 +172,12 @@ at all — its absence is the steady state, not a missing metric.
 Keystone creates and deletes are synchronous, so `resource.time_to_ready` is
 largely unused there. The one exception is **token-issue latency**, recorded with
 `kind=token` in addition to the `token`/`create` operation histogram.
+`keystone pressure` adds two operations under `kind=token`, `validate` and
+`revoke`, which record no time-to-ready; its pool issues record as
+`token`/`create` like any token issue, and the three listings of its
+`effective` operation as `role_assignment`/`list` and `project`/`list`. The
+per-draw samples of its `Pressure` section stay in the run record and are not
+exported, so no call is exported twice.
 
 ### Prometheus naming
 

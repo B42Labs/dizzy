@@ -11,6 +11,10 @@ when the run ends. A consumer must check `incomplete` before it treats a
 a checkpoint as a finished run. `monitor` writes one per iteration only with
 `--keep-run-records`, since in a long loop they accumulate unboundedly.
 
+`keystone pressure` writes one with an extra `pressure` object instead of a
+`chaos` object, and checkpoints it the same way, once a minute marked
+`incomplete`.
+
 `mix chaos` writes one record for all of its personas and background lanes,
 with `service: "mix"`, a `personas` array and, when the run had lanes, a
 `lanes` array instead of a top-level `chaos` object, and checkpoints it the
@@ -34,7 +38,8 @@ same way.
 | `services` | array of strings | `mix` only; the opt-in services bound to the personas. Omitted when empty |
 | `personas` | array | `mix` only; one entry per persona; see below |
 | `lanes` | array | `mix` only; one entry per background lane; see below. Omitted when the run had none |
-| `incomplete` | bool | `true` on a record `chaos` wrote while still running; `finishedAt` is then the checkpoint time and `metrics.wall` the time elapsed so far. Omitted on a final record |
+| `pressure` | object | `keystone pressure` runs only; see below. Absent on every other record |
+| `incomplete` | bool | `true` on a record `chaos` or `keystone pressure` wrote while still running; `finishedAt` is then the checkpoint time and `metrics.wall` the time elapsed so far. Omitted on a final record |
 
 ## `created[]`
 
@@ -88,7 +93,8 @@ nanoseconds, as Go encodes `time.Duration`.
 Under `metrics`, `median`, `p90`, `p95` and `p99` are estimates within 1% of the
 exact value, since the collector keeps a fixed-size histogram instead of every
 sample. `min`, `mean` and `max` are exact, and so is every value in
-`chaos.buckets[]`.
+`chaos.buckets[]`. Under `pressure`, the percentiles of `operations` and of
+every bucket are estimates within 1% as well.
 
 ### Error kinds
 
@@ -129,6 +135,58 @@ the full width. A record written before the first tick has no buckets.
 | `start` | duration | Offset from the start of the run |
 | `stats` | Stats | Stats for this bucket |
 | `errors` | array | `{kind, count}` for this bucket |
+
+## `pressure`
+
+Present only on a run record written by `keystone pressure`. A record written
+by any other command, or by a release that predates the verb, has no
+`pressure` key.
+
+The top-level `metrics` count, by resource kind, every call the run's
+Keystone client made before the record was written: the provisioning, the
+token pool's issues and refreshes, and every call of a draw. A validation and
+a revocation both count under `token`. `pressure` counts the workers' draws by
+operation: one sample per draw, whatever calls it made. A `revoke` sample
+therefore covers the revocation and the reissue together; the revocation call
+alone is the `token`/`revoke` series of the `--otel` export.
+
+| Field | Type | Notes |
+|---|---|---|
+| `workers` | int | Closed-loop workers |
+| `tokens` | int | Size of the token pool |
+| `churnUsers` | int | Users reserved for `grant_churn`. `0`, and so omitted, when the run reserved none, which includes every run whose `grant_churn` weight is `0` |
+| `mix` | array | `{operation, weight}` for every operation with a positive weight, sorted by operation |
+| `operations` | object | The run's draws, shaped like [`metrics`](#metrics), with one `byType` entry per operation drawn; `type` is the operation name and `wall` the time the workers ran |
+| `revocations` | int | `revoke` draws that succeeded |
+| `buckets` | array | Time-sliced stats; see below |
+| `bucketWidth` | duration | Width of every bucket of a run with `--duration 0`, in nanoseconds. Omitted for a bounded run |
+
+The median, p90, p95 and p99 in `operations` and in every bucket are the
+collector's estimates within 1% of the exact value; `min`, `mean` and `max`
+are exact. Their `errors[]` label a failure `canceled`, `timeout`,
+`forbidden`, `not-found`, `transient` (a 500, 502, 503, 504 or 429), `other`
+(any other failure, a 400 or a 501 among them) or `pool-empty` (a draw found
+the token pool empty), where the top-level `metrics` use the
+[error kinds](#error-kinds) above.
+
+The record carries no token and no password: the token pool and the users'
+passwords stay in the memory of the process that ran it.
+
+### `buckets[]`
+
+Every draw lands in the bucket of the offset at which it started, so a
+latency change over the run is visible next to the revocations that had
+accumulated by then. A bounded run has ten buckets of equal width, and a draw
+that starts at or after the end lands in the last one. A run with
+`--duration 0` has one bucket per `bucketWidth`, starting at offset 0,
+including buckets without draws; its last bucket may be partial, and its
+throughput still divides by the full width.
+
+| Field | Type | Notes |
+|---|---|---|
+| `start` | duration | Offset from the start of the workers |
+| `operations` | object | The draws that started in this bucket, shaped like [`metrics`](#metrics), with one `byType` entry per operation drawn in it; `wall` is the bucket width, and `errors` the bucket's error breakdown |
+| `revocations` | int | Cumulative: the `revoke` draws that succeeded in this bucket and in every earlier one |
 
 ## `personas[]`
 

@@ -4,7 +4,7 @@ The `devstack-c5c3` Make targets drive a local [Cobalt Core "forge" control
 plane](https://c5c3.github.io/forge/quick-start-controlplane.html) instead of a
 real cloud. That quick-start brings up **Keystone + Horizon**, so the targets
 default to the `keystone` service and to admin credentials — exactly the tier
-Keystone's `apply` and `monitor` need.
+Keystone's `apply` and `monitor` need, and the only one `pressure` accepts.
 
 ## The two target families
 
@@ -36,12 +36,38 @@ $ kubectl wait controlplane/controlplane -n openstack --for=condition=Ready
 $ make devstack-c5c3                                                        # keystone apply of the small profile, then clean up
 $ make devstack-c5c3 DEVSTACK_C5C3_SCENARIO=scenarios/keystone/medium.yaml
 $ make devstack-c5c3 DEVSTACK_C5C3_CMD=chaos ARGS="--duration 10m"
+$ make devstack-c5c3 DEVSTACK_C5C3_CMD=pressure ARGS="--duration 5m"        # closed-loop token load, then clean up
 $ make devstack-c5c3 KEEP=1                                                 # keep the resources and the run record
 ```
 
 Note that `scenarios/keystone/medium.yaml` declares two domains and is therefore
 admin-only — fine here, since the `devstack-c5c3` targets use admin credentials.
 See [Keystone's privilege model](../explanation/privilege-model.md).
+
+## Put pressure on the token path
+
+`DEVSTACK_C5C3_CMD=pressure` runs `keystone pressure`, which validates,
+revokes and lists role assignments of the run's own users as fast as Keystone
+answers. The dev stack is the place for it: every `revoke` is a real
+revocation event, and on Keystone 2026.2 each one flushes the token validation
+cache for every user of that Keystone, so the verb never belongs on a shared
+cloud. See [`pressure`](../reference/cli.md#pressure) and
+[Pressure mode](../explanation/pressure-mode.md).
+
+The run tears its own resources down and runs its leak check before it exits.
+The target's cleanup step then runs `keystone cleanup --run` on the new run
+record as after any other command. The resources are already gone and a 404
+counts as success, so the step succeeds and deletes the record. To keep the
+record for `keystone report`, pass `KEEP=1`: the pressure run has already torn
+its resources down unless `ARGS` contains `--no-cleanup`.
+
+```console
+$ make devstack-c5c3 DEVSTACK_C5C3_CMD=pressure ARGS="--duration 5m" KEEP=1
+$ ./dizzy keystone report --run run-<id>.json
+```
+
+Each Keystone profile's `pressure:` block sets a duration too, 5 minutes for
+the default `small` profile, so `ARGS` may stay empty.
 
 ## Why `clouds.yaml` is regenerated every time
 
