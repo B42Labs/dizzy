@@ -15,7 +15,6 @@ package keystonegraph
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -190,24 +189,10 @@ func deleteRetry(ctx context.Context, opTimeout time.Duration, c Keystone, res r
 }
 
 // Classify labels an operation error for the churn engine's per-bucket error
-// breakdown, reusing the keystone classification helpers so the labels match the
-// kinds operators already see in the metrics report. It is wired into the engine
-// via chaos.Config.Classify. forbidden takes the slot Cinder's quota label uses.
+// breakdown with keystone.ClassifyOperationError, the classifier the pressure
+// operations share, so a Keystone failure carries the same label in either
+// report. It is wired into the engine via chaos.Config.Classify. forbidden
+// takes the slot Cinder's quota label uses.
 func Classify(err error) string {
-	switch {
-	case err == nil:
-		return ""
-	case errors.Is(err, context.Canceled):
-		return "canceled"
-	case errors.Is(err, context.DeadlineExceeded):
-		return "timeout"
-	case keystone.IsForbidden(err):
-		return "forbidden"
-	case keystone.IsNotFound(err):
-		return "not-found"
-	case keystone.IsRetryable(err):
-		return "transient"
-	default:
-		return "other"
-	}
+	return keystone.ClassifyOperationError(err)
 }

@@ -80,13 +80,10 @@ func (c *Client) FindRoleByName(ctx context.Context, name string) (string, error
 // grant the admin role).
 func (c *Client) AssignRole(ctx context.Context, a keystoneplan.Assignment, userID, projectID, domainID, roleID string) (resource.Resource, error) {
 	opts := roles.AssignOpts{UserID: userID}
-	target := ""
 	if projectID != "" {
 		opts.ProjectID = projectID
-		target = "project:" + projectID
 	} else {
 		opts.DomainID = domainID
-		target = "domain:" + domainID
 	}
 	err := c.timed(ctx, string(KindAssignment), "create", func(ctx context.Context) error {
 		return roles.Assign(ctx, c.gc, roleID, opts).ExtractErr()
@@ -94,11 +91,31 @@ func (c *Client) AssignRole(ctx context.Context, a keystoneplan.Assignment, user
 	if err != nil {
 		return resource.Resource{}, wrapCreate(KindAssignment, assignmentLogical(a), err)
 	}
+	return AssignmentResource(a, userID, projectID, domainID, roleID), nil
+}
+
+// AssignmentResource returns the synthetic-id resource AssignRole records for
+// the grant of roleID to userID on projectID (when set) or on domainID. A
+// caller that churns an existing grant builds the resource to pass to Delete
+// with it, without a cloud call, so the id always has the shape Delete and
+// cleanup parse.
+func AssignmentResource(a keystoneplan.Assignment, userID, projectID, domainID, roleID string) resource.Resource {
+	kind, targetID := "domain", domainID
+	if projectID != "" {
+		kind, targetID = "project", projectID
+	}
 	return resource.Resource{
 		Kind:    KindAssignment,
 		Logical: assignmentLogical(a),
-		ID:      userID + ":" + target + ":" + roleID,
-	}, nil
+		ID:      assignmentID(userID, kind, targetID, roleID),
+	}
+}
+
+// assignmentID builds the synthetic assignment id
+// "<userID>:project|domain:<targetID>:<roleID>" that parseAssignmentID inverts.
+// It is the one place the format is written.
+func assignmentID(userID, kind, targetID, roleID string) string {
+	return userID + ":" + kind + ":" + targetID + ":" + roleID
 }
 
 // assignmentLogical renders a human-readable label for an assignment, for the
@@ -149,12 +166,12 @@ func (c *Client) ListAssignmentsForUser(ctx context.Context, userID string) ([]r
 				case ra.Scope.Project.ID != "":
 					found = append(found, resource.Resource{
 						Kind: KindAssignment,
-						ID:   userID + ":project:" + ra.Scope.Project.ID + ":" + ra.Role.ID,
+						ID:   assignmentID(userID, "project", ra.Scope.Project.ID, ra.Role.ID),
 					})
 				case ra.Scope.Domain.ID != "":
 					found = append(found, resource.Resource{
 						Kind: KindAssignment,
-						ID:   userID + ":domain:" + ra.Scope.Domain.ID + ":" + ra.Role.ID,
+						ID:   assignmentID(userID, "domain", ra.Scope.Domain.ID, ra.Role.ID),
 					})
 				}
 			}
@@ -165,6 +182,31 @@ func (c *Client) ListAssignmentsForUser(ctx context.Context, userID string) ([]r
 		return nil, fmt.Errorf("listing assignments for user %s: %w", userID, err)
 	}
 	return found, nil
+}
+
+// ListEffectiveAssignments lists the effective role assignments of a user
+// (GET /v3/role_assignments?user.id=<userID>&effective=true) over every page
+// and returns how many there are. Keystone expands group memberships and
+// inherited grants for an effective listing. It is recorded as the
+// role_assignment/list operation.
+func (c *Client) ListEffectiveAssignments(ctx context.Context, userID string) (int, error) {
+	effective := true
+	var n int
+	err := c.timed(ctx, string(KindAssignment), "list", func(ctx context.Context) error {
+		n = 0
+		return roles.ListAssignments(c.gc, roles.ListAssignmentsOpts{UserID: userID, Effective: &effective}).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
+			items, err := roles.ExtractRoleAssignments(page)
+			if err != nil {
+				return false, err
+			}
+			n += len(items)
+			return true, nil
+		})
+	})
+	if err != nil {
+		return 0, fmt.Errorf("listing effective assignments for user %s: %w", userID, err)
+	}
+	return n, nil
 }
 
 // ListRolesByPrefix returns the roles whose name carries this run's

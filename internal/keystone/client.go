@@ -172,6 +172,31 @@ func errKind(err error) string {
 	return "other"
 }
 
+// ClassifyOperationError labels an operation error for a per-bucket error
+// breakdown: "" for nil, then canceled, timeout, forbidden (a 403 policy
+// denial), not-found (a 404), transient (a 5xx or 429) and other, checked in
+// that order. The churn graph and the pressure operations both label their
+// samples with it, so one Keystone failure reads the same in either report.
+// Unlike errKind it collapses the HTTP status into these few labels.
+func ClassifyOperationError(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case IsForbidden(err):
+		return "forbidden"
+	case IsNotFound(err):
+		return "not-found"
+	case IsRetryable(err):
+		return "transient"
+	default:
+		return "other"
+	}
+}
+
 // IsRetryable reports whether err is a transient Keystone failure worth
 // retrying: a 5xx or a 429 rate-limit. Unlike Cinder, a 409 conflict is NOT
 // retryable — Keystone names are unique within their scope, so a conflict is a
