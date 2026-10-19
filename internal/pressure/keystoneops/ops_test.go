@@ -335,20 +335,51 @@ func TestPrimeRoundRobin(t *testing.T) {
 	}
 }
 
-// TestPrimeConcurrencyFloor checks that a concurrency below 1 primes one token
-// at a time instead of none.
+// TestPrimeConcurrencyFloor checks that a concurrency below 1 primes the pool
+// one token at a time instead of none: Prime with concurrency 0 over four
+// tokens has exactly one issue in flight at every step, and issues every token
+// once each is let through. The fake holds every issue at its gate and the
+// test lets them through one at a time. In the synctest bubble, synctest.Wait
+// returns once every goroutine is blocked, so Prime has started every issue it
+// can start before the test counts them: a floor of 2 or 3 has more than one
+// in flight, and a missing floor, which blocks Prime on its semaphore before
+// the first issue, has none.
 func TestPrimeConcurrencyFloor(t *testing.T) {
-	f := newFake(newFakeClock(), time.Hour)
-	s := buildSet(t, f, fixtureOptions(3, churnOn))
-	if err := s.Prime(context.Background(), 0); err != nil {
-		t.Fatalf("Prime: %v", err)
-	}
-	if n := s.pool.len(); n != 3 {
-		t.Errorf("pool size = %d, want 3", n)
-	}
-	if n := f.maxIssuesInFlight(); n != 1 {
-		t.Errorf("at most %d issues were in flight, want 1", n)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		const tokens = 4 // more than the 3 pool pairs, and more than a floor of 3
+		f := newFake(newFakeClock(), time.Hour)
+		f.gateIssues(t)
+		s := buildSet(t, f, fixtureOptions(tokens, churnOn))
+		primed := make(chan error, 1)
+		go func() { primed <- s.Prime(context.Background(), 0) }()
+
+		for released := range tokens {
+			synctest.Wait()
+			if n := f.issuesInFlight(); n != 1 {
+				t.Fatalf("%d issues in flight with %d of %d let through, want 1 (a concurrency of 0 primes one token at a time)", n, released, tokens)
+			}
+			f.releaseIssue(t)
+		}
+		synctest.Wait()
+		select {
+		case err := <-primed:
+			if err != nil {
+				t.Fatalf("Prime: %v", err)
+			}
+		default:
+			t.Fatal("Prime did not return after every issue was let through")
+		}
+
+		if n := len(f.recorded(kindIssue)); n != tokens {
+			t.Errorf("%d issues made, want %d", n, tokens)
+		}
+		if n := s.pool.len(); n != tokens {
+			t.Errorf("pool size = %d, want %d", n, tokens)
+		}
+		if n := f.maxIssuesInFlight(); n != 1 {
+			t.Errorf("at most %d issues were in flight at once, want 1", n)
+		}
+	})
 }
 
 // TestPrimeFailure checks that a failed issue stops priming: with concurrency 1
