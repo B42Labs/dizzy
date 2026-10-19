@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -149,9 +150,6 @@ every user of that Keystone, not only for the run's own users.`,
 			if err := checkPressureMix(o.Weights); err != nil {
 				return err
 			}
-			cfg.Seed = p.Seed
-			cfg.Classify = keystoneops.Classify
-			cfg.CheckpointInterval = chaosCheckpointInterval
 			if err := cfg.Validate(); err != nil {
 				return err
 			}
@@ -183,6 +181,10 @@ every user of that Keystone, not only for the run's own users.`,
 			if err != nil {
 				return fmt.Errorf("creating identity client: %w", err)
 			}
+			// The workers and the token refresher, whose reissues run next
+			// to them with up to --concurrency in flight, all go to the one
+			// Keystone endpoint, as provisioning and priming do before them.
+			sizeConnectionPool(gc, cfg.Workers+opts.concurrency)
 
 			if _, err := resolvePressureTier(ctx, gc, priv); err != nil {
 				return err
@@ -240,7 +242,9 @@ var _ pressureKeystone = (*keystone.Client)(nil)
 // id, the plan, the engine config and the operation options that passed every
 // pre-cloud check, the global concurrency and per-operation timeout,
 // --no-cleanup, and the collector and telemetry the Keystone client records
-// into. A nil tel is the disabled export.
+// into. cfg comes as mergePressureConfig returns it, without the seed, the
+// classifier and the checkpoint, which runKeystonePressure sets. A nil tel is
+// the disabled export.
 type pressureRun struct {
 	runID       string
 	plan        *keystoneplan.Plan
@@ -256,13 +260,14 @@ type pressureRun struct {
 // runKeystonePressure is keystone pressure from its first write on, once
 // every pre-cloud check and the privilege pre-check passed. It provisions the
 // plan in the admin tier, builds the operation set, primes the token pool,
-// runs the workers with a run-record checkpoint every
-// r.cfg.CheckpointInterval, prints the metrics summary and the Pressure table,
-// writes the run record, and tears down through finishKeystoneTeardown. A
-// failure before the workers finish goes through failPressureSetup, which
-// writes a record whose error names the failure and tears down what was
-// created so far. It is split from the command so a test can drive it with a
-// fake Keystone; it prints to cmd's output.
+// runs the workers from the plan's seed, with keystoneops.Classify labeling
+// their errors and a run-record checkpoint every chaosCheckpointInterval,
+// prints the metrics summary and the Pressure table, writes the run record,
+// and tears down through finishKeystoneTeardown. A failure before the workers
+// finish goes through failPressureSetup, which writes a record whose error
+// names the failure and tears down what was created so far. It is split from
+// the command so a test can drive it with a fake Keystone; it prints to cmd's
+// output.
 func runKeystonePressure(ctx context.Context, cmd *cobra.Command, c pressureKeystone, r pressureRun) error {
 	p, cfg, o := r.plan, r.cfg, r.o
 	out := cmd.OutOrStdout()
@@ -325,6 +330,15 @@ func runKeystonePressure(ctx context.Context, cmd *cobra.Command, c pressureKeys
 			Pressure:   pressureStats(res, o),
 		}
 	}
+	// The engine settings that make the run this command's run are set here,
+	// not by the caller, so the run a test drives through this function is the
+	// run the command makes: the workers draw from the plan's seed, so a
+	// scenario's seed reproduces their operation sequence; errors carry
+	// keystoneops' labels rather than the engine's canceled/timeout/other; and
+	// the record is rewritten every chaosCheckpointInterval.
+	cfg.Seed = p.Seed
+	cfg.Classify = keystoneops.Classify
+	cfg.CheckpointInterval = chaosCheckpointInterval
 	cfg.OnCheckpoint = chaosCheckpoint(".", buildRecord)
 
 	duration := pressureDurationLabel(cfg)
@@ -400,7 +414,9 @@ func parseMixFlag(values []string) (map[string]int, error) {
 // value or the default; --churn-users 0 reserves no user. Each mix weight the
 // block or a --mix value names overrides the default of that operation alone,
 // and an explicit 0 switches it off. It does not set the seed, the classifier
-// or the checkpoint, which the command adds once the plan exists.
+// or the checkpoint, which runKeystonePressure adds once the plan is
+// provisioned; pressure.Config.Validate does not read them while OnCheckpoint
+// is unset, so the command's pre-cloud check is the same without them.
 func mergePressureConfig(cmd *cobra.Command, opts *globalOptions, s keystonescenario.Scenario, f pressureFlags) (pressure.Config, keystoneops.Options, error) {
 	cfg := pressure.Config{
 		Workers:     defaultPressureWorkers,
@@ -665,6 +681,42 @@ func checkPressureMix(weights map[string]int) error {
 		})
 	}
 	return pressure.ValidateOperations(ops)
+}
+
+// sizeConnectionPool lets gc keep up to conns idle connections to its
+// endpoint. The identity client gophercloud builds uses http.DefaultTransport
+// or a clone of it, which keeps net/http's default of two idle connections per
+// host, so closed-loop workers against one Keystone endpoint would otherwise
+// churn connections: a request that finds no idle connection opens a new TCP
+// and TLS connection, and the latency samples include handshakes rather than
+// measuring Keystone alone. The pool-token calls share this transport, since
+// they copy gc's HTTP client.
+//
+// A nil transport, which stands for http.DefaultTransport, and an
+// *http.Transport are both replaced by a clone, so neither the process-wide
+// default nor a transport another client may share changes; the clone keeps
+// the TLS settings and the HTTP/2 negotiation of its origin. The clone keeps
+// conns idle connections per host and at least conns idle connections in
+// all: a larger MaxIdleConns stays, as does 0, which means no limit. Any
+// other RoundTripper is left alone with a warning, since its pool is out of
+// reach.
+func sizeConnectionPool(gc *gophercloud.ServiceClient, conns int) {
+	rt := gc.HTTPClient.Transport
+	if rt == nil {
+		rt = http.DefaultTransport
+	}
+	base, ok := rt.(*http.Transport)
+	if !ok {
+		slog.Warn("the connection pool could not be sized: the identity client's transport is not an *http.Transport, so latency samples may include connection handshakes",
+			"transport", fmt.Sprintf("%T", rt), "connections", conns)
+		return
+	}
+	t := base.Clone()
+	t.MaxIdleConnsPerHost = conns
+	if t.MaxIdleConns != 0 && t.MaxIdleConns < conns {
+		t.MaxIdleConns = conns
+	}
+	gc.HTTPClient.Transport = t
 }
 
 // pressureDurationLabel is the duration a pressure run logs: "unbounded" for a
