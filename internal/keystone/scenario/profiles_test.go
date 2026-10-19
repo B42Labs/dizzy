@@ -79,6 +79,48 @@ func TestProfilesShipChaosBlock(t *testing.T) {
 	}
 }
 
+// TestProfilesShipPressureBlock asserts every shipped Keystone profile carries
+// a pressure block with the duration, workers and tokens of its row in the
+// scenario schema's profile table, so `keystone pressure --scenario
+// scenarios/keystone/<profile>.yaml` runs without extra flags, and that no
+// profile sets churn_users, mix, propagation or bucket_width, which stay at the
+// command's defaults.
+func TestProfilesShipPressureBlock(t *testing.T) {
+	want := map[string]struct {
+		duration time.Duration
+		workers  int
+		tokens   int
+	}{
+		"small":  {duration: 5 * time.Minute, workers: 8, tokens: 20},
+		"medium": {duration: 30 * time.Minute, workers: 32, tokens: 200},
+		"large":  {duration: time.Hour, workers: 128, tokens: 1000},
+	}
+	for _, name := range profileNames {
+		t.Run(name, func(t *testing.T) {
+			w, ok := want[name]
+			if !ok {
+				t.Fatalf("profile keystone/%s.yaml has no expected pressure values in this test", name)
+			}
+			p := readProfile(t, name).Pressure
+			if p == nil {
+				t.Fatalf("profile keystone/%s.yaml has no pressure block", name)
+			}
+			if got := time.Duration(p.Duration); got != w.duration {
+				t.Errorf("profile keystone/%s.yaml pressure.duration = %s, want %s", name, got, w.duration)
+			}
+			if p.Workers != w.workers {
+				t.Errorf("profile keystone/%s.yaml pressure.workers = %d, want %d", name, p.Workers, w.workers)
+			}
+			if p.Tokens != w.tokens {
+				t.Errorf("profile keystone/%s.yaml pressure.tokens = %d, want %d", name, p.Tokens, w.tokens)
+			}
+			if p.ChurnUsers != nil || p.Mix != nil || p.Propagation != nil || p.BucketWidth != 0 {
+				t.Errorf("profile keystone/%s.yaml pressure block = %s, want only duration, workers and tokens set", name, describePressure(p))
+			}
+		})
+	}
+}
+
 // TestSmallProfileSingleDomain asserts the small profile keeps a single domain,
 // so it stays runnable in domain-manager mode (which requires domains <= 1).
 func TestSmallProfileSingleDomain(t *testing.T) {

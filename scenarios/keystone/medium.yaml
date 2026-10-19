@@ -20,3 +20,8 @@ chaos:
   churn_ratio: 0.5
   target_fill: 0.8
   token_ratio: 0.3
+
+pressure:
+  duration: 30m
+  workers: 32
+  tokens: 200

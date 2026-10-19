@@ -32,6 +32,13 @@ type Scenario struct {
 	// duplicated by design so a typo in any service's scenario keeps failing
 	// loudly.
 	Chaos *Chaos `yaml:"chaos,omitempty"`
+	// Pressure, when present, configures the closed-loop load mode (the
+	// keystone pressure subcommand). Only keystone pressure reads it; apply,
+	// generate, chaos and a mix run's keystone lane ignore it, so it takes no
+	// part in the plan. It is a pointer so an absent block stays nil, and like
+	// the chaos block its values are defaults that the pressure CLI flags
+	// override where a flag exists.
+	Pressure *Pressure `yaml:"pressure,omitempty"`
 }
 
 // Chaos holds the churn-mode knobs read from a scenario's chaos block. Every
@@ -55,6 +62,52 @@ type Chaos struct {
 	TargetFill  float64  `yaml:"target_fill"`
 	TokenRatio  *float64 `yaml:"token_ratio"`
 	BucketWidth Duration `yaml:"bucket_width"`
+}
+
+// Pressure holds the closed-loop load knobs read from a scenario's pressure
+// block. It is read only by the keystone pressure subcommand. Every field
+// except Propagation has a pressure CLI flag that overrides it, and Set has no
+// key for the block, as for the chaos block. A zero Duration, Workers, Tokens
+// or BucketWidth means unset and falls back to the command's default; Duration
+// is not required here because a flag may supply it, and a zero duration in
+// the block never selects a run without an end, which only --duration 0 does.
+// ChurnUsers is a pointer so an omitted key (nil) falls back to the command's
+// default while an explicit churn_users: 0 reserves no user for grant_churn.
+//
+// BucketWidth is the width of one time bucket of a run without an end, as for
+// the chaos block. The probe and bad_token weights of Mix and the Propagation
+// block are parsed and validated now and delivered by later work; until then
+// the command rejects a positive value for any of them.
+type Pressure struct {
+	Duration    Duration     `yaml:"duration"`
+	Workers     int          `yaml:"workers"`
+	Tokens      int          `yaml:"tokens"`
+	ChurnUsers  *int         `yaml:"churn_users"`
+	Mix         *Mix         `yaml:"mix"`
+	Propagation *Propagation `yaml:"propagation"`
+	BucketWidth Duration     `yaml:"bucket_width"`
+}
+
+// Mix holds the pressure operation weights: a worker draws an operation with
+// probability weight divided by the sum of the weights. Each weight is a
+// pointer so an omitted key (nil) falls back to the command's default while
+// an explicit 0 switches the operation off. Probe and BadToken are parsed now
+// and delivered by later work.
+type Mix struct {
+	Validate   *int `yaml:"validate"`
+	Probe      *int `yaml:"probe"`
+	Effective  *int `yaml:"effective"`
+	Revoke     *int `yaml:"revoke"`
+	GrantChurn *int `yaml:"grant_churn"`
+	Issue      *int `yaml:"issue"`
+	BadToken   *int `yaml:"bad_token"`
+}
+
+// Propagation configures the propagation probe, which revokes one pool token
+// every Every and measures how long a service takes to reject it. It is parsed
+// now and delivered by later work.
+type Propagation struct {
+	Every Duration `yaml:"every"`
 }
 
 // Interval is the random delay range between scheduled churn actions.
@@ -213,6 +266,9 @@ func (s Scenario) Validate() error {
 	if err := s.Chaos.validate(); err != nil {
 		return err
 	}
+	if err := s.Pressure.validate(); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -247,6 +303,66 @@ func (c *Chaos) validate() error {
 	}
 	if c.TokenRatio != nil && (*c.TokenRatio < 0 || *c.TokenRatio > 1) {
 		return fmt.Errorf("chaos.token_ratio must be between 0 and 1, got %v", *c.TokenRatio)
+	}
+	return nil
+}
+
+// validate checks the pressure block for semantic consistency. A nil receiver
+// (no pressure block) is valid. Nothing is required here because the
+// command's defaults and flags may supply every value; only the values that
+// are present must not be negative. The checks that need the merged values,
+// such as the workers ceiling, an all-zero mix or an operation this build does
+// not run, belong to the command.
+func (p *Pressure) validate() error {
+	if p == nil {
+		return nil
+	}
+	if p.Duration < 0 {
+		return fmt.Errorf("pressure.duration must not be negative, got %s", time.Duration(p.Duration))
+	}
+	if p.BucketWidth < 0 {
+		return fmt.Errorf("pressure.bucket_width must not be negative, got %s", time.Duration(p.BucketWidth))
+	}
+	if p.Workers < 0 {
+		return fmt.Errorf("pressure.workers must not be negative, got %d", p.Workers)
+	}
+	if p.Tokens < 0 {
+		return fmt.Errorf("pressure.tokens must not be negative, got %d", p.Tokens)
+	}
+	if p.ChurnUsers != nil && *p.ChurnUsers < 0 {
+		return fmt.Errorf("pressure.churn_users must not be negative, got %d", *p.ChurnUsers)
+	}
+	if err := p.Mix.validate(); err != nil {
+		return err
+	}
+	if p.Propagation != nil && p.Propagation.Every < 0 {
+		return fmt.Errorf("pressure.propagation.every must not be negative, got %s", time.Duration(p.Propagation.Every))
+	}
+	return nil
+}
+
+// validate rejects a negative weight in the pressure mix, naming the weight by
+// its YAML key. A nil receiver (no mix) and a nil weight (an omitted key) are
+// valid.
+func (m *Mix) validate() error {
+	if m == nil {
+		return nil
+	}
+	for _, w := range []struct {
+		key    string
+		weight *int
+	}{
+		{"validate", m.Validate},
+		{"probe", m.Probe},
+		{"effective", m.Effective},
+		{"revoke", m.Revoke},
+		{"grant_churn", m.GrantChurn},
+		{"issue", m.Issue},
+		{"bad_token", m.BadToken},
+	} {
+		if w.weight != nil && *w.weight < 0 {
+			return fmt.Errorf("pressure.mix.%s must not be negative, got %d", w.key, *w.weight)
+		}
 	}
 	return nil
 }
