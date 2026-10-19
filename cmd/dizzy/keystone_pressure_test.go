@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -830,19 +833,55 @@ const pressureTestRunID = "run1234"
 // runKeystonePressure without a cloud. It creates every resource with an id
 // derived from its logical name, answers every pressure operation with
 // success, lists nothing for the teardown's discovery, and records each
-// Delete. assignErr and issueErr, when set, fail every role assignment or
-// every scoped token issue. At its first Delete it notes whether the run
-// record exists in the working directory, so a test can tell the record was
-// written before the teardown began. The provisioning stages and the workers
-// call it concurrently, so mu guards the fields below it.
+// Delete. assignErr, issueErr and validateErr, when set, fail every role
+// assignment, every scoped token issue or every token validation. At its
+// first Delete it notes whether the run record exists in the working
+// directory, so a test can tell the record was written before the teardown
+// began. The provisioning stages and the workers call it concurrently, so mu
+// guards the fields below it.
 type fakePressureKeystone struct {
-	assignErr error
-	issueErr  error
+	assignErr   error
+	issueErr    error
+	validateErr error
+
+	// stopAfter, when positive, makes the fake record in drawn, in call
+	// order, each validate, effective and revoke the workers run, and call
+	// stop once it has recorded stopAfter of them, so a test that cancels
+	// its run's context with stop ends the run after exactly that many. The
+	// three are told apart by a call no other stage makes: ValidateToken,
+	// ListEffectiveAssignments and RevokeToken, each the operation's first
+	// Keystone call. grant_churn and issue share their calls with
+	// provisioning, priming and teardown and are not recorded.
+	stopAfter int
+	stop      context.CancelFunc
 
 	mu                 sync.Mutex
 	issued             int
 	deleted            []resource.Resource
 	recordBeforeDelete bool
+	drawn              []string
+}
+
+// drew records op as the next operation a worker ran and calls stop once
+// stopAfter operations are recorded. It records nothing while stopAfter is 0
+// or once stopAfter operations are recorded.
+func (f *fakePressureKeystone) drew(op string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.drawn) >= f.stopAfter {
+		return
+	}
+	f.drawn = append(f.drawn, op)
+	if len(f.drawn) == f.stopAfter {
+		f.stop()
+	}
+}
+
+// drawnOps returns a copy of the operations drew recorded.
+func (f *fakePressureKeystone) drawnOps() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.drawn)
 }
 
 // created returns the resource the fake creates for logical.
@@ -895,14 +934,23 @@ func (f *fakePressureKeystone) IssueScopedToken(context.Context, keystoneplan.To
 	return keystone.IssuedToken{ID: fmt.Sprintf("token-%d", f.issued), ExpiresAt: time.Now().Add(time.Hour)}, nil
 }
 
-// ValidateToken accepts every token.
-func (f *fakePressureKeystone) ValidateToken(context.Context, string) error { return nil }
+// ValidateToken records a validate and accepts every token, or fails with
+// validateErr.
+func (f *fakePressureKeystone) ValidateToken(context.Context, string) error {
+	f.drew(keystoneops.OpValidate)
+	return f.validateErr
+}
 
-// RevokeToken revokes every token.
-func (f *fakePressureKeystone) RevokeToken(context.Context, string) error { return nil }
+// RevokeToken records a revoke and revokes every token.
+func (f *fakePressureKeystone) RevokeToken(context.Context, string) error {
+	f.drew(keystoneops.OpRevoke)
+	return nil
+}
 
-// ListEffectiveAssignments lists one assignment for every user.
+// ListEffectiveAssignments records an effective and lists one assignment for
+// every user.
 func (f *fakePressureKeystone) ListEffectiveAssignments(context.Context, string) (int, error) {
+	f.drew(keystoneops.OpEffective)
 	return 1, nil
 }
 
@@ -982,20 +1030,20 @@ func pressureTestPlan(t *testing.T) *keystoneplan.Plan {
 
 // pressureTestRun is a pressureRun over p that passes every pre-cloud check: a
 // 20ms bounded run of two workers over a pool of four tokens, one churn user
-// and the default mix, under pressureTestRunID.
+// and the default mix, under pressureTestRunID. Its cfg leaves the seed, the
+// classifier and the checkpoint interval zero, as mergePressureConfig does,
+// so a run completes, draws from the plan's seed and labels its errors as
+// keystoneops does only if runKeystonePressure sets them.
 func pressureTestRun(t *testing.T, p *keystoneplan.Plan) pressureRun {
 	t.Helper()
 	r := pressureRun{
 		runID: pressureTestRunID,
 		plan:  p,
 		cfg: pressure.Config{
-			Duration:           20 * time.Millisecond,
-			BucketWidth:        defaultChaosBucketWidth,
-			Workers:            2,
-			Seed:               p.Seed,
-			OpTimeout:          time.Second,
-			Classify:           keystoneops.Classify,
-			CheckpointInterval: chaosCheckpointInterval,
+			Duration:    20 * time.Millisecond,
+			BucketWidth: defaultChaosBucketWidth,
+			Workers:     2,
+			OpTimeout:   time.Second,
 		},
 		o:           keystoneops.Options{Tokens: 4, ChurnUsers: 1, Weights: defaultPressureMix(), OpTimeout: time.Second},
 		concurrency: 2,
@@ -1024,7 +1072,9 @@ func loadPressureTestRecord(t *testing.T) *run.Record {
 
 // TestRunKeystonePressureCompletes drives a short run against the fake: it
 // writes a record with pressure statistics, prints the Pressure table, tears
-// down every created resource and reports no leak.
+// down every created resource and reports no leak. The run's config carries no
+// checkpoint interval, so the engine would refuse it unless
+// runKeystonePressure sets one.
 func TestRunKeystonePressureCompletes(t *testing.T) {
 	t.Chdir(t.TempDir())
 	p := pressureTestPlan(t)
@@ -1201,4 +1251,201 @@ func TestRunKeystonePressureSetupFailures(t *testing.T) {
 			}
 		})
 	}
+}
+
+// pressureDrawLen is how many validate, effective and revoke operations a run
+// of runPressureDraws records before the fake ends it.
+const pressureDrawLen = 24
+
+// runPressureDraws drives an unbounded run of one worker over p with weights
+// against f, which records the operations the worker runs and cancels the
+// run's context once it has recorded pressureDrawLen of them, so the run ends
+// after the same operations however fast the machine is. It runs in a fresh
+// working directory and returns the recorded operations in order and the run
+// record.
+func runPressureDraws(t *testing.T, p *keystoneplan.Plan, f *fakePressureKeystone, weights map[string]int) ([]string, *run.Record) {
+	t.Helper()
+	t.Chdir(t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.stopAfter, f.stop = pressureDrawLen, cancel
+
+	r := pressureTestRun(t, p)
+	r.cfg.Workers = 1
+	r.cfg.Duration, r.cfg.Unbounded = 0, true
+	r.o.Weights = weights
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+
+	if err := runKeystonePressure(ctx, cmd, f, r); err != nil {
+		t.Fatalf("runKeystonePressure: %v", err)
+	}
+	drawn := f.drawnOps()
+	if len(drawn) != pressureDrawLen {
+		t.Fatalf("the run recorded %d operations, want %d", len(drawn), pressureDrawLen)
+	}
+	return drawn, loadPressureTestRecord(t)
+}
+
+// TestRunKeystonePressureDrawsFromThePlanSeed proves the engine draws from the
+// plan's seed: with one worker, two runs of the same plan run the same
+// operations in the same order, and a run of the plan under another seed runs
+// another order. Only validate, effective and revoke carry a weight, the three
+// the fake records, so the recorded order is the order the worker drew.
+func TestRunKeystonePressureDrawsFromThePlanSeed(t *testing.T) {
+	p := pressureTestPlan(t)
+	reseeded := *p
+	reseeded.Seed = p.Seed + 1
+	weights := map[string]int{keystoneops.OpValidate: 1, keystoneops.OpEffective: 1, keystoneops.OpRevoke: 1}
+
+	first, rec := runPressureDraws(t, p, &fakePressureKeystone{}, weights)
+	if rec.Seed != p.Seed {
+		t.Errorf("record seed = %d, want the plan seed %d", rec.Seed, p.Seed)
+	}
+	again, _ := runPressureDraws(t, p, &fakePressureKeystone{}, weights)
+	other, _ := runPressureDraws(t, &reseeded, &fakePressureKeystone{}, weights)
+
+	if !slices.Equal(first, again) {
+		t.Errorf("two runs with plan seed %d ran\n%v\nand\n%v\nwant the same order", p.Seed, first, again)
+	}
+	if slices.Equal(first, other) {
+		t.Errorf("runs with plan seeds %d and %d both ran %v; the workers must draw from the plan seed", p.Seed, reseeded.Seed, first)
+	}
+}
+
+// TestRunKeystonePressureClassifiesWithKeystoneops proves the engine labels
+// operation errors with keystoneops.Classify: a 404 on every token validation
+// shows up in the record's pressure errors as "not-found", where the engine's
+// default classifier would have said "other".
+func TestRunKeystonePressureClassifiesWithKeystoneops(t *testing.T) {
+	p := pressureTestPlan(t)
+	notFound := gophercloud.ErrUnexpectedResponseCode{Method: http.MethodGet, URL: "auth/tokens", Expected: []int{http.StatusOK}, Actual: http.StatusNotFound}
+	if got := keystoneops.Classify(notFound); got != "not-found" {
+		t.Fatalf("keystoneops.Classify(404) = %q, want not-found", got)
+	}
+	f := &fakePressureKeystone{validateErr: notFound}
+
+	drawn, rec := runPressureDraws(t, p, f, defaultPressureMix())
+	if !slices.Contains(drawn, keystoneops.OpValidate) {
+		t.Fatalf("the run ran no validate: %v", drawn)
+	}
+	if rec.Pressure == nil {
+		t.Fatal("record has no pressure statistics")
+	}
+	kinds := make(map[string]int, len(rec.Pressure.Operations.Errors))
+	for _, e := range rec.Pressure.Operations.Errors {
+		kinds[e.Kind] = e.Count
+	}
+	if kinds["not-found"] == 0 {
+		t.Errorf("record pressure errors = %+v, want the failed validations under not-found", rec.Pressure.Operations.Errors)
+	}
+	if kinds["other"] != 0 {
+		t.Errorf("record pressure errors = %+v; %d error(s) carry the engine's default label other", rec.Pressure.Operations.Errors, kinds["other"])
+	}
+}
+
+// stubRoundTripper is an http.RoundTripper that is not an *http.Transport,
+// the kind of transport sizeConnectionPool cannot size.
+type stubRoundTripper struct{ name string }
+
+// RoundTrip fails every request; sizeConnectionPool sends none.
+func (s *stubRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("%s: unexpected request", s.name)
+}
+
+// identityClientWith returns a service client whose HTTP client uses rt, the
+// default transport when rt is nil.
+func identityClientWith(rt http.RoundTripper) *gophercloud.ServiceClient {
+	return &gophercloud.ServiceClient{ProviderClient: &gophercloud.ProviderClient{HTTPClient: http.Client{Transport: rt}}}
+}
+
+// TestSizeConnectionPool proves sizeConnectionPool sizes a clone of the
+// transport it finds and never the transport itself: http.DefaultTransport
+// for a nil transport, or an *http.Transport another client may share.
+func TestSizeConnectionPool(t *testing.T) {
+	const conns = 128
+
+	t.Run("a nil transport gets a sized clone of the default transport", func(t *testing.T) {
+		def, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			t.Fatalf("http.DefaultTransport is a %T", http.DefaultTransport)
+		}
+		perHost, idle := def.MaxIdleConnsPerHost, def.MaxIdleConns
+		gc := identityClientWith(nil)
+
+		sizeConnectionPool(gc, conns)
+
+		got, ok := gc.HTTPClient.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("transport = %T, want *http.Transport", gc.HTTPClient.Transport)
+		}
+		if got == def {
+			t.Error("sizeConnectionPool installed http.DefaultTransport itself, want a clone")
+		}
+		if got.MaxIdleConnsPerHost != conns {
+			t.Errorf("MaxIdleConnsPerHost = %d, want %d", got.MaxIdleConnsPerHost, conns)
+		}
+		if got.MaxIdleConns != 0 && got.MaxIdleConns < conns {
+			t.Errorf("MaxIdleConns = %d, want at least %d", got.MaxIdleConns, conns)
+		}
+		if got.ForceAttemptHTTP2 != def.ForceAttemptHTTP2 {
+			t.Errorf("ForceAttemptHTTP2 = %v, want the default transport's %v", got.ForceAttemptHTTP2, def.ForceAttemptHTTP2)
+		}
+		if def.MaxIdleConnsPerHost != perHost || def.MaxIdleConns != idle {
+			t.Errorf("http.DefaultTransport MaxIdleConnsPerHost/MaxIdleConns = %d/%d, want them unchanged at %d/%d",
+				def.MaxIdleConnsPerHost, def.MaxIdleConns, perHost, idle)
+		}
+	})
+
+	t.Run("an *http.Transport gets a sized clone with its TLS settings", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			idle     int
+			wantIdle int
+		}{
+			{"MaxIdleConns below conns is raised", 100, conns},
+			{"a larger MaxIdleConns is kept", 500, 500},
+			{"MaxIdleConns 0, no limit, is kept", 0, 0},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				tlsConfig := &tls.Config{ServerName: "keystone.example", RootCAs: x509.NewCertPool(), MinVersion: tls.VersionTLS12}
+				orig := &http.Transport{TLSClientConfig: tlsConfig, ForceAttemptHTTP2: true, MaxIdleConns: tc.idle}
+				gc := identityClientWith(orig)
+
+				sizeConnectionPool(gc, conns)
+
+				got, ok := gc.HTTPClient.Transport.(*http.Transport)
+				if !ok {
+					t.Fatalf("transport = %T, want *http.Transport", gc.HTTPClient.Transport)
+				}
+				if got == orig {
+					t.Error("the client kept the original transport, want a sized clone of it")
+				}
+				if got.MaxIdleConnsPerHost != conns || got.MaxIdleConns != tc.wantIdle {
+					t.Errorf("MaxIdleConnsPerHost/MaxIdleConns = %d/%d, want %d/%d", got.MaxIdleConnsPerHost, got.MaxIdleConns, conns, tc.wantIdle)
+				}
+				c := got.TLSClientConfig
+				if c == nil || c.ServerName != tlsConfig.ServerName || c.RootCAs != tlsConfig.RootCAs || c.MinVersion != tlsConfig.MinVersion {
+					t.Errorf("TLSClientConfig = %+v, want the original's server name, root CAs and minimum version", c)
+				}
+				if !got.ForceAttemptHTTP2 {
+					t.Error("the clone lost ForceAttemptHTTP2")
+				}
+				if orig.MaxIdleConnsPerHost != 0 || orig.MaxIdleConns != tc.idle || orig.TLSClientConfig != tlsConfig {
+					t.Errorf("original MaxIdleConnsPerHost/MaxIdleConns = %d/%d, want it unchanged at 0/%d", orig.MaxIdleConnsPerHost, orig.MaxIdleConns, tc.idle)
+				}
+			})
+		}
+	})
+
+	t.Run("another RoundTripper is left alone", func(t *testing.T) {
+		rt := &stubRoundTripper{name: "stub"}
+		gc := identityClientWith(rt)
+
+		sizeConnectionPool(gc, conns)
+
+		if got, ok := gc.HTTPClient.Transport.(*stubRoundTripper); !ok || got != rt {
+			t.Errorf("transport = %T %p, want the original %p", gc.HTTPClient.Transport, gc.HTTPClient.Transport, rt)
+		}
+	})
 }

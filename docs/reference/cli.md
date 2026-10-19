@@ -342,6 +342,11 @@ call. `--seed` overrides the scenario seed, which also seeds the workers'
 generators. `--otel` exports the client's calls, among them `token`/`validate`
 and `token`/`revoke`; see [Metrics](metrics.md).
 
+**Connections.** The identity client keeps up to `--workers` plus
+`--concurrency` idle connections to the Keystone endpoint, where other verbs
+keep 2. Over HTTP/1.1 a smaller pool would close most connections after each
+request, and the latency samples would then include a TCP and TLS handshake.
+
 **End of the run.** By default the run tears its resources down at the end or
 when interrupted, then runs the leak check, as `chaos` does. With
 `--duration 0` the signal is the normal end of the run. `--no-cleanup` leaves
