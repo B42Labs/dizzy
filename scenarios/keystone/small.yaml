@@ -21,6 +21,11 @@ chaos:                                 # `keystone chaos --scenario scenarios/ke
   target_fill: 0.8                     # fraction of the envelope kept populated (0..1)
   token_ratio: 0.3                     # probability per tick of issuing a token as a live, assigned user
 
+pressure:                              # `keystone pressure --scenario scenarios/keystone/small.yaml` runs as-is
+  duration: 5m                         # total runtime; the only hard stop besides Ctrl-C
+  workers: 8                           # closed-loop workers, each sending its next request when the last returns
+  tokens: 20                           # pool of project-scoped user tokens, issued before the first worker starts
+
 # A single domain keeps this profile runnable in domain-manager mode (which
 # requires domains <= 1). It stays deliberately tiny so it runs against any
 # domain that has a manager.

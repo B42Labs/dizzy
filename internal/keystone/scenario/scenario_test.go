@@ -1,6 +1,9 @@
 package scenario
 
 import (
+	"fmt"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +12,10 @@ import (
 // floatPtr returns a pointer to f, for building the *float64 chaos fields
 // (TokenRatio) in test fixtures.
 func floatPtr(f float64) *float64 { return &f }
+
+// intPtr returns a pointer to n, for building the *int pressure fields
+// (ChurnUsers and the Mix weights) in test fixtures.
+func intPtr(n int) *int { return &n }
 
 // smallScenario is the compact scenario backing the golden test; it mirrors the
 // shipped scenarios/keystone/small.yaml so the profile test can tie to it.
@@ -35,6 +42,11 @@ func smallScenario() Scenario {
 			ChurnRatio: 0.5,
 			TargetFill: 0.8,
 			TokenRatio: floatPtr(0.3),
+		},
+		Pressure: &Pressure{
+			Duration: Duration(5 * time.Minute),
+			Workers:  8,
+			Tokens:   20,
 		},
 	}
 }
@@ -272,4 +284,173 @@ func TestChaosBucketWidth(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestParsePressureBlock confirms a full pressure block, including every mix
+// weight and the propagation block that later work delivers, parses into the
+// matching fields and validates; that a scenario with no pressure block is
+// valid; and that an unknown key at any level of the block fails strict
+// unmarshal loudly. Each weight carries a distinct value so a swapped YAML tag
+// shows up as a mismatch.
+func TestParsePressureBlock(t *testing.T) {
+	yaml := `name: p
+seed: 1
+resources:
+  domains: 1
+  roles: 1
+  projects: 1
+  users: 2
+distribution:
+  projects_per_domain: { min: 1, max: 1 }
+  assignments_per_user: { min: 1, max: 1 }
+pressure:
+  duration: 10m
+  workers: 4
+  tokens: 50
+  churn_users: 1
+  bucket_width: 2m
+  mix:
+    validate: 60
+    probe: 3
+    effective: 5
+    revoke: 2
+    grant_churn: 4
+    issue: 1
+    bad_token: 7
+  propagation: { every: 30s }
+`
+	s, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	want := &Pressure{
+		Duration:   Duration(10 * time.Minute),
+		Workers:    4,
+		Tokens:     50,
+		ChurnUsers: intPtr(1),
+		Mix: &Mix{
+			Validate:   intPtr(60),
+			Probe:      intPtr(3),
+			Effective:  intPtr(5),
+			Revoke:     intPtr(2),
+			GrantChurn: intPtr(4),
+			Issue:      intPtr(1),
+			BadToken:   intPtr(7),
+		},
+		Propagation: &Propagation{Every: Duration(30 * time.Second)},
+		BucketWidth: Duration(2 * time.Minute),
+	}
+	if !reflect.DeepEqual(s.Pressure, want) {
+		t.Errorf("pressure block = %s, want %s", describePressure(s.Pressure), describePressure(want))
+	}
+	if err := s.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil for a well-formed pressure block", err)
+	}
+
+	// A scenario with no pressure block validates the same as before.
+	noPressure := smallScenario()
+	noPressure.Pressure = nil
+	if err := noPressure.Validate(); err != nil {
+		t.Errorf("Validate() with no pressure block = %v, want nil", err)
+	}
+
+	// An unknown key in the block or in one of its nested blocks must fail
+	// strict unmarshal, not be silently ignored.
+	for _, block := range []string{
+		"{ nope: 1 }",
+		"{ mix: { nope: 1 } }",
+		"{ propagation: { nope: 1s } }",
+	} {
+		if _, err := Parse([]byte("name: p\npressure: " + block + "\n")); err == nil {
+			t.Errorf("Parse of pressure: %s: expected an error, got nil", block)
+		}
+	}
+}
+
+// TestValidatePressureBlock covers each way a pressure block can be
+// semantically invalid, one violated rule at a time, each failing with the
+// message that names its key; and the values that read as unset or as an
+// operation switched off, which must validate.
+func TestValidatePressureBlock(t *testing.T) {
+	tests := []struct {
+		name    string
+		block   string
+		wantErr string
+	}{
+		{name: "empty block", block: "{}"},
+		{name: "zero values are unset", block: "{ duration: 0, workers: 0, tokens: 0, bucket_width: 0 }"},
+		{name: "zero churn users", block: "{ churn_users: 0 }"},
+		{
+			name:  "every weight zero",
+			block: "{ mix: { validate: 0, probe: 0, effective: 0, revoke: 0, grant_churn: 0, issue: 0, bad_token: 0 } }",
+		},
+		{name: "empty mix", block: "{ mix: {} }"},
+		{name: "zero propagation interval", block: "{ propagation: { every: 0s } }"},
+		{name: "negative workers", block: "{ workers: -1 }", wantErr: "pressure.workers must not be negative, got -1"},
+		{name: "negative tokens", block: "{ tokens: -1 }", wantErr: "pressure.tokens must not be negative, got -1"},
+		{name: "negative churn_users", block: "{ churn_users: -1 }", wantErr: "pressure.churn_users must not be negative, got -1"},
+		{name: "negative duration", block: "{ duration: -1m }", wantErr: "pressure.duration must not be negative, got -1m0s"},
+		{name: "negative bucket_width", block: "{ bucket_width: -1m }", wantErr: "pressure.bucket_width must not be negative, got -1m0s"},
+		{name: "negative validate weight", block: "{ mix: { validate: -1 } }", wantErr: "pressure.mix.validate must not be negative, got -1"},
+		{name: "negative probe weight", block: "{ mix: { probe: -2 } }", wantErr: "pressure.mix.probe must not be negative, got -2"},
+		{name: "negative effective weight", block: "{ mix: { effective: -3 } }", wantErr: "pressure.mix.effective must not be negative, got -3"},
+		{name: "negative revoke weight", block: "{ mix: { revoke: -4 } }", wantErr: "pressure.mix.revoke must not be negative, got -4"},
+		{name: "negative grant_churn weight", block: "{ mix: { grant_churn: -5 } }", wantErr: "pressure.mix.grant_churn must not be negative, got -5"},
+		{name: "negative issue weight", block: "{ mix: { issue: -6 } }", wantErr: "pressure.mix.issue must not be negative, got -6"},
+		{name: "negative bad_token weight", block: "{ mix: { bad_token: -7 } }", wantErr: "pressure.mix.bad_token must not be negative, got -7"},
+		{
+			name:    "negative propagation interval",
+			block:   "{ propagation: { every: -1s } }",
+			wantErr: "pressure.propagation.every must not be negative, got -1s",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			parsed, err := Parse([]byte("name: x\npressure: " + tc.block + "\n"))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if parsed.Pressure == nil {
+				t.Fatal("pressure block did not parse into a non-nil Pressure")
+			}
+			s := smallScenario()
+			s.Pressure = parsed.Pressure
+			err = s.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != tc.wantErr {
+				t.Fatalf("Validate() = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// describePressure renders a pressure block with its durations as duration
+// strings and its pointers dereferenced, so a failed comparison prints values
+// rather than addresses.
+func describePressure(p *Pressure) string {
+	if p == nil {
+		return "<nil>"
+	}
+	ptr := func(n *int) string {
+		if n == nil {
+			return "<nil>"
+		}
+		return strconv.Itoa(*n)
+	}
+	s := fmt.Sprintf("{duration: %s, workers: %d, tokens: %d, churn_users: %s, bucket_width: %s",
+		time.Duration(p.Duration), p.Workers, p.Tokens, ptr(p.ChurnUsers), time.Duration(p.BucketWidth))
+	if m := p.Mix; m != nil {
+		s += fmt.Sprintf(", mix: {validate: %s, probe: %s, effective: %s, revoke: %s, grant_churn: %s, issue: %s, bad_token: %s}",
+			ptr(m.Validate), ptr(m.Probe), ptr(m.Effective), ptr(m.Revoke), ptr(m.GrantChurn), ptr(m.Issue), ptr(m.BadToken))
+	}
+	if p.Propagation != nil {
+		s += fmt.Sprintf(", propagation: {every: %s}", time.Duration(p.Propagation.Every))
+	}
+	return s + "}"
 }
