@@ -7,6 +7,7 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/projects"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/users"
 	"github.com/gophercloud/gophercloud/v2/pagination"
 
 	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
@@ -79,6 +80,54 @@ func (c *Client) listProjects(ctx context.Context, tag string) ([]resource.Resou
 		return nil, fmt.Errorf("listing projects by tag: %w", err)
 	}
 	return found, nil
+}
+
+// ListUserProjects lists the projects a user has a role on
+// (GET /v3/users/<userID>/projects) over every page, as the admin, and returns
+// how many there are. It is recorded as the project/list operation.
+func (c *Client) ListUserProjects(ctx context.Context, userID string) (int, error) {
+	n, err := c.countProjects(ctx, users.ListProjects(c.gc, userID))
+	if err != nil {
+		return 0, fmt.Errorf("listing projects of user %s: %w", userID, err)
+	}
+	return n, nil
+}
+
+// ListAvailableProjects lists the projects token may scope to
+// (GET /v3/auth/projects) over every page, sent with token as X-Auth-Token
+// through a copy of the admin client (withToken), and returns how many there
+// are. The admin client's token is neither read nor changed, and a 401 is the
+// token's own failure rather than a retry after re-authentication. It is
+// recorded as the project/list operation. The error's text never carries the
+// token (redactToken).
+func (c *Client) ListAvailableProjects(ctx context.Context, token string) (int, error) {
+	n, err := c.countProjects(ctx, projects.ListAvailable(withToken(c.gc, token)))
+	if err != nil {
+		return 0, fmt.Errorf("listing available projects: %w", redactToken(err, token))
+	}
+	return n, nil
+}
+
+// countProjects walks every page of a project listing through timed as the
+// project/list operation and returns the number of projects. Counting page by
+// page keeps memory flat however many projects the listing returns.
+func (c *Client) countProjects(ctx context.Context, pager pagination.Pager) (int, error) {
+	var n int
+	err := c.timed(ctx, string(KindProject), "list", func(ctx context.Context) error {
+		n = 0
+		return pager.EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
+			items, err := projects.ExtractProjects(page)
+			if err != nil {
+				return false, err
+			}
+			n += len(items)
+			return true, nil
+		})
+	})
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // hasTag reports whether tags contains want. It is the client-side backstop the

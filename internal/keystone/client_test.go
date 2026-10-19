@@ -4,19 +4,25 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
 	"github.com/B42Labs/dizzy/internal/metrics"
 	"github.com/B42Labs/dizzy/internal/resource"
+	"github.com/B42Labs/dizzy/internal/telemetry"
 )
 
 // respErr builds a gophercloud unexpected-response error for the given status
@@ -449,5 +455,606 @@ func TestRandomPasswordUnique(t *testing.T) {
 	}
 	if a == b {
 		t.Error("two RandomPassword calls returned the same value; it must be random")
+	}
+}
+
+// adminToken is the token the admin client of telemetryTestClient carries, and
+// poolToken the created user's token the pressure calls send, so a test can
+// tell the two apart in the request headers.
+const (
+	adminToken = "admin-tok"
+	poolToken  = "pool-tok"
+)
+
+// telemetryTestClient builds a testClient that carries adminToken and mirrors
+// each timed call into a ManualReader-backed telemetry, so a test can assert
+// the request headers, the in-memory sample and the live operation series of
+// one call.
+func telemetryTestClient(t *testing.T, ts *httptest.Server) (*Client, *metrics.Collector, *sdkmetric.ManualReader) {
+	t.Helper()
+	reader := sdkmetric.NewManualReader()
+	tel, err := telemetry.NewWithProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	if err != nil {
+		t.Fatalf("NewWithProvider: %v", err)
+	}
+	c, m := testClient(ts)
+	c.gc.SetToken(adminToken)
+	c.SetTelemetry(tel)
+	return c, m, reader
+}
+
+// hasOperationPoint reports whether dizzy.operation.duration has a data point
+// whose attributes are exactly want.
+func hasOperationPoint(t *testing.T, reader *sdkmetric.ManualReader, want map[string]string) bool {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collecting metrics: %v", err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "dizzy.operation.duration" {
+				continue
+			}
+			h, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf("%s is not a float64 histogram: %T", m.Name, m.Data)
+			}
+			for _, dp := range h.DataPoints {
+				if attrsEqual(dp.Attributes, want) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// attrsEqual reports whether set has exactly the wanted string attributes.
+func attrsEqual(set attribute.Set, want map[string]string) bool {
+	if set.Len() != len(want) {
+		return false
+	}
+	for k, v := range want {
+		got, ok := set.Value(attribute.Key(k))
+		if !ok || got.AsString() != v {
+			return false
+		}
+	}
+	return true
+}
+
+// statsOf returns the aggregate's stats for one sample type, or zero stats when
+// no sample of that type was recorded.
+func statsOf(agg metrics.Aggregate, typ string) metrics.Stats {
+	for _, s := range agg.ByType {
+		if s.Type == typ {
+			return s
+		}
+	}
+	return metrics.Stats{}
+}
+
+// errorCount returns how many samples of the aggregate carry error kind.
+func errorCount(agg metrics.Aggregate, kind string) int {
+	for _, e := range agg.Errors {
+		if e.Kind == kind {
+			return e.Count
+		}
+	}
+	return 0
+}
+
+// TestValidateToken confirms ValidateToken sends the request keystonemiddleware
+// makes on a cache miss (GET /auth/tokens with the admin token as X-Auth-Token
+// and the pool token as X-Subject-Token), records it as a token sample and as
+// the token/validate operation, and that a 404 for an invalid token classifies
+// as http_404 in the samples and as not-found for the bucket breakdown, with
+// the token kept out of the error text although the 404 body names it.
+func TestValidateToken(t *testing.T) {
+	cases := []struct {
+		name         string
+		status       int
+		wantErrKind  string
+		wantClassify string
+		wantOutcome  string
+	}{
+		{"valid token", http.StatusOK, "", "", "success"},
+		{"invalid token is a 404", http.StatusNotFound, "http_404", "not-found", "error"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests int
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/auth/tokens") {
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+				if got := r.Header.Get("X-Subject-Token"); got != poolToken {
+					t.Errorf("X-Subject-Token = %q, want the pool token %q", got, poolToken)
+				}
+				if got := r.Header.Get("X-Auth-Token"); got != adminToken {
+					t.Errorf("X-Auth-Token = %q, want the admin token %q", got, adminToken)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				if tc.status == http.StatusOK {
+					_, _ = io.WriteString(w, `{"token":{"expires_at":"2030-01-01T00:00:00.000000Z"}}`)
+					return
+				}
+				_, _ = io.WriteString(w, `{"error":{"code":404,"title":"Not Found","message":"Could not find token: `+poolToken+`."}}`)
+			}))
+			defer ts.Close()
+
+			c, m, reader := telemetryTestClient(t, ts)
+			err := c.ValidateToken(context.Background(), poolToken)
+			if got := errKind(err); got != tc.wantErrKind {
+				t.Errorf("errKind(%v) = %q, want %q", err, got, tc.wantErrKind)
+			}
+			if got := ClassifyOperationError(err); got != tc.wantClassify {
+				t.Errorf("ClassifyOperationError(%v) = %q, want %q", err, got, tc.wantClassify)
+			}
+			if err != nil && strings.Contains(err.Error(), poolToken) {
+				t.Errorf("error %q carries the token", err)
+			}
+			if requests != 1 {
+				t.Errorf("requests = %d, want 1", requests)
+			}
+
+			agg := m.Aggregate(time.Second)
+			st := statsOf(agg, string(KindToken))
+			if st.Attempted != 1 || st.Failed != boolToInt(tc.wantErrKind != "") {
+				t.Errorf("token samples = %+v, want 1 attempted and %d failed", st, boolToInt(tc.wantErrKind != ""))
+			}
+			if tc.wantErrKind != "" && errorCount(agg, tc.wantErrKind) != 1 {
+				t.Errorf("errors = %+v, want one %s", agg.Errors, tc.wantErrKind)
+			}
+			want := map[string]string{"kind": "token", "operation": "validate", "outcome": tc.wantOutcome}
+			if !hasOperationPoint(t, reader, want) {
+				t.Errorf("no dizzy.operation.duration point with %v", want)
+			}
+		})
+	}
+}
+
+// boolToInt returns 1 for true and 0 for false, for expected sample counts.
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// TestRevokeToken confirms RevokeToken sends DELETE /auth/tokens with the pool
+// token as X-Subject-Token under the admin token, and that a 204 records a
+// successful token sample under the token/revoke operation.
+func TestRevokeToken(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || !strings.HasSuffix(r.URL.Path, "/auth/tokens") {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("X-Subject-Token"); got != poolToken {
+			t.Errorf("X-Subject-Token = %q, want the pool token %q", got, poolToken)
+		}
+		if got := r.Header.Get("X-Auth-Token"); got != adminToken {
+			t.Errorf("X-Auth-Token = %q, want the admin token %q", got, adminToken)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	c, m, reader := telemetryTestClient(t, ts)
+	if err := c.RevokeToken(context.Background(), poolToken); err != nil {
+		t.Fatalf("RevokeToken: %v", err)
+	}
+	st := statsOf(m.Aggregate(time.Second), string(KindToken))
+	if st.Attempted != 1 || st.Succeeded != 1 {
+		t.Errorf("token samples = %+v, want 1 attempted and 1 succeeded", st)
+	}
+	want := map[string]string{"kind": "token", "operation": "revoke", "outcome": "success"}
+	if !hasOperationPoint(t, reader, want) {
+		t.Errorf("no dizzy.operation.duration point with %v", want)
+	}
+}
+
+// TestRevokeTokenFailure confirms a failed revocation returns an error that
+// keeps the response status for classification and whose text does not carry
+// the token, although Keystone's 404 body names it.
+func TestRevokeTokenFailure(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"error":{"code":404,"title":"Not Found","message":"Could not find token: `+poolToken+`."}}`)
+	}))
+	defer ts.Close()
+
+	c, m, _ := telemetryTestClient(t, ts)
+	err := c.RevokeToken(context.Background(), poolToken)
+	if got := ClassifyOperationError(err); got != "not-found" {
+		t.Errorf("ClassifyOperationError(%v) = %q, want not-found", err, got)
+	}
+	if err == nil || strings.Contains(err.Error(), poolToken) {
+		t.Errorf("error %v is nil or carries the token", err)
+	}
+	if got := errorCount(m.Aggregate(time.Second), "http_404"); got != 1 {
+		t.Errorf("http_404 samples = %d, want 1", got)
+	}
+}
+
+// assignmentsPage renders one page of a role assignment listing with n
+// project-scoped assignments for userID and next as the links.next value.
+func assignmentsPage(userID string, n int, next string) string {
+	items := make([]string, n)
+	for i := range items {
+		items[i] = fmt.Sprintf(`{"role":{"id":"rid%d"},"scope":{"project":{"id":"pid%d"}},"user":{"id":%q}}`, i, i, userID)
+	}
+	nextJSON := "null"
+	if next != "" {
+		nextJSON = fmt.Sprintf("%q", next)
+	}
+	return fmt.Sprintf(`{"role_assignments":[%s],"links":{"next":%s}}`, strings.Join(items, ","), nextJSON)
+}
+
+// TestListEffectiveAssignments confirms the listing asks Keystone for the
+// user's effective assignments (effective=true and user.id in the query), counts
+// them across every page, returns 0 and no error for an empty listing, and
+// returns a wrapped error for a 500 that is recorded as a role_assignment sample
+// with error kind http_500 under the role_assignment/list operation.
+func TestListEffectiveAssignments(t *testing.T) {
+	cases := []struct {
+		name        string
+		pages       []int // assignments per page; nil for a 500
+		want        int
+		wantErrKind string
+	}{
+		{"two pages", []int{2, 1}, 3, ""},
+		{"empty listing", []int{0}, 0, ""},
+		{"server error", nil, 0, "http_500"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var queries []url.Values
+			var ts *httptest.Server
+			ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/role_assignments") {
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+				queries = append(queries, r.URL.Query())
+				w.Header().Set("Content-Type", "application/json")
+				if tc.pages == nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = io.WriteString(w, `{"error":{"code":500,"title":"Internal Server Error","message":"boom"}}`)
+					return
+				}
+				page := 0
+				if r.URL.Query().Get("page") == "2" {
+					page = 1
+				}
+				next := ""
+				if page+1 < len(tc.pages) {
+					next = ts.URL + "/role_assignments?effective=true&user.id=uid1&page=2"
+				}
+				_, _ = io.WriteString(w, assignmentsPage("uid1", tc.pages[page], next))
+			}))
+			defer ts.Close()
+
+			c, m, reader := telemetryTestClient(t, ts)
+			got, err := c.ListEffectiveAssignments(context.Background(), "uid1")
+			if gotKind := errKind(err); gotKind != tc.wantErrKind {
+				t.Fatalf("errKind(%v) = %q, want %q", err, gotKind, tc.wantErrKind)
+			}
+			if got != tc.want {
+				t.Errorf("ListEffectiveAssignments = %d, want %d", got, tc.want)
+			}
+			if len(queries) == 0 {
+				t.Fatal("no request reached the server")
+			}
+			if q := queries[0]; q.Get("effective") != "true" || q.Get("user.id") != "uid1" {
+				t.Errorf("first query = %v, want effective=true and user.id=uid1", q)
+			}
+			if wantRequests := max(len(tc.pages), 1); len(queries) != wantRequests {
+				t.Errorf("requests = %d, want %d", len(queries), wantRequests)
+			}
+
+			agg := m.Aggregate(time.Second)
+			st := statsOf(agg, string(KindAssignment))
+			if st.Attempted != 1 {
+				t.Errorf("role_assignment samples = %d, want 1 for the whole listing", st.Attempted)
+			}
+			outcome := "success"
+			if tc.wantErrKind != "" {
+				outcome = "error"
+				if st.Failed != 1 || errorCount(agg, tc.wantErrKind) != 1 {
+					t.Errorf("role_assignment samples = %+v, errors = %+v, want one failed %s", st, agg.Errors, tc.wantErrKind)
+				}
+				if !strings.Contains(err.Error(), "uid1") {
+					t.Errorf("error %q does not name the user", err)
+				}
+			}
+			want := map[string]string{"kind": "role_assignment", "operation": "list", "outcome": outcome}
+			if !hasOperationPoint(t, reader, want) {
+				t.Errorf("no dizzy.operation.duration point with %v", want)
+			}
+		})
+	}
+}
+
+// projectsBody renders a project listing with n projects and no next page.
+func projectsBody(n int) string {
+	items := make([]string, n)
+	for i := range items {
+		items[i] = fmt.Sprintf(`{"id":"pid%d","name":"proj-%d"}`, i, i)
+	}
+	return fmt.Sprintf(`{"projects":[%s],"links":{"next":null}}`, strings.Join(items, ","))
+}
+
+// TestListUserProjects confirms the listing asks for the user's projects as the
+// admin and returns their count, recorded as one project/list sample.
+func TestListUserProjects(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/users/uid1/projects") {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("X-Auth-Token"); got != adminToken {
+			t.Errorf("X-Auth-Token = %q, want the admin token %q", got, adminToken)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, projectsBody(2))
+	}))
+	defer ts.Close()
+
+	c, m, reader := telemetryTestClient(t, ts)
+	got, err := c.ListUserProjects(context.Background(), "uid1")
+	if err != nil {
+		t.Fatalf("ListUserProjects: %v", err)
+	}
+	if got != 2 {
+		t.Errorf("ListUserProjects = %d, want 2", got)
+	}
+	if st := statsOf(m.Aggregate(time.Second), string(KindProject)); st.Attempted != 1 || st.Succeeded != 1 {
+		t.Errorf("project samples = %+v, want 1 attempted and 1 succeeded", st)
+	}
+	want := map[string]string{"kind": "project", "operation": "list", "outcome": "success"}
+	if !hasOperationPoint(t, reader, want) {
+		t.Errorf("no dizzy.operation.duration point with %v", want)
+	}
+}
+
+// TestListAvailableProjects confirms the listing is sent with the pool token as
+// X-Auth-Token, returns the project count, and leaves the admin client's token
+// as it was; a 401 for the pool token is the request's own failure and never
+// re-authenticates the admin client.
+func TestListAvailableProjects(t *testing.T) {
+	cases := []struct {
+		name        string
+		status      int
+		want        int
+		wantErrKind string
+	}{
+		{"pool token accepted", http.StatusOK, 3, ""},
+		{"pool token rejected", http.StatusUnauthorized, 0, "http_401"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests int
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/auth/projects") {
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+				if got := r.Header.Get("X-Auth-Token"); got != poolToken {
+					t.Errorf("X-Auth-Token = %q, want the pool token %q", got, poolToken)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				if tc.status != http.StatusOK {
+					_, _ = io.WriteString(w, `{"error":{"code":401,"title":"Unauthorized","message":"The token `+poolToken+` is not valid."}}`)
+					return
+				}
+				_, _ = io.WriteString(w, projectsBody(tc.want))
+			}))
+			defer ts.Close()
+
+			c, m, _ := telemetryTestClient(t, ts)
+			var reauths int
+			c.gc.ReauthFunc = func(context.Context) error {
+				reauths++
+				return nil
+			}
+			got, err := c.ListAvailableProjects(context.Background(), poolToken)
+			if gotKind := errKind(err); gotKind != tc.wantErrKind {
+				t.Fatalf("errKind(%v) = %q, want %q", err, gotKind, tc.wantErrKind)
+			}
+			if got != tc.want {
+				t.Errorf("ListAvailableProjects = %d, want %d", got, tc.want)
+			}
+			if err != nil && strings.Contains(err.Error(), poolToken) {
+				t.Errorf("error %q carries the token", err)
+			}
+			if tok := c.gc.Token(); tok != adminToken {
+				t.Errorf("admin token after the call = %q, want %q unchanged", tok, adminToken)
+			}
+			if requests != 1 || reauths != 0 {
+				t.Errorf("requests = %d and admin re-authentications = %d, want 1 and 0", requests, reauths)
+			}
+			if st := statsOf(m.Aggregate(time.Second), string(KindProject)); st.Attempted != 1 {
+				t.Errorf("project samples = %d, want 1", st.Attempted)
+			}
+		})
+	}
+}
+
+// TestIssueScopedTokenReturnsToken confirms the issued token carries the id
+// from the X-Subject-Token response header and the expiry from the body, and
+// that the issue still records one token/create sample and one token readiness
+// record.
+func TestIssueScopedTokenReturnsToken(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/auth/tokens") {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("X-Subject-Token", "tok-123")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"token":{"expires_at":"2030-01-01T12:30:00.000000Z"}}`)
+	}))
+	defer ts.Close()
+
+	c, m, reader := telemetryTestClient(t, ts)
+	got, err := c.IssueScopedToken(context.Background(), keystoneplan.TokenIssue{User: "user-0001", Project: "proj-0001"}, "did1", "s3cret", "pid1")
+	if err != nil {
+		t.Fatalf("IssueScopedToken: %v", err)
+	}
+	if got.ID != "tok-123" {
+		t.Errorf("token id = %q, want tok-123 from X-Subject-Token", got.ID)
+	}
+	if want := time.Date(2030, 1, 1, 12, 30, 0, 0, time.UTC); !got.ExpiresAt.Equal(want) {
+		t.Errorf("ExpiresAt = %v, want %v", got.ExpiresAt, want)
+	}
+
+	agg := m.Aggregate(time.Second)
+	if st := statsOf(agg, string(KindToken)); st.Attempted != 1 || st.Succeeded != 1 {
+		t.Errorf("token samples = %+v, want 1 attempted and 1 succeeded", st)
+	}
+	var ready int
+	for _, r := range agg.Readiness {
+		if r.Type == string(KindToken) {
+			ready = r.Count
+		}
+	}
+	if ready != 1 {
+		t.Errorf("token readiness records = %d, want 1", ready)
+	}
+	want := map[string]string{"kind": "token", "operation": "create", "outcome": "success"}
+	if !hasOperationPoint(t, reader, want) {
+		t.Errorf("no dizzy.operation.duration point with %v", want)
+	}
+	if tok := c.gc.Token(); tok != adminToken {
+		t.Errorf("admin token after the issue = %q, want %q unchanged", tok, adminToken)
+	}
+}
+
+// TestClassifyOperationError pins the labels of the shared per-bucket
+// classifier and the order it checks them in: a context error wins over the
+// response status it wraps.
+func TestClassifyOperationError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"nil", nil, ""},
+		{"canceled", context.Canceled, "canceled"},
+		{"wrapped canceled", fmt.Errorf("op: %w", context.Canceled), "canceled"},
+		{"timeout", context.DeadlineExceeded, "timeout"},
+		{"canceled before a transient status", fmt.Errorf("%w: %w", context.Canceled, respErr(503, "")), "canceled"},
+		{"timeout before a transient status", fmt.Errorf("%w: %w", context.DeadlineExceeded, respErr(500, "")), "timeout"},
+		{"403", respErr(403, "policy"), "forbidden"},
+		{"wrapped forbidden", wrapCreate(KindProject, "proj-0001", respErr(403, "policy")), "forbidden"},
+		{"404", respErr(404, ""), "not-found"},
+		{"resource not found", gophercloud.ErrResourceNotFound{}, "not-found"},
+		{"500", respErr(500, ""), "transient"},
+		{"503", respErr(503, ""), "transient"},
+		{"429", respErr(429, ""), "transient"},
+		{"409", respErr(409, "duplicate"), "other"},
+		{"401", respErr(401, ""), "other"},
+		{"transport", errors.New("connection refused"), "other"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClassifyOperationError(tc.err); got != tc.want {
+				t.Errorf("ClassifyOperationError(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAssignmentResource confirms the synthetic assignment id for a project-
+// and a domain-scoped grant, that it parses back to the same fields, and that
+// AssignRole returns exactly the resource AssignmentResource builds.
+func TestAssignmentResource(t *testing.T) {
+	cases := []struct {
+		name        string
+		a           keystoneplan.Assignment
+		projectID   string
+		domainID    string
+		wantID      string
+		wantLogical string
+		wantTarget  assignmentTarget
+	}{
+		{
+			name:        "project scope",
+			a:           keystoneplan.Assignment{User: "user-0001", Role: "role-0001", Project: "proj-0001"},
+			projectID:   "pid1",
+			domainID:    "did1",
+			wantID:      "uid1:project:pid1:rid1",
+			wantLogical: "user-0001->proj-0001/role-0001",
+			wantTarget:  assignmentTarget{userID: "uid1", kind: "project", targetID: "pid1", roleID: "rid1"},
+		},
+		{
+			name:        "domain scope",
+			a:           keystoneplan.Assignment{User: "user-0001", Role: "role-0001"},
+			domainID:    "did1",
+			wantID:      "uid1:domain:did1:rid1",
+			wantLogical: "user-0001->domain/role-0001",
+			wantTarget:  assignmentTarget{userID: "uid1", kind: "domain", targetID: "did1", roleID: "rid1"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := AssignmentResource(tc.a, "uid1", tc.projectID, tc.domainID, "rid1")
+			want := resource.Resource{Kind: KindAssignment, Logical: tc.wantLogical, ID: tc.wantID}
+			if got != want {
+				t.Errorf("AssignmentResource = %+v, want %+v", got, want)
+			}
+			parsed, err := parseAssignmentID(got.ID)
+			if err != nil {
+				t.Fatalf("parseAssignmentID(%q): %v", got.ID, err)
+			}
+			if parsed != tc.wantTarget {
+				t.Errorf("parseAssignmentID(%q) = %+v, want %+v", got.ID, parsed, tc.wantTarget)
+			}
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPut {
+					t.Errorf("method = %s, want PUT", r.Method)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer ts.Close()
+			c, _ := testClient(ts)
+			assigned, err := c.AssignRole(context.Background(), tc.a, "uid1", tc.projectID, tc.domainID, "rid1")
+			if err != nil {
+				t.Fatalf("AssignRole: %v", err)
+			}
+			if assigned != want {
+				t.Errorf("AssignRole = %+v, want the AssignmentResource %+v", assigned, want)
+			}
+		})
+	}
+}
+
+// TestRedactToken confirms the redacted error drops every occurrence of the
+// token from its text and keeps the response error reachable for errors.As,
+// and that a nil error or an empty token passes through unchanged.
+func TestRedactToken(t *testing.T) {
+	orig := respErr(404, `{"message":"Could not find token: tok-1, tok-1."}`)
+	err := redactToken(orig, "tok-1")
+	if strings.Contains(err.Error(), "tok-1") {
+		t.Errorf("redacted error %q carries the token", err)
+	}
+	if !strings.Contains(err.Error(), "<token>") {
+		t.Errorf("redacted error %q lacks the <token> placeholder", err)
+	}
+	if got := errKind(fmt.Errorf("ctx: %w", err)); got != "http_404" {
+		t.Errorf("errKind(redacted) = %q, want http_404", got)
+	}
+	if redactToken(nil, "tok-1") != nil {
+		t.Error("redactToken(nil) is not nil")
+	}
+	if got := redactToken(orig, ""); got.Error() != orig.Error() {
+		t.Errorf("redactToken with an empty token = %v, want the original error", got)
+	} else if _, wrapped := got.(*tokenRedacted); wrapped {
+		t.Error("redactToken with an empty token wrapped the error, want it returned as is")
 	}
 }
