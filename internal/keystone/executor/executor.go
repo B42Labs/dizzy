@@ -124,36 +124,59 @@ func BindRoots(ctx context.Context, c Keystone, p *plan.Plan, tier keystone.Tier
 	return b, created, nil
 }
 
-// Apply binds the plan's roots, creates its projects and users concurrently,
-// grants its role assignments, and issues its tokens, in strictly ordered
-// stages. Within a stage independent work runs concurrently up to concurrency,
-// each operation retried on transient errors and bounded by opTimeout. A 403
-// policy denial, or any non-retryable error, stops the run and is returned along
-// with the resources created so far; ctx cancellation returns ctx.Err(). tier
-// and res select admin (create roots) or domain-manager (bind roots) mode.
-func Apply(ctx context.Context, c Keystone, p *plan.Plan, tier keystone.Tier, res keystone.Resolution, concurrency int, opTimeout time.Duration) (*Result, error) {
+// Provisioned is the outcome of Provision: the created resources, the root
+// bindings, every project's and user's cloud id by logical name, and every
+// user's password, held in memory for the caller's token operations.
+type Provisioned struct {
+	// Created lists every resource that was created, in dependency order (roots,
+	// then projects and users, then assignments), exactly as Apply records it.
+	Created []resource.Resource
+	// Bindings maps the plan's logical domains and roles to their cloud ids.
+	Bindings Bindings
+	// IDs maps the logical name of every created project and user to its cloud
+	// id.
+	IDs map[string]string
+	// Passwords maps every user's logical name to the random password it was
+	// created with. It lives only in process memory and is never persisted.
+	Passwords map[string]string
+}
+
+// Provision runs the first three stages of Apply: it binds the plan's roots,
+// creates its projects and users concurrently and grants its role assignments,
+// but issues no token. It returns what those stages built so a caller can
+// issue and keep tokens itself. Within a stage independent work runs
+// concurrently up to concurrency, each operation retried on transient errors
+// and bounded by opTimeout. A 403 policy denial, or any non-retryable error,
+// stops the run and is returned along with the Provisioned holding what was
+// created so far; ctx cancellation returns ctx.Err(). The returned
+// *Provisioned is never nil. tier and res select admin (create roots) or
+// domain-manager (bind roots) mode.
+func Provision(ctx context.Context, c Keystone, p *plan.Plan, tier keystone.Tier, res keystone.Resolution, concurrency int, opTimeout time.Duration) (*Provisioned, error) {
 	e := &applier{c: c, opTimeout: opTimeout}
-	result := &Result{}
+	prov := &Provisioned{
+		IDs:       make(map[string]string, len(p.Projects)+len(p.Users)),
+		Passwords: make(map[string]string, len(p.Users)),
+	}
 
 	// Stage 1: bind the roots (create in admin mode, map in domain-manager mode).
 	bindings, roots, err := BindRoots(ctx, c, p, tier, res, concurrency, opTimeout)
-	result.Created = append(result.Created, roots...)
+	prov.Bindings = bindings
+	prov.Created = append(prov.Created, roots...)
 	if err != nil {
-		return result, err
+		return prov, err
 	}
 
-	// passwords holds a fresh random password per user, generated once here
-	// (single-threaded) and only read within the concurrent stages that create
-	// the users and later issue their tokens — like resByLogical and userDomain
+	// Passwords holds a fresh random password per user, generated once here
+	// (single-threaded) and only read within the concurrent stage that creates
+	// the users and by the caller's later token issues — like IDs and userDomain
 	// below — so no lock is needed. It is never derived from the user's
 	// cloud-visible name or the seed, and never persisted.
-	passwords := make(map[string]string, len(p.Users))
 	for _, u := range p.Users {
 		pw, err := keystone.RandomPassword()
 		if err != nil {
-			return result, fmt.Errorf("generating password for user %q: %w", u.Name, err)
+			return prov, fmt.Errorf("generating password for user %q: %w", u.Name, err)
 		}
-		passwords[u.Name] = pw
+		prov.Passwords[u.Name] = pw
 	}
 
 	// Stage 2: create projects and users concurrently in one pool.
@@ -165,42 +188,54 @@ func Apply(ctx context.Context, c Keystone, p *plan.Plan, tier keystone.Tier, re
 		children = append(children, rootChild{user: &p.Users[i]})
 	}
 	childRes, err := runStage(ctx, children, concurrency, func(ctx context.Context, ch rootChild) (resource.Resource, error) {
-		return e.provisionChild(ctx, ch, bindings, passwords)
+		return e.provisionChild(ctx, ch, bindings, prov.Passwords)
 	})
-	result.Created = appendCreated(result.Created, childRes)
+	prov.Created = appendCreated(prov.Created, childRes)
 
-	// resByLogical maps a project/user logical name to its created resource,
-	// built between stages (single-threaded) and read concurrently within the
-	// next stages, so no lock is needed.
-	resByLogical := make(map[string]resource.Resource, len(children))
+	// IDs maps a project/user logical name to its cloud id, built between stages
+	// (single-threaded) and read concurrently within the next stage, so no lock
+	// is needed.
 	for i, ch := range children {
 		if childRes[i].ID == "" {
 			continue
 		}
-		resByLogical[ch.logical()] = childRes[i]
+		prov.IDs[ch.logical()] = childRes[i].ID
 	}
 	if err != nil {
-		return result, err
+		return prov, err
 	}
 
-	// userDomain maps a user's logical name to its domain's cloud id, for
-	// domain-scoped grants and token issues.
-	userDomain := make(map[string]string, len(p.Users))
-	for _, u := range p.Users {
-		userDomain[u.Name] = bindings.Domains[u.Domain]
-	}
+	userDomain := userDomains(p, bindings)
 
 	// Stage 3: grant each (user, target, role) assignment.
 	assignRes, err := runStage(ctx, p.Assignments, concurrency, func(ctx context.Context, a plan.Assignment) (resource.Resource, error) {
 		projectID := ""
 		if a.Project != "" {
-			projectID = resByLogical[a.Project].ID
+			projectID = prov.IDs[a.Project]
 		}
 		return e.create(ctx, func(ctx context.Context) (resource.Resource, error) {
-			return c.AssignRole(ctx, a, resByLogical[a.User].ID, projectID, userDomain[a.User], bindings.Roles[a.Role])
+			return c.AssignRole(ctx, a, prov.IDs[a.User], projectID, userDomain[a.User], bindings.Roles[a.Role])
 		})
 	})
-	result.Created = appendCreated(result.Created, assignRes)
+	prov.Created = appendCreated(prov.Created, assignRes)
+	if err != nil {
+		return prov, err
+	}
+
+	return prov, nil
+}
+
+// Apply binds the plan's roots, creates its projects and users concurrently,
+// grants its role assignments (Provision), and then issues its tokens, in
+// strictly ordered stages. Within a stage independent work runs concurrently up
+// to concurrency, each operation retried on transient errors and bounded by
+// opTimeout. A 403 policy denial, or any non-retryable error, stops the run and
+// is returned along with the resources created so far; ctx cancellation returns
+// ctx.Err(). tier and res select admin (create roots) or domain-manager (bind
+// roots) mode.
+func Apply(ctx context.Context, c Keystone, p *plan.Plan, tier keystone.Tier, res keystone.Resolution, concurrency int, opTimeout time.Duration) (*Result, error) {
+	prov, err := Provision(ctx, c, p, tier, res, concurrency, opTimeout)
+	result := &Result{Created: prov.Created}
 	if err != nil {
 		return result, err
 	}
@@ -209,14 +244,26 @@ func Apply(ctx context.Context, c Keystone, p *plan.Plan, tier keystone.Tier, re
 	// project. A failed issue is a failed operation and fails the run — the point
 	// of including it as an end-to-end consistency check. Tokens create no
 	// resource.
+	e := &applier{c: c, opTimeout: opTimeout}
+	userDomain := userDomains(p, prov.Bindings)
 	_, err = runStage(ctx, p.Tokens, concurrency, func(ctx context.Context, t plan.TokenIssue) (resource.Resource, error) {
-		return resource.Resource{}, e.issueToken(ctx, t, userDomain[t.User], passwords[t.User], resByLogical[t.Project].ID)
+		return resource.Resource{}, e.issueToken(ctx, t, userDomain[t.User], prov.Passwords[t.User], prov.IDs[t.Project])
 	})
 	if err != nil {
 		return result, err
 	}
 
 	return result, nil
+}
+
+// userDomains maps each user's logical name to its domain's cloud id under b,
+// for domain-scoped grants and token issues.
+func userDomains(p *plan.Plan, b Bindings) map[string]string {
+	userDomain := make(map[string]string, len(p.Users))
+	for _, u := range p.Users {
+		userDomain[u.Name] = b.Domains[u.Domain]
+	}
+	return userDomain
 }
 
 // applier carries the apply-wide configuration shared by the stage helpers.
