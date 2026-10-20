@@ -36,31 +36,44 @@ the topology should be gone.
 
 A `keystone pressure` record renders the metrics as above, by resource kind,
 then a `Pressure` section with the workers' draws by operation: one sample per
-draw, whatever calls it made. Its percentiles, per operation and per bucket,
-are estimates within 1%, unlike a churn run's exact bucket percentiles. The
-token path moves in sub-millisecond steps, so the table rounds its latencies
-to the microsecond.
+draw, whatever calls it made. Its percentiles, per operation, per stage and
+per bucket, are estimates within 1%, unlike a churn run's exact bucket
+percentiles. The token path moves in sub-millisecond steps, so the table
+rounds its latencies to the microsecond.
 
 - **table**: a `Pressure` block with the lines `workers:`, `token pool:`,
   `churn users:` (only when the run reserved any), `mix:` and
   `revocations:`; an `Operations` table with one row per operation drawn and
   the columns `OPERATION`, `OPS`, `OK`, `FAILED`, `OPS/S`, `MIN`, `MEAN`,
-  `P50`, `P90`, `P95`, `P99` and `MAX`; and a `Latency and errors over time`
-  table with the columns `START`, `OPERATION`, `OPS`, `OK`, `FAILED`, `P50`,
-  `P99`, `REVOCATIONS` and `ERRORS`. Per bucket, an `all` row carries the
-  bucket's cumulative revocations and its error kinds as `kind=count` pairs
-  (`-` for none), followed by one row per operation drawn in the bucket with
-  those two cells empty. `START` is rounded to the millisecond, and a row
-  without operations shows `-` for its latencies.
+  `P50`, `P90`, `P95`, `P99` and `MAX`; for a run with stages, a `Stages`
+  table; and a `Latency and errors over time` table with the columns `START`,
+  `OPERATION`, `OPS`, `OK`, `FAILED`, `P50`, `P99`, `REVOCATIONS` and
+  `ERRORS`. Per bucket, an `all` row carries the bucket's cumulative
+  revocations and its error kinds as `kind=count` pairs (`-` for none),
+  followed by one row per operation drawn in the bucket with those two cells
+  empty. `START` is rounded to the millisecond, and a row without operations
+  shows `-` for its latencies. The `Stages` table has the columns `STAGE`,
+  `FAN`, `START`, `END`, `OPERATION`, `OPS`, `OK`, `FAILED`, `OPS/S`, `P50`,
+  `P95` and `P99`. Per stage, an `all` row is followed by one row per
+  operation drawn in the stage, and every row carries the stage's number, its
+  `fan_assignments` or `-` for none, and its start and end rounded to the
+  millisecond. A stage's throughput divides by the time from its start to its
+  end.
 - **json**: `{"metrics": …, "pressure": …}`, with `"incomplete": true` added
-  on a checkpoint.
+  on a checkpoint. A staged run's stages are `pressure.stages`; see
+  [Run record](run-record.md#stages).
 - **csv**: the same header, with one row per operation labelled
-  `pressure/<operation>` and then, per bucket, one row per operation labelled
+  `pressure/<operation>`, then, per stage, one row per operation labelled
+  `pressure/stage-<index>/<operation>`, e.g. `pressure/stage-2/effective`,
+  and then, per bucket, one row per operation labelled
   `pressure@<start>/<operation>`, e.g. `pressure@1m0s/validate`, appended
-  after the per-kind rows. The cumulative revocations have no column; the
-  other formats carry them.
+  after the per-kind rows. The cumulative revocations and a stage's
+  `fan_assignments` and window have no column; the other formats carry them.
 - **html**: after the overall sections, a `Pressure` section with the
-  settings and the revocations and the per-operation table, then per
+  settings and the revocations and the per-operation table; for a run with
+  stages, a `Pressure stages` section with a sortable table with the columns
+  `stage`, `fan`, `start`, `end`, `operation`, `ops`, `ok`, `failed`,
+  `ops/s`, `p50`, `p95` and `p99`, rows as in the text table; then per
   operation a `Pressure: <operation>` section with its throughput and latency
   charts over time. A record without buckets shows no charts.
 
@@ -88,6 +101,47 @@ the percentiles of separate engines cannot be merged.
   charts over time, then one `Lane <name>` section per lane with its project
   and scenario, its KPI tiles and the same two charts. A persona or lane
   without churn statistics yet shows no charts.
+
+### Comparing two runs
+
+`report --compare` renders the comparison of two `keystone pressure` records
+in three formats; see [Comparing two runs](cli.md#comparing-two-runs) for
+which record is the base and when the command refuses two records. Each
+metric of an operation is a row: `p50`, `p95`, `p99` and `ops/s`, for `all`
+and then for every operation either record drew, sorted by name.
+
+- **table**: a `Comparison` block with a `base:` and an `other:` line, each
+  naming the run id, with ` (incomplete)` after it for a checkpoint, and the
+  scenario, seed, workers, tokens and mix, and, when `--allow-mismatch` let
+  differing loads through, a `loads differ:` line with the differences joined
+  by `; `. Then an `Operations` table with the columns `OPERATION`, `METRIC`,
+  `BASE`, `OTHER`, `DELTA` and `CHANGE` and, when either record has stages, a
+  `Stages` table with `STAGE` and `FAN` before those columns. A latency is
+  rounded to the microsecond and a throughput has one decimal. `DELTA` is the
+  other minus the base with an explicit sign, e.g. `-420µs`, `+30µs`, `0s` or
+  `+1190.4`, and `CHANGE` is the delta as a percentage of the base value,
+  e.g. `-22.8%`. A side that lacks the operation or the stage, or drew
+  nothing in it, shows `-` in its cell, in `DELTA` and in `CHANGE`, and a base
+  value of `0` shows `-` in `CHANGE`. `FAN` is the base's `fan_assignments`,
+  or the other's when only the other has the stage, and `-` for none.
+- **json**: `{"base": …, "other": …, "mismatches": […], "operations": […], "stages": […]}`.
+  `base` and `other` hold `runID`, `scenario`, `seed`, `incomplete` (only
+  when `true`), `workers`, `tokens`, `mix` and `stages`, the `fan_assignments`
+  of every stage with `0` for none, omitted for a run without stages. Each
+  entry of `operations` holds `operation` and `base`, `other` and `delta`,
+  each with `p50`, `p95` and `p99` in nanoseconds and `throughput`; a side
+  that lacks the operation or the stage, or drew nothing in it, omits its
+  key, and `delta` is omitted then too.
+  Each entry of `stages` holds `index`, `fanAssignments` and its own
+  `operations`. `mismatches` and `stages` are omitted when empty.
+- **csv**: not available; `--compare` with `--format csv` fails.
+- **html**: a self-contained page with the heading
+  `Comparison: run <base> vs run <other>`, one line of chips per run, starting
+  with `base run <id>` and `other run <id>`, a yellow `Loads differ: …` banner
+  when the loads differ, and a sortable `Operations` table and, when either
+  record has stages, a sortable `Stages` table, with the columns of the text
+  tables in lower case. The `+` of a `delta` or `change` cell is written as
+  the entity `&#43;` in the page source, which a browser shows as `+`.
 
 ## OpenTelemetry export
 
@@ -174,10 +228,11 @@ largely unused there. The one exception is **token-issue latency**, recorded wit
 `kind=token` in addition to the `token`/`create` operation histogram.
 `keystone pressure` adds two operations under `kind=token`, `validate` and
 `revoke`, which record no time-to-ready; its pool issues record as
-`token`/`create` like any token issue, and the three listings of its
-`effective` operation as `role_assignment`/`list` and `project`/`list`. The
-per-draw samples of its `Pressure` section stay in the run record and are not
-exported, so no call is exported twice.
+`token`/`create` like any token issue, the three listings of its `effective`
+operation as `role_assignment`/`list` and `project`/`list`, and the grants of
+its stages as `role_assignment`/`create` like any grant. The per-draw samples
+of its `Pressure` section stay in the run record and are not exported, so no
+call is exported twice.
 
 ### Prometheus naming
 

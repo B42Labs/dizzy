@@ -24,6 +24,8 @@ re-query, report on, and tear down by tag. `dizzy mix` offers `generate`,
 `dizzy keystone` additionally offers `pressure`, a closed-loop load on
 Keystone's token validation, revocation and role-listing path for a lab cloud;
 see [Pressure mode](docs/explanation/pressure-mode.md).
+`dizzy keystone report --compare` prints the difference between two pressure
+runs.
 
 It is **not** a correctness suite like Tempest. It measures latency, error
 rates, and state convergence under load. The two are complementary. It creates
