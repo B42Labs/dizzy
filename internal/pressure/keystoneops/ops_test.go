@@ -3,6 +3,7 @@ package keystoneops
 import (
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"math/rand"
 	"reflect"
@@ -17,6 +18,7 @@ import (
 	"github.com/B42Labs/dizzy/internal/keystone"
 	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
 	"github.com/B42Labs/dizzy/internal/pressure"
+	"github.com/B42Labs/dizzy/internal/resource"
 )
 
 // churnOn is a mix in which grant_churn draws, so Build reserves churn users.
@@ -65,7 +67,7 @@ func TestBuildErrors(t *testing.T) {
 				return p
 			},
 			opts:    Options{Tokens: 1, Weights: map[string]int{OpValidate: 1}, OpTimeout: time.Second},
-			wantErr: "pressure needs at least one project-scoped assignment outside the churn users to issue pool tokens from; the plan has none",
+			wantErr: "pressure needs at least one project-scoped assignment outside the churn and fan users to issue pool tokens from; the plan has none",
 		},
 		{
 			name: "only the churn users hold project-scoped assignments",
@@ -79,7 +81,7 @@ func TestBuildErrors(t *testing.T) {
 				return p
 			},
 			opts:    fixtureOptions(1, churnOn),
-			wantErr: "pressure needs at least one project-scoped assignment outside the churn users to issue pool tokens from; the plan has none",
+			wantErr: "pressure needs at least one project-scoped assignment outside the churn and fan users to issue pool tokens from; the plan has none",
 		},
 		{
 			name:    "zero tokens",
@@ -107,7 +109,7 @@ func TestBuildErrors(t *testing.T) {
 				return p
 			},
 			opts:    fixtureOptions(1, churnOn),
-			wantErr: "pressure grant_churn needs the churn users to hold at least one assignment; the last 1 user(s) of the plan hold none",
+			wantErr: "pressure grant_churn needs the churn users to hold at least one assignment; the last 1 regular user(s) of the plan hold none",
 		},
 		{
 			name: "invalid plan",
@@ -250,6 +252,226 @@ func TestBuildPartition(t *testing.T) {
 			t.Errorf("pool pairs = %v, want %v", got, want)
 		}
 	})
+}
+
+// TestBuildFanPartition checks the three-way partition Build makes over a
+// plan whose last user is a fan user: the churn user comes from the end of the
+// regular users, the pool pairs from the regular users outside the churn set,
+// and the fan user gets one pair after them, for its first project-scoped
+// assignment in plan order, with every plan project and role resolved for
+// GrowFan. A plan without fan users resolves no project or role beyond what
+// its pairs and churn grants need.
+func TestBuildFanPartition(t *testing.T) {
+	type pairArgs struct{ user, project string }
+	pairsOf := func(s *Set) []pairArgs {
+		var out []pairArgs
+		for _, p := range s.pairs {
+			out = append(out, pairArgs{p.issue.User, p.issue.Project})
+		}
+		return out
+	}
+	// fan-0001 holds a domain-scoped grant first and then grants on proj-0004
+	// and proj-0002, so its token pair is proj-0004's.
+	plan := func() *keystoneplan.Plan { return fanPlan(5, []string{"", "proj-0004", "proj-0002"}) }
+
+	t.Run("grant_churn reserves the last regular user", func(t *testing.T) {
+		s := buildFanSet(t, newFake(newFakeClock(), time.Hour), plan(), fixtureOptions(2, churnOn))
+		var churned []keystoneplan.Assignment
+		for _, g := range s.churn {
+			churned = append(churned, g.a)
+		}
+		if want := []keystoneplan.Assignment{{User: "user-0003", Role: "role-0001", Project: "proj-0003"}}; !reflect.DeepEqual(churned, want) {
+			t.Errorf("churn grants = %v, want user-0003's %v", churned, want)
+		}
+		want := []pairArgs{{"user-0001", "proj-0001"}, {"user-0002", "proj-0002"}, {"fan-0001", "proj-0004"}}
+		if got := pairsOf(s); !reflect.DeepEqual(got, want) {
+			t.Errorf("pairs = %v, want the two pool pairs and then the fan pair %v", got, want)
+		}
+		if s.poolPairs != 2 {
+			t.Errorf("poolPairs = %d, want 2", s.poolPairs)
+		}
+		wantPair := pair{
+			issue:     keystoneplan.TokenIssue{User: "fan-0001", Project: "proj-0004"},
+			userID:    "id-fan-0001",
+			domainID:  "did-1",
+			password:  "pw-fan-0001",
+			projectID: "id-proj-0004",
+		}
+		if got := s.pairs[len(s.pairs)-1]; got != wantPair {
+			t.Errorf("fan pair = %+v, want %+v", got, wantPair)
+		}
+		if len(s.fan) != 1 {
+			t.Fatalf("%d fan users, want 1", len(s.fan))
+		}
+		u := s.fan[0]
+		if u.name != "fan-0001" || u.userID != "id-fan-0001" || u.domainID != "did-1" || u.pair != 2 {
+			t.Errorf("fan user = {name %q, userID %q, domainID %q, pair %d}, want {fan-0001, id-fan-0001, did-1, 2}", u.name, u.userID, u.domainID, u.pair)
+		}
+		if want := map[string]bool{"proj-0002": true, "proj-0004": true}; !maps.Equal(u.held, want) {
+			t.Errorf("fan user holds %v, want its project-scoped grants %v", u.held, want)
+		}
+		wantProjects := []idName{
+			{"proj-0001", "id-proj-0001"}, {"proj-0002", "id-proj-0002"}, {"proj-0003", "id-proj-0003"},
+			{"proj-0004", "id-proj-0004"}, {"proj-0005", "id-proj-0005"},
+		}
+		if !reflect.DeepEqual(s.projects, wantProjects) {
+			t.Errorf("projects = %v, want %v", s.projects, wantProjects)
+		}
+		if want := []idName{{"role-0001", "rid-1"}, {"role-0002", "rid-2"}}; !reflect.DeepEqual(s.roles, want) {
+			t.Errorf("roles = %v, want %v", s.roles, want)
+		}
+	})
+
+	t.Run("without grant_churn every regular user holds a pool pair", func(t *testing.T) {
+		s := buildFanSet(t, newFake(newFakeClock(), time.Hour), plan(), fixtureOptions(3, churnOff))
+		want := []pairArgs{{"user-0001", "proj-0001"}, {"user-0002", "proj-0002"}, {"user-0003", "proj-0003"}, {"fan-0001", "proj-0004"}}
+		if got := pairsOf(s); !reflect.DeepEqual(got, want) {
+			t.Errorf("pairs = %v, want %v", got, want)
+		}
+		if s.poolPairs != 3 || len(s.churn) != 0 {
+			t.Errorf("poolPairs = %d with %d churn grants, want 3 and none", s.poolPairs, len(s.churn))
+		}
+	})
+
+	t.Run("a plan without fan users resolves nothing for GrowFan", func(t *testing.T) {
+		p := fanPlan(5)
+		ids := fanIDs(p)
+		delete(ids, "proj-0005") // no grant names it
+		b := fixtureBindings()
+		delete(b.Roles, "role-0002") // no grant uses it
+		s, err := Build(p, newFake(newFakeClock(), time.Hour), b, ids, fanPasswords(p), fixtureOptions(2, churnOn))
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		if len(s.fan) != 0 || len(s.projects) != 0 || len(s.roles) != 0 {
+			t.Errorf("set has %d fan users, %d projects and %d roles, want none", len(s.fan), len(s.projects), len(s.roles))
+		}
+		if s.poolPairs != len(s.pairs) {
+			t.Errorf("poolPairs = %d of %d pairs, want every pair a pool pair", s.poolPairs, len(s.pairs))
+		}
+	})
+}
+
+// TestBuildFanErrors covers the Build errors of a plan with fan users, with
+// their exact messages: the churn and pool checks count the regular users
+// only, a fan user needs a project-scoped grant to scope its token to, and the
+// ids of every project and role and a fan user's password must resolve. Build
+// makes no cloud call on any of them.
+func TestBuildFanErrors(t *testing.T) {
+	const noPoolPair = "pressure needs at least one project-scoped assignment outside the churn and fan users to issue pool tokens from; the plan has none"
+	tests := []struct {
+		name      string
+		plan      func() *keystoneplan.Plan
+		opts      Options
+		ids       func(map[string]string)
+		passwords func(map[string]string)
+		roles     func(map[string]string)
+		wantErr   string
+	}{
+		{
+			// The plan has four users, but only its three regular users can be
+			// churn users.
+			name:    "fan users are never churn users",
+			plan:    func() *keystoneplan.Plan { return fanPlan(5, []string{"proj-0004"}) },
+			opts:    Options{Tokens: 1, ChurnUsers: 3, Weights: churnOn, OpTimeout: time.Second},
+			wantErr: "pressure.churn_users (3) must leave at least one user outside the churn set; the plan has 3 users",
+		},
+		{
+			// user-0001 and user-0002 hold domain-scoped grants only, so the
+			// only regular user with a project-scoped grant is the churn user.
+			name: "only the churn and fan users hold project-scoped grants",
+			plan: func() *keystoneplan.Plan {
+				p := fanPlan(5, []string{"proj-0004"})
+				p.Assignments[0].Project, p.Assignments[1].Project = "", ""
+				return p
+			},
+			opts:    fixtureOptions(1, churnOn),
+			wantErr: noPoolPair,
+		},
+		{
+			name: "only the fan users hold project-scoped grants",
+			plan: func() *keystoneplan.Plan {
+				p := fanPlan(5, []string{"proj-0004"})
+				for i := range 3 {
+					p.Assignments[i].Project = ""
+				}
+				return p
+			},
+			opts:    fixtureOptions(1, churnOff),
+			wantErr: noPoolPair,
+		},
+		{
+			// The churn user is user-0003, the last regular user, not
+			// fan-0001, the last user of the plan.
+			name: "the last regular user holds no grant",
+			plan: func() *keystoneplan.Plan {
+				p := fanPlan(5, []string{"proj-0004"})
+				p.Assignments = slices.Delete(p.Assignments, 2, 3)
+				return p
+			},
+			opts:    fixtureOptions(1, churnOn),
+			wantErr: "pressure grant_churn needs the churn users to hold at least one assignment; the last 1 regular user(s) of the plan hold none",
+		},
+		{
+			name:    "a fan user with a domain-scoped grant only",
+			plan:    func() *keystoneplan.Plan { return fanPlan(5, []string{""}) },
+			opts:    fixtureOptions(1, churnOn),
+			wantErr: `pressure fan user "fan-0001" holds no project-scoped assignment to scope its token to`,
+		},
+		{
+			name:    "a fan user without a grant",
+			plan:    func() *keystoneplan.Plan { return fanPlan(5, []string{"proj-0001"}, nil) },
+			opts:    fixtureOptions(1, churnOn),
+			wantErr: `pressure fan user "fan-0002" holds no project-scoped assignment to scope its token to`,
+		},
+		{
+			name:    "missing id of a project no grant names",
+			plan:    func() *keystoneplan.Plan { return fanPlan(5, []string{"proj-0004"}) },
+			opts:    fixtureOptions(1, churnOn),
+			ids:     func(m map[string]string) { delete(m, "proj-0005") },
+			wantErr: `pressure set: no cloud id for project "proj-0005"`,
+		},
+		{
+			name:    "missing id of a role no grant names",
+			plan:    func() *keystoneplan.Plan { return fanPlan(5, []string{"proj-0004"}) },
+			opts:    fixtureOptions(1, churnOn),
+			roles:   func(m map[string]string) { delete(m, "role-0002") },
+			wantErr: `pressure set: no cloud id for role "role-0002"`,
+		},
+		{
+			name:      "missing password of a fan user",
+			plan:      func() *keystoneplan.Plan { return fanPlan(5, []string{"proj-0004"}) },
+			opts:      fixtureOptions(1, churnOn),
+			passwords: func(m map[string]string) { delete(m, "fan-0001") },
+			wantErr:   `pressure set: no password for user "fan-0001"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := tt.plan()
+			ids, passwords, b := fanIDs(p), fanPasswords(p), fixtureBindings()
+			if tt.ids != nil {
+				tt.ids(ids)
+			}
+			if tt.passwords != nil {
+				tt.passwords(passwords)
+			}
+			if tt.roles != nil {
+				tt.roles(b.Roles)
+			}
+			f := newFake(newFakeClock(), time.Hour)
+			s, err := Build(p, f, b, ids, passwords, tt.opts)
+			if err == nil || err.Error() != tt.wantErr {
+				t.Fatalf("Build error = %v, want %q", err, tt.wantErr)
+			}
+			if s != nil {
+				t.Errorf("Build returned a set with its error")
+			}
+			if calls := f.recorded(); len(calls) != 0 {
+				t.Errorf("Build made %d cloud calls, want none", len(calls))
+			}
+		})
+	}
 }
 
 // TestBuildCopiesWeights checks that a change to the caller's weight map after
@@ -551,6 +773,74 @@ func TestPrimeTwice(t *testing.T) {
 	}
 }
 
+// TestPrimeFanTokens checks that Prime issues the pool tokens and then one
+// token per fan user: with Tokens 4 over the two pool pairs and two fan users
+// it makes six issues, the round robin of the first four never lands on a fan
+// pair, and the last two are the fan users' in fan order, each with its own
+// password and project, and fill the fan pool. A failing fifth issue counts
+// the tokens of both pools in its message and fills neither pool.
+func TestPrimeFanTokens(t *testing.T) {
+	plan := func() *keystoneplan.Plan {
+		return fanPlan(5, []string{"proj-0004", "proj-0002"}, []string{"proj-0005"})
+	}
+
+	t.Run("fills both pools", func(t *testing.T) {
+		s, f := primedFanSet(t, plan(), fixtureOptions(4, churnOn))
+		type issueArgs struct{ user, project, password, projectID string }
+		var got []issueArgs
+		for _, c := range f.recorded(kindIssue) {
+			got = append(got, issueArgs{c.user, c.project, c.password, c.projectID})
+		}
+		want := []issueArgs{
+			{"user-0001", "proj-0001", "pw-user-0001", "id-proj-0001"},
+			{"user-0002", "proj-0002", "pw-user-0002", "id-proj-0002"},
+			{"user-0001", "proj-0001", "pw-user-0001", "id-proj-0001"},
+			{"user-0002", "proj-0002", "pw-user-0002", "id-proj-0002"},
+			{"fan-0001", "proj-0004", "pw-fan-0001", "id-proj-0004"},
+			{"fan-0002", "proj-0005", "pw-fan-0002", "id-proj-0005"},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("issues = %v, want %v", got, want)
+		}
+		var poolPairs, fanPairs []int
+		for _, e := range poolEntries(s) {
+			poolPairs = append(poolPairs, e.pair)
+		}
+		for _, e := range fanEntries(s) {
+			fanPairs = append(fanPairs, e.pair)
+		}
+		if want := []int{0, 1, 0, 1}; !reflect.DeepEqual(poolPairs, want) {
+			t.Errorf("pool entries are for pairs %v, want %v", poolPairs, want)
+		}
+		if want := []int{2, 3}; !reflect.DeepEqual(fanPairs, want) || s.fan[0].pair != 2 || s.fan[1].pair != 3 {
+			t.Errorf("fan pool entries are for pairs %v and the fan users' pairs are %d and %d, want both %v", fanPairs, s.fan[0].pair, s.fan[1].pair, want)
+		}
+	})
+
+	t.Run("a failing fifth issue", func(t *testing.T) {
+		f := newFake(newFakeClock(), time.Hour)
+		f.failNth(kindIssue, 5, gophercloud.ErrUnexpectedResponseCode{Actual: 500})
+		s := buildFanSet(t, f, plan(), fixtureOptions(4, churnOn))
+		err := s.Prime(context.Background(), 1)
+		if want := "priming token pool (4 of 6 issued): "; err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Fatalf("Prime error = %v, want the prefix %q", err, want)
+		}
+		var code gophercloud.ErrUnexpectedResponseCode
+		if !errors.As(err, &code) || code.Actual != 500 {
+			t.Errorf("error %v does not wrap the 500", err)
+		}
+		if n := len(f.recorded(kindIssue)); n != 5 {
+			t.Errorf("%d issues made, want 5 (none after the failure)", n)
+		}
+		if s.pool.len() != 0 || s.fanPool.len() != 0 {
+			t.Errorf("a failed Prime left %d pool and %d fan pool entries, want none", s.pool.len(), s.fanPool.len())
+		}
+		if s.done != nil {
+			t.Error("a failed Prime started the refresher")
+		}
+	})
+}
+
 // TestValidate checks that validate validates a pool token and leaves it in
 // the pool.
 func TestValidate(t *testing.T) {
@@ -755,6 +1045,110 @@ func TestEffective(t *testing.T) {
 	})
 }
 
+// TestEffectiveFanUser checks that effective lists a fan user when the set has
+// one: the assignment and user project listings carry the fan user's id and
+// the available projects listing its fan token, and neither pool changes.
+// With two fan users the draws reach both, each listing with its own token;
+// without fan users effective lists the user of a pool token as before.
+func TestEffectiveFanUser(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("lists the fan user", func(t *testing.T) {
+		s, f := primedFanSet(t, fanPlan(5, []string{"proj-0002", "proj-0004"}), fixtureOptions(2, churnOn))
+		poolBefore, fanBefore := poolTokens(s), fanTokens(s)
+		fanToken := fanEntries(s)[0].token
+		m := f.mark()
+		if err := operation(t, s, OpEffective)(ctx, rand.New(rand.NewSource(1))); err != nil {
+			t.Fatalf("effective: %v", err)
+		}
+		want := []call{
+			{kind: kindEffective, userID: "id-fan-0001"},
+			{kind: kindUserProjects, userID: "id-fan-0001"},
+			{kind: kindAvailable, token: fanToken},
+		}
+		if calls := f.since(m); !reflect.DeepEqual(calls, want) {
+			t.Errorf("calls = %+v, want %+v", calls, want)
+		}
+		if !maps.Equal(poolTokens(s), poolBefore) || !maps.Equal(fanTokens(s), fanBefore) {
+			t.Error("effective changed a pool")
+		}
+	})
+
+	t.Run("draws every fan user", func(t *testing.T) {
+		s, f := primedFanSet(t, fanPlan(5, []string{"proj-0002"}, []string{"proj-0004"}), fixtureOptions(2, churnOn))
+		userOf := make(map[string]string) // fan token to its fan user's id
+		for _, e := range fanEntries(s) {
+			userOf[e.token] = s.pairs[e.pair].userID
+		}
+		do := operation(t, s, OpEffective)
+		rng := rand.New(rand.NewSource(1))
+		listed := make(map[string]int)
+		for range 50 {
+			m := f.mark()
+			if err := do(ctx, rng); err != nil {
+				t.Fatalf("effective: %v", err)
+			}
+			calls := f.since(m)
+			userID, ok := userOf[calls[2].token]
+			if !ok || calls[0].userID != userID || calls[1].userID != userID {
+				t.Fatalf("calls = %+v, want the listings of one fan user with its token", calls)
+			}
+			listed[userID]++
+		}
+		if listed["id-fan-0001"] == 0 || listed["id-fan-0002"] == 0 {
+			t.Errorf("fan users listed = %v, want both", listed)
+		}
+	})
+
+	t.Run("without fan users lists a pool user", func(t *testing.T) {
+		s, f := primedFanSet(t, fanPlan(5), fixtureOptions(2, churnOn))
+		before := poolTokens(s)
+		m := f.mark()
+		if err := operation(t, s, OpEffective)(ctx, rand.New(rand.NewSource(1))); err != nil {
+			t.Fatalf("effective: %v", err)
+		}
+		calls := f.since(m)
+		if len(calls) != 3 {
+			t.Fatalf("calls = %+v, want three listings", calls)
+		}
+		pairIdx, ok := before[calls[2].token]
+		if !ok {
+			t.Fatalf("listed available projects with %q, not a pool token", calls[2].token)
+		}
+		if userID := s.pairs[pairIdx].userID; calls[0].userID != userID || calls[1].userID != userID {
+			t.Errorf("calls = %+v, want the listings of the pool token's user %q", calls, userID)
+		}
+	})
+}
+
+// TestPoolOperationsSkipFanUsers checks that validate, revoke, grant_churn and
+// issue never touch a fan user: over many draws of each, no call carries a
+// fan user's name, id or token, and the fan pool keeps its entries.
+func TestPoolOperationsSkipFanUsers(t *testing.T) {
+	ctx := context.Background()
+	s, f := primedFanSet(t, fanPlan(5, []string{"proj-0002", "proj-0004"}), fixtureOptions(2, churnOn))
+	fanBefore := fanTokens(s)
+	m := f.mark()
+	rng := rand.New(rand.NewSource(1))
+	for _, name := range []string{OpValidate, OpRevoke, OpGrantChurn, OpIssue} {
+		do := operation(t, s, name)
+		for range 50 {
+			if err := do(ctx, rng); err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+		}
+	}
+	for _, c := range f.since(m) {
+		_, fanToken := fanBefore[c.token]
+		if fanToken || c.user == "fan-0001" || c.a.User == "fan-0001" || c.userID == "id-fan-0001" || strings.Contains(c.res.ID, "id-fan-0001") {
+			t.Errorf("call %+v touches the fan user", c)
+		}
+	}
+	if !maps.Equal(fanTokens(s), fanBefore) {
+		t.Errorf("fan pool = %v after the pool operations, want %v", fanTokens(s), fanBefore)
+	}
+}
+
 // TestGrantChurn checks that grant_churn removes a churn user's grant and
 // grants it again with the same arguments, never touches a pool user's grant,
 // restores the grant after a failed removal, and skips a busy grant.
@@ -938,6 +1332,335 @@ func TestIssue(t *testing.T) {
 			t.Errorf("pool = %v after a failed issue, want %v", after, before)
 		}
 	})
+}
+
+// TestGrowFan covers GrowFan over the five projects and two roles of a
+// fanPlan: the grants a user lacks go to the first projects it holds none
+// on, in plan order, with the roles cycled from its count of grants; a second
+// call with the same target grants nothing; a target above the projects fails
+// without a call; a failed grant stops further grants, keeps what was created
+// and leaves the failed project for a later call; a transient failure is
+// retried; and the grants in flight never exceed the concurrency.
+func TestGrowFan(t *testing.T) {
+	ctx := context.Background()
+	// fanGrantCall is the AssignRole call GrowFan makes to grant role on
+	// project to the fan user user, its deadline left out.
+	fanGrantCall := func(user, role, project string) call {
+		roleID := map[string]string{"role-0001": "rid-1", "role-0002": "rid-2"}[role]
+		return call{
+			kind:      kindAssign,
+			a:         keystoneplan.Assignment{User: user, Role: role, Project: project},
+			userID:    "id-" + user,
+			projectID: "id-" + project,
+			domainID:  "did-1",
+			roleID:    roleID,
+		}
+	}
+	// grantCalls returns the fake's grants since mark m in call order, without
+	// their deadlines.
+	grantCalls := func(f *fakeKeystone, m int) []call {
+		var out []call
+		for _, c := range f.since(m) {
+			if c.kind == kindAssign {
+				c.deadline = time.Time{}
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	resourceOf := func(c call) resource.Resource {
+		return keystone.AssignmentResource(c.a, c.userID, c.projectID, c.domainID, c.roleID)
+	}
+	byID := func(a, b resource.Resource) int { return strings.Compare(a.ID, b.ID) }
+	byProject := func(a, b call) int { return strings.Compare(a.a.Project, b.a.Project) }
+	// twoHeld is the set whose fan user holds proj-0002 and proj-0004.
+	twoHeld := func(t *testing.T, f *fakeKeystone) *Set {
+		return buildFanSet(t, f, fanPlan(5, []string{"proj-0002", "proj-0004"}), fixtureOptions(1, churnOn))
+	}
+
+	t.Run("grants the first missing projects with cycled roles", func(t *testing.T) {
+		f := newFake(newFakeClock(), time.Hour)
+		s := twoHeld(t, f)
+		res, err := s.GrowFan(ctx, 4, 2)
+		end := time.Now()
+		if err != nil {
+			t.Fatalf("GrowFan(4, 2): %v", err)
+		}
+		// h is 2, so proj-0001 gets roles[(2+0) % 2] and proj-0003 roles[(2+1) % 2].
+		want := []call{
+			fanGrantCall("fan-0001", "role-0001", "proj-0001"),
+			fanGrantCall("fan-0001", "role-0002", "proj-0003"),
+		}
+		for _, c := range f.recorded(kindAssign) {
+			if c.deadline.IsZero() || c.deadline.After(end.Add(s.o.OpTimeout)) {
+				t.Errorf("grant %+v ran with deadline %v, want one at most OpTimeout %s after the call", c.a, c.deadline, s.o.OpTimeout)
+			}
+		}
+		got := grantCalls(f, 0)
+		slices.SortFunc(got, byProject) // two grants in flight finish in either order
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("grants = %+v, want %+v", got, want)
+		}
+		wantRes := []resource.Resource{resourceOf(want[0]), resourceOf(want[1])}
+		slices.SortFunc(res, byID)
+		slices.SortFunc(wantRes, byID)
+		if !reflect.DeepEqual(res, wantRes) {
+			t.Errorf("created = %+v, want the role_assignment resources %+v", res, wantRes)
+		}
+		for _, r := range res {
+			if r.Kind != keystone.KindAssignment {
+				t.Errorf("created %+v of kind %q, want %q", r, r.Kind, keystone.KindAssignment)
+			}
+		}
+		wantHeld := map[string]bool{"proj-0001": true, "proj-0002": true, "proj-0003": true, "proj-0004": true}
+		if !maps.Equal(s.fan[0].held, wantHeld) {
+			t.Errorf("fan user holds %v, want %v", s.fan[0].held, wantHeld)
+		}
+
+		m := f.mark()
+		res, err = s.GrowFan(ctx, 4, 2)
+		if err != nil || len(res) != 0 {
+			t.Errorf("a second GrowFan(4, 2) = %v, %v; want no resources and no error", res, err)
+		}
+		if calls := f.since(m); len(calls) != 0 {
+			t.Errorf("a second GrowFan(4, 2) made calls %+v, want none", calls)
+		}
+
+		// h is 4 now, so proj-0005 gets roles[(4+0) % 2].
+		m = f.mark()
+		if _, err := s.GrowFan(ctx, 5, 1); err != nil {
+			t.Fatalf("GrowFan(5, 1): %v", err)
+		}
+		if got, want := grantCalls(f, m), []call{fanGrantCall("fan-0001", "role-0001", "proj-0005")}; !reflect.DeepEqual(got, want) {
+			t.Errorf("grants = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("grows every fan user", func(t *testing.T) {
+		f := newFake(newFakeClock(), time.Hour)
+		s := buildFanSet(t, f, fanPlan(5, []string{"proj-0002", "proj-0004"}, []string{"proj-0001"}), fixtureOptions(1, churnOn))
+		res, err := s.GrowFan(ctx, 3, 1)
+		if err != nil {
+			t.Fatalf("GrowFan(3, 1): %v", err)
+		}
+		// fan-0001 holds 2 and fan-0002 holds 1; with one grant in flight
+		// they run in fan and plan order.
+		want := []call{
+			fanGrantCall("fan-0001", "role-0001", "proj-0001"),
+			fanGrantCall("fan-0002", "role-0002", "proj-0002"),
+			fanGrantCall("fan-0002", "role-0001", "proj-0003"),
+		}
+		got := grantCalls(f, 0)
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("grants = %+v, want %+v", got, want)
+		}
+		if wantRes := []resource.Resource{resourceOf(want[0]), resourceOf(want[1]), resourceOf(want[2])}; !reflect.DeepEqual(res, wantRes) {
+			t.Errorf("created = %+v, want %+v in completion order", res, wantRes)
+		}
+	})
+
+	t.Run("a target above the projects", func(t *testing.T) {
+		f := newFake(newFakeClock(), time.Hour)
+		s := twoHeld(t, f)
+		res, err := s.GrowFan(ctx, 6, 1)
+		if want := "fan assignments (6) exceed the plan's 5 projects"; err == nil || err.Error() != want {
+			t.Errorf("GrowFan(6, 1) error = %v, want %q", err, want)
+		}
+		if len(res) != 0 {
+			t.Errorf("GrowFan(6, 1) created %+v, want nothing", res)
+		}
+		if calls := f.recorded(); len(calls) != 0 {
+			t.Errorf("GrowFan(6, 1) made calls %+v, want none", calls)
+		}
+	})
+
+	t.Run("a failed grant", func(t *testing.T) {
+		f := newFake(newFakeClock(), time.Hour)
+		f.failNth(kindAssign, 2, errFake)
+		s := twoHeld(t, f)
+		res, err := s.GrowFan(ctx, 4, 1)
+		if want := `growing fan user "fan-0001" to 4 assignments (1 granted): `; err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Fatalf("GrowFan(4, 1) error = %v, want the prefix %q", err, want)
+		}
+		if !errors.Is(err, errFake) {
+			t.Errorf("error %v does not wrap the grant's", err)
+		}
+		first := fanGrantCall("fan-0001", "role-0001", "proj-0001")
+		if want := []resource.Resource{resourceOf(first)}; !reflect.DeepEqual(res, want) {
+			t.Errorf("created = %+v, want the grant made before the failure %+v", res, want)
+		}
+		if s.fan[0].held["proj-0003"] || !s.fan[0].held["proj-0001"] {
+			t.Errorf("fan user holds %v, want proj-0001 and not the failed proj-0003", s.fan[0].held)
+		}
+
+		// A later call makes the failed grant, with the role of the user's
+		// third grant, roles[(3+0) % 2].
+		m := f.mark()
+		res, err = s.GrowFan(ctx, 4, 1)
+		if err != nil {
+			t.Fatalf("GrowFan(4, 1) after the failure: %v", err)
+		}
+		want := fanGrantCall("fan-0001", "role-0002", "proj-0003")
+		if got := grantCalls(f, m); !reflect.DeepEqual(got, []call{want}) {
+			t.Errorf("grants = %+v, want %+v", got, []call{want})
+		}
+		if !reflect.DeepEqual(res, []resource.Resource{resourceOf(want)}) {
+			t.Errorf("created = %+v, want %+v", res, resourceOf(want))
+		}
+	})
+
+	t.Run("a failure stops further grants", func(t *testing.T) {
+		f := newFake(newFakeClock(), time.Hour)
+		f.failNth(kindAssign, 1, errFake)
+		s := twoHeld(t, f)
+		res, err := s.GrowFan(ctx, 5, 1)
+		if want := `growing fan user "fan-0001" to 5 assignments (0 granted): `; err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Fatalf("GrowFan(5, 1) error = %v, want the prefix %q", err, want)
+		}
+		if len(res) != 0 {
+			t.Errorf("created = %+v, want nothing", res)
+		}
+		if n := len(f.recorded(kindAssign)); n != 1 {
+			t.Errorf("%d grants made, want 1 (none after the failure)", n)
+		}
+	})
+
+	t.Run("a cancelled context grants nothing", func(t *testing.T) {
+		f := newFake(newFakeClock(), time.Hour)
+		s := twoHeld(t, f)
+		cctx, cancel := context.WithCancel(ctx)
+		cancel()
+		res, err := s.GrowFan(cctx, 4, 2)
+		if want := `growing fan user "fan-0001" to 4 assignments (0 granted): context canceled`; err == nil || err.Error() != want {
+			t.Errorf("GrowFan error = %v, want %q", err, want)
+		}
+		if !errors.Is(err, context.Canceled) || len(res) != 0 {
+			t.Errorf("GrowFan = %+v, %v; want nothing and context.Canceled", res, err)
+		}
+		if calls := f.recorded(); len(calls) != 0 {
+			t.Errorf("GrowFan on a cancelled context made calls %+v, want none", calls)
+		}
+	})
+
+	t.Run("a transient failure is retried", func(t *testing.T) {
+		// In the synctest bubble WithRetry's backoff passes on the bubble's
+		// clock, so the retry costs no wall time.
+		synctest.Test(t, func(t *testing.T) {
+			f := newFake(newFakeClock(), time.Hour)
+			f.failNth(kindAssign, 1, gophercloud.ErrUnexpectedResponseCode{Actual: 503})
+			s := twoHeld(t, f)
+			res, err := s.GrowFan(ctx, 4, 1)
+			if err != nil {
+				t.Fatalf("GrowFan(4, 1): %v", err)
+			}
+			first := fanGrantCall("fan-0001", "role-0001", "proj-0001")
+			want := []call{first, first, fanGrantCall("fan-0001", "role-0002", "proj-0003")}
+			if got := grantCalls(f, 0); !reflect.DeepEqual(got, want) {
+				t.Errorf("grants = %+v, want the first one retried %+v", got, want)
+			}
+			if len(res) != 2 {
+				t.Errorf("created %d resources, want 2", len(res))
+			}
+		})
+	})
+
+	t.Run("a failure waits for the grants in flight", func(t *testing.T) {
+		// With concurrency 2 one grant is held at the fake's gate while the
+		// other fails. In the synctest bubble, synctest.Wait returns once
+		// every goroutine is blocked, so a GrowFan that does not wait for the
+		// held grant has returned by then.
+		synctest.Test(t, func(t *testing.T) {
+			f := newFake(newFakeClock(), time.Hour)
+			f.failNth(kindAssign, 2, errFake)
+			f.gateAssigns(t)
+			s := twoHeld(t, f)
+			type result struct {
+				res []resource.Resource
+				err error
+			}
+			grown := make(chan result, 1)
+			go func() {
+				res, err := s.GrowFan(ctx, 5, 2)
+				grown <- result{res, err}
+			}()
+
+			synctest.Wait()
+			select {
+			case r := <-grown:
+				t.Fatalf("GrowFan returned (%v) while a grant was still in flight", r.err)
+			default:
+			}
+			f.releaseAssign(t)
+			synctest.Wait()
+			var r result
+			select {
+			case r = <-grown:
+			default:
+				t.Fatal("GrowFan did not return after the held grant was let through")
+			}
+			if want := `growing fan user "fan-0001" to 5 assignments (1 granted): `; r.err == nil || !strings.HasPrefix(r.err.Error(), want) {
+				t.Errorf("GrowFan error = %v, want the prefix %q", r.err, want)
+			}
+			if len(r.res) != 1 {
+				t.Errorf("created %d resources, want the held grant's 1", len(r.res))
+			}
+			if n := len(f.recorded(kindAssign)); n != 2 {
+				t.Errorf("%d grants made, want 2 (the third never started)", n)
+			}
+		})
+	})
+
+	// Two fan users over ten projects need nine grants each. The fake holds
+	// every grant at its gate and the test lets them through one at a time. In
+	// the synctest bubble, synctest.Wait returns once every goroutine is
+	// blocked, so GrowFan has started every grant it can start before the test
+	// counts them: an unbounded GrowFan has all eighteen in flight, and one
+	// without the floor of 1 none.
+	for _, tt := range []struct{ concurrency, want int }{{2, 2}, {0, 1}} {
+		t.Run(fmt.Sprintf("concurrency %d", tt.concurrency), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const grants = 18
+				f := newFake(newFakeClock(), time.Hour)
+				f.gateAssigns(t)
+				s := buildFanSet(t, f, fanPlan(10, []string{"proj-0001"}, []string{"proj-0002"}), fixtureOptions(1, churnOn))
+				type result struct {
+					res []resource.Resource
+					err error
+				}
+				grown := make(chan result, 1)
+				go func() {
+					res, err := s.GrowFan(ctx, 10, tt.concurrency)
+					grown <- result{res, err}
+				}()
+
+				for released := range grants {
+					synctest.Wait()
+					if n, want := f.assignsInFlight(), min(tt.want, grants-released); n != want {
+						t.Fatalf("%d grants in flight with %d of %d let through, want %d", n, released, grants, want)
+					}
+					f.releaseAssign(t)
+				}
+				synctest.Wait()
+				var r result
+				select {
+				case r = <-grown:
+				default:
+					t.Fatal("GrowFan did not return after every grant was let through")
+				}
+				if r.err != nil || len(r.res) != grants {
+					t.Errorf("GrowFan(10, %d) = %d resources, %v; want %d and no error", tt.concurrency, len(r.res), r.err, grants)
+				}
+				if n := f.maxAssignsInFlight(); n != tt.want {
+					t.Errorf("at most %d grants were in flight at once, want %d", n, tt.want)
+				}
+				for _, u := range s.fan {
+					if len(u.held) != 10 {
+						t.Errorf("fan user %q holds %d projects, want 10", u.name, len(u.held))
+					}
+				}
+			})
+		})
+	}
 }
 
 // TestClassify checks the labels Classify gives.

@@ -2,10 +2,13 @@
 // token validation, effective role listings, token revocation, role grant
 // churn and token issue. They run over a pool of real project-scoped tokens
 // that the package issues for the provisioned users of a plan and keeps fresh
-// while the run goes on. The engine in internal/pressure stays service-neutral;
-// this package supplies its operations as closures over a Keystone client and
-// the pool. The pool tokens and the users' passwords live only in process
-// memory: no log line, error text, run record or checkpoint carries them.
+// while the run goes on. A plan's fan users, which hold a grant on many
+// projects, get a token each outside the pool: the effective listings target
+// them, and GrowFan adds grants to them between the stages of a run. The
+// engine in internal/pressure stays service-neutral; this package supplies its
+// operations as closures over a Keystone client and the pool. The pool tokens
+// and the users' passwords live only in process memory: no log line, error
+// text, run record or checkpoint carries them.
 package keystoneops
 
 import (
@@ -68,9 +71,10 @@ var errNoChurnGrants = errors.New("keystoneops: grant_churn has no churn assignm
 type Options struct {
 	// Tokens is the pool size, at least 1.
 	Tokens int
-	// ChurnUsers is the number of users, taken from the end of the plan,
-	// reserved for grant_churn. They hold no pool token. It applies only when
-	// the grant_churn weight is positive; otherwise no user is reserved.
+	// ChurnUsers is the number of users, taken from the end of the plan's
+	// regular users, reserved for grant_churn; a fan user is never one. They
+	// hold no pool token. It applies only when the grant_churn weight is
+	// positive; otherwise no user is reserved.
 	ChurnUsers int
 	// Weights maps an operation name to its weight; a missing name is 0.
 	Weights map[string]int
@@ -104,16 +108,47 @@ type churnGrant struct {
 	roleID    string
 }
 
+// fanUser is one fan user: its ids, the projects it holds a grant on (by
+// logical name) and the index of its pair in pairs, for its token. The
+// password its token is issued with lives in that pair.
+type fanUser struct {
+	name, userID, domainID string
+	mu                     sync.Mutex      // guards held while GrowFan grants
+	held                   map[string]bool // project logical names with a grant
+	pair                   int
+}
+
+// idName is a plan resource's logical name and cloud id.
+type idName struct{ Name, ID string }
+
+// fanGrant is one grant GrowFan makes: role on project for the fan user u.
+type fanGrant struct {
+	u       *fanUser
+	project idName
+	role    idName
+}
+
 // Set is the Keystone operation set of one pressure run: the client, the
-// resolved pool pairs and churn grants, the token pool and its refresher.
-// Build creates it, Prime fills the pool and starts the refresher, Operations
-// hands the operations to pressure.Run, and Close stops the refresher.
+// resolved pool pairs, churn grants and fan users, the token pool, the fan
+// users' tokens and their refresher. Build creates it, Prime fills the pools
+// and starts the refresher, Operations hands the operations to pressure.Run,
+// GrowFan grows the fan users' grants between stages, and Close stops the
+// refresher.
 type Set struct {
-	c     Keystone
-	o     Options
-	pairs []pair
-	churn []*churnGrant
-	pool  pool
+	c Keystone
+	o Options
+	// pairs holds the poolPairs pool pairs first and then one pair per fan
+	// user, in the order of fan, so a pool round robin over the first
+	// poolPairs entries never issues a fan user's token.
+	pairs     []pair
+	poolPairs int
+	churn     []*churnGrant
+	pool      pool
+
+	fan      []*fanUser
+	fanPool  pool     // one entry per fan user, never taken
+	projects []idName // every plan project in plan order
+	roles    []idName // every plan role in plan order
 
 	// now reads the clock for the token lifetime and the refresher's due
 	// check. It is time.Now; tests replace it to move the clock.
@@ -133,13 +168,18 @@ type Set struct {
 // logical name in ids, and the users' passwords in passwords, all three as
 // keystoneexec.Provision returned them.
 //
-// The churn users are the last o.ChurnUsers users of p.Users in plan order
-// when the grant_churn weight is positive, and none otherwise; grant_churn
-// removes and restores their assignments only. The pool pairs are the
-// distinct project-scoped (user, project) pairs of p.Assignments whose user is
-// not a churn user, in first-appearance order. Build checks the plan, the
-// options and the partition, and resolves every id it needs, so a run fails
-// here, before any token is issued, rather than in a worker.
+// Build partitions the users three ways. The fan users are the users with Fan
+// set, in plan order. The churn users are the last o.ChurnUsers of the other,
+// regular users in plan order when the grant_churn weight is positive, and
+// none otherwise; grant_churn removes and restores their assignments only.
+// The pool pairs are the distinct project-scoped (user, project) pairs of
+// p.Assignments whose user is neither a churn nor a fan user, in
+// first-appearance order. Each fan user gets one more pair, after the pool
+// pairs, for its first project-scoped assignment in plan order, which its own
+// token is scoped to; a plan with fan users also resolves every project and
+// role, the grants GrowFan may make. Build checks the plan, the options and
+// the partition, and resolves every id it needs, so a run fails here, before
+// any token is issued, rather than in a worker.
 func Build(p *keystoneplan.Plan, c Keystone, b keystoneexec.Bindings, ids, passwords map[string]string, o Options) (*Set, error) {
 	if err := p.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid plan: %w", err)
@@ -154,19 +194,44 @@ func Build(p *keystoneplan.Plan, c Keystone, b keystoneexec.Bindings, ids, passw
 		return nil, fmt.Errorf("pressure op-timeout must be positive, got %s", o.OpTimeout)
 	}
 
+	// The fan users are set apart first, so neither the churn set nor the pool
+	// ever takes one.
+	var regular, fanUsers []keystoneplan.User
+	for _, u := range p.Users {
+		if u.Fan {
+			fanUsers = append(fanUsers, u)
+		} else {
+			regular = append(regular, u)
+		}
+	}
 	churnUsers := make(map[string]bool)
 	if o.Weights[OpGrantChurn] > 0 {
-		if o.ChurnUsers >= len(p.Users) {
-			return nil, fmt.Errorf("pressure.churn_users (%d) must leave at least one user outside the churn set; the plan has %d users", o.ChurnUsers, len(p.Users))
+		if o.ChurnUsers >= len(regular) {
+			return nil, fmt.Errorf("pressure.churn_users (%d) must leave at least one user outside the churn set; the plan has %d users", o.ChurnUsers, len(regular))
 		}
-		for _, u := range p.Users[len(p.Users)-o.ChurnUsers:] {
+		for _, u := range regular[len(regular)-o.ChurnUsers:] {
 			churnUsers[u.Name] = true
 		}
 	}
+	fanHeld := make(map[string]map[string]bool, len(fanUsers))
+	for _, u := range fanUsers {
+		fanHeld[u.Name] = make(map[string]bool)
+	}
 
 	var churnAssignments, poolAssignments []keystoneplan.Assignment
+	fanFirst := make(map[string]keystoneplan.Assignment, len(fanUsers)) // a fan user's first project-scoped assignment
 	seen := make(map[[2]string]bool)
 	for _, a := range p.Assignments {
+		if held, ok := fanHeld[a.User]; ok {
+			if a.Project == "" {
+				continue
+			}
+			if _, ok := fanFirst[a.User]; !ok {
+				fanFirst[a.User] = a
+			}
+			held[a.Project] = true
+			continue
+		}
 		if churnUsers[a.User] {
 			churnAssignments = append(churnAssignments, a)
 			continue
@@ -179,10 +244,15 @@ func Build(p *keystoneplan.Plan, c Keystone, b keystoneexec.Bindings, ids, passw
 		poolAssignments = append(poolAssignments, a)
 	}
 	if o.Weights[OpGrantChurn] > 0 && len(churnAssignments) == 0 {
-		return nil, fmt.Errorf("pressure grant_churn needs the churn users to hold at least one assignment; the last %d user(s) of the plan hold none", o.ChurnUsers)
+		return nil, fmt.Errorf("pressure grant_churn needs the churn users to hold at least one assignment; the last %d regular user(s) of the plan hold none", o.ChurnUsers)
 	}
 	if len(poolAssignments) == 0 {
-		return nil, errors.New("pressure needs at least one project-scoped assignment outside the churn users to issue pool tokens from; the plan has none")
+		return nil, errors.New("pressure needs at least one project-scoped assignment outside the churn and fan users to issue pool tokens from; the plan has none")
+	}
+	for _, u := range fanUsers {
+		if _, ok := fanFirst[u.Name]; !ok {
+			return nil, fmt.Errorf("pressure fan user %q holds no project-scoped assignment to scope its token to", u.Name)
+		}
 	}
 
 	r := resolver{b: b, ids: ids, passwords: passwords, userDomain: make(map[string]string, len(p.Users))}
@@ -198,12 +268,39 @@ func Build(p *keystoneplan.Plan, c Keystone, b keystoneexec.Bindings, ids, passw
 		}
 		s.pairs = append(s.pairs, pr)
 	}
+	s.poolPairs = len(s.pairs)
+	for _, u := range fanUsers {
+		pr, err := r.pair(fanFirst[u.Name])
+		if err != nil {
+			return nil, err
+		}
+		s.fan = append(s.fan, &fanUser{name: u.Name, userID: pr.userID, domainID: pr.domainID, held: fanHeld[u.Name], pair: len(s.pairs)})
+		s.pairs = append(s.pairs, pr)
+	}
 	for _, a := range churnAssignments {
 		g, err := r.grant(a)
 		if err != nil {
 			return nil, err
 		}
 		s.churn = append(s.churn, g)
+	}
+	// GrowFan may grant any plan role on any plan project, so a plan with fan
+	// users resolves them all up front; a plan without needs neither.
+	if len(s.fan) > 0 {
+		for _, pr := range p.Projects {
+			id, err := r.id("project", pr.Name)
+			if err != nil {
+				return nil, err
+			}
+			s.projects = append(s.projects, idName{Name: pr.Name, ID: id})
+		}
+		for _, rl := range p.Roles {
+			id, err := r.role(rl.Name)
+			if err != nil {
+				return nil, err
+			}
+			s.roles = append(s.roles, idName{Name: rl.Name, ID: id})
+		}
 	}
 	return s, nil
 }
@@ -237,7 +334,8 @@ func (r resolver) domainID(user string) (string, error) {
 	return id, nil
 }
 
-// pair resolves the pool pair of the project-scoped assignment a.
+// pair resolves the pair of the project-scoped assignment a, a pool pair or
+// the pair of a fan user's token.
 func (r resolver) pair(a keystoneplan.Assignment) (pair, error) {
 	userID, err := r.id("user", a.User)
 	if err != nil {
@@ -280,22 +378,33 @@ func (r resolver) grant(a keystoneplan.Assignment) (*churnGrant, error) {
 	if err != nil {
 		return nil, err
 	}
-	roleID := r.b.Roles[a.Role]
-	if roleID == "" {
-		return nil, fmt.Errorf("pressure set: no cloud id for role %q", a.Role)
+	roleID, err := r.role(a.Role)
+	if err != nil {
+		return nil, err
 	}
 	return &churnGrant{a: a, userID: userID, projectID: projectID, domainID: domainID, roleID: roleID}, nil
 }
 
+// role returns the cloud id of the role with logical name from the root
+// bindings.
+func (r resolver) role(name string) (string, error) {
+	id := r.b.Roles[name]
+	if id == "" {
+		return "", fmt.Errorf("pressure set: no cloud id for role %q", name)
+	}
+	return id, nil
+}
+
 // Prime fills the pool with o.Tokens tokens, token k for pool pair k modulo
-// the number of pairs, with at most concurrency issues in flight (at least
-// one), each bounded by o.OpTimeout. The first failure stops further issues;
-// Prime waits for the issues in flight and returns the failure with the
-// number of tokens issued so far. On success it starts the refresher, which
-// replaces every entry that comes within a quarter of the token lifetime (at
-// most 5 minutes) of its expiry, and runs until Close or until ctx ends. The
-// lifetime is that of the first token, measured from just before its issue
-// started. A pool can be primed once.
+// the number of pool pairs, and then the fan pool with one token per fan user,
+// for its pair, with at most concurrency issues in flight (at least one), each
+// bounded by o.OpTimeout. The first failure stops further issues; Prime waits
+// for the issues in flight and returns the failure with the number of tokens
+// issued so far out of both pools' total. On success it starts the refresher,
+// which replaces every entry of either pool that comes within a quarter of the
+// token lifetime (at most 5 minutes) of its expiry, and runs until Close or
+// until ctx ends. The lifetime is that of the first pool token, measured from
+// just before its issue started. A pool can be primed once.
 func (s *Set) Prime(ctx context.Context, concurrency int) error {
 	s.mu.Lock()
 	if s.primed {
@@ -306,16 +415,18 @@ func (s *Set) Prime(ctx context.Context, concurrency int) error {
 	s.mu.Unlock()
 	concurrency = max(concurrency, 1)
 
+	// Token k < o.Tokens is pool token k; token o.Tokens+i is fan user i's.
+	total := s.o.Tokens + len(s.fan)
 	var (
 		mu       sync.Mutex // guards the four below
 		firstErr error
 		issued   int
-		entries  = make([]entry, s.o.Tokens)
+		entries  = make([]entry, total)
 		lifetime time.Duration
 		wg       sync.WaitGroup
 	)
 	sem := make(chan struct{}, concurrency)
-	for k := range s.o.Tokens {
+	for k := range total {
 		sem <- struct{}{}
 		mu.Lock()
 		if firstErr == nil && ctx.Err() != nil {
@@ -326,12 +437,16 @@ func (s *Set) Prime(ctx context.Context, concurrency int) error {
 		if stop {
 			break
 		}
+		i := k % s.poolPairs
+		if k >= s.o.Tokens {
+			i = s.fan[k-s.o.Tokens].pair
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
 			started := s.now()
-			e, err := s.issueBounded(ctx, k%len(s.pairs))
+			e, err := s.issueBounded(ctx, i)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -349,13 +464,16 @@ func (s *Set) Prime(ctx context.Context, concurrency int) error {
 	}
 	wg.Wait()
 	if firstErr != nil {
-		return fmt.Errorf("priming token pool (%d of %d issued): %w", issued, s.o.Tokens, firstErr)
+		return fmt.Errorf("priming token pool (%d of %d issued): %w", issued, total, firstErr)
 	}
-	// The entries enter the pool in issue order, so the pool's layout, and with
+	// The entries enter their pools in issue order, so a pool's layout, and with
 	// it which entry a seeded draw picks, does not depend on which issue
 	// returned first.
-	for _, e := range entries {
+	for _, e := range entries[:s.o.Tokens] {
 		s.pool.put(e)
+	}
+	for _, e := range entries[s.o.Tokens:] {
+		s.fanPool.put(e)
 	}
 	s.startRefresher(ctx, lifetime, concurrency)
 	return nil
@@ -411,19 +529,29 @@ func (s *Set) startRefresher(ctx context.Context, lifetime time.Duration, concur
 	}()
 }
 
-// refreshDue replaces every pool entry that expires less than the refresh
-// margin after now. For each one it first issues a token for the same pair,
-// with at most Prime's concurrency in flight and each issue bounded by
-// o.OpTimeout, and only then swaps the new entry in place of the old one, so
-// the pool is never emptied by a refresh and the operations keep drawing from
-// it meanwhile. An entry a revoke or an issue took in the meantime is not
-// replaced and its new token is discarded, so the pool never grows. A failed
-// issue keeps the old entry for the next tick.
+// refreshDue replaces every entry of the pool and of the fan pool that
+// expires less than the refresh margin after now. For each one it first
+// issues a token for the same pair, with at most Prime's concurrency in flight
+// across both pools and each issue bounded by o.OpTimeout, and only then swaps
+// the new entry in place of the old one in the old one's pool, so no pool is
+// emptied by a refresh and the operations keep drawing from it meanwhile. An
+// entry a revoke or an issue took in the meantime is not replaced and its new
+// token is discarded, so the pool never grows. A failed issue keeps the old
+// entry for the next tick.
 func (s *Set) refreshDue(ctx context.Context, now time.Time) {
 	s.mu.Lock()
 	margin, concurrency := s.margin, s.concurrency
 	s.mu.Unlock()
-	due := s.pool.expiringBefore(now.Add(margin))
+	type dueEntry struct {
+		p   *pool
+		old entry
+	}
+	var due []dueEntry
+	for _, p := range []*pool{&s.pool, &s.fanPool} {
+		for _, e := range p.expiringBefore(now.Add(margin)) {
+			due = append(due, dueEntry{p, e})
+		}
+	}
 	if len(due) == 0 {
 		return
 	}
@@ -431,7 +559,7 @@ func (s *Set) refreshDue(ctx context.Context, now time.Time) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	sem := make(chan struct{}, max(concurrency, 1))
-	for _, old := range due {
+	for _, d := range due {
 		select {
 		case <-ctx.Done():
 			return
@@ -441,14 +569,14 @@ func (s *Set) refreshDue(ctx context.Context, now time.Time) {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			next, err := s.issueBounded(ctx, old.pair)
+			next, err := s.issueBounded(ctx, d.old.pair)
 			if err != nil {
 				if ctx.Err() == nil {
 					slog.Warn("token pool refresh failed; the entry is retried on the next tick", "error", err)
 				}
 				return
 			}
-			s.pool.replace(old, next)
+			d.p.replace(d.old, next)
 		}()
 	}
 }
@@ -467,16 +595,17 @@ func (s *Set) Close() {
 	<-done
 }
 
-// issueBounded issues a token for pool pair i on a context bounded by
-// o.OpTimeout, for the issues Prime and the refresher make outside any
-// operation.
+// issueBounded issues a token for pair i, a pool pair or a fan user's, on a
+// context bounded by o.OpTimeout, for the issues Prime and the refresher make
+// outside any operation.
 func (s *Set) issueBounded(ctx context.Context, i int) (entry, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.o.OpTimeout)
 	defer cancel()
 	return s.issue(ctx, i)
 }
 
-// issue issues a token for pool pair i and returns it as a pool entry.
+// issue issues a token for pair i and returns it as an entry of the pool or
+// the fan pool.
 func (s *Set) issue(ctx context.Context, i int) (entry, error) {
 	p := &s.pairs[i]
 	t, err := s.c.IssueScopedToken(ctx, p.issue, p.domainID, p.password, p.projectID)
@@ -511,11 +640,17 @@ func (s *Set) validate(ctx context.Context, rng *rand.Rand) error {
 	return s.c.ValidateToken(ctx, e.token)
 }
 
-// effective lists a random pool user's effective role assignments, the
-// projects that user can access, and the projects the pool token itself can
-// access, in that order. The first error ends the operation.
+// effective lists a user's effective role assignments, the projects that user
+// can access, and the projects the user's token itself can access, in that
+// order. The user is a random fan user when the set has any, with the token of
+// its fan pool entry, so the listings grow with the fan's grants; otherwise it
+// is the user of a random pool token. The first error ends the operation.
 func (s *Set) effective(ctx context.Context, rng *rand.Rand) error {
-	e, ok := s.pool.peek(rng)
+	p := &s.pool
+	if len(s.fan) > 0 {
+		p = &s.fanPool
+	}
+	e, ok := p.peek(rng)
 	if !ok {
 		return ErrPoolEmpty
 	}
@@ -558,7 +693,7 @@ func (s *Set) revoke(ctx context.Context, rng *rand.Rand) error {
 // one only when every grant is busy, so a lock wait rarely inflates the
 // measured latency. The re-grant runs even after a failed removal, so the
 // grant is restored whenever the cloud allows it; the first error is
-// returned. A pool user's grant is never touched.
+// returned. Neither a pool user's nor a fan user's grant is ever touched.
 func (s *Set) grantChurn(ctx context.Context, rng *rand.Rand) error {
 	if len(s.churn) == 0 {
 		return errNoChurnGrants
@@ -605,4 +740,114 @@ func (s *Set) reissue(ctx context.Context, rng *rand.Rand) error {
 	}
 	s.pool.put(next)
 	return nil
+}
+
+// GrowFan grants role assignments to every fan user until each holds at
+// least n. A user holding h grants gets one on each of the first n-h
+// projects, in plan order, that it holds none on; the j-th of them (0-based)
+// gets the role roles[(h+j) % len(roles)]. Each grant runs through
+// keystoneexec.WithRetry bounded by o.OpTimeout, with at most concurrency
+// grants in flight (at least 1). It returns the created resources, in
+// completion order, those created before a failure included, and the first
+// error. A user already holding n grants is left as it is, so a second call
+// with the same n grants nothing.
+//
+// A user's grants are counted as the projects it holds a grant on, so a
+// project the plan grants it with two roles counts once. An n above the
+// plan's projects fails before any grant, and a cancelled ctx stops GrowFan
+// before the next grant. After the first failure no further grant starts:
+// GrowFan waits for the grants in flight and names the failing user with the
+// number of grants that user got in this call. A set without fan users grants
+// nothing.
+func (s *Set) GrowFan(ctx context.Context, n, concurrency int) ([]resource.Resource, error) {
+	if len(s.fan) == 0 {
+		return nil, nil
+	}
+	if n > len(s.projects) {
+		return nil, fmt.Errorf("fan assignments (%d) exceed the plan's %d projects", n, len(s.projects))
+	}
+	concurrency = max(concurrency, 1)
+
+	var grants []fanGrant
+	for _, u := range s.fan {
+		u.mu.Lock()
+		h, j := len(u.held), 0
+		for _, project := range s.projects {
+			if h+j >= n {
+				break
+			}
+			if u.held[project.Name] {
+				continue
+			}
+			grants = append(grants, fanGrant{u: u, project: project, role: s.roles[(h+j)%len(s.roles)]})
+			j++
+		}
+		u.mu.Unlock()
+	}
+
+	var (
+		mu      sync.Mutex // guards the four below
+		created = make([]resource.Resource, 0, len(grants))
+		granted = make(map[*fanUser]int) // grants made per user in this call
+		failed  *fanUser                 // the user of the first failure
+		cause   error
+		wg      sync.WaitGroup
+	)
+	sem := make(chan struct{}, concurrency)
+	for _, g := range grants {
+		sem <- struct{}{}
+		mu.Lock()
+		if failed == nil && ctx.Err() != nil {
+			failed, cause = g.u, ctx.Err()
+		}
+		stop := failed != nil
+		mu.Unlock()
+		if stop {
+			break
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			res, err := s.grantFan(ctx, g)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if failed == nil {
+					failed, cause = g.u, err
+				}
+				return
+			}
+			created = append(created, res)
+			granted[g.u]++
+		}()
+	}
+	wg.Wait()
+	if failed != nil {
+		return created, fmt.Errorf("growing fan user %q to %d assignments (%d granted): %w", failed.name, n, granted[failed], cause)
+	}
+	return created, nil
+}
+
+// grantFan makes grant g through keystoneexec.WithRetry, each attempt bounded
+// by o.OpTimeout, and records the project in the fan user's held set once the
+// grant succeeded.
+func (s *Set) grantFan(ctx context.Context, g fanGrant) (resource.Resource, error) {
+	a := keystoneplan.Assignment{User: g.u.name, Role: g.role.Name, Project: g.project.Name}
+	var res resource.Resource
+	err := keystoneexec.WithRetry(ctx, s.o.OpTimeout, func(ctx context.Context) error {
+		r, err := s.c.AssignRole(ctx, a, g.u.userID, g.project.ID, g.u.domainID, g.role.ID)
+		if err != nil {
+			return err
+		}
+		res = r
+		return nil
+	})
+	if err != nil {
+		return resource.Resource{}, err
+	}
+	g.u.mu.Lock()
+	g.u.held[g.project.Name] = true
+	g.u.mu.Unlock()
+	return res, nil
 }

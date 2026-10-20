@@ -148,6 +148,69 @@ func TestRefreshDue(t *testing.T) {
 	})
 }
 
+// TestRefreshDueFanTokens checks that the refresh covers the fan users'
+// tokens: the pool tokens live an hour, which sets a 5-minute margin, and the
+// fan tokens 40 minutes, so 36 minutes after priming only the fan tokens are
+// due. The refresh reissues each for its fan pair, replaces it in the fan
+// pool, which keeps one entry per fan user, and leaves the pool as it was.
+func TestRefreshDueFanTokens(t *testing.T) {
+	ctx := context.Background()
+	f := newFake(newFakeClock(), time.Hour)
+	// Prime with concurrency 1 issues the two pool tokens and then the two
+	// fan tokens, in that order.
+	f.setIssueTiming(0, time.Hour, time.Hour, 40*time.Minute, 40*time.Minute)
+	s := buildFanSet(t, f, fanPlan(5, []string{"proj-0002"}, []string{"proj-0004"}), fixtureOptions(2, churnOn))
+	if err := s.Prime(ctx, 1); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+	// Stop the refresher goroutine, so only the test's own call refreshes.
+	s.Close()
+	if s.margin != maxRefreshMargin {
+		t.Fatalf("margin = %s, want %s from the hour-long first pool token", s.margin, maxRefreshMargin)
+	}
+	poolBefore, fanBefore := poolTokens(s), fanTokens(s)
+
+	now := f.clock.Now().Add(36 * time.Minute)
+	f.clock.Set(now)
+	m := f.mark()
+	s.refreshDue(ctx, now)
+
+	type issueArgs struct{ user, project string }
+	got := make(map[issueArgs]int)
+	for _, c := range f.since(m) {
+		got[issueArgs{c.user, c.project}]++
+	}
+	if want := map[issueArgs]int{{"fan-0001", "proj-0002"}: 1, {"fan-0002", "proj-0004"}: 1}; !maps.Equal(got, want) {
+		t.Errorf("refresh issues = %v, want one per fan user for its pair %v", got, want)
+	}
+	if after := poolTokens(s); !maps.Equal(after, poolBefore) {
+		t.Errorf("pool = %v after a refresh of the fan tokens, want %v", after, poolBefore)
+	}
+	after := fanTokens(s)
+	if len(after) != len(s.fan) {
+		t.Fatalf("fan pool = %v, want one entry per fan user", after)
+	}
+	for tok := range fanBefore {
+		if _, ok := after[tok]; ok {
+			t.Errorf("old fan token %s is still in the fan pool", tok)
+		}
+	}
+	pairs := make(map[int]bool)
+	for _, pairIdx := range after {
+		pairs[pairIdx] = true
+	}
+	for _, u := range s.fan {
+		if !pairs[u.pair] {
+			t.Errorf("fan pool %v has no entry for fan user %q's pair %d", after, u.name, u.pair)
+		}
+	}
+	for _, e := range fanEntries(s) {
+		if want := now.Add(time.Hour); !e.expiresAt.Equal(want) {
+			t.Errorf("fan entry expires at %s, want %s", e.expiresAt, want)
+		}
+	}
+}
+
 // TestRefreshSchedule checks the refresher's timing: the margin is a quarter
 // of the token lifetime and at most five minutes, the refresher looks every
 // half margin, and a lifetime too short for a positive interval, as a token
