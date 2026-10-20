@@ -67,9 +67,17 @@ type Client struct {
 	runID   string
 	metrics *metrics.Collector
 	tel     *telemetry.Telemetry
+
+	// eo selects the endpoints IssueScopedToken resolves from an issued token's
+	// catalog, and resolveEndpoints switches that resolution on. Both are set
+	// by SetEndpointOpts and never change afterwards.
+	eo               gophercloud.EndpointOpts
+	resolveEndpoints bool
 }
 
 // New returns a Client that names resources for runID and records timing into m.
+// It does not resolve endpoints from issued tokens; SetEndpointOpts turns that
+// on.
 func New(gc *gophercloud.ServiceClient, runID string, m *metrics.Collector) *Client {
 	return &Client{gc: gc, runID: runID, metrics: m}
 }
@@ -80,6 +88,18 @@ func New(gc *gophercloud.ServiceClient, runID string, m *metrics.Collector) *Cli
 // every telemetry call is a no-op.
 func (c *Client) SetTelemetry(t *telemetry.Telemetry) {
 	c.tel = t
+}
+
+// SetEndpointOpts makes IssueScopedToken resolve the endpoints of Nova,
+// Neutron, Cinder and Glance from each issued token's own catalog, selected
+// with eo, the region and interface of the clouds.yaml entry. The token's
+// catalog, not the admin's, is read because Cinder's URL names the token's
+// project. It must be called before the client issues concurrently. A client
+// without it (the default after New) leaves IssuedToken.Endpoints nil, as
+// apply, chaos, monitor and the churn graph need.
+func (c *Client) SetEndpointOpts(eo gophercloud.EndpointOpts) {
+	c.eo = eo
+	c.resolveEndpoints = true
 }
 
 // resourceName builds the deterministic cloud name for a logical plan name.
@@ -171,6 +191,12 @@ func errKind(err error) string {
 	}
 	return "other"
 }
+
+// ErrorKind is the error label the client's own samples carry, for a caller
+// outside the package that records calls the same way: "" for a nil error,
+// timeout, canceled, http_<status> for the statuses Keystone returns,
+// http_other for any other status, and other.
+func ErrorKind(err error) string { return errKind(err) }
 
 // ClassifyOperationError labels an operation error for a per-bucket error
 // breakdown: "" for nil, then canceled, timeout, forbidden (a 403 policy
