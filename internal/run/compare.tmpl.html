@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Comparison: run {{.Base.RunID}} vs run {{.Other.RunID}}</title>
+<style>{{template "styles"}}</style>
+</head>
+<body>
+
+<h1>Comparison: run {{.Base.RunID}} vs run {{.Other.RunID}}</h1>
+{{- template "comparedRun" .Base}}
+{{- template "comparedRun" .Other}}
+{{- if .Mismatches}}
+<div class="banner warn">Loads differ: {{.Mismatches}}</div>
+{{- end}}
+
+<h2>Operations</h2>
+<table class="sortable">
+  <thead><tr>{{range .OperationColumns}}<th>{{.}}</th>{{end}}</tr></thead>
+  <tbody>
+  {{range .Operations}}
+    <tr>{{range .Cells}}<td data-sort="{{.Sort}}">{{.Text}}</td>{{end}}</tr>
+  {{end}}
+  </tbody>
+</table>
+{{- if .Stages}}
+
+<h2>Stages</h2>
+<table class="sortable">
+  <thead><tr>{{range .StageColumns}}<th>{{.}}</th>{{end}}</tr></thead>
+  <tbody>
+  {{range .Stages}}
+    <tr>{{range .Cells}}<td data-sort="{{.Sort}}">{{.Text}}</td>{{end}}</tr>
+  {{end}}
+  </tbody>
+</table>
+{{- end}}
+
+<script>
+"use strict";
+{{template "sortScript"}}</script>
+</body>
+</html>
+{{define "comparedRun"}}
+<div class="chips">
+  <span class="chip">{{.Role}} run {{.RunID}}{{if .Incomplete}} (incomplete){{end}}</span>
+  <span class="chip">scenario {{.Scenario}}</span>
+  <span class="chip">seed {{.Seed}}</span>
+  <span class="chip">workers {{.Workers}}</span>
+  <span class="chip">tokens {{.Tokens}}</span>
+  <span class="chip">mix {{.Mix}}</span>
+</div>
+{{- end -}}
