@@ -2,6 +2,7 @@ package keystoneops
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"math/rand"
 	"strings"
@@ -59,6 +60,58 @@ func TestPoolReplace(t *testing.T) {
 	}
 	if got := []entry{p.entries[0], p.entries[1]}; got[0].token != "a" || got[1].token != "b2" || p.len() != 2 {
 		t.Errorf("entries = %v, want a and b2 in place", p.entries)
+	}
+}
+
+// TestRevokedTokensRingAndAge checks the revoked-token ring: 300 adds, one a
+// second, keep the last 256 in add order and drop the first 44. pick reports
+// none, without drawing from the generator, while every token is younger than
+// five minutes; a token exactly five minutes old is eligible; and later it
+// draws only among the eligible tokens, not always the same one.
+func TestRevokedTokensRingAndAge(t *testing.T) {
+	var r revokedTokens
+	t0 := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	revokedAt := func(i int) time.Time { return t0.Add(time.Duration(i) * time.Second) }
+	for i := range 300 {
+		r.add(fmt.Sprintf("rev-%d", i), revokedAt(i))
+	}
+	if n := r.len(); n != 256 {
+		t.Fatalf("len() = %d after 300 adds, want 256", n)
+	}
+	for i, e := range r.entries {
+		if want := fmt.Sprintf("rev-%d", i+44); e.token != want {
+			t.Fatalf("entry %d is %s, want %s: the first 44 dropped and the rest in add order", i, e.token, want)
+		}
+	}
+
+	rng := rand.New(rand.NewSource(1))
+	oldest := revokedAt(44) // the oldest token the ring still holds
+	if tok, ok := r.pick(rng, oldest.Add(revokedTokenAge-time.Nanosecond)); ok {
+		t.Errorf("pick = %s while every token is younger than five minutes, want none", tok)
+	}
+	if got, want := rng.Int63(), rand.New(rand.NewSource(1)).Int63(); got != want {
+		t.Error("pick drew from the generator although no token was eligible")
+	}
+	if tok, ok := r.pick(rng, oldest.Add(revokedTokenAge)); !ok || tok != "rev-44" {
+		t.Errorf("pick = %q, %v at exactly five minutes, want the one eligible rev-44", tok, ok)
+	}
+
+	// Five minutes after rev-100, the tokens rev-44 to rev-100 are eligible.
+	now := revokedAt(100).Add(revokedTokenAge)
+	seen := make(map[string]bool)
+	for range 200 {
+		tok, ok := r.pick(rng, now)
+		if !ok {
+			t.Fatal("pick reported none with 57 eligible tokens")
+		}
+		var i int
+		if _, err := fmt.Sscanf(tok, "rev-%d", &i); err != nil || i < 44 || i > 100 {
+			t.Fatalf("pick = %s, want one of rev-44 to rev-100", tok)
+		}
+		seen[tok] = true
+	}
+	if len(seen) < 2 {
+		t.Errorf("200 picks returned only %v, want a draw among the eligible tokens", seen)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -17,7 +18,9 @@ import (
 
 	"github.com/B42Labs/dizzy/internal/keystone"
 	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
+	"github.com/B42Labs/dizzy/internal/metrics"
 	"github.com/B42Labs/dizzy/internal/pressure"
+	"github.com/B42Labs/dizzy/internal/pressure/probe"
 	"github.com/B42Labs/dizzy/internal/resource"
 )
 
@@ -170,7 +173,7 @@ func TestBuildErrors(t *testing.T) {
 				tt.bindings(b.Domains, b.Roles)
 			}
 			f := newFake(newFakeClock(), time.Hour)
-			s, err := Build(tt.plan(), f, b, ids, passwords, tt.opts)
+			s, err := Build(tt.plan(), f, nil, b, ids, passwords, tt.opts)
 			if err == nil || err.Error() != tt.wantErr {
 				t.Fatalf("Build error = %v, want %q", err, tt.wantErr)
 			}
@@ -339,7 +342,7 @@ func TestBuildFanPartition(t *testing.T) {
 		delete(ids, "proj-0005") // no grant names it
 		b := fixtureBindings()
 		delete(b.Roles, "role-0002") // no grant uses it
-		s, err := Build(p, newFake(newFakeClock(), time.Hour), b, ids, fanPasswords(p), fixtureOptions(2, churnOn))
+		s, err := Build(p, newFake(newFakeClock(), time.Hour), nil, b, ids, fanPasswords(p), fixtureOptions(2, churnOn))
 		if err != nil {
 			t.Fatalf("Build: %v", err)
 		}
@@ -460,7 +463,7 @@ func TestBuildFanErrors(t *testing.T) {
 				tt.roles(b.Roles)
 			}
 			f := newFake(newFakeClock(), time.Hour)
-			s, err := Build(p, f, b, ids, passwords, tt.opts)
+			s, err := Build(p, f, nil, b, ids, passwords, tt.opts)
 			if err == nil || err.Error() != tt.wantErr {
 				t.Fatalf("Build error = %v, want %q", err, tt.wantErr)
 			}
@@ -479,7 +482,7 @@ func TestBuildFanErrors(t *testing.T) {
 func TestBuildCopiesWeights(t *testing.T) {
 	f := newFake(newFakeClock(), time.Hour)
 	weights := map[string]int{OpValidate: 60}
-	s, err := Build(pressurePlan(), f, fixtureBindings(), fixtureIDs(), fixturePasswords(), Options{Tokens: 1, Weights: weights, OpTimeout: time.Second})
+	s, err := Build(pressurePlan(), f, nil, fixtureBindings(), fixtureIDs(), fixturePasswords(), Options{Tokens: 1, Weights: weights, OpTimeout: time.Second})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -489,12 +492,81 @@ func TestBuildCopiesWeights(t *testing.T) {
 	}
 }
 
-// TestOperationsNamesAndWeights checks that Operations returns all five
-// operations in order, each with its weight from Options, and 0 for a missing
-// weight.
+// defaultWeights is the command's default mix: the five Keystone operations
+// at their weights and probe and bad_token at 0.
+var defaultWeights = map[string]int{OpValidate: 60, OpEffective: 5, OpRevoke: 2, OpGrantChurn: 2, OpIssue: 1, OpProbe: 0, OpBadToken: 0}
+
+// TestBuildNeedsServices checks the Build errors of a run that sends tokens
+// to the other services, with their exact messages: a positive probe or
+// bad_token weight and the propagation probe each need a service client, and
+// the propagation probe needs a positive timeout, which Build checks first,
+// with a client or without. A run that needs no service, the default mix
+// with the propagation probe off, builds without a client. Build makes no
+// call on any of them.
+func TestBuildNeedsServices(t *testing.T) {
+	const noClient = "pressure probe, bad_token and the propagation probe need a service client; none was given"
+	options := func(weights map[string]int, p Propagation) Options {
+		o := fixtureOptions(1, defaultWeights)
+		maps.Copy(o.Weights, weights)
+		o.Propagation = p
+		return o
+	}
+	on := Propagation{Every: 30 * time.Second, Timeout: 10 * time.Minute}
+	tests := []struct {
+		name    string
+		svc     *fakeServices // nil passes no client at all
+		opts    Options
+		wantErr string // empty when Build succeeds
+	}{
+		{"probe without a client", nil, options(map[string]int{OpProbe: 1}, Propagation{}), noClient},
+		{"bad_token without a client", nil, options(map[string]int{OpBadToken: 1}, Propagation{}), noClient},
+		{"the propagation probe without a client", nil, options(nil, on), noClient},
+		{"the defaults without a client", nil, options(nil, Propagation{}), ""},
+		{"probe, bad_token and the propagation probe with a client", newFakeServices(), options(map[string]int{OpProbe: 1, OpBadToken: 1}, on), ""},
+		{"a zero propagation timeout without a client", nil, options(nil, Propagation{Every: 30 * time.Second}), "pressure propagation timeout must be positive, got 0s"},
+		{"a zero propagation timeout with a client", newFakeServices(), options(nil, Propagation{Every: 30 * time.Second}), "pressure propagation timeout must be positive, got 0s"},
+		{"a negative propagation timeout", newFakeServices(), options(nil, Propagation{Every: 30 * time.Second, Timeout: -time.Second}), "pressure propagation timeout must be positive, got -1s"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var svc Services // a nil *fakeServices would be a non-nil Services
+			if tt.svc != nil {
+				svc = tt.svc
+			}
+			f := newFake(newFakeClock(), time.Hour)
+			s, err := Build(pressurePlan(), f, svc, fixtureBindings(), fixtureIDs(), fixturePasswords(), tt.opts)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Build: %v", err)
+				}
+				s.Close()
+			} else {
+				if err == nil || err.Error() != tt.wantErr {
+					t.Fatalf("Build error = %v, want %q", err, tt.wantErr)
+				}
+				if s != nil {
+					t.Errorf("Build returned a set with its error")
+				}
+			}
+			if calls := f.recorded(); len(calls) != 0 {
+				t.Errorf("Build made %d cloud calls, want none", len(calls))
+			}
+			if tt.svc != nil {
+				if calls := tt.svc.recorded(); len(calls) != 0 {
+					t.Errorf("Build made %d services calls, want none", len(calls))
+				}
+			}
+		})
+	}
+}
+
+// TestOperationsNamesAndWeights checks that Operations returns all seven
+// operations in order, the order OperationNames lists, with probe and
+// bad_token after the five Keystone operations, each with its weight from
+// Options, and 0 for a missing weight.
 func TestOperationsNamesAndWeights(t *testing.T) {
 	f := newFake(newFakeClock(), time.Hour)
-	s := buildSet(t, f, fixtureOptions(1, map[string]int{OpValidate: 60, OpRevoke: 2, OpIssue: 1}))
+	s := buildSet(t, f, fixtureOptions(1, map[string]int{OpValidate: 60, OpRevoke: 2, OpIssue: 1, OpProbe: 4}))
 	ops := s.Operations()
 	var names []string
 	weights := make(map[string]int)
@@ -505,11 +577,14 @@ func TestOperationsNamesAndWeights(t *testing.T) {
 			t.Errorf("operation %q has no Do", op.Name)
 		}
 	}
-	wantNames := []string{"validate", "effective", "revoke", "grant_churn", "issue"}
+	wantNames := []string{"validate", "effective", "revoke", "grant_churn", "issue", "probe", "bad_token"}
 	if !reflect.DeepEqual(names, wantNames) {
 		t.Errorf("names = %v, want %v", names, wantNames)
 	}
-	wantWeights := map[string]int{"validate": 60, "effective": 0, "revoke": 2, "grant_churn": 0, "issue": 1}
+	if !reflect.DeepEqual(OperationNames, wantNames) {
+		t.Errorf("OperationNames = %v, want %v", OperationNames, wantNames)
+	}
+	wantWeights := map[string]int{"validate": 60, "effective": 0, "revoke": 2, "grant_churn": 0, "issue": 1, "probe": 4, "bad_token": 0}
 	if !maps.Equal(weights, wantWeights) {
 		t.Errorf("weights = %v, want %v", weights, wantWeights)
 	}
@@ -837,6 +912,87 @@ func TestPrimeFanTokens(t *testing.T) {
 		}
 		if s.done != nil {
 			t.Error("a failed Prime started the refresher")
+		}
+	})
+}
+
+// TestPrimeServiceCheck checks that a run that sends tokens to the other
+// services takes its services from the first pool token's catalog. A first
+// token whose catalog lists none of the four fails Prime with its exact
+// message after the issues and before any entry enters a pool, also when the
+// later tokens list one, and starts neither the refresher nor the propagation
+// probe. A catalog listing glance and nova gives the services in
+// probe.Services order and starts both. A run that needs no service primes
+// over tokens without endpoints and has no services.
+func TestPrimeServiceCheck(t *testing.T) {
+	const noService = "pressure probe needs at least one of nova, neutron, cinder, glance in the pool users' catalog; the first pool token's catalog lists none"
+	plan := func() *keystoneplan.Plan { return fanPlan(5, []string{"proj-0004"}) }
+	needs := func() Options {
+		o := fixtureOptions(2, map[string]int{OpValidate: 1, OpProbe: 1})
+		o.Propagation = Propagation{Every: time.Hour, Timeout: time.Minute} // never ticks during the test
+		return o
+	}
+
+	t.Run("a first token without a service", func(t *testing.T) {
+		f := newFake(newFakeClock(), time.Hour)
+		f.setEndpointsFrom(2, fixtureEndpoints("nova")) // the second token on lists nova
+		s := buildFanSet(t, f, plan(), needs())
+		err := s.Prime(context.Background(), 1) // one issue at a time, so the first token is pool token 0
+		if err == nil || err.Error() != noService {
+			t.Fatalf("Prime error = %v, want %q", err, noService)
+		}
+		if n := len(f.recorded(kindIssue)); n != 3 {
+			t.Errorf("%d issues made, want the 2 pool tokens and the fan user's", n)
+		}
+		if s.pool.len() != 0 || s.fanPool.len() != 0 {
+			t.Errorf("a failed Prime left %d pool and %d fan pool entries, want none", s.pool.len(), s.fanPool.len())
+		}
+		if s.done != nil || s.propDone != nil {
+			t.Error("a failed Prime started the refresher or the propagation probe")
+		}
+		if got := s.Services(); got != nil {
+			t.Errorf("Services() = %v after a failed Prime, want nil", got)
+		}
+		s.Close() // nothing runs, so it returns at once
+	})
+
+	t.Run("a catalog listing glance and nova", func(t *testing.T) {
+		f := newFake(newFakeClock(), time.Hour)
+		f.setEndpoints(fixtureEndpoints("glance", "nova"))
+		s := buildFanSet(t, f, plan(), needs())
+		if got := s.Services(); got != nil {
+			t.Errorf("Services() = %v before Prime, want nil", got)
+		}
+		if err := s.Prime(context.Background(), 2); err != nil {
+			t.Fatalf("Prime: %v", err)
+		}
+		got := s.Services()
+		if want := []string{"nova", "glance"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("Services() = %v, want %v", got, want)
+		}
+		got[0] = "changed"
+		if s.Services()[0] != "nova" {
+			t.Error("a change to the returned slice changed the set's services")
+		}
+		if s.pool.len() != 2 || s.fanPool.len() != 1 {
+			t.Errorf("pools hold %d and %d entries, want 2 and 1", s.pool.len(), s.fanPool.len())
+		}
+		if s.done == nil || s.propDone == nil {
+			t.Error("Prime did not start the refresher and the propagation probe")
+		}
+	})
+
+	t.Run("a run without a need", func(t *testing.T) {
+		f := newFake(newFakeClock(), time.Hour)
+		s := buildFanSet(t, f, plan(), fixtureOptions(2, churnOff))
+		if err := s.Prime(context.Background(), 2); err != nil {
+			t.Fatalf("Prime: %v", err)
+		}
+		if got := s.Services(); got != nil {
+			t.Errorf("Services() = %v for a run that needs none, want nil", got)
+		}
+		if s.pool.len() != 2 || s.propDone != nil {
+			t.Errorf("pool holds %d entries with the propagation probe started %v, want 2 and not started", s.pool.len(), s.propDone != nil)
 		}
 	})
 }
@@ -1663,6 +1819,901 @@ func TestGrowFan(t *testing.T) {
 	}
 }
 
+// probeWeights is a mix in which probe and bad_token draw.
+var probeWeights = map[string]int{OpValidate: 1, OpProbe: 1, OpBadToken: 1}
+
+// TestProbe checks the probe operation over tokens whose catalog lists nova
+// and cinder: it sends the drawn pool token to one of the two at that
+// service's endpoint and leaves the token in the pool, it draws among the
+// listed services only, and its sample lands in the set's probe samples under
+// the service, a failing probe as a failure with its Classify label.
+func TestProbe(t *testing.T) {
+	ctx := context.Background()
+	eps := fixtureEndpoints("nova", "cinder")
+
+	t.Run("sends the drawn token to a listed service", func(t *testing.T) {
+		s, _, fs := primedServiceSet(t, fixtureOptions(3, probeWeights), eps, 0)
+		before := poolTokens(s)
+		// The operation's first draw picks its token, so a peek with the same
+		// seed names it.
+		drawn, _ := s.pool.peek(rand.New(rand.NewSource(1)))
+		if err := operation(t, s, OpProbe)(ctx, rand.New(rand.NewSource(1))); err != nil {
+			t.Fatalf("probe: %v", err)
+		}
+		calls := fs.recorded()
+		if len(calls) != 1 || calls[0].kind != kindProbe {
+			t.Fatalf("services calls = %+v, want one probe", calls)
+		}
+		c := calls[0]
+		if c.service != "nova" && c.service != "cinder" {
+			t.Errorf("probed %q, want nova or cinder", c.service)
+		}
+		if c.endpoint != eps[c.service] {
+			t.Errorf("probed %s at %q, want its endpoint %q", c.service, c.endpoint, eps[c.service])
+		}
+		if c.token != drawn.token {
+			t.Errorf("probed with %q, want the drawn pool token %q", c.token, drawn.token)
+		}
+		if !maps.Equal(poolTokens(s), before) {
+			t.Error("probe changed the pool")
+		}
+		byType := s.ServiceStats(time.Second).Probes.ByType
+		if len(byType) != 1 || byType[0].Type != c.service || byType[0].Attempted != 1 || byType[0].Succeeded != 1 {
+			t.Errorf("probe samples = %+v, want one successful %s sample", byType, c.service)
+		}
+	})
+
+	t.Run("draws among the listed services only", func(t *testing.T) {
+		s, _, fs := primedServiceSet(t, fixtureOptions(3, probeWeights), eps, 0)
+		probeOp, rng := operation(t, s, OpProbe), rand.New(rand.NewSource(1))
+		for range 50 {
+			if err := probeOp(ctx, rng); err != nil {
+				t.Fatalf("probe: %v", err)
+			}
+		}
+		seen := make(map[string]int)
+		for _, c := range fs.recorded(kindProbe) {
+			seen[c.service]++
+		}
+		if len(seen) != 2 || seen["nova"] == 0 || seen["cinder"] == 0 {
+			t.Errorf("probes per service = %v, want both nova and cinder and nothing else", seen)
+		}
+	})
+
+	t.Run("a failing probe", func(t *testing.T) {
+		s, _, fs := primedServiceSet(t, fixtureOptions(3, probeWeights), eps, 0)
+		fs.answerAll(gophercloud.ErrUnexpectedResponseCode{Actual: 401})
+		err := operation(t, s, OpProbe)(ctx, rand.New(rand.NewSource(1)))
+		if !gophercloud.ResponseCodeIs(err, 401) {
+			t.Fatalf("probe error = %v, want the service's 401", err)
+		}
+		c := fs.recorded(kindProbe)[0]
+		probes := s.ServiceStats(time.Second).Probes
+		if len(probes.ByType) != 1 || probes.ByType[0].Type != c.service || probes.ByType[0].Failed != 1 || probes.ByType[0].Succeeded != 0 {
+			t.Errorf("probe samples = %+v, want one failed %s sample", probes.ByType, c.service)
+		}
+		if want := []metrics.ErrorCount{{Kind: "unauthorized", Count: 1}}; Classify(err) != "unauthorized" || !reflect.DeepEqual(probes.Errors, want) {
+			t.Errorf("probe errors = %+v with Classify %q, want %+v", probes.Errors, Classify(err), want)
+		}
+	})
+}
+
+// TestProbeNoService checks that probe and bad_token make no services call
+// and record no sample when they have nothing to send: on an empty pool they
+// return ErrPoolEmpty, and on a token whose catalog lists none of the four
+// services ErrNoService, labelled pool-empty and no-service.
+func TestProbeNoService(t *testing.T) {
+	ctx := context.Background()
+	for _, name := range []string{OpProbe, OpBadToken} {
+		t.Run(name+" on an empty pool", func(t *testing.T) {
+			s, _, fs := primedServiceSet(t, fixtureOptions(1, probeWeights), fixtureEndpoints("nova"), 0)
+			rng := rand.New(rand.NewSource(1))
+			s.pool.take(rng) // another worker holds the only entry
+			err := operation(t, s, name)(ctx, rng)
+			if !errors.Is(err, ErrPoolEmpty) || Classify(err) != "pool-empty" {
+				t.Errorf("%s error = %v (%q), want ErrPoolEmpty", name, err, Classify(err))
+			}
+			assertNoServiceCall(t, s, fs)
+		})
+
+		t.Run(name+" on a token without a service", func(t *testing.T) {
+			// A run that needs no service primes over tokens whose catalog
+			// lists none of the four, as the client returns it: empty, not nil.
+			s, _, fs := primedServiceSet(t, fixtureOptions(3, churnOn), map[string]string{}, 0)
+			err := operation(t, s, name)(ctx, rand.New(rand.NewSource(1)))
+			if !errors.Is(err, ErrNoService) || Classify(err) != "no-service" {
+				t.Errorf("%s error = %v (%q), want ErrNoService", name, err, Classify(err))
+			}
+			assertNoServiceCall(t, s, fs)
+		})
+	}
+}
+
+// assertNoServiceCall fails the test when fs saw a call or s recorded a probe
+// or bad-token sample.
+func assertNoServiceCall(t *testing.T, s *Set, fs *fakeServices) {
+	t.Helper()
+	if calls := fs.recorded(); len(calls) != 0 {
+		t.Errorf("services calls = %+v, want none", calls)
+	}
+	ss := s.ServiceStats(time.Second)
+	if ss.Probes.Overall.Attempted != 0 || ss.BadTokens.Overall.Attempted != 0 {
+		t.Errorf("recorded %d probe and %d bad-token samples, want none", ss.Probes.Overall.Attempted, ss.BadTokens.Overall.Attempted)
+	}
+}
+
+// fernetAlphabet is the alphabet of a Fernet token, A-Za-z0-9-_.
+const fernetAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+// TestBadTokenRandom checks the random bad token of a set that revoked no
+// token: over twenty seeds, each draw rejects at neutron, the one service the
+// catalog lists, a token as long as the drawn pool token, made of the Fernet
+// alphabet only and none of the pool's tokens. The pool holds tok-1 to tok-12,
+// so the drawn tokens are 5 or 6 characters long, and the draws cover both.
+// The token is the one a generator replayed through the pool draw and the
+// service draw alone yields: on an empty ring the draw makes no even draw,
+// so a seeded worker sends the tokens it sent before the ring existed.
+func TestBadTokenRandom(t *testing.T) {
+	ctx := context.Background()
+	eps := fixtureEndpoints("neutron")
+	s, _, fs := primedServiceSet(t, fixtureOptions(12, probeWeights), eps, 0)
+	pool := poolTokens(s)
+	badToken := operation(t, s, OpBadToken)
+	lengths := make(map[int]bool)
+	for seed := range int64(20) {
+		// The operation's first draw picks the pool token it takes the
+		// length from, so a peek with the same seed names it; the service
+		// draw among its listed services, neutron alone, follows, and then
+		// the token's characters.
+		replay := rand.New(rand.NewSource(seed))
+		drawn, _ := s.pool.peek(replay)
+		replay.Intn(len(listedServices(drawn.endpoints)))
+		want := randomToken(replay, len(drawn.token))
+		m := len(fs.recorded())
+		if err := badToken(ctx, rand.New(rand.NewSource(seed))); err != nil {
+			t.Fatalf("bad_token (seed %d): %v", seed, err)
+		}
+		calls := fs.recorded()[m:]
+		if len(calls) != 1 || calls[0].kind != kindReject {
+			t.Fatalf("services calls = %+v, want one reject", calls)
+		}
+		c := calls[0]
+		if c.service != "neutron" || c.endpoint != eps["neutron"] {
+			t.Errorf("rejected at %s %q, want neutron at %q", c.service, c.endpoint, eps["neutron"])
+		}
+		if len(c.token) != len(drawn.token) {
+			t.Errorf("seed %d: sent a token of %d characters, want %d as the drawn pool token", seed, len(c.token), len(drawn.token))
+		}
+		if strings.Trim(c.token, fernetAlphabet) != "" {
+			t.Errorf("seed %d: sent a token with characters outside A-Za-z0-9-_", seed)
+		}
+		if _, ok := pool[c.token]; ok {
+			t.Errorf("seed %d: sent a pool token as a bad token", seed)
+		}
+		if c.token != want {
+			t.Errorf("seed %d: sent a token other than the one the pool and service draws alone lead to", seed)
+		}
+		lengths[len(drawn.token)] = true
+	}
+	if !lengths[5] || !lengths[6] {
+		t.Errorf("the drawn pool tokens had lengths %v, want both 5 and 6", lengths)
+	}
+	byType := s.ServiceStats(time.Second).BadTokens.ByType
+	if len(byType) != 1 || byType[0].Type != "neutron" || byType[0].Attempted != 20 || byType[0].Succeeded != 20 {
+		t.Errorf("bad-token samples = %+v, want 20 successful neutron samples", byType)
+	}
+}
+
+// TestBadTokenRevoked checks the revoked bad token: a token the revoke
+// operation revoked joins the ring at the set's clock, is never sent while it
+// is 4 minutes old, and from 5 minutes on is sent on about half the draws,
+// the others sending a random token. A failed revoke adds nothing.
+func TestBadTokenRevoked(t *testing.T) {
+	ctx := context.Background()
+	weights := map[string]int{OpValidate: 1, OpRevoke: 1, OpBadToken: 1}
+
+	t.Run("sent once 5 minutes old", func(t *testing.T) {
+		s, f, fs := primedServiceSet(t, fixtureOptions(3, weights), fixtureEndpoints("nova", "glance"), 0)
+		start := f.clock.Now()
+		m := f.mark()
+		if err := operation(t, s, OpRevoke)(ctx, rand.New(rand.NewSource(1))); err != nil {
+			t.Fatalf("revoke: %v", err)
+		}
+		revoked := f.since(m)[0].token
+		if got := revokedOf(s); !reflect.DeepEqual(got, []string{revoked}) {
+			t.Fatalf("revoked tokens = %v, want the revoked %q", got, revoked)
+		}
+		if at := s.revoked.entries[0].at; !at.Equal(start) {
+			t.Errorf("the token was revoked at %s on the ring, want the set's clock %s", at, start)
+		}
+
+		// draws runs bad_token n times with a generator seeded with seed and
+		// counts the revoked and the random tokens it sent.
+		badToken := operation(t, s, OpBadToken)
+		draws := func(n int, seed int64) (revokedSent, randomSent int) {
+			t.Helper()
+			rng := rand.New(rand.NewSource(seed))
+			m := len(fs.recorded(kindReject))
+			for range n {
+				if err := badToken(ctx, rng); err != nil {
+					t.Fatalf("bad_token: %v", err)
+				}
+			}
+			for _, c := range fs.recorded(kindReject)[m:] {
+				if c.token == revoked {
+					revokedSent++
+				} else {
+					randomSent++
+				}
+			}
+			return revokedSent, randomSent
+		}
+
+		f.clock.Set(start.Add(4 * time.Minute))
+		if r, _ := draws(20, 7); r != 0 {
+			t.Errorf("the revoked token was sent %d times at 4 minutes, want never", r)
+		}
+		f.clock.Set(start.Add(5 * time.Minute))
+		if r, rnd := draws(20, 7); r == 0 || rnd == 0 {
+			t.Errorf("at 5 minutes the draws sent the revoked token %d and a random one %d times, want both at least once", r, rnd)
+		}
+	})
+
+	t.Run("a failed revoke adds nothing", func(t *testing.T) {
+		s, f, _ := primedServiceSet(t, fixtureOptions(3, weights), fixtureEndpoints("nova"), 0)
+		f.fail(kindRevoke, gophercloud.ErrUnexpectedResponseCode{Actual: 404})
+		if err := operation(t, s, OpRevoke)(ctx, rand.New(rand.NewSource(1))); err == nil {
+			t.Fatal("revoke succeeded, want the 404")
+		}
+		if n := s.revoked.len(); n != 0 {
+			t.Errorf("revoked tokens hold %d after a failed revoke, want none", n)
+		}
+	})
+}
+
+// TestBadTokenOutcomes checks what a bad_token draw makes of the service's
+// answer: the 401, which the fake's nil answer stands for, is a success, a
+// service that accepted the token fails the draw with probe.ErrAccepted,
+// labelled accepted, and any other failure is returned as is. Each lands in
+// the set's bad-token samples under the service.
+func TestBadTokenOutcomes(t *testing.T) {
+	tests := []struct {
+		name     string
+		answer   error
+		check    func(error) bool
+		wantKind string // the Classify label; empty for a success
+	}{
+		{"a 401 is a success", nil, func(err error) bool { return err == nil }, ""},
+		{"an accepted token", probe.ErrAccepted, func(err error) bool { return errors.Is(err, probe.ErrAccepted) }, "accepted"},
+		{"a 503", gophercloud.ErrUnexpectedResponseCode{Actual: 503}, func(err error) bool { return gophercloud.ResponseCodeIs(err, 503) }, "transient"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, _, fs := primedServiceSet(t, fixtureOptions(3, probeWeights), fixtureEndpoints("cinder"), 0)
+			fs.answer("cinder", tt.answer)
+			err := operation(t, s, OpBadToken)(context.Background(), rand.New(rand.NewSource(1)))
+			if !tt.check(err) || Classify(err) != tt.wantKind {
+				t.Fatalf("bad_token error = %v (%q), want the %q outcome", err, Classify(err), tt.wantKind)
+			}
+			bad := s.ServiceStats(time.Second).BadTokens
+			if len(bad.ByType) != 1 || bad.ByType[0].Type != "cinder" || bad.ByType[0].Attempted != 1 {
+				t.Fatalf("bad-token samples = %+v, want one cinder sample", bad.ByType)
+			}
+			var wantErrors []metrics.ErrorCount
+			wantFailed := 0
+			if tt.wantKind != "" {
+				wantErrors, wantFailed = []metrics.ErrorCount{{Kind: tt.wantKind, Count: 1}}, 1
+			}
+			if bad.ByType[0].Failed != wantFailed || !reflect.DeepEqual(bad.Errors, wantErrors) {
+				t.Errorf("bad-token sample failed %d with errors %+v, want %d and %+v", bad.ByType[0].Failed, bad.Errors, wantFailed, wantErrors)
+			}
+		})
+	}
+}
+
+// propagationOptions are options for pressurePlan with a pool of tokens, the
+// validate operation only, seed 7 and the propagation probe at every and
+// timeout.
+func propagationOptions(tokens int, every, timeout time.Duration) Options {
+	o := fixtureOptions(tokens, map[string]int{OpValidate: 1})
+	o.Seed = 7
+	o.Propagation = Propagation{Every: every, Timeout: timeout}
+	return o
+}
+
+// TestPropagationProbe runs the propagation probe in a synctest bubble, whose
+// clock makes its timing exact. With Every 20ms, Timeout 500ms and a poll
+// every 5ms over tokens listing nova and glance, the first probe starts at
+// 20ms, revokes and replaces a pool token, and polls nova with it at 20, 25
+// and 30ms; the services fake rejects a token's third poll, so its delay is
+// two poll intervals. The second probe starts at 40ms and polls glance, the
+// next service in turn, at 40 and 45ms, and the test closes the set at 48ms,
+// before that probe's third poll, so it is abandoned. Each tick that fired
+// made one revoke and one reissue, each bounded by OpTimeout, every poll is
+// bounded by its probe's deadline, the pool keeps its size, and the revoked
+// tokens left the pool and joined the ring.
+func TestPropagationProbe(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const every, timeout, pollEvery = 20 * time.Millisecond, 500 * time.Millisecond, 5 * time.Millisecond
+		const ticks = 2 // at 20 and 40ms
+		o := propagationOptions(3, every, timeout)
+		eps := fixtureEndpoints("nova", "glance")
+		start := time.Now()
+		s, f, fs := primedServiceSet(t, o, eps, pollEvery)
+		fs.rejectFromPoll(3)
+		primed := f.mark()
+		time.Sleep(48 * time.Millisecond)
+		s.Close()
+
+		var revokes, issues []call
+		for _, c := range f.since(primed) {
+			switch c.kind {
+			case kindRevoke:
+				revokes = append(revokes, c)
+			case kindIssue:
+				issues = append(issues, c)
+			}
+		}
+		if len(revokes) != ticks || len(issues) != ticks {
+			t.Fatalf("the fake saw %d revokes and %d issues, want one of each per tick (%d)", len(revokes), len(issues), ticks)
+		}
+		for k := range ticks {
+			want := start.Add(time.Duration(k+1) * every).Add(o.OpTimeout)
+			if !revokes[k].deadline.Equal(want) || !issues[k].deadline.Equal(want) {
+				t.Errorf("probe %d revoked with deadline %v and reissued with %v, want both %v", k, revokes[k].deadline, issues[k].deadline, want)
+			}
+		}
+		if n := s.pool.len(); n != 3 {
+			t.Errorf("pool size = %d, want 3", n)
+		}
+		first, second := revokes[0].token, revokes[1].token
+		pool := poolTokens(s)
+		for _, tok := range []string{first, second} {
+			if _, ok := pool[tok]; ok {
+				t.Errorf("the revoked token %s is still in the pool", tok)
+			}
+		}
+
+		polls := fs.polledWith(first)
+		if len(polls) != 3 || !polls[2].rejected || polls[0].rejected || polls[1].rejected {
+			t.Fatalf("polls with the first revoked token = %+v, want three, the third rejected", polls)
+		}
+		for _, c := range polls {
+			if c.service != "nova" || c.endpoint != eps["nova"] {
+				t.Errorf("the first probe polled %s at %q, want nova at %q", c.service, c.endpoint, eps["nova"])
+			}
+			if want := start.Add(every + timeout); !c.deadline.Equal(want) {
+				t.Errorf("a poll ran with deadline %v, want the probe's deadline %v", c.deadline, want)
+			}
+		}
+		secondPolls := fs.polledWith(second)
+		if len(secondPolls) != 2 {
+			t.Errorf("the second probe polled %d times before Close, want 2", len(secondPolls))
+		}
+		for _, c := range secondPolls {
+			if c.service != "glance" || c.endpoint != eps["glance"] {
+				t.Errorf("the second probe polled %s at %q, want glance at %q", c.service, c.endpoint, eps["glance"])
+			}
+		}
+
+		delays := fs.recorded(kindRevocation)
+		if len(delays) != 1 || !delays[0].ok {
+			t.Fatalf("RecordRevocationDelay calls = %+v, want one with ok", delays)
+		}
+		d := delays[0].d
+		if d < 2*pollEvery {
+			t.Errorf("delay = %s, want at least two poll intervals (%s)", d, 2*pollEvery)
+		}
+		ps := s.ServiceStats(time.Second).Propagation
+		if ps.Probes != 1 || ps.TimedOut != 0 || ps.Delay.Max != d {
+			t.Errorf("propagation stats = %+v, want 1 probe, none timed out and a max delay of %s", ps, d)
+		}
+		if ps.Every != every || ps.Timeout != timeout {
+			t.Errorf("propagation settings = %s every, %s timeout, want %s and %s", ps.Every, ps.Timeout, every, timeout)
+		}
+		if got := revokedOf(s); !reflect.DeepEqual(got, []string{first, second}) {
+			t.Errorf("revoked tokens = %v, want %v", got, []string{first, second})
+		}
+		// The ring ages a token on the set's clock, which the bubble's time
+		// does not move, not at the instant the delay is measured from.
+		for i, r := range s.revoked.entries {
+			if !r.at.Equal(f.clock.Now()) {
+				t.Errorf("revoked token %d joined the ring at %s, want the set's clock %s", i, r.at, f.clock.Now())
+			}
+		}
+	})
+}
+
+// TestPropagationFallbackService checks the service a probe polls when the
+// revoked token's catalog lacks the one whose turn it is, in a synctest
+// bubble. The set's services come from the first pool token, nova and
+// glance, and the test then gives every pool token, and every token issued
+// later, a catalog of neutron and glance alone. The first probe, at 20ms,
+// whose turn is nova, polls neutron, the first service its token's catalog
+// lists, at that service's endpoint; the second, at 40ms, polls glance, its
+// turn. The services fake rejects every first poll, so each probe polls
+// once.
+func TestPropagationFallbackService(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, f, fs := primedServiceSet(t, propagationOptions(3, 20*time.Millisecond, 500*time.Millisecond), fixtureEndpoints("nova", "glance"), 5*time.Millisecond)
+		fs.rejectFromPoll(1)
+		if got, want := s.Services(), []string{"nova", "glance"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("Services() = %v, want %v", got, want)
+		}
+		eps := fixtureEndpoints("neutron", "glance")
+		s.pool.mu.Lock()
+		for i := range s.pool.entries {
+			s.pool.entries[i].endpoints = maps.Clone(eps)
+		}
+		s.pool.mu.Unlock()
+		f.setEndpoints(eps)
+		time.Sleep(45 * time.Millisecond)
+		s.Close()
+
+		revokes := f.recorded(kindRevoke)
+		if len(revokes) != 2 {
+			t.Fatalf("the fake saw %d revokes, want one per tick (2)", len(revokes))
+		}
+		for k, want := range []string{"neutron", "glance"} {
+			polls := fs.polledWith(revokes[k].token)
+			if len(polls) != 1 || polls[0].service != want || polls[0].endpoint != eps[want] {
+				t.Errorf("probe %d polled %+v, want one poll of %s at %q", k, polls, want, eps[want])
+			}
+		}
+	})
+}
+
+// TestPropagationPollBound checks the bound of each poll, in a synctest
+// bubble: the earlier of the probe's deadline and o.OpTimeout from the poll's
+// start. With Every 20ms, Timeout 12ms, OpTimeout 6ms, a poll every 5ms and a
+// service that never refuses the token, the probe revokes at 20ms, so its
+// deadline is 32ms. It polls at 20 and 25ms, each bounded by OpTimeout, to 26
+// and 31ms, and then at 30ms and at the deadline, both bounded by the
+// deadline, before it records the timeout.
+func TestPropagationPollBound(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const every, timeout, opTimeout, pollEvery = 20 * time.Millisecond, 12 * time.Millisecond, 6 * time.Millisecond, 5 * time.Millisecond
+		o := propagationOptions(3, every, timeout)
+		o.OpTimeout = opTimeout
+		start := time.Now()
+		s, f, fs := primedServiceSet(t, o, fixtureEndpoints("cinder"), pollEvery)
+		time.Sleep(35 * time.Millisecond)
+		s.Close()
+
+		revokes := f.recorded(kindRevoke)
+		if len(revokes) != 1 {
+			t.Fatalf("the fake saw %d revokes, want one, at 20ms", len(revokes))
+		}
+		ms := func(n int) time.Time { return start.Add(time.Duration(n) * time.Millisecond) }
+		want := []struct{ began, deadline time.Time }{{ms(20), ms(26)}, {ms(25), ms(31)}, {ms(30), ms(32)}, {ms(32), ms(32)}}
+		polls := fs.polledWith(revokes[0].token)
+		if len(polls) != len(want) {
+			t.Fatalf("the probe polled %d times, want %d", len(polls), len(want))
+		}
+		for i, c := range polls {
+			if !c.began.Equal(want[i].began) || !c.deadline.Equal(want[i].deadline) {
+				t.Errorf("poll %d began at %v with deadline %v, want %v and %v", i, c.began.Sub(start), c.deadline.Sub(start), want[i].began.Sub(start), want[i].deadline.Sub(start))
+			}
+		}
+		if delays := fs.recorded(kindRevocation); len(delays) != 1 || delays[0].d != timeout || delays[0].ok {
+			t.Errorf("RecordRevocationDelay calls = %+v, want one of %s without ok", delays, timeout)
+		}
+	})
+}
+
+// TestPropagationTimeout runs a propagation probe against a service that never
+// refuses the revoked token, in a synctest bubble: with Every 20ms, Timeout
+// 50ms and a poll every 5ms, the first probe polls at 20 to 65ms, waits until
+// its deadline at 70ms, sends one last poll there on a context already at the
+// deadline, and then times out, recording the timeout as its delay and
+// logging the warning; the test closes the set at 78ms, before the later
+// probes' deadlines. A service that fails every poll with a 503 is no answer
+// either: the probe keeps polling until the timeout. A service that hangs
+// gets one poll, which the probe's deadline cuts off at 70ms; the poll takes
+// until 80ms to return, and the probe still records the timeout itself, not
+// the 60ms that passed. In every case the ticks at 20, 40 and 60ms (and 80ms
+// for the hung service) each revoked a token on time, although the first
+// probe was still polling: each probe runs on its own goroutine.
+func TestPropagationTimeout(t *testing.T) {
+	const every, timeout, pollEvery = 20 * time.Millisecond, 50 * time.Millisecond, 5 * time.Millisecond
+	tests := []struct {
+		name      string
+		answer    error            // what every poll that is not rejected returns
+		hang      time.Duration    // when positive, every poll blocks until its context ends and returns this much later
+		check     func(error) bool // whether the error of a poll before the deadline is the service's answer
+		run       time.Duration    // when the test closes the set
+		polls     int              // the first probe's polls, the last one ending at its deadline
+		lastBegan time.Duration    // when the first probe's last poll began, after the start
+		ticks     int              // the ticks before the test closes the set, one revoke each
+	}{
+		{"a service that keeps accepting the token", nil, 0, func(err error) bool { return err == nil }, 78 * time.Millisecond, int(timeout/pollEvery) + 1, every + timeout, 3},
+		{"a service that fails every poll", gophercloud.ErrUnexpectedResponseCode{Actual: 503}, 0, func(err error) bool { return gophercloud.ResponseCodeIs(err, 503) }, 78 * time.Millisecond, int(timeout/pollEvery) + 1, every + timeout, 3},
+		// The hung service never answers a poll before the deadline.
+		{"a service that hangs", nil, 10 * time.Millisecond, func(err error) bool { return err == nil }, 85 * time.Millisecond, 1, every, 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				logs := captureLogs(t)
+				start := time.Now()
+				o := propagationOptions(3, every, timeout)
+				s, f, fs := primedServiceSet(t, o, fixtureEndpoints("neutron"), pollEvery)
+				fs.answerAll(tt.answer)
+				if tt.hang > 0 {
+					fs.blockPolls(tt.hang)
+				}
+				time.Sleep(tt.run)
+				s.Close()
+
+				delays := fs.recorded(kindRevocation)
+				if len(delays) != 1 || delays[0].d != timeout || delays[0].ok {
+					t.Fatalf("RecordRevocationDelay calls = %+v, want one of %s without ok", delays, timeout)
+				}
+				ps := s.ServiceStats(time.Second).Propagation
+				if ps.Probes != 1 || ps.TimedOut != 1 || ps.Delay.Max != timeout {
+					t.Errorf("propagation stats = %+v, want 1 probe, 1 timed out and a max delay of %s", ps, timeout)
+				}
+				revokes := f.recorded(kindRevoke)
+				if len(revokes) != tt.ticks {
+					t.Fatalf("the fake saw %d revokes, want one per tick (%d) while the first probe polled", len(revokes), tt.ticks)
+				}
+				for k, c := range revokes {
+					if want := start.Add(time.Duration(k+1) * every).Add(o.OpTimeout); !c.deadline.Equal(want) {
+						t.Errorf("probe %d revoked with deadline %v, want its tick plus the op timeout, %v", k, c.deadline, want)
+					}
+				}
+				polls := fs.polledWith(revokes[0].token)
+				if len(polls) != tt.polls {
+					t.Fatalf("the first probe polled %d times, want %d until its timeout", len(polls), tt.polls)
+				}
+				for _, c := range polls[:len(polls)-1] {
+					if c.rejected || !tt.check(c.err) {
+						t.Errorf("a poll answered %v, %v, want the service's answer %v", c.rejected, c.err, tt.answer)
+					}
+				}
+				deadline := start.Add(every + timeout)
+				last := polls[len(polls)-1]
+				if last.rejected || !errors.Is(last.err, context.DeadlineExceeded) || !last.deadline.Equal(deadline) {
+					t.Errorf("the last poll answered %v, %v with deadline %v, want it cut off at the probe's deadline %v", last.rejected, last.err, last.deadline, deadline)
+				}
+				if want := start.Add(tt.lastBegan); !last.began.Equal(want) {
+					t.Errorf("the last poll began at %v, want %v", last.began, want)
+				}
+				out := logs.String()
+				for _, want := range []string{"propagation probe timed out; the service still accepted the revoked token", "service=neutron", "timeout=50ms"} {
+					if !strings.Contains(out, want) {
+						t.Errorf("log = %q, want %q", out, want)
+					}
+				}
+				if strings.Contains(out, "tok-") {
+					t.Errorf("log = %q carries a token", out)
+				}
+			})
+		})
+	}
+}
+
+// TestPropagationSkips checks the three ways a propagation probe skips, each
+// in a synctest bubble with one tick at 20ms before the test closes the set at
+// 30ms: a failed revoke still reissues for the token's pair, keeps the pool's
+// size and polls nothing; an empty pool revokes nothing; and a token whose
+// catalog lists no service is revoked and replaced but polls nothing. Each
+// logs its warning without a token and records no probe.
+func TestPropagationSkips(t *testing.T) {
+	const every, timeout, pollEvery = 20 * time.Millisecond, 500 * time.Millisecond, 5 * time.Millisecond
+
+	// run primes a set of tokens tokens over nova, lets prepare change it,
+	// runs it for one tick and closes it, and returns the set, the fakes, the
+	// Keystone calls the tick made, the pool before the tick and the log.
+	run := func(t *testing.T, tokens int, prepare func(*Set, *fakeKeystone)) (*Set, *fakeServices, []call, map[string]int, string) {
+		t.Helper()
+		logs := captureLogs(t)
+		s, f, fs := primedServiceSet(t, propagationOptions(tokens, every, timeout), fixtureEndpoints("nova"), pollEvery)
+		prepare(s, f)
+		before := poolTokens(s)
+		m := f.mark()
+		time.Sleep(30 * time.Millisecond)
+		s.Close()
+		out := logs.String()
+		if strings.Contains(out, "tok-") {
+			t.Errorf("log = %q carries a token", out)
+		}
+		if polls := fs.recorded(kindPoll); len(polls) != 0 {
+			t.Errorf("polls = %+v, want none", polls)
+		}
+		if delays := fs.recorded(kindRevocation); len(delays) != 0 || s.ServiceStats(time.Second).Propagation.Probes != 0 {
+			t.Errorf("recorded the delays %+v, want no probe", delays)
+		}
+		return s, fs, f.since(m), before, out
+	}
+
+	t.Run("the revoke failed", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			s, _, calls, before, out := run(t, 3, func(_ *Set, f *fakeKeystone) { f.fail(kindRevoke, errFake) })
+			if len(calls) != 2 || calls[0].kind != kindRevoke || calls[1].kind != kindIssue {
+				t.Fatalf("calls = %+v, want a revoke and then an issue", calls)
+			}
+			p := s.pairs[before[calls[0].token]].issue
+			if calls[1].user != p.User || calls[1].project != p.Project {
+				t.Errorf("reissued for (%s, %s), want the revoked token's pair (%s, %s)", calls[1].user, calls[1].project, p.User, p.Project)
+			}
+			if n := s.pool.len(); n != 3 {
+				t.Errorf("pool size = %d, want 3", n)
+			}
+			if !strings.Contains(out, "propagation probe skipped; the revoke failed") {
+				t.Errorf("log = %q, want the revoke warning", out)
+			}
+			if n := s.revoked.len(); n != 0 {
+				t.Errorf("revoked tokens hold %d after a failed revoke, want none", n)
+			}
+		})
+	})
+
+	t.Run("the token pool is empty", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			_, _, calls, _, out := run(t, 1, func(s *Set, _ *fakeKeystone) { s.pool.take(rand.New(rand.NewSource(1))) })
+			if len(calls) != 0 {
+				t.Errorf("calls = %+v, want none", calls)
+			}
+			if !strings.Contains(out, "propagation probe skipped; the token pool is empty") {
+				t.Errorf("log = %q, want the empty pool warning", out)
+			}
+		})
+	})
+
+	t.Run("the token's catalog lists no service", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var token string
+			s, _, calls, _, out := run(t, 1, func(s *Set, _ *fakeKeystone) {
+				e, _ := s.pool.take(rand.New(rand.NewSource(1)))
+				e.endpoints = map[string]string{}
+				s.pool.put(e)
+				token = e.token
+			})
+			if len(calls) != 2 || calls[0].kind != kindRevoke || calls[0].token != token || calls[1].kind != kindIssue {
+				t.Fatalf("calls = %+v, want the token's revoke and then an issue", calls)
+			}
+			if !strings.Contains(out, "propagation probe skipped; the token's catalog lists no service") {
+				t.Errorf("log = %q, want the catalog warning", out)
+			}
+			if got := revokedOf(s); !reflect.DeepEqual(got, []string{token}) {
+				t.Errorf("revoked tokens = %v, want the revoked %s", got, token)
+			}
+		})
+	})
+}
+
+// TestPropagationCloseWaits checks that Close waits for a probe in flight, in
+// a synctest bubble: the first probe starts at 20ms with a 10ms timeout, and
+// its poll blocks until its context ends and then takes 10ms more to return.
+// Close at 25ms cuts it short and returns only after the poll returned, at
+// 35ms on the bubble's clock, with the context's error, and after the probe
+// and its ticker goroutine ended. The poll returned past the probe's 30ms
+// deadline, yet the probe records no delay and no timeout: the run ended. A
+// Close while the probe's revoke or reissue is held does not cut either
+// short: it returns once both returned, the pool keeps its size, nothing
+// logs a failure, and the abandoned probe polls nothing. A probe that starts
+// once the run ended, as one whose tick raced Close does, takes no token. A
+// Prime after Close starts no probe.
+func TestPropagationCloseWaits(t *testing.T) {
+	const linger = 10 * time.Millisecond
+	t.Run("a poll in flight", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			s, _, fs := primedServiceSet(t, propagationOptions(3, 20*time.Millisecond, 10*time.Millisecond), fixtureEndpoints("glance"), 5*time.Millisecond)
+			fs.blockPolls(linger)
+			time.Sleep(25 * time.Millisecond) // the first probe's poll blocks from 20ms on
+			if polls := fs.recorded(kindPoll); len(polls) != 0 {
+				t.Fatalf("polls = %+v returned before Close, want the poll blocked", polls)
+			}
+			closing := time.Now()
+			s.Close()
+			if waited := time.Since(closing); waited < linger {
+				t.Errorf("Close returned after %s, before the blocked poll returned %s after the cancel", waited, linger)
+			}
+			polls := fs.recorded(kindPoll)
+			if len(polls) != 1 || !errors.Is(polls[0].err, context.Canceled) {
+				t.Fatalf("polls = %+v, want the one poll returned with context.Canceled", polls)
+			}
+			select {
+			case <-s.propDone:
+			default:
+				t.Error("Close returned before the propagation goroutine")
+			}
+			if delays := fs.recorded(kindRevocation); len(delays) != 0 {
+				t.Errorf("recorded the delays %+v for an abandoned probe, want none", delays)
+			}
+			if ps := s.ServiceStats(time.Second).Propagation; ps.Probes != 0 || ps.TimedOut != 0 {
+				t.Errorf("propagation stats = %+v, want no probe", ps)
+			}
+		})
+	})
+
+	for _, held := range []struct {
+		name string
+		gate func(*fakeKeystone, *testing.T)
+		open func(*fakeKeystone)
+	}{
+		{"a revoke in flight", (*fakeKeystone).gateRevokes, (*fakeKeystone).openRevokeGate},
+		{"a reissue in flight", (*fakeKeystone).gateIssues, (*fakeKeystone).openGate},
+	} {
+		t.Run(held.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				logs := captureLogs(t)
+				s, f, fs := primedServiceSet(t, propagationOptions(3, 20*time.Millisecond, 500*time.Millisecond), fixtureEndpoints("glance"), 5*time.Millisecond)
+				held.gate(f, t)
+				time.Sleep(25 * time.Millisecond) // the first probe's call is held from 20ms on
+
+				closed := make(chan struct{})
+				go func() {
+					s.Close()
+					close(closed)
+				}()
+				synctest.Wait()
+				select {
+				case <-closed:
+					t.Fatal("Close returned while the probe's call was held")
+				default:
+				}
+				held.open(f)
+				<-closed
+
+				if n := s.pool.len(); n != 3 {
+					t.Errorf("pool size = %d after Close, want 3", n)
+				}
+				revokes, issues := f.recorded(kindRevoke), f.recorded(kindIssue)
+				if len(revokes) != 1 || len(issues) != 4 { // three primed, one reissued
+					t.Errorf("the fake saw %d revokes and %d issues, want 1 and 4", len(revokes), len(issues))
+				}
+				out := logs.String()
+				for _, unwanted := range []string{"token pool shrank", "propagation probe skipped", "tok-"} {
+					if strings.Contains(out, unwanted) {
+						t.Errorf("log = %q, want no %q", out, unwanted)
+					}
+				}
+				if calls := fs.recorded(kindPoll, kindRevocation); len(calls) != 0 {
+					t.Errorf("services calls = %+v, want no poll and no delay for the abandoned probe", calls)
+				}
+				if ps := s.ServiceStats(time.Second).Propagation; ps.Probes != 0 {
+					t.Errorf("propagation stats = %+v, want no probe", ps)
+				}
+			})
+		})
+	}
+
+	t.Run("a probe that starts after the run ended", func(t *testing.T) {
+		// A tick can race Close's cancel; the probe it starts then sees the
+		// ended context first.
+		o := propagationOptions(3, time.Hour, 500*time.Millisecond) // never ticks during the test
+		s, f, fs := primedServiceSet(t, o, fixtureEndpoints("glance"), 0)
+		before := poolTokens(s)
+		m := f.mark()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		s.propagate(ctx, 0, rand.New(rand.NewSource(1)))
+		if calls := f.since(m); len(calls) != 0 {
+			t.Errorf("Keystone calls = %+v, want none", calls)
+		}
+		if !maps.Equal(poolTokens(s), before) {
+			t.Error("the probe changed the pool")
+		}
+		if calls := fs.recorded(); len(calls) != 0 || s.revoked.len() != 0 {
+			t.Errorf("services calls = %+v and %d revoked tokens, want none", calls, s.revoked.len())
+		}
+	})
+
+	t.Run("a Prime after Close", func(t *testing.T) {
+		f := newFake(newFakeClock(), time.Hour)
+		f.setEndpoints(fixtureEndpoints("glance"))
+		s := buildServiceSet(t, f, newFakeServices(), propagationOptions(2, 20*time.Millisecond, 500*time.Millisecond))
+		s.Close()
+		if err := s.Prime(context.Background(), 2); err != nil {
+			t.Fatalf("Prime: %v", err)
+		}
+		if s.propDone != nil {
+			t.Error("a Prime after Close started the propagation probe")
+		}
+	})
+}
+
+// TestServiceStats checks what ServiceStats reports: nothing but the
+// propagation settings for a set that recorded nothing; the probe and
+// bad-token samples per service, sorted by service, with their throughput
+// over the wall and their error labels; and the propagation outcome from the
+// set's delays, a timed-out probe counting as the timeout. It also reads the
+// stats while workers draw, which the race detector checks.
+func TestServiceStats(t *testing.T) {
+	ctx := context.Background()
+	o := fixtureOptions(3, probeWeights)
+	o.Propagation = Propagation{Every: time.Hour, Timeout: 10 * time.Minute} // never ticks during the test
+	eps := fixtureEndpoints("nova", "glance")
+
+	t.Run("nothing recorded", func(t *testing.T) {
+		s, _, _ := primedServiceSet(t, o, eps, 0)
+		ss := s.ServiceStats(time.Second)
+		if ss.Probes.Overall.Attempted != 0 || ss.Probes.ByType != nil || ss.BadTokens.Overall.Attempted != 0 || ss.BadTokens.ByType != nil {
+			t.Errorf("stats = %+v, want no probe and no bad-token sample", ss)
+		}
+		if want := (PropagationStats{Every: time.Hour, Timeout: 10 * time.Minute}); ss.Propagation != want {
+			t.Errorf("propagation stats = %+v, want %+v", ss.Propagation, want)
+		}
+	})
+
+	t.Run("samples per service and the delays", func(t *testing.T) {
+		s, _, fs := primedServiceSet(t, o, eps, 0)
+		fs.answer("glance", gophercloud.ErrUnexpectedResponseCode{Actual: 503})
+		rng := rand.New(rand.NewSource(1))
+		for _, name := range []string{OpProbe, OpBadToken} {
+			op := operation(t, s, name)
+			for range 20 {
+				_ = op(ctx, rng) // glance fails, nova succeeds
+			}
+		}
+		perService := func(kind string) map[string]int {
+			n := make(map[string]int)
+			for _, c := range fs.recorded(kind) {
+				n[c.service]++
+			}
+			return n
+		}
+		ss := s.ServiceStats(2 * time.Second)
+		for _, c := range []struct {
+			name  string
+			kind  string
+			stats metrics.Aggregate
+		}{{"probe", kindProbe, ss.Probes}, {"bad-token", kindReject, ss.BadTokens}} {
+			n := perService(c.kind)
+			if n["glance"] == 0 || n["nova"] == 0 {
+				t.Fatalf("%s calls per service = %v, want both services", c.name, n)
+			}
+			byType := c.stats.ByType
+			if len(byType) != 2 || byType[0].Type != "glance" || byType[1].Type != "nova" {
+				t.Fatalf("%s samples = %+v, want glance and then nova", c.name, byType)
+			}
+			if g := byType[0]; g.Attempted != n["glance"] || g.Failed != n["glance"] {
+				t.Errorf("%s glance samples = %+v, want %d, all failed", c.name, g, n["glance"])
+			}
+			if nv := byType[1]; nv.Attempted != n["nova"] || nv.Succeeded != n["nova"] || nv.Throughput != float64(n["nova"])/2 {
+				t.Errorf("%s nova samples = %+v, want %d, all succeeded, at %v/s over the 2s wall", c.name, nv, n["nova"], float64(n["nova"])/2)
+			}
+			if want := []metrics.ErrorCount{{Kind: "transient", Count: n["glance"]}}; !reflect.DeepEqual(c.stats.Errors, want) {
+				t.Errorf("%s errors = %+v, want %+v", c.name, c.stats.Errors, want)
+			}
+		}
+
+		s.recordPropagation(ctx, 2*time.Second, true)
+		s.recordPropagation(ctx, 10*time.Minute, false)
+		ps := s.ServiceStats(time.Second).Propagation
+		if ps.Probes != 2 || ps.TimedOut != 1 || ps.Delay.Min != 2*time.Second || ps.Delay.Max != 10*time.Minute {
+			t.Errorf("propagation stats = %+v, want 2 probes, 1 timed out, delays from 2s to the 10m timeout", ps)
+		}
+		if delays := fs.recorded(kindRevocation); len(delays) != 2 {
+			t.Errorf("RecordRevocationDelay calls = %+v, want both through the seam", delays)
+		}
+	})
+
+	t.Run("read while workers draw", func(t *testing.T) {
+		s, _, _ := primedServiceSet(t, o, eps, 0)
+		const workers, draws = 4, 100
+		probeOp := operation(t, s, OpProbe)
+		var wg sync.WaitGroup
+		for w := range workers {
+			wg.Go(func() {
+				rng := rand.New(rand.NewSource(int64(w)))
+				for range draws {
+					_ = probeOp(ctx, rng)
+				}
+			})
+		}
+		for range 50 {
+			s.ServiceStats(time.Second)
+		}
+		wg.Wait()
+		if n := s.ServiceStats(time.Second).Probes.Overall.Attempted; n != workers*draws {
+			t.Errorf("probe samples = %d, want %d", n, workers*draws)
+		}
+	})
+}
+
 // TestClassify checks the labels Classify gives.
 func TestClassify(t *testing.T) {
 	tests := []struct {
@@ -1678,6 +2729,16 @@ func TestClassify(t *testing.T) {
 		{"timeout", context.DeadlineExceeded, "timeout"},
 		{"canceled", context.Canceled, "canceled"},
 		{"other", errFake, "other"},
+		{"x", errors.New("x"), "other"},
+		{"no service", ErrNoService, "no-service"},
+		{"no service wrapped", fmt.Errorf("probe: %w", ErrNoService), "no-service"},
+		{"accepted", probe.ErrAccepted, "accepted"},
+		{"accepted wrapped", fmt.Errorf("bad_token: %w", probe.ErrAccepted), "accepted"},
+		{"401", gophercloud.ErrUnexpectedResponseCode{Actual: 401}, "unauthorized"},
+		// The probe adapter redacts the token from every error it returns; the
+		// status stays reachable, so the label is the same.
+		{"401 redacted", keystone.RedactToken(gophercloud.ErrUnexpectedResponseCode{Actual: 401, Body: []byte("tok-1")}, "tok-1"), "unauthorized"},
+		{"403", gophercloud.ErrUnexpectedResponseCode{Actual: 403}, "forbidden"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1686,15 +2747,23 @@ func TestClassify(t *testing.T) {
 			}
 		})
 	}
+
+	// The 401 label is the pressure classifier's own: the churn graph's
+	// classifier, which Classify delegates to, keeps a 401 as other.
+	if got := keystone.ClassifyOperationError(gophercloud.ErrUnexpectedResponseCode{Actual: 401}); got != "other" {
+		t.Errorf("keystone.ClassifyOperationError(401) = %q, want other", got)
+	}
 }
 
-// TestRunWithEngine drives the operations through pressure.Run with four
-// workers: with revoke at weight 0 the fake sees no revocation, the pool keeps
-// its size, the result has no revoke entry, and the only error kind is the one
-// the fake injects.
+// TestRunWithEngine drives the seven operations through pressure.Run with four
+// workers, over tokens whose catalog lists nova and glance: with revoke at
+// weight 0 the fake sees no revocation, the pool keeps its size, the result
+// has no revoke entry, and the only error kind is the one the fake injects.
+// The probe and bad_token draws reach the services fake, and the set's
+// per-service samples count exactly the draws the engine counts for each.
 func TestRunWithEngine(t *testing.T) {
-	weights := map[string]int{OpValidate: 60, OpRevoke: 0, OpEffective: 5, OpGrantChurn: 2, OpIssue: 1}
-	s, f := primedSet(t, time.Hour, 6, weights)
+	weights := map[string]int{OpValidate: 60, OpRevoke: 0, OpEffective: 5, OpGrantChurn: 2, OpIssue: 1, OpProbe: 3, OpBadToken: 2}
+	s, f, fs := primedServiceSet(t, fixtureOptions(6, weights), fixtureEndpoints("nova", "glance"), 0)
 	f.failNth(kindValidate, 3, gophercloud.ErrUnexpectedResponseCode{Actual: 404})
 	f.failNth(kindValidate, 7, gophercloud.ErrUnexpectedResponseCode{Actual: 404})
 
@@ -1731,5 +2800,31 @@ func TestRunWithEngine(t *testing.T) {
 	}
 	if failed := res.Operations.Overall.Failed; failed > 2 {
 		t.Errorf("%d operations failed, want at most the 2 injected", failed)
+	}
+
+	attempted := make(map[string]int)
+	for _, st := range res.Operations.ByType {
+		attempted[st.Type] = st.Attempted
+	}
+	ss := s.ServiceStats(res.Operations.Wall)
+	for _, c := range []struct {
+		op    string
+		kind  string
+		stats metrics.Aggregate
+	}{{OpProbe, kindProbe, ss.Probes}, {OpBadToken, kindReject, ss.BadTokens}} {
+		if attempted[c.op] == 0 {
+			t.Errorf("the run drew no %s", c.op)
+		}
+		if got := len(fs.recorded(c.kind)); got != attempted[c.op] {
+			t.Errorf("the services fake saw %d %s calls, want the %d %s draws", got, c.kind, attempted[c.op], c.op)
+		}
+		if got := c.stats.Overall.Attempted; got != attempted[c.op] {
+			t.Errorf("the set's %s samples count %d, want the engine's %d", c.op, got, attempted[c.op])
+		}
+		for _, st := range c.stats.ByType {
+			if st.Type != "nova" && st.Type != "glance" {
+				t.Errorf("%s went to %q, which the tokens' catalog does not list", c.op, st.Type)
+			}
+		}
 	}
 }

@@ -311,7 +311,7 @@ func runKeystonePressure(ctx context.Context, cmd *cobra.Command, c pressureKeys
 		return setupFailed(prov.Created, "provisioning plan", err)
 	}
 
-	set, err := keystoneops.Build(p, c, prov.Bindings, prov.IDs, prov.Passwords, o)
+	set, err := keystoneops.Build(p, c, nil, prov.Bindings, prov.IDs, prov.Passwords, o)
 	if err != nil {
 		return setupFailed(prov.Created, "building pressure set", err)
 	}
