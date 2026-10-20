@@ -53,7 +53,7 @@ type call struct {
 	token     string
 	a         keystoneplan.Assignment
 	res       resource.Resource
-	deadline  time.Time // the context deadline of an issue; zero when it had none
+	deadline  time.Time // the context deadline of an issue or a grant; zero when it had none
 }
 
 // fakeClock is a clock tests move by hand. It is safe for concurrent use.
@@ -87,8 +87,9 @@ func (c *fakeClock) Set(t time.Time) {
 // a call of a kind on request: every call of the kind, or only its n-th call.
 // It tracks how many issues are in flight at once, can hold the first issues
 // until a number of them overlap, and can hold issues at a gate the test
-// opens one issue at a time or all at once. It is safe for concurrent use by
-// the pool, the refresher and the engine's workers.
+// opens one issue at a time or all at once. It tracks and gates role grants
+// the same way, with a gate of their own. It is safe for concurrent use by
+// the pool, the refresher, the engine's workers and GrowFan.
 type fakeKeystone struct {
 	clock    *fakeClock
 	lifetime time.Duration
@@ -118,6 +119,12 @@ type fakeKeystone struct {
 	// send lets one held issue through, closing it lets every issue through.
 	gate     chan struct{}
 	gateOpen bool
+
+	// assigning and maxAssigning count the AssignRole calls in flight now and
+	// at most. assignGate holds the grants as gate holds the issues.
+	assigning, maxAssigning int
+	assignGate              chan struct{}
+	assignGateOpen          bool
 }
 
 // newFake returns a fake whose tokens live lifetime on clock.
@@ -263,6 +270,56 @@ func (f *fakeKeystone) openGate() {
 	}
 }
 
+// gateAssigns holds every later grant that the fake does not fail at a gate
+// until releaseAssign lets it through, as gateIssues holds issues. The gate
+// opens when the test ends, so no grant stays held after a failed test.
+func (f *fakeKeystone) gateAssigns(t *testing.T) {
+	t.Helper()
+	f.mu.Lock()
+	f.assignGate = make(chan struct{})
+	f.mu.Unlock()
+	t.Cleanup(f.openAssignGate)
+}
+
+// releaseAssign lets one grant held at the gate through, failing the test when
+// no grant is held there.
+func (f *fakeKeystone) releaseAssign(t *testing.T) {
+	t.Helper()
+	f.mu.Lock()
+	gate := f.assignGate
+	f.mu.Unlock()
+	select {
+	case gate <- struct{}{}:
+	default:
+		t.Fatal("no grant is held at the gate")
+	}
+}
+
+// openAssignGate lets every held and every later grant through. It is safe to
+// call more than once and without a gate.
+func (f *fakeKeystone) openAssignGate() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.assignGate != nil && !f.assignGateOpen {
+		close(f.assignGate)
+		f.assignGateOpen = true
+	}
+}
+
+// assignsInFlight returns the number of grants in flight now.
+func (f *fakeKeystone) assignsInFlight() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.assigning
+}
+
+// maxAssignsInFlight returns the most grants that were in flight at once.
+func (f *fakeKeystone) maxAssignsInFlight() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.maxAssigning
+}
+
 // containsKind reports whether kinds holds k.
 func containsKind(kinds []string, k string) bool {
 	for _, x := range kinds {
@@ -373,11 +430,33 @@ func (f *fakeKeystone) ListAvailableProjects(_ context.Context, token string) (i
 	return 1, nil
 }
 
-// AssignRole records the grant and returns its assignment resource or the
-// injected error.
-func (f *fakeKeystone) AssignRole(_ context.Context, a keystoneplan.Assignment, userID, projectID, domainID, roleID string) (resource.Resource, error) {
-	if _, err := f.begin(call{kind: kindAssign, a: a, userID: userID, projectID: projectID, domainID: domainID, roleID: roleID}); err != nil {
+// AssignRole records the grant with its context deadline and then fails it,
+// or holds it at the grant gate when one is set and returns its assignment
+// resource.
+func (f *fakeKeystone) AssignRole(ctx context.Context, a keystoneplan.Assignment, userID, projectID, domainID, roleID string) (resource.Resource, error) {
+	deadline, _ := ctx.Deadline()
+	_, err := f.begin(call{kind: kindAssign, a: a, userID: userID, projectID: projectID, domainID: domainID, roleID: roleID, deadline: deadline})
+
+	f.mu.Lock()
+	f.assigning++
+	f.maxAssigning = max(f.maxAssigning, f.assigning)
+	gate := f.assignGate
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.assigning--
+		f.mu.Unlock()
+	}()
+
+	if err != nil {
 		return resource.Resource{}, err
+	}
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return resource.Resource{}, ctx.Err()
+		}
 	}
 	return keystone.AssignmentResource(a, userID, projectID, domainID, roleID), nil
 }
@@ -478,23 +557,117 @@ func primedSet(t *testing.T, lifetime time.Duration, tokens int, weights map[str
 	return s, f
 }
 
+// fanPlan is a self-consistent plan in dom-0001 with the two roles of
+// fixtureBindings and the projects proj-0001 to proj-<projects>, at least
+// three: the regular users user-0001, user-0002 and user-0003, each with a
+// role-0001 grant on the project of its number, and then one fan user per
+// entry of held, fan-0001 first, each with a role-0001 grant on every project
+// its entry names, in that order, where an empty name is a domain-scoped
+// grant. The regular users' grants come first among the assignments.
+func fanPlan(projects int, held ...[]string) *keystoneplan.Plan {
+	p := &keystoneplan.Plan{
+		Scenario: "fan", Seed: 9,
+		Domains: []keystoneplan.Domain{{Name: "dom-0001"}},
+		Roles:   []keystoneplan.Role{{Name: "role-0001"}, {Name: "role-0002"}},
+	}
+	for i := range projects {
+		p.Projects = append(p.Projects, keystoneplan.Project{Name: fmt.Sprintf("proj-%04d", i+1), Domain: "dom-0001"})
+	}
+	for i := range 3 {
+		name := fmt.Sprintf("user-%04d", i+1)
+		p.Users = append(p.Users, keystoneplan.User{Name: name, Domain: "dom-0001"})
+		p.Assignments = append(p.Assignments, keystoneplan.Assignment{User: name, Role: "role-0001", Project: fmt.Sprintf("proj-%04d", i+1)})
+	}
+	for i, projects := range held {
+		name := fmt.Sprintf("fan-%04d", i+1)
+		p.Users = append(p.Users, keystoneplan.User{Name: name, Domain: "dom-0001", Fan: true})
+		for _, project := range projects {
+			p.Assignments = append(p.Assignments, keystoneplan.Assignment{User: name, Role: "role-0001", Project: project})
+		}
+	}
+	return p
+}
+
+// fanIDs returns the cloud ids of p's projects and users, "id-" and the
+// logical name, as Provision would return them.
+func fanIDs(p *keystoneplan.Plan) map[string]string {
+	ids := make(map[string]string, len(p.Projects)+len(p.Users))
+	for _, pr := range p.Projects {
+		ids[pr.Name] = "id-" + pr.Name
+	}
+	for _, u := range p.Users {
+		ids[u.Name] = "id-" + u.Name
+	}
+	return ids
+}
+
+// fanPasswords returns the passwords of p's users, "pw-" and the logical
+// name.
+func fanPasswords(p *keystoneplan.Plan) map[string]string {
+	passwords := make(map[string]string, len(p.Users))
+	for _, u := range p.Users {
+		passwords[u.Name] = "pw-" + u.Name
+	}
+	return passwords
+}
+
+// buildFanSet builds a set over p, a fanPlan, against f with o, the bindings
+// of fixtureBindings and the ids and passwords of fanIDs and fanPasswords,
+// reading the time from f's clock, and closes it when the test ends.
+func buildFanSet(t *testing.T, f *fakeKeystone, p *keystoneplan.Plan, o Options) *Set {
+	t.Helper()
+	s, err := Build(p, f, fixtureBindings(), fanIDs(p), fanPasswords(p), o)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	s.now = f.clock.Now
+	t.Cleanup(s.Close)
+	return s
+}
+
+// primedFanSet builds a set over p, a fanPlan, with o against a fake whose
+// tokens live an hour, and primes it with concurrency 1, so the pool tokens
+// and then the fan users' tokens are issued in order.
+func primedFanSet(t *testing.T, p *keystoneplan.Plan, o Options) (*Set, *fakeKeystone) {
+	t.Helper()
+	f := newFake(newFakeClock(), time.Hour)
+	s := buildFanSet(t, f, p, o)
+	if err := s.Prime(context.Background(), 1); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+	return s, f
+}
+
 // poolTokens returns the pool's tokens with the pair index each was issued
 // for.
-func poolTokens(s *Set) map[string]int {
-	s.pool.mu.Lock()
-	defer s.pool.mu.Unlock()
-	out := make(map[string]int, len(s.pool.entries))
-	for _, e := range s.pool.entries {
+func poolTokens(s *Set) map[string]int { return tokensOf(&s.pool) }
+
+// fanTokens returns the fan pool's tokens with the pair index each was issued
+// for.
+func fanTokens(s *Set) map[string]int { return tokensOf(&s.fanPool) }
+
+// tokensOf returns p's tokens with the pair index each was issued for.
+func tokensOf(p *pool) map[string]int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make(map[string]int, len(p.entries))
+	for _, e := range p.entries {
 		out[e.token] = e.pair
 	}
 	return out
 }
 
 // poolEntries returns a copy of the pool's entries in pool order.
-func poolEntries(s *Set) []entry {
-	s.pool.mu.Lock()
-	defer s.pool.mu.Unlock()
-	return append([]entry(nil), s.pool.entries...)
+func poolEntries(s *Set) []entry { return entriesOf(&s.pool) }
+
+// fanEntries returns a copy of the fan pool's entries in pool order.
+func fanEntries(s *Set) []entry { return entriesOf(&s.fanPool) }
+
+// entriesOf returns a copy of p's entries in pool order.
+func entriesOf(p *pool) []entry {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]entry(nil), p.entries...)
 }
 
 // operation returns the set's operation named name.
