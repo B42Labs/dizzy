@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/B42Labs/dizzy/internal/metrics"
 	"github.com/B42Labs/dizzy/internal/resource"
@@ -1047,5 +1049,194 @@ func TestReportPressureWithoutBuckets(t *testing.T) {
 	}
 	if !strings.Contains(out["csv"], "pressure/validate") {
 		t.Errorf("CSV report lacks the operation rows:\n%s", out["csv"])
+	}
+}
+
+// pressureStagesRecord builds the record of a bounded, staged keystone
+// pressure run over the operations effective and validate, two one-minute
+// buckets and two stages. The first stage sets no fan_assignments override
+// and drew no effective operation, so its effective row has no latencies.
+// The second grew every fan user to 1000 grants and resumed the workers
+// 1.5004 s into its window, so its start shows rounded to the millisecond.
+// The stages' counts add up to the run's.
+func pressureStagesRecord() *Record {
+	r := pressureRecord()
+	p := r.Pressure
+	p.ChurnUsers, p.Revocations, p.BucketWidth = 0, 0, 0
+	p.Mix = []PressureWeight{{Operation: "effective", Weight: 20}, {Operation: "validate", Weight: 10}}
+	p.Operations.ByType[0].Type = "effective"
+	for i := range p.Buckets {
+		p.Buckets[i].Operations.ByType[0].Type = "effective"
+		p.Buckets[i].Revocations = 0
+	}
+	secondStart := time.Minute + 1500*time.Millisecond + 400*time.Microsecond
+	p.Stages = []PressureStage{
+		{
+			Index: 1,
+			Start: 0,
+			End:   time.Minute,
+			Operations: metrics.Aggregate{
+				Wall:    time.Minute,
+				Overall: metrics.Stats{Attempted: 20, Succeeded: 19, Failed: 1, Throughput: 0.33, Latency: metrics.Latency{Median: 340 * time.Microsecond, P95: 800 * time.Microsecond, P99: 1100 * time.Microsecond}},
+				ByType: []metrics.Stats{
+					{Type: "effective"},
+					{Type: "validate", Attempted: 20, Succeeded: 19, Failed: 1, Throughput: 0.33, Latency: metrics.Latency{Median: 340 * time.Microsecond, P95: 800 * time.Microsecond, P99: 1100 * time.Microsecond}},
+				},
+				Errors: []metrics.ErrorCount{{Kind: "http_404", Count: 1}},
+			},
+		},
+		{
+			Index:          2,
+			FanAssignments: 1000,
+			Start:          secondStart,
+			End:            2 * time.Minute,
+			Operations: metrics.Aggregate{
+				Wall:    2*time.Minute - secondStart,
+				Overall: metrics.Stats{Attempted: 20, Succeeded: 19, Failed: 1, Throughput: 0.34, Latency: metrics.Latency{Median: 900 * time.Microsecond, P95: 4 * time.Millisecond, P99: 4500 * time.Microsecond}},
+				ByType: []metrics.Stats{
+					{Type: "effective", Attempted: 4, Succeeded: 3, Failed: 1, Throughput: 0.07, Latency: metrics.Latency{Median: 4 * time.Millisecond, P95: 4500 * time.Microsecond, P99: 4500 * time.Microsecond}},
+					{Type: "validate", Attempted: 16, Succeeded: 16, Throughput: 0.27, Latency: metrics.Latency{Median: 370 * time.Microsecond, P95: time.Millisecond, P99: 1200 * time.Microsecond}},
+				},
+				Errors: []metrics.ErrorCount{{Kind: "timeout", Count: 1}},
+			},
+		},
+	}
+	return r
+}
+
+// TestWritePressureTableStages confirms a staged run's pressure block puts
+// the stage table between the operation table and the bucket table, with
+// per stage an "all" row and then one row per operation, "-" for a stage
+// without an override and for the latencies of an operation without draws,
+// the window rounded to the millisecond, and START, END and OPERATION
+// left-aligned.
+func TestWritePressureTableStages(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WritePressureTable(&buf, pressureStagesRecord().Pressure); err != nil {
+		t.Fatalf("WritePressureTable: %v", err)
+	}
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	title := slices.Index(lines, "Stages")
+	ops := slices.Index(lines, "Operations")
+	buckets := slices.Index(lines, "Latency and errors over time")
+	if ops < 0 || title < ops || buckets < title {
+		t.Fatalf("tables missing or out of order (operations %d, stages %d, buckets %d):\n%s", ops, title, buckets, buf.String())
+	}
+	if lines[title-1] != "" {
+		t.Errorf("stage table title is preceded by %q, want a blank line", lines[title-1])
+	}
+	want := [][]string{
+		{"STAGE", "FAN", "START", "END", "OPERATION", "OPS", "OK", "FAILED", "OPS/S", "P50", "P95", "P99"},
+		{"1", "-", "0s", "1m0s", "all", "20", "19", "1", "0.3", "340µs", "800µs", "1.1ms"},
+		{"1", "-", "0s", "1m0s", "effective", "0", "0", "0", "0.0", "-", "-", "-"},
+		{"1", "-", "0s", "1m0s", "validate", "20", "19", "1", "0.3", "340µs", "800µs", "1.1ms"},
+		{"2", "1000", "1m1.5s", "2m0s", "all", "20", "19", "1", "0.3", "900µs", "4ms", "4.5ms"},
+		{"2", "1000", "1m1.5s", "2m0s", "effective", "4", "3", "1", "0.1", "4ms", "4.5ms", "4.5ms"},
+		{"2", "1000", "1m1.5s", "2m0s", "validate", "16", "16", "0", "0.3", "370µs", "1ms", "1.2ms"},
+	}
+	rows := lines[title+1 : buckets-1]
+	if len(rows) != len(want) {
+		t.Fatalf("stage table has %d lines, want %d:\n%s", len(rows), len(want), buf.String())
+	}
+	for i, w := range want {
+		if got := strings.Fields(rows[i]); !reflect.DeepEqual(got, w) {
+			t.Errorf("stage row %d = %q, want %q", i, got, w)
+		}
+	}
+	// The cells of a left-aligned column start at the rune offset of its
+	// header in every row; STAGE and FAN are right-aligned.
+	for _, col := range []string{"START", "END", "OPERATION"} {
+		offset := utf8.RuneCountInString(rows[0][:strings.Index(rows[0], col)])
+		for i, row := range rows[1:] {
+			cell := want[i+1][slices.Index(want[0], col)]
+			if r := []rune(row); offset > len(r) || !strings.HasPrefix(string(r[offset:]), cell) {
+				t.Errorf("%s cell %q of stage row %d does not start under its header in %q", col, cell, i+1, row)
+			}
+		}
+	}
+	for i, prefix := range map[int]string{1: "    1     -  0s", 4: "    2  1000  1m1.5s"} {
+		if !strings.HasPrefix(rows[i], prefix) {
+			t.Errorf("stage row %d = %q, want it to start with %q (STAGE and FAN right-aligned)", i, rows[i], prefix)
+		}
+	}
+}
+
+// TestWriteCSVPressureStages confirms a staged run's CSV puts one row per
+// stage and operation, labelled pressure/stage-<index>/<operation> without an
+// "all" row, after the run's operation rows and before the bucket rows.
+func TestWriteCSVPressureStages(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteCSV(&buf, pressureStagesRecord()); err != nil {
+		t.Fatalf("WriteCSV: %v", err)
+	}
+	records, err := csv.NewReader(&buf).ReadAll()
+	if err != nil {
+		t.Fatalf("parsing csv: %v", err)
+	}
+	var labels []string
+	for _, rec := range records[1:] {
+		labels = append(labels, rec[0])
+	}
+	want := []string{
+		"overall", "project", "token",
+		"pressure/effective", "pressure/validate",
+		"pressure/stage-1/effective", "pressure/stage-1/validate",
+		"pressure/stage-2/effective", "pressure/stage-2/validate",
+		"pressure@0s/effective", "pressure@0s/validate",
+		"pressure@1m0s/effective", "pressure@1m0s/validate",
+	}
+	if !reflect.DeepEqual(labels, want) {
+		t.Errorf("row labels = %v, want %v", labels, want)
+	}
+	// pressure/stage-2/validate: 16 attempted, 16 succeeded, p50 0.370 ms.
+	if row := records[9]; row[1] != "16" || row[2] != "16" || row[7] != "0.370" {
+		t.Errorf("pressure/stage-2/validate row = %v, want attempted 16, succeeded 16, median 0.370", row)
+	}
+}
+
+// TestWriteJSONPressureStages confirms a staged run's JSON report carries the
+// stages inside the pressure object, decoding back to the record's stages,
+// with fanAssignments omitted for the stage without an override, and that a
+// run without stages carries no stages key.
+func TestWriteJSONPressureStages(t *testing.T) {
+	rec := pressureStagesRecord()
+	var buf bytes.Buffer
+	if err := WriteJSON(&buf, rec); err != nil {
+		t.Fatalf("WriteJSON: %v", err)
+	}
+	var got struct {
+		Pressure struct {
+			Stages []json.RawMessage `json:"stages"`
+		} `json:"pressure"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("report JSON does not decode: %v", err)
+	}
+	stages := make([]PressureStage, 0, len(got.Pressure.Stages))
+	for i, raw := range got.Pressure.Stages {
+		var st PressureStage
+		if err := json.Unmarshal(raw, &st); err != nil {
+			t.Fatalf("decoding .pressure.stages[%d]: %v", i, err)
+		}
+		stages = append(stages, st)
+	}
+	if !reflect.DeepEqual(stages, rec.Pressure.Stages) {
+		t.Errorf(".pressure.stages = %+v, want %+v", stages, rec.Pressure.Stages)
+	}
+	if len(got.Pressure.Stages) == 2 {
+		if bytes.Contains(got.Pressure.Stages[0], []byte(`"fanAssignments"`)) {
+			t.Errorf("stage without an override carries fanAssignments: %s", got.Pressure.Stages[0])
+		}
+		if !bytes.Contains(got.Pressure.Stages[1], []byte(`"fanAssignments": 1000`)) {
+			t.Errorf("stage with an override lacks \"fanAssignments\": 1000: %s", got.Pressure.Stages[1])
+		}
+	}
+
+	var plain bytes.Buffer
+	if err := WriteJSON(&plain, pressureRecord()); err != nil {
+		t.Fatalf("WriteJSON(without stages): %v", err)
+	}
+	if strings.Contains(plain.String(), `"stages"`) {
+		t.Errorf("JSON report of a run without stages carries a stages key:\n%s", plain.String())
 	}
 }

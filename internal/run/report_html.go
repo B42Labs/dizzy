@@ -73,17 +73,20 @@ type htmlView struct {
 }
 
 // pressureView is the pressure section of a report: the run's settings and
-// revocations as chips, the per-operation table, and one pair of time-series
-// charts per operation.
+// revocations as chips, the per-operation table, the stage table of a staged
+// run (Stages is empty for any other), and one pair of time-series charts per
+// operation.
 type pressureView struct {
-	Workers     int
-	Tokens      int
-	ChurnUsers  int
-	Revocations int
-	Mix         string
-	Columns     []string
-	PerType     []typeRow
-	Series      []pressureSeries
+	Workers      int
+	Tokens       int
+	ChurnUsers   int
+	Revocations  int
+	Mix          string
+	Columns      []string
+	PerType      []typeRow
+	StageColumns []string
+	Stages       []typeRow
+	Series       []pressureSeries
 }
 
 // pressureSeries is the time series of one pressure operation. Chart carries
@@ -259,6 +262,10 @@ type tsBar struct {
 // perTypeColumns names the columns of the per-type table in the order
 // buildPerType fills them.
 var perTypeColumns = []string{"type", "ops", "ok", "failed", "success", "ops/s", "min", "mean", "p50", "p90", "p95", "p99", "max"}
+
+// pressureStageColumns names the columns of the pressure stage table in the
+// order buildPressureStageRow fills them.
+var pressureStageColumns = []string{"stage", "fan", "start", "end", "operation", "ops", "ok", "failed", "ops/s", "p50", "p95", "p99"}
 
 // buildHTMLView converts a record into the render-ready view model.
 func buildHTMLView(r *Record) htmlView {
@@ -531,18 +538,21 @@ func buildChaosView(c *ChaosStats) *chaosView {
 
 // buildPressureView converts a pressure run's statistics into its section:
 // the chips, the per-operation table in the columns of the per-type table
-// with "operation" in place of "type", and per operation, in the order of
-// Operations.ByType, the time-series charts of that operation's buckets.
+// with "operation" in place of "type", the stage table, and per operation,
+// in the order of Operations.ByType, the time-series charts of that
+// operation's buckets.
 func buildPressureView(p *PressureStats) *pressureView {
 	v := &pressureView{
-		Workers:     p.Workers,
-		Tokens:      p.Tokens,
-		ChurnUsers:  p.ChurnUsers,
-		Revocations: p.Revocations,
-		Mix:         formatPressureMix(p.Mix),
-		Columns:     append([]string{"operation"}, perTypeColumns[1:]...),
-		PerType:     buildPerType(p.Operations.ByType),
-		Series:      make([]pressureSeries, 0, len(p.Operations.ByType)),
+		Workers:      p.Workers,
+		Tokens:       p.Tokens,
+		ChurnUsers:   p.ChurnUsers,
+		Revocations:  p.Revocations,
+		Mix:          formatPressureMix(p.Mix),
+		Columns:      append([]string{"operation"}, perTypeColumns[1:]...),
+		PerType:      buildPerType(p.Operations.ByType),
+		StageColumns: pressureStageColumns,
+		Stages:       buildPressureStages(p.Stages),
+		Series:       make([]pressureSeries, 0, len(p.Operations.ByType)),
 	}
 	for _, s := range p.Operations.ByType {
 		buckets := operationBuckets(p.Buckets, s.Type)
@@ -554,6 +564,48 @@ func buildPressureView(p *PressureStats) *pressureView {
 		v.Series = append(v.Series, pressureSeries{Name: s.Type, Chart: chart})
 	}
 	return v
+}
+
+// buildPressureStages converts a staged run's stages into the rows of the
+// stage table: per stage an "all" row from its overall group, then one row
+// per operation. It returns nil for a run without stages.
+func buildPressureStages(stages []PressureStage) []typeRow {
+	var rows []typeRow
+	for _, st := range stages {
+		rows = append(rows, buildPressureStageRow(st, "all", st.Operations.Overall))
+		for _, s := range st.Operations.ByType {
+			rows = append(rows, buildPressureStageRow(st, s.Type, s))
+		}
+	}
+	return rows
+}
+
+// buildPressureStageRow renders one row of the stage table in
+// pressureStageColumns: the index, override and window of st, the operation
+// label, and the counts, throughput and latencies of s. The window and
+// latency cells are humanized and sort by their nanosecond value, the counts
+// by their number, and a stage without a fan_assignments override shows "-"
+// and sorts as -1, below every stage with one.
+func buildPressureStageRow(st PressureStage, label string, s metrics.Stats) typeRow {
+	index := strconv.Itoa(st.Index)
+	fan := cell{Text: fanLabel(st.FanAssignments), Sort: strconv.Itoa(st.FanAssignments)}
+	if st.FanAssignments == 0 {
+		fan.Sort = "-1"
+	}
+	return typeRow{Cells: []cell{
+		{Text: index, Sort: index},
+		fan,
+		latencyCell(st.Start),
+		latencyCell(st.End),
+		{Text: label, Sort: label},
+		{Text: strconv.Itoa(s.Attempted), Sort: strconv.Itoa(s.Attempted)},
+		{Text: strconv.Itoa(s.Succeeded), Sort: strconv.Itoa(s.Succeeded)},
+		{Text: strconv.Itoa(s.Failed), Sort: strconv.Itoa(s.Failed)},
+		{Text: f2(s.Throughput), Sort: f2(s.Throughput)},
+		latencyCell(s.Latency.Median),
+		latencyCell(s.Latency.P95),
+		latencyCell(s.Latency.P99),
+	}}
 }
 
 // operationBuckets converts a pressure run's buckets into the series of one
