@@ -48,9 +48,14 @@ type Project struct {
 
 // User is a user in a domain, both referenced by logical name. Its password is
 // derived at apply time from the seed and logical name, never persisted here.
+// Fan marks a fan user: one of the users a scenario's distribution.fan_users
+// appends after the regular users, each holding a grant on many projects. The
+// key is omitted for a regular user, so a plan without fan users encodes as it
+// did before they existed.
 type User struct {
 	Name   string `json:"name"`
 	Domain string `json:"domain"`
+	Fan    bool   `json:"fan,omitempty"`
 }
 
 // Assignment is a (user, target, role) grant. Project is the logical name of
@@ -165,8 +170,22 @@ func (p *Plan) DomainScopedAssignments() int {
 	return n
 }
 
+// FanUsers counts the fan users, the users with Fan set.
+func (p *Plan) FanUsers() int {
+	var n int
+	for _, u := range p.Users {
+		if u.Fan {
+			n++
+		}
+	}
+	return n
+}
+
 // Summary returns a deterministic, human-readable count of the plan, used by
 // "keystone apply --dry-run" to preview a scenario without touching a cloud.
+// The users count includes the fan users, which a line of their own counts
+// again only when the plan has any, so the summary of a plan without fan users
+// is unchanged.
 func (p *Plan) Summary() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Plan for scenario %q (seed %d)\n", p.Scenario, p.Seed)
@@ -174,6 +193,9 @@ func (p *Plan) Summary() string {
 	fmt.Fprintf(&b, "  roles:           %d\n", len(p.Roles))
 	fmt.Fprintf(&b, "  projects:        %d\n", len(p.Projects))
 	fmt.Fprintf(&b, "  users:           %d\n", len(p.Users))
+	if n := p.FanUsers(); n > 0 {
+		fmt.Fprintf(&b, "  fan users:       %d\n", n)
+	}
 	fmt.Fprintf(&b, "  assignments:     %d (%d domain-scoped)\n", len(p.Assignments), p.DomainScopedAssignments())
 	fmt.Fprintf(&b, "  token issues:    %d\n", len(p.Tokens))
 	return b.String()

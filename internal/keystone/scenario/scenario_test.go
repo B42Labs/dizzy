@@ -65,6 +65,7 @@ func TestValidate(t *testing.T) {
 		name    string
 		mutate  func(*Scenario)
 		wantErr bool
+		wantMsg string // the exact error, when set; implies wantErr
 	}{
 		{name: "valid", mutate: func(*Scenario) {}},
 		{name: "empty name", mutate: func(s *Scenario) { s.Name = "" }, wantErr: true},
@@ -98,12 +99,111 @@ func TestValidate(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			// Without fan users fan_assignments is never drawn from, so the
+			// total and its message name the regular product alone.
+			name: "total without fan users ignores fan_assignments",
+			mutate: func(s *Scenario) {
+				s.Resources.Users = maxCount
+				s.Distribution.AssignmentsPerUser = Range{Min: 0, Max: 2}
+				s.Distribution.FanAssignments = Range{Min: 1, Max: maxCount}
+			},
+			wantMsg: "resources.users (1000000) × distribution.assignments_per_user.max (2) = 2000000 exceeds the total assignment limit of 1000000",
+		},
+		{
+			name: "fan users",
+			mutate: func(s *Scenario) {
+				s.Resources.Projects = 4
+				s.Distribution.FanUsers = 2
+				s.Distribution.FanAssignments = Range{Min: 3, Max: 4}
+			},
+		},
+		{
+			name:   "fan_assignments unchecked against projects without fan users",
+			mutate: func(s *Scenario) { s.Distribution.FanAssignments = Range{Min: 0, Max: 99} },
+		},
+		{
+			name:    "negative fan users",
+			mutate:  func(s *Scenario) { s.Distribution.FanUsers = -1 },
+			wantMsg: "distribution.fan_users must not be negative, got -1",
+		},
+		{
+			name:    "fan users above the limit",
+			mutate:  func(s *Scenario) { s.Distribution.FanUsers = maxCount + 1 },
+			wantMsg: "distribution.fan_users exceeds the limit of 1000000, got 1000001",
+		},
+		{
+			name:    "fan_assignments min above max",
+			mutate:  func(s *Scenario) { s.Distribution.FanAssignments = Range{Min: 3, Max: 2} },
+			wantMsg: "distribution.fan_assignments.min (3) must not exceed distribution.fan_assignments.max (2)",
+		},
+		{
+			name: "fan users without a domain",
+			mutate: func(s *Scenario) {
+				s.Resources.Domains, s.Resources.Projects, s.Resources.Users = 0, 0, 0
+				s.Distribution.FanUsers = 1
+				s.Distribution.FanAssignments = Range{Min: 1, Max: 1}
+			},
+			wantMsg: "resources.domains must be at least 1 when projects or users are created, got 0",
+		},
+		{
+			// The regular users draw no grant, so only the fan user needs a
+			// role.
+			name: "fan users without a role",
+			mutate: func(s *Scenario) {
+				s.Resources.Roles = 0
+				s.Distribution.AssignmentsPerUser = Range{Min: 0, Max: 0}
+				s.Distribution.FanUsers = 1
+				s.Distribution.FanAssignments = Range{Min: 1, Max: 2}
+			},
+			wantMsg: "resources.roles must be at least 1 when users draw assignments, got 0",
+		},
+		{
+			name: "fan_assignments min zero with fan users",
+			mutate: func(s *Scenario) {
+				s.Distribution.FanUsers = 1
+				s.Distribution.FanAssignments = Range{Min: 0, Max: 2}
+			},
+			wantMsg: "distribution.fan_assignments.min must be at least 1 when fan users are created, got 0",
+		},
+		{
+			name: "fan_assignments max above the projects",
+			mutate: func(s *Scenario) {
+				s.Distribution.FanUsers = 1
+				s.Distribution.FanAssignments = Range{Min: 1, Max: s.Resources.Projects + 1}
+			},
+			wantMsg: "distribution.fan_assignments.max (6) exceeds resources.projects (5); a fan user holds one grant per distinct project",
+		},
+		{
+			// 10 users × 3 plus 1 fan user × 999970 is exactly the limit.
+			name: "fan users at the total limit",
+			mutate: func(s *Scenario) {
+				s.Resources.Projects = maxCount - 30
+				s.Distribution.FanUsers = 1
+				s.Distribution.FanAssignments = Range{Min: 1, Max: maxCount - 30}
+			},
+		},
+		{
+			name: "fan users exceed the total limit",
+			mutate: func(s *Scenario) {
+				s.Resources.Projects = maxCount
+				s.Distribution.FanUsers = 1
+				s.Distribution.FanAssignments = Range{Min: 1, Max: maxCount}
+			},
+			wantMsg: "resources.users (10) × distribution.assignments_per_user.max (3) + distribution.fan_users (1) × distribution.fan_assignments.max (1000000) = 1000030 exceeds the total assignment limit of 1000000",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			s := smallScenario()
 			tc.mutate(&s)
 			err := s.Validate()
+			if tc.wantMsg != "" {
+				if err == nil || err.Error() != tc.wantMsg {
+					t.Fatalf("Validate() = %v, want %q", err, tc.wantMsg)
+				}
+				return
+			}
 			if tc.wantErr && err == nil {
 				t.Fatal("Validate() = nil, want error")
 			}
@@ -132,6 +232,9 @@ func TestSet(t *testing.T) {
 		{"distribution.assignments_per_user.max", "5", func(s Scenario) bool { return s.Distribution.AssignmentsPerUser.Max == 5 }},
 		{"distribution.domain_scoped_assignment_ratio", "0.25", func(s Scenario) bool { return s.Distribution.DomainScopedAssignmentRatio == 0.25 }},
 		{"distribution.users_issuing_tokens_ratio", "0.75", func(s Scenario) bool { return s.Distribution.UsersIssuingTokensRatio == 0.75 }},
+		{"distribution.fan_users", "1", func(s Scenario) bool { return s.Distribution.FanUsers == 1 }},
+		{"distribution.fan_assignments.min", "2", func(s Scenario) bool { return s.Distribution.FanAssignments.Min == 2 }},
+		{"distribution.fan_assignments.max", "3", func(s Scenario) bool { return s.Distribution.FanAssignments.Max == 3 }},
 	}
 	for _, k := range keys {
 		t.Run(k.key, func(t *testing.T) {
@@ -143,6 +246,43 @@ func TestSet(t *testing.T) {
 				t.Errorf("Set(%q,%q) did not apply", k.key, k.value)
 			}
 		})
+	}
+}
+
+// TestParseFanDistribution confirms the fan keys of the distribution block
+// parse into their fields and validate when the fan users' max fits the
+// projects, and that an unknown key inside fan_assignments fails strict
+// unmarshal loudly.
+func TestParseFanDistribution(t *testing.T) {
+	yaml := `name: f
+seed: 1
+resources:
+  domains: 1
+  roles: 2
+  projects: 4
+  users: 2
+distribution:
+  projects_per_domain: { min: 1, max: 4 }
+  assignments_per_user: { min: 1, max: 1 }
+  fan_users: 2
+  fan_assignments: { min: 3, max: 4 }
+`
+	s, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if s.Distribution.FanUsers != 2 {
+		t.Errorf("fan_users = %d, want 2", s.Distribution.FanUsers)
+	}
+	if want := (Range{Min: 3, Max: 4}); s.Distribution.FanAssignments != want {
+		t.Errorf("fan_assignments = %+v, want %+v", s.Distribution.FanAssignments, want)
+	}
+	if err := s.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil for fan_assignments.max equal to resources.projects", err)
+	}
+
+	if _, err := Parse([]byte("name: f\ndistribution:\n  fan_assignments: { min: 1, max: 1, nope: 1 }\n")); err == nil {
+		t.Error("Parse of a fan_assignments block with an unknown key: expected an error, got nil")
 	}
 }
 

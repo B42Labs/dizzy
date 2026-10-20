@@ -121,6 +121,21 @@ func TestProfilesShipPressureBlock(t *testing.T) {
 	}
 }
 
+// TestProfilesHaveNoFanUsers asserts no shipped Keystone profile sets
+// fan_users or fan_assignments, so every profile keeps its plan and its
+// provisioning time; a fan scenario starts from the example in the scenario
+// schema instead.
+func TestProfilesHaveNoFanUsers(t *testing.T) {
+	for _, name := range profileNames {
+		t.Run(name, func(t *testing.T) {
+			s := readProfile(t, name)
+			if d := s.Distribution; d.FanUsers != 0 || d.FanAssignments != (Range{}) {
+				t.Errorf("profile keystone/%s.yaml sets fan_users %d and fan_assignments %+v, want neither", name, d.FanUsers, d.FanAssignments)
+			}
+		})
+	}
+}
+
 // TestSmallProfileSingleDomain asserts the small profile keeps a single domain,
 // so it stays runnable in domain-manager mode (which requires domains <= 1).
 func TestSmallProfileSingleDomain(t *testing.T) {

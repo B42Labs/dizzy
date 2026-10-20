@@ -141,6 +141,32 @@ func TestSummaryCounts(t *testing.T) {
 	}
 }
 
+// TestSummaryFanUsers checks the fan users line: a plan with a fan user
+// prints its count right after the users line, which counts the fan user too,
+// and a plan without fan users prints no such line.
+func TestSummaryFanUsers(t *testing.T) {
+	p := validPlan()
+	p.Users = append(p.Users, User{Name: "fan-0001", Domain: "dom-0001", Fan: true})
+	p.Assignments = append(p.Assignments,
+		Assignment{User: "fan-0001", Role: "role-0001", Project: "proj-0001"},
+		Assignment{User: "fan-0001", Role: "role-0002", Project: "proj-0002"},
+	)
+	if err := p.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil for a plan with a fan user", err)
+	}
+	if got := p.FanUsers(); got != 1 {
+		t.Errorf("FanUsers() = %d, want 1", got)
+	}
+	got := p.Summary()
+	if want := "  users:           3\n  fan users:       1\n"; !strings.Contains(got, want) {
+		t.Errorf("Summary() missing %q:\n%s", want, got)
+	}
+
+	if got := validPlan().Summary(); strings.Contains(got, "fan users") {
+		t.Errorf("Summary() of a plan without fan users has a fan users line:\n%s", got)
+	}
+}
+
 func TestDomainScopedAssignments(t *testing.T) {
 	if got := validPlan().DomainScopedAssignments(); got != 1 {
 		t.Errorf("DomainScopedAssignments() = %d, want 1", got)
