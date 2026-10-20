@@ -572,3 +572,443 @@ func TestWriteComparisonHTMLEscapes(t *testing.T) {
 		}
 	}
 }
+
+// comparisonServiceRecords returns two staged pressure records of the same
+// load that also sent their pool tokens to the other services: press001
+// probed nova only, at a p50 of 1.2ms, and press002 nova at 0.9ms and glance;
+// neither drew a bad token. Both ran the propagation probe every 30s with a
+// 10m ceiling and completed 12 probes without a timeout, press001 at a p50
+// of 180s and a max of 300s, the delays of keystonemiddleware's token cache,
+// press002 at 3s and 6s. Their operations are those of comparisonRecords and
+// their stages those of goldenComparison.
+func comparisonServiceRecords() (base, other *Record) {
+	base, other = comparisonRecords()
+	base.Pressure.Stages = pressureStages(300*time.Microsecond, 0, 1000)
+	other.Pressure.Stages = pressureStages(250*time.Microsecond, 0, 1000)
+	probe := func(service string, throughput float64, p50, p95, p99 time.Duration) metrics.Stats {
+		return metrics.Stats{Type: service, Attempted: 60, Succeeded: 60, Throughput: throughput,
+			Latency: metrics.Latency{Median: p50, P95: p95, P99: p99}}
+	}
+	base.Pressure.Probes = []metrics.Stats{
+		probe("nova", 0.7, 1200*time.Microsecond, 2400*time.Microsecond, 3100*time.Microsecond),
+	}
+	other.Pressure.Probes = []metrics.Stats{
+		probe("glance", 0.6, 3100*time.Microsecond, 5500*time.Microsecond, 7200*time.Microsecond),
+		probe("nova", 0.7, 900*time.Microsecond, 1800*time.Microsecond, 2500*time.Microsecond),
+	}
+	base.Pressure.Propagation = &PressurePropagation{Every: 30 * time.Second, Timeout: 10 * time.Minute, Probes: 12,
+		Delay: metrics.Latency{Median: 180 * time.Second, P95: 280 * time.Second, P99: 300 * time.Second, Max: 300 * time.Second}}
+	other.Pressure.Propagation = &PressurePropagation{Every: 30 * time.Second, Timeout: 10 * time.Minute, Probes: 12,
+		Delay: metrics.Latency{Median: 3 * time.Second, P95: 5500 * time.Millisecond, P99: 6 * time.Second, Max: 6 * time.Second}}
+	return base, other
+}
+
+// TestCompareServices confirms the comparison lists every service either
+// record probed, by name and without an "all" entry, nil on the side that
+// did not probe it and with the other minus the base as the delta otherwise;
+// that the bad tokens of one record compare the same way and are nil when
+// neither drew any; that the propagation delta is the other's probes minus
+// the base's field by field; that the summaries carry the probe's settings;
+// and that two records without probes, bad tokens or the propagation probe
+// compare with none of the three and leave their keys out of the JSON.
+func TestCompareServices(t *testing.T) {
+	base, other := comparisonServiceRecords()
+	c := mustCompare(t, base, other, false)
+
+	var names []string
+	for _, d := range c.Probes {
+		names = append(names, d.Operation)
+	}
+	if want := []string{"glance", "nova"}; !reflect.DeepEqual(names, want) {
+		t.Fatalf("probes = %v, want %v and no all entry", names, want)
+	}
+	if glance := c.Probes[0]; glance.Base != nil || glance.Other == nil || glance.Delta != nil {
+		t.Errorf("glance, which only the other probed = %+v, want no base or delta", glance)
+	}
+	if d := c.Probes[1].Delta; d == nil || d.P50 != -300*time.Microsecond || d.P95 != -600*time.Microsecond || d.P99 != -600*time.Microsecond {
+		t.Errorf("nova delta = %+v, want p50 -300µs, p95 -600µs and p99 -600µs", d)
+	}
+	if c.BadTokens != nil {
+		t.Errorf("records without bad tokens compare with bad tokens %+v", c.BadTokens)
+	}
+
+	p := c.Propagation
+	if p == nil {
+		t.Fatal("records with the propagation probe compare without it")
+	}
+	wantBase := &DelayMetric{P50: 180 * time.Second, P95: 280 * time.Second, P99: 300 * time.Second, Max: 300 * time.Second, Probes: 12}
+	wantOther := &DelayMetric{P50: 3 * time.Second, P95: 5500 * time.Millisecond, P99: 6 * time.Second, Max: 6 * time.Second, Probes: 12}
+	if !reflect.DeepEqual(p.Base, wantBase) || !reflect.DeepEqual(p.Other, wantOther) {
+		t.Errorf("propagation base %+v, other %+v, want %+v and %+v", p.Base, p.Other, wantBase, wantOther)
+	}
+	wantDelta := &DelayMetric{P50: -177 * time.Second, P95: -274500 * time.Millisecond, P99: -294 * time.Second, Max: -294 * time.Second}
+	if !reflect.DeepEqual(p.Delta, wantDelta) {
+		t.Errorf("propagation delta = %+v, want %+v", p.Delta, wantDelta)
+	}
+	for _, s := range []RunSummary{c.Base, c.Other} {
+		if s.PropagationEvery != 30*time.Second || s.PropagationTimeout != 10*time.Minute {
+			t.Errorf("summary of run %s carries propagation every %v and timeout %v, want 30s and 10m", s.RunID, s.PropagationEvery, s.PropagationTimeout)
+		}
+	}
+
+	base.Pressure.BadTokens = []metrics.Stats{{Type: "nova", Attempted: 30, Succeeded: 30, Latency: metrics.Latency{Median: 900 * time.Microsecond}}}
+	c = mustCompare(t, base, other, false)
+	if len(c.BadTokens) != 1 || c.BadTokens[0].Operation != "nova" || c.BadTokens[0].Base == nil ||
+		c.BadTokens[0].Other != nil || c.BadTokens[0].Delta != nil {
+		t.Errorf("bad tokens only the base drew = %+v, want nova with a base and no other or delta", c.BadTokens)
+	}
+
+	plain := mustCompare(t, pressureRecord(), pressureRecord(), false)
+	if plain.Probes != nil || plain.BadTokens != nil || plain.Propagation != nil {
+		t.Errorf("records without services compare with probes %+v, bad tokens %+v and propagation %+v",
+			plain.Probes, plain.BadTokens, plain.Propagation)
+	}
+	data, err := json.Marshal(plain)
+	if err != nil {
+		t.Fatalf("encoding comparison: %v", err)
+	}
+	for _, key := range []string{`"probes"`, `"badTokens"`, `"propagation"`, `"propagationEvery"`, `"propagationTimeout"`} {
+		if strings.Contains(string(data), key) {
+			t.Errorf("comparison JSON of records without services carries %s:\n%s", key, data)
+		}
+	}
+}
+
+// TestComparePropagationMismatch confirms Compare refuses two records whose
+// propagation probe settings differ, naming "off" for the record without the
+// probe and every=<every>,timeout=<timeout> for the other, that the entry
+// sits after the mix and before the stage count when all three differ, that
+// a ceiling alone differing counts as well, and that equal settings add no
+// entry even when the delays differ.
+func TestComparePropagationMismatch(t *testing.T) {
+	base, other := comparisonServiceRecords()
+	other.Pressure.Propagation = nil
+	_, err := Compare(base, other, false)
+	const want = "the records come from different loads (propagation every=30s,timeout=10m0s vs off); pass --allow-mismatch to compare them anyway"
+	if err == nil || err.Error() != want {
+		t.Fatalf("Compare error = %v, want %q", err, want)
+	}
+
+	other.Pressure.Mix = []PressureWeight{{Operation: "validate", Weight: 9}}
+	other.Pressure.Stages = other.Pressure.Stages[:1]
+	c := mustCompare(t, base, other, true)
+	wantMismatches := []string{
+		"mix revoke=1, validate=9 vs validate=9",
+		"propagation every=30s,timeout=10m0s vs off",
+		"stages 2 vs 1",
+	}
+	if !reflect.DeepEqual(c.Mismatches, wantMismatches) {
+		t.Errorf("Mismatches = %q, want %q", c.Mismatches, wantMismatches)
+	}
+
+	base, other = comparisonServiceRecords()
+	other.Pressure.Propagation.Timeout = 5 * time.Minute
+	c = mustCompare(t, base, other, true)
+	if want := []string{"propagation every=30s,timeout=10m0s vs every=30s,timeout=5m0s"}; !reflect.DeepEqual(c.Mismatches, want) {
+		t.Errorf("Mismatches with only the ceiling differing = %q, want %q", c.Mismatches, want)
+	}
+
+	base, other = comparisonServiceRecords()
+	for _, allow := range []bool{false, true} {
+		if c := mustCompare(t, base, other, allow); c.Mismatches != nil {
+			t.Errorf("Compare(allowMismatch %v) of equal propagation settings has mismatches %q", allow, c.Mismatches)
+		}
+	}
+}
+
+// TestComparePropagationOneSide confirms a record without the propagation
+// probe, or with one that completed no probe, is nil on its side of the
+// propagation comparison and leaves no delta, while the other side is set,
+// in either position.
+func TestComparePropagationOneSide(t *testing.T) {
+	_, withProbe := comparisonServiceRecords()
+	want := delayOf(withProbe.Pressure.Propagation)
+	tests := []struct {
+		name          string
+		propagation   *PressurePropagation
+		allowMismatch bool // a record without the probe differs in its load
+	}{
+		{"without the probe", nil, true},
+		{"no probe completed", &PressurePropagation{Every: 30 * time.Second, Timeout: 10 * time.Minute}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			base, other := comparisonServiceRecords()
+			base.Pressure.Propagation = tc.propagation
+			p := mustCompare(t, base, other, tc.allowMismatch).Propagation
+			if p == nil || p.Base != nil || p.Delta != nil || !reflect.DeepEqual(p.Other, want) {
+				t.Errorf("propagation with the base %s = %+v, want no base or delta and the other %+v", tc.name, p, want)
+			}
+			p = mustCompare(t, other, base, tc.allowMismatch).Propagation
+			if p == nil || p.Other != nil || p.Delta != nil || !reflect.DeepEqual(p.Base, want) {
+				t.Errorf("propagation with the other %s = %+v, want no other or delta and the base %+v", tc.name, p, want)
+			}
+		})
+	}
+}
+
+// TestWriteComparisonTableServices confirms the comparison's text of two
+// records with probes and the propagation probe: both load lines end with
+// the probe's settings, a Probes table with four rows per service and a
+// Propagation table with the delay percentiles and the probe counts follow
+// the Operations table and precede the Stages table, no Bad tokens table is
+// written without bad tokens, and a missing side shows "-" in its cell, in
+// DELTA and in CHANGE.
+func TestWriteComparisonTableServices(t *testing.T) {
+	base, other := comparisonServiceRecords()
+	var buf bytes.Buffer
+	if err := WriteComparisonTable(&buf, mustCompare(t, base, other, false)); err != nil {
+		t.Fatalf("WriteComparisonTable: %v", err)
+	}
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	const suffix = ", propagation every=30s,timeout=10m0s"
+	wantHead := []string{
+		"Comparison",
+		"  base:  run press001, scenario small, seed 42, workers 4, tokens 3, mix revoke=1, validate=9" + suffix,
+		"  other: run press002, scenario small, seed 42, workers 4, tokens 3, mix revoke=1, validate=9" + suffix,
+	}
+	if len(lines) < len(wantHead) || !reflect.DeepEqual(lines[:len(wantHead)], wantHead) {
+		t.Fatalf("comparison = %q, want it to start with %q", lines, wantHead)
+	}
+	titles := []string{"Operations", "Probes", "Propagation", "Stages"}
+	at := make([]int, len(titles))
+	for i, title := range titles {
+		at[i] = slices.Index(lines, title)
+		if at[i] < 1 || lines[at[i]-1] != "" {
+			t.Fatalf("comparison lacks the %q title after a blank line:\n%s", title, buf.String())
+		}
+		if i > 0 && at[i] < at[i-1] {
+			t.Fatalf("%q at line %d precedes %q at line %d:\n%s", title, at[i], titles[i-1], at[i-1], buf.String())
+		}
+	}
+	if slices.Contains(lines, "Bad tokens") {
+		t.Errorf("comparison of records without bad tokens has a Bad tokens table:\n%s", buf.String())
+	}
+	probes, propagation, stages := at[1], at[2], at[3]
+
+	checkRows := func(title string, got, want []string) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Errorf("%s table has %d lines, want %d:\n%s", title, len(got), len(want), strings.Join(got, "\n"))
+			return
+		}
+		for i, w := range want {
+			if !reflect.DeepEqual(strings.Fields(got[i]), strings.Fields(w)) {
+				t.Errorf("%s row %d = %q, want %q", title, i, got[i], w)
+			}
+		}
+	}
+	checkRows("Probes", lines[probes+1:propagation-1], []string{
+		"SERVICE  METRIC  BASE  OTHER  DELTA  CHANGE",
+		"glance  p50  -  3.1ms  -  -",
+		"glance  p95  -  5.5ms  -  -",
+		"glance  p99  -  7.2ms  -  -",
+		"glance  ops/s  -  0.6  -  -",
+		"nova  p50  1.2ms  900µs  -300µs  -25.0%",
+		"nova  p95  2.4ms  1.8ms  -600µs  -25.0%",
+		"nova  p99  3.1ms  2.5ms  -600µs  -19.4%",
+		"nova  ops/s  0.7  0.7  +0.0  +0.0%",
+	})
+	checkRows("Propagation", lines[propagation+1:stages-1], []string{
+		"METRIC  BASE  OTHER  DELTA  CHANGE",
+		"p50  3m0s  3s  -2m57s  -98.3%",
+		"p95  4m40s  5.5s  -4m34.5s  -98.0%",
+		"p99  5m0s  6s  -4m54s  -98.0%",
+		"max  5m0s  6s  -4m54s  -98.0%",
+		"probes  12  12  +0  +0.0%",
+		"timed out  0  0  +0  -",
+	})
+	// METRIC is the only label: "timed out" starts under its header.
+	if row := lines[stages-2]; !strings.HasPrefix(row, "timed out  ") || !strings.HasPrefix(lines[propagation+1], "METRIC  ") {
+		t.Errorf("propagation table does not left-align METRIC: %q under %q", row, lines[propagation+1])
+	}
+
+	// A base whose probe completed nothing keeps the load and is a missing
+	// side in every row.
+	base.Pressure.Propagation = &PressurePropagation{Every: 30 * time.Second, Timeout: 10 * time.Minute}
+	buf.Reset()
+	if err := WriteComparisonTable(&buf, mustCompare(t, base, other, false)); err != nil {
+		t.Fatalf("WriteComparisonTable(missing side): %v", err)
+	}
+	lines = strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	propagation, stages = slices.Index(lines, "Propagation"), slices.Index(lines, "Stages")
+	if propagation < 0 || stages < propagation {
+		t.Fatalf("comparison with a missing side lacks the propagation table:\n%s", buf.String())
+	}
+	checkRows("Propagation with a missing base", lines[propagation+1:stages-1], []string{
+		"METRIC  BASE  OTHER  DELTA  CHANGE",
+		"p50  -  3s  -  -",
+		"p95  -  5.5s  -  -",
+		"p99  -  6s  -  -",
+		"max  -  6s  -  -",
+		"probes  -  12  -  -",
+		"timed out  -  0  -  -",
+	})
+}
+
+// TestWriteComparisonJSONServices confirms the JSON of a comparison with
+// probes and the propagation probe carries the probes and propagation keys,
+// no badTokens key without bad tokens, the probe's settings in both
+// summaries, and decodes back to the comparison.
+func TestWriteComparisonJSONServices(t *testing.T) {
+	base, other := comparisonServiceRecords()
+	c := mustCompare(t, base, other, false)
+	var buf bytes.Buffer
+	if err := WriteComparisonJSON(&buf, c); err != nil {
+		t.Fatalf("WriteComparisonJSON: %v", err)
+	}
+	var got Comparison
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("comparison JSON does not decode: %v", err)
+	}
+	if !reflect.DeepEqual(&got, c) {
+		t.Errorf("decoded comparison = %+v, want %+v", got, *c)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(buf.Bytes(), &raw); err != nil {
+		t.Fatalf("comparison JSON does not decode as an object: %v", err)
+	}
+	keys := make([]string, 0, len(raw))
+	for k := range raw {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if want := []string{"base", "operations", "other", "probes", "propagation", "stages"}; !reflect.DeepEqual(keys, want) {
+		t.Errorf("comparison JSON keys = %v, want %v", keys, want)
+	}
+	for _, role := range []string{"base", "other"} {
+		for _, want := range []string{`"propagationEvery": 30000000000`, `"propagationTimeout": 600000000000`} {
+			if !bytes.Contains(raw[role], []byte(want)) {
+				t.Errorf("%s summary lacks %s: %s", role, want, raw[role])
+			}
+		}
+	}
+	if !bytes.Contains(raw["propagation"], []byte(`"p50": -177000000000`)) {
+		t.Errorf("propagation JSON lacks the p50 delta of -177s: %s", raw["propagation"])
+	}
+}
+
+// TestWriteComparisonHTMLGoldenServices locks the rendered comparison page of
+// two staged records with probes and the propagation probe: the propagation
+// chip on both runs' lines, and the sortable Probes and Propagation tables
+// between the Operations and the Stages table. It also confirms the page
+// stays self-contained and escapes a service name.
+func TestWriteComparisonHTMLGoldenServices(t *testing.T) {
+	base, other := comparisonServiceRecords()
+	var buf bytes.Buffer
+	if err := WriteComparisonHTML(&buf, mustCompare(t, base, other, false)); err != nil {
+		t.Fatalf("WriteComparisonHTML: %v", err)
+	}
+	checkGolden(t, "compare-pressure-services.html", buf.Bytes())
+
+	out := buf.String()
+	headings := []string{"<h2>Operations</h2>", "<h2>Probes</h2>", "<h2>Propagation</h2>", "<h2>Stages</h2>"}
+	prev := -1
+	for _, h := range headings {
+		at := strings.Index(out, h)
+		if at < 0 || at < prev || strings.Count(out, h) != 1 {
+			t.Fatalf("comparison page has %q %d times at %d, want it once after %d", h, strings.Count(out, h), at, prev)
+		}
+		prev = at
+	}
+	if strings.Contains(out, "<h2>Bad tokens</h2>") {
+		t.Error("comparison page of records without bad tokens has a Bad tokens table")
+	}
+	baseRun := out[strings.Index(out, `<span class="chip">base run press001</span>`):]
+	baseRun = baseRun[:strings.Index(baseRun, "</div>")]
+	if !strings.Contains(baseRun, `<span class="chip">propagation every=30s,timeout=10m0s</span>`) {
+		t.Errorf("base run's chips lack the propagation chip:\n%s", baseRun)
+	}
+	for _, want := range []string{
+		"<h2>Probes</h2>\n<table class=\"sortable\">\n  <thead><tr><th>service</th><th>metric</th><th>base</th><th>other</th><th>delta</th><th>change</th></tr></thead>",
+		"<h2>Propagation</h2>\n<table class=\"sortable\">\n  <thead><tr><th>metric</th><th>base</th><th>other</th><th>delta</th><th>change</th></tr></thead>",
+		`<tr><td data-sort="glance">glance</td><td data-sort="p50">p50</td><td data-sort="">-</td><td data-sort="3100000">3.1ms</td><td data-sort="">-</td><td data-sort="">-</td></tr>`,
+		`<tr><td data-sort="nova">nova</td><td data-sort="p50">p50</td><td data-sort="1200000">1.2ms</td><td data-sort="900000">900µs</td><td data-sort="-300000">-300µs</td><td data-sort="-25.00">-25.0%</td></tr>`,
+		`<tr><td data-sort="p50">p50</td><td data-sort="180000000000">3m0s</td><td data-sort="3000000000">3s</td><td data-sort="-177000000000">-2m57s</td><td data-sort="-98.33">-98.3%</td></tr>`,
+		// html/template escapes the sign of a delta as &#43;.
+		`<tr><td data-sort="timed out">timed out</td><td data-sort="0">0</td><td data-sort="0">0</td><td data-sort="0">&#43;0</td><td data-sort="">-</td></tr>`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("comparison page lacks %q", want)
+		}
+	}
+	for _, bad := range []string{"http://", "https://", "<link ", "src=", "url(http", "@import"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("comparison page contains external reference %q, expected a self-contained file", bad)
+		}
+	}
+
+	const name = "<b>x</b>"
+	other.Pressure.Probes[0].Type = name
+	buf.Reset()
+	if err := WriteComparisonHTML(&buf, mustCompare(t, base, other, false)); err != nil {
+		t.Fatalf("WriteComparisonHTML(markup service): %v", err)
+	}
+	if strings.Contains(buf.String(), name) {
+		t.Error("service name rendered without escaping")
+	}
+	if got := strings.Count(buf.String(), `<td data-sort="&lt;b&gt;x&lt;/b&gt;">&lt;b&gt;x&lt;/b&gt;</td>`); got != 4 {
+		t.Errorf("comparison page has %d cells with the escaped service name, want 4, one per metric row", got)
+	}
+}
+
+// TestWriteComparisonBadTokens confirms the comparison of two records that
+// both drew bad tokens: the text has a Bad tokens table with four rows per
+// service between the Probes and the Propagation table, and the page a
+// sortable Bad tokens table in the same place, in the markup of the Probes
+// table.
+func TestWriteComparisonBadTokens(t *testing.T) {
+	base, other := comparisonServiceRecords()
+	badToken := func(p50 time.Duration) []metrics.Stats {
+		return []metrics.Stats{{Type: "neutron", Attempted: 40, Succeeded: 40, Throughput: 0.5,
+			Latency: metrics.Latency{Median: p50, P95: 2 * p50, P99: 3 * p50}}}
+	}
+	base.Pressure.BadTokens = badToken(2 * time.Millisecond)
+	other.Pressure.BadTokens = badToken(500 * time.Microsecond)
+	c := mustCompare(t, base, other, false)
+
+	var buf bytes.Buffer
+	if err := WriteComparisonTable(&buf, c); err != nil {
+		t.Fatalf("WriteComparisonTable: %v", err)
+	}
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	probes, bad, propagation := slices.Index(lines, "Probes"), slices.Index(lines, "Bad tokens"), slices.Index(lines, "Propagation")
+	if probes < 0 || bad < probes || propagation < bad || lines[bad-1] != "" {
+		t.Fatalf("comparison has Probes at %d, Bad tokens at %d and Propagation at %d, want them in that order after blank lines:\n%s",
+			probes, bad, propagation, buf.String())
+	}
+	want := []string{
+		"SERVICE  METRIC  BASE  OTHER  DELTA  CHANGE",
+		"neutron  p50  2ms  500µs  -1.5ms  -75.0%",
+		"neutron  p95  4ms  1ms  -3ms  -75.0%",
+		"neutron  p99  6ms  1.5ms  -4.5ms  -75.0%",
+		"neutron  ops/s  0.5  0.5  +0.0  +0.0%",
+	}
+	got := lines[bad+1 : propagation-1]
+	if len(got) != len(want) {
+		t.Fatalf("Bad tokens table = %q, want %q", got, want)
+	}
+	for i, w := range want {
+		if !reflect.DeepEqual(strings.Fields(got[i]), strings.Fields(w)) {
+			t.Errorf("Bad tokens row %d = %q, want %q", i, got[i], w)
+		}
+	}
+
+	buf.Reset()
+	if err := WriteComparisonHTML(&buf, c); err != nil {
+		t.Fatalf("WriteComparisonHTML: %v", err)
+	}
+	out := buf.String()
+	at := strings.Index(out, "<h2>Bad tokens</h2>")
+	if at < strings.Index(out, "<h2>Probes</h2>") || at > strings.Index(out, "<h2>Propagation</h2>") || strings.Count(out, "<h2>Bad tokens</h2>") != 1 {
+		t.Fatalf("comparison page has the Bad tokens heading at %d, want it once between Probes and Propagation", at)
+	}
+	for _, w := range []string{
+		"<h2>Bad tokens</h2>\n<table class=\"sortable\">\n  <thead><tr><th>service</th><th>metric</th><th>base</th><th>other</th><th>delta</th><th>change</th></tr></thead>",
+		`<tr><td data-sort="neutron">neutron</td><td data-sort="p50">p50</td><td data-sort="2000000">2ms</td><td data-sort="500000">500µs</td><td data-sort="-1500000">-1.5ms</td><td data-sort="-75.00">-75.0%</td></tr>`,
+	} {
+		if !strings.Contains(out, w) {
+			t.Errorf("comparison page lacks %q", w)
+		}
+	}
+}

@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Comparison: run press001 vs run press002</title>
+<style>
+:root {
+  --fg: #1b1f24; --muted: #5b6570; --line: #d7dde3; --bg: #ffffff;
+  --panel: #f6f8fa; --ok: #2da44e; --fail: #cf222e; --bar: #4493f8;
+  --p50: #8250df; --p99: #bc4c00;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 24px; background: var(--bg); color: var(--fg);
+  font: 14px/1.5 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+}
+h1 { font-size: 20px; margin: 0 0 4px; }
+h2 { font-size: 16px; margin: 28px 0 10px; }
+.muted { color: var(--muted); }
+.banner { padding: 10px 14px; border-radius: 6px; margin: 12px 0; font-weight: 600; }
+.banner.ok { background: #dafbe1; color: #116329; }
+.banner.fail { background: #ffebe9; color: #82071e; }
+.banner.warn { background: #fff8c5; color: #7d4e00; }
+.banner .detail { font-weight: 400; margin-top: 4px; word-break: break-word; }
+.meta { color: var(--muted); }
+.meta b { color: var(--fg); font-weight: 600; }
+.kpis { display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0; }
+.kpi {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px 16px; min-width: 130px;
+}
+.kpi .v { font-size: 22px; font-weight: 700; }
+.kpi .l { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+table { border-collapse: collapse; width: 100%; }
+th, td { padding: 6px 10px; border-bottom: 1px solid var(--line); text-align: right; }
+th:first-child, td:first-child { text-align: left; }
+thead th { color: var(--muted); font-weight: 600; }
+.sortable thead th { cursor: pointer; user-select: none; white-space: nowrap; }
+.sortable thead th::after { content: ""; }
+.sortable thead th.asc::after { content: " \25B2"; }
+.sortable thead th.desc::after { content: " \25BC"; }
+svg { max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.lbl { fill: var(--fg); font-size: 12px; }
+.cap { fill: var(--muted); font-size: 12px; }
+.axis { fill: var(--muted); font-size: 11px; }
+.grid { stroke: var(--line); stroke-width: 1; }
+.lat-line { stroke: var(--muted); stroke-width: 2; }
+.lat-band { fill: var(--bar); }
+.seg-ok { fill: var(--ok); }
+.seg-fail { fill: var(--fail); }
+.bar { fill: var(--bar); }
+.bar-fail { fill: var(--fail); }
+.line-p50 { fill: none; stroke: var(--p50); stroke-width: 1.5; }
+.line-p99 { fill: none; stroke: var(--p99); stroke-width: 1.5; }
+.legend { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+.legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin: 0 4px 0 12px; }
+.toggle { cursor: pointer; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; font: inherit; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.chip { background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; font-size: 13px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+[hidden] { display: none; }
+</style>
+</head>
+<body>
+
+<h1>Comparison: run press001 vs run press002</h1>
+<div class="chips">
+  <span class="chip">base run press001</span>
+  <span class="chip">scenario small</span>
+  <span class="chip">seed 42</span>
+  <span class="chip">workers 4</span>
+  <span class="chip">tokens 3</span>
+  <span class="chip">mix revoke=1, validate=9</span>
+  <span class="chip">propagation every=30s,timeout=10m0s</span>
+</div>
+<div class="chips">
+  <span class="chip">other run press002</span>
+  <span class="chip">scenario small</span>
+  <span class="chip">seed 42</span>
+  <span class="chip">workers 4</span>
+  <span class="chip">tokens 3</span>
+  <span class="chip">mix revoke=1, validate=9</span>
+  <span class="chip">propagation every=30s,timeout=10m0s</span>
+</div>
+
+<h2>Operations</h2>
+<table class="sortable">
+  <thead><tr><th>operation</th><th>metric</th><th>base</th><th>other</th><th>delta</th><th>change</th></tr></thead>
+  <tbody>
+  
+    <tr><td data-sort="all">all</td><td data-sort="p50">p50</td><td data-sort="0">0s</td><td data-sort="0">0s</td><td data-sort="0">0s</td><td data-sort="">-</td></tr>
+  
+    <tr><td data-sort="all">all</td><td data-sort="p95">p95</td><td data-sort="0">0s</td><td data-sort="0">0s</td><td data-sort="0">0s</td><td data-sort="">-</td></tr>
+  
+    <tr><td data-sort="all">all</td><td data-sort="p99">p99</td><td data-sort="0">0s</td><td data-sort="0">0s</td><td data-sort="0">0s</td><td data-sort="">-</td></tr>
+  
+    <tr><td data-sort="all">all</td><td data-sort="ops/s">ops/s</td><td data-sort="0.44">0.4</td><td data-sort="0.44">0.4</td><td data-sort="0.00">&#43;0.0</td><td data-sort="0.00">&#43;0.0%</td></tr>
+  
+    <tr><td data-sort="revoke">revoke</td><td data-sort="p50">p50</td><td data-sort="3000000">3ms</td><td data-sort="">-</td><td data-sort="">-</td><td data-sort="">-</td></tr>
+  
+    <tr><td data-sort="revoke">revoke</td><td data-sort="p95">p95</td><td data-sort="5000000">5ms</td><td data-sort="">-</td><td data-sort="">-</td><td data-sort="">-</td></tr>
+  
+    <tr><td data-sort="revoke">revoke</td><td data-sort="p99">p99</td><td data-sort="5000000">5ms</td><td data-sort="">-</td><td data-sort="">-</td><td data-sort="">-</td></tr>
+  
+    <tr><td data-sort="revoke">revoke</td><td data-sort="ops/s">ops/s</td><td data-sort="0.04">0.0</td><td data-sort="">-</td><td data-sort="">-</td><td data-sort="">-</td></tr>
+  
+    <tr><td data-sort="validate">validate</td><td data-sort="p50">p50</td><td data-sort="350000">350µs</td><td data-sort="280000">280µs</td><td data-sort="-70000">-70µs</td><td data-sort="-20.00">-20.0%</td></tr>
+  
+    <tr><td data-sort="validate">validate</td><td data-sort="p95">p95</td><td data-sort="900000">900µs</td><td data-sort="900000">900µs</td><td data-sort="0">0s</td><td data-sort="0.00">&#43;0.0%</td></tr>
+  
+    <tr><td data-sort="validate">validate</td><td data-sort="p99">p99</td><td data-sort="1200000">1.2ms</td><td data-sort="1500000">1.5ms</td><td data-sort="300000">&#43;300µs</td><td data-sort="25.00">&#43;25.0%</td></tr>
+  
+    <tr><td data-sort="validate">validate</td><td data-sort="ops/s">ops/s</td><td data-sort="0.40">0.4</td><td data-sort="0.50">0.5</td><td data-sort="0.10">&#43;0.1</td><td data-sort="25.00">&#43;25.0%</td></tr>
+  
+  </tbody>
+</table>
+
+<h2>Probes</h2>
+<table class="sortable">
+  <thead><tr><th>service</th><th>metric</th><th>base</th><th>other</th><th>delta</th><th>change</th></tr></thead>
+  <tbody>
+  
+    <tr><td data-sort="glance">glance</td><td data-sort="p50">p50</td><td data-sort="">-</td><td data-sort="3100000">3.1ms</td><td data-sort="">-</td><td data-sort="">-</td></tr>
+  
+    <tr><td data-sort="glance">glance</td><td data-sort="p95">p95</td><td data-sort="">-</td><td data-sort="5500000">5.5ms</td><td data-sort="">-</td><td data-sort="">-</td></tr>
+  
+    <tr><td data-sort="glance">glance</td><td data-sort="p99">p99</td><td data-sort="">-</td><td data-sort="7200000">7.2ms</td><td data-sort="">-</td><td data-sort="">-</td></tr>
+  
+    <tr><td data-sort="glance">glance</td><td data-sort="ops/s">ops/s</td><td data-sort="">-</td><td data-sort="0.60">0.6</td><td data-sort="">-</td><td data-sort="">-</td></tr>
+  
+    <tr><td data-sort="nova">nova</td><td data-sort="p50">p50</td><td data-sort="1200000">1.2ms</td><td data-sort="900000">900µs</td><td data-sort="-300000">-300µs</td><td data-sort="-25.00">-25.0%</td></tr>
+  
+    <tr><td data-sort="nova">nova</td><td data-sort="p95">p95</td><td data-sort="2400000">2.4ms</td><td data-sort="1800000">1.8ms</td><td data-sort="-600000">-600µs</td><td data-sort="-25.00">-25.0%</td></tr>
+  
+    <tr><td data-sort="nova">nova</td><td data-sort="p99">p99</td><td data-sort="3100000">3.1ms</td><td data-sort="2500000">2.5ms</td><td data-sort="-600000">-600µs</td><td data-sort="-19.35">-19.4%</td></tr>
+  
+    <tr><td data-sort="nova">nova</td><td data-sort="ops/s">ops/s</td><td data-sort="0.70">0.7</td><td data-sort="0.70">0.7</td><td data-sort="0.00">&#43;0.0</td><td data-sort="0.00">&#43;0.0%</td></tr>
+  
+  </tbody>
+</table>
+
+<h2>Propagation</h2>
+<table class="sortable">
+  <thead><tr><th>metric</th><th>base</th><th>other</th><th>delta</th><th>change</th></tr></thead>
+  <tbody>
+  
+    <tr><td data-sort="p50">p50</td><td data-sort="180000000000">3m0s</td><td data-sort="3000000000">3s</td><td data-sort="-177000000000">-2m57s</td><td data-sort="-98.33">-98.3%</td></tr>
+  
+    <tr><td data-sort="p95">p95</td><td data-sort="280000000000">4m40s</td><td data-sort="5500000000">5.5s</td><td data-sort="-274500000000">-4m34.5s</td><td data-sort="-98.04">-98.0%</td></tr>
+  
+    <tr><td data-sort="p99">p99</td><td data-sort="300000000000">5m0s</td><td data-sort="6000000000">6s</td><td data-sort="-294000000000">-4m54s</td><td data-sort="-98.00">-98.0%</td></tr>
+  
+    <tr><td data-sort="max">max</td><td data-sort="300000000000">5m0s</td><td data-sort="6000000000">6s</td><td data-sort="-294000000000">-4m54s</td><td data-sort="-98.00">-98.0%</td></tr>
+  
+    <tr><td data-sort="probes">probes</td><td data-sort="12">12</td><td data-sort="12">12</td><td data-sort="0">&#43;0</td><td data-sort="0.00">&#43;0.0%</td></tr>
+  
+    <tr><td data-sort="timed out">timed out</td><td data-sort="0">0</td><td data-sort="0">0</td><td data-sort="0">&#43;0</td><td data-sort="">-</td></tr>
+  
+  </tbody>
+</table>
+
+<h2>Stages</h2>
+<table class="sortable">
+  <thead><tr><th>stage</th><th>fan</th><th>operation</th><th>metric</th><th>base</th><th>other</th><th>delta</th><th>change</th></tr></thead>
+  <tbody>
+  
+    <tr><td data-sort="1">1</td><td data-sort="-1">-</td><td data-sort="all">all</td><td data-sort="p50">p50</td><td data-sort="300000">300µs</td><td data-sort="250000">250µs</td><td data-sort="-50000">-50µs</td><td data-sort="-16.67">-16.7%</td></tr>
+  
+    <tr><td data-sort="1">1</td><td data-sort="-1">-</td><td data-sort="all">all</td><td data-sort="p95">p95</td><td data-sort="900000">900µs</td><td data-sort="900000">900µs</td><td data-sort="0">0s</td><td data-sort="0.00">&#43;0.0%</td></tr>
+  
+    <tr><td data-sort="1">1</td><td data-sort="-1">-</td><td data-sort="all">all</td><td data-sort="p99">p99</td><td data-sort="1200000">1.2ms</td><td data-sort="1200000">1.2ms</td><td data-sort="0">0s</td><td data-sort="0.00">&#43;0.0%</td></tr>
+  
+    <tr><td data-sort="1">1</td><td data-sort="-1">-</td><td data-sort="all">all</td><td data-sort="ops/s">ops/s</td><td data-sort="0.17">0.2</td><td data-sort="0.17">0.2</td><td data-sort="0.00">&#43;0.0</td><td data-sort="0.00">&#43;0.0%</td></tr>
+  
+    <tr><td data-sort="1">1</td><td data-sort="-1">-</td><td data-sort="validate">validate</td><td data-sort="p50">p50</td><td data-sort="300000">300µs</td><td data-sort="250000">250µs</td><td data-sort="-50000">-50µs</td><td data-sort="-16.67">-16.7%</td></tr>
+  
+    <tr><td data-sort="1">1</td><td data-sort="-1">-</td><td data-sort="validate">validate</td><td data-sort="p95">p95</td><td data-sort="900000">900µs</td><td data-sort="900000">900µs</td><td data-sort="0">0s</td><td data-sort="0.00">&#43;0.0%</td></tr>
+  
+    <tr><td data-sort="1">1</td><td data-sort="-1">-</td><td data-sort="validate">validate</td><td data-sort="p99">p99</td><td data-sort="1200000">1.2ms</td><td data-sort="1200000">1.2ms</td><td data-sort="0">0s</td><td data-sort="0.00">&#43;0.0%</td></tr>
+  
+    <tr><td data-sort="1">1</td><td data-sort="-1">-</td><td data-sort="validate">validate</td><td data-sort="ops/s">ops/s</td><td data-sort="0.17">0.2</td><td data-sort="0.17">0.2</td><td data-sort="0.00">&#43;0.0</td><td data-sort="0.00">&#43;0.0%</td></tr>
+  
+    <tr><td data-sort="2">2</td><td data-sort="1000">1000</td><td data-sort="all">all</td><td data-sort="p50">p50</td><td data-sort="400000">400µs</td><td data-sort="350000">350µs</td><td data-sort="-50000">-50µs</td><td data-sort="-12.50">-12.5%</td></tr>
+  
+    <tr><td data-sort="2">2</td><td data-sort="1000">1000</td><td data-sort="all">all</td><td data-sort="p95">p95</td><td data-sort="900000">900µs</td><td data-sort="900000">900µs</td><td data-sort="0">0s</td><td data-sort="0.00">&#43;0.0%</td></tr>
+  
+    <tr><td data-sort="2">2</td><td data-sort="1000">1000</td><td data-sort="all">all</td><td data-sort="p99">p99</td><td data-sort="1200000">1.2ms</td><td data-sort="1200000">1.2ms</td><td data-sort="0">0s</td><td data-sort="0.00">&#43;0.0%</td></tr>
+  
+    <tr><td data-sort="2">2</td><td data-sort="1000">1000</td><td data-sort="all">all</td><td data-sort="ops/s">ops/s</td><td data-sort="0.17">0.2</td><td data-sort="0.17">0.2</td><td data-sort="0.00">&#43;0.0</td><td data-sort="0.00">&#43;0.0%</td></tr>
+  
+    <tr><td data-sort="2">2</td><td data-sort="1000">1000</td><td data-sort="validate">validate</td><td data-sort="p50">p50</td><td data-sort="400000">400µs</td><td data-sort="350000">350µs</td><td data-sort="-50000">-50µs</td><td data-sort="-12.50">-12.5%</td></tr>
+  
+    <tr><td data-sort="2">2</td><td data-sort="1000">1000</td><td data-sort="validate">validate</td><td data-sort="p95">p95</td><td data-sort="900000">900µs</td><td data-sort="900000">900µs</td><td data-sort="0">0s</td><td data-sort="0.00">&#43;0.0%</td></tr>
+  
+    <tr><td data-sort="2">2</td><td data-sort="1000">1000</td><td data-sort="validate">validate</td><td data-sort="p99">p99</td><td data-sort="1200000">1.2ms</td><td data-sort="1200000">1.2ms</td><td data-sort="0">0s</td><td data-sort="0.00">&#43;0.0%</td></tr>
+  
+    <tr><td data-sort="2">2</td><td data-sort="1000">1000</td><td data-sort="validate">validate</td><td data-sort="ops/s">ops/s</td><td data-sort="0.17">0.2</td><td data-sort="0.17">0.2</td><td data-sort="0.00">&#43;0.0</td><td data-sort="0.00">&#43;0.0%</td></tr>
+  
+  </tbody>
+</table>
+
+<script>
+"use strict";
+document.querySelectorAll("table.sortable").forEach(function (table) {
+  var headers = table.tHead.rows[0].cells;
+  Array.prototype.forEach.call(headers, function (th, col) {
+    th.addEventListener("click", function () {
+      var asc = !th.classList.contains("asc");
+      Array.prototype.forEach.call(headers, function (h) { h.classList.remove("asc", "desc"); });
+      th.classList.add(asc ? "asc" : "desc");
+      var body = table.tBodies[0];
+      var rows = Array.prototype.slice.call(body.rows);
+      rows.sort(function (a, b) {
+        var x = a.cells[col].dataset.sort, y = b.cells[col].dataset.sort;
+        var nx = parseFloat(x), ny = parseFloat(y);
+        var cmp = (!isNaN(nx) && !isNaN(ny)) ? nx - ny : String(x).localeCompare(String(y));
+        return asc ? cmp : -cmp;
+      });
+      rows.forEach(function (r) { body.appendChild(r); });
+    });
+  });
+});
+</script>
+</body>
+</html>

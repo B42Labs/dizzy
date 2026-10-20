@@ -147,29 +147,39 @@ type laneView struct {
 
 // comparisonView is the fully precomputed model of the comparison page: the
 // two runs, the mismatches joined by "; " (empty when the loads match), and
-// the rows of the operation table and of the stage table, which is empty
-// when neither record has stages.
+// the rows of the operation table, of the probe and bad-token tables, each
+// empty when neither record drew such a token, of the propagation table,
+// empty when neither record ran the probe, and of the stage table, which is
+// empty when neither record has stages.
 type comparisonView struct {
-	Base             comparisonRun
-	Other            comparisonRun
-	Mismatches       string
-	OperationColumns []string
-	Operations       []typeRow
-	StageColumns     []string
-	Stages           []typeRow
+	Base               comparisonRun
+	Other              comparisonRun
+	Mismatches         string
+	OperationColumns   []string
+	Operations         []typeRow
+	ServiceColumns     []string
+	Probes             []typeRow
+	BadTokens          []typeRow
+	PropagationColumns []string
+	Propagation        []typeRow
+	StageColumns       []string
+	Stages             []typeRow
 }
 
 // comparisonRun is one run of the comparison page, shown as a line of chips.
-// Role is "base" or "other".
+// Role is "base" or "other". Propagation is the propagation probe's settings
+// as formatPropagationLoad renders them, and empty, so the page shows no
+// chip, for a run without the probe.
 type comparisonRun struct {
-	Role       string
-	RunID      string
-	Incomplete bool
-	Scenario   string
-	Seed       string
-	Workers    int
-	Tokens     int
-	Mix        string
+	Role        string
+	RunID       string
+	Incomplete  bool
+	Scenario    string
+	Seed        string
+	Workers     int
+	Tokens      int
+	Mix         string
+	Propagation string
 }
 
 type headerView struct {
@@ -692,31 +702,39 @@ func buildPressureStageRow(st PressureStage, label string, s metrics.Stats) type
 	}}
 }
 
-// comparisonOperationColumns and comparisonStageColumns name the columns of
+// comparisonOperationColumns, comparisonServiceColumns,
+// comparisonPropagationColumns and comparisonStageColumns name the columns of
 // the comparison page's tables: those of WriteComparisonTable, in lower case.
 var (
-	comparisonOperationColumns = []string{"operation", "metric", "base", "other", "delta", "change"}
-	comparisonStageColumns     = []string{"stage", "fan", "operation", "metric", "base", "other", "delta", "change"}
+	comparisonOperationColumns   = []string{"operation", "metric", "base", "other", "delta", "change"}
+	comparisonServiceColumns     = []string{"service", "metric", "base", "other", "delta", "change"}
+	comparisonPropagationColumns = []string{"metric", "base", "other", "delta", "change"}
+	comparisonStageColumns       = []string{"stage", "fan", "operation", "metric", "base", "other", "delta", "change"}
 )
 
 // buildComparisonView converts a comparison into the model of its page, with
 // the cells WriteComparisonTable shows and their sort keys.
 func buildComparisonView(c *Comparison) comparisonView {
 	return comparisonView{
-		Base:             buildComparisonRun("base", c.Base),
-		Other:            buildComparisonRun("other", c.Other),
-		Mismatches:       strings.Join(c.Mismatches, "; "),
-		OperationColumns: comparisonOperationColumns,
-		Operations:       comparisonRows(nil, c.Operations),
-		StageColumns:     comparisonStageColumns,
-		Stages:           stageComparisonRows(c.Stages),
+		Base:               buildComparisonRun("base", c.Base),
+		Other:              buildComparisonRun("other", c.Other),
+		Mismatches:         strings.Join(c.Mismatches, "; "),
+		OperationColumns:   comparisonOperationColumns,
+		Operations:         comparisonRows(nil, c.Operations),
+		ServiceColumns:     comparisonServiceColumns,
+		Probes:             comparisonRows(nil, c.Probes),
+		BadTokens:          comparisonRows(nil, c.BadTokens),
+		PropagationColumns: comparisonPropagationColumns,
+		Propagation:        propagationRows(c.Propagation),
+		StageColumns:       comparisonStageColumns,
+		Stages:             stageComparisonRows(c.Stages),
 	}
 }
 
 // buildComparisonRun converts the summary of one compared run into its
 // chips line under the given role.
 func buildComparisonRun(role string, s RunSummary) comparisonRun {
-	return comparisonRun{
+	r := comparisonRun{
 		Role:       role,
 		RunID:      s.RunID,
 		Incomplete: s.Incomplete,
@@ -726,6 +744,10 @@ func buildComparisonRun(role string, s RunSummary) comparisonRun {
 		Tokens:     s.Tokens,
 		Mix:        formatPressureMix(s.Mix),
 	}
+	if s.PropagationEvery > 0 {
+		r.Propagation = formatPropagationLoad(s.PropagationEvery, s.PropagationTimeout)
+	}
+	return r
 }
 
 // operationBuckets converts a pressure run's buckets into the series of one
