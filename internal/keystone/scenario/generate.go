@@ -33,6 +33,14 @@ import (
 //  6. tokens — per user in order (only when users_issuing_tokens_ratio > 0),
 //     draw Float64 < ratio, then scope to a uniform draw over that user's
 //     distinct project-scoped grant targets (users with none are skipped).
+//  7. fan users (fan-%04d) — only when fan_users > 0, so a plan without them
+//     draws nothing more: per fan user in order, draw n from fan_assignments,
+//     then n distinct projects of any domain by a partial Fisher–Yates shuffle
+//     of the project list (the k-th draw is uniform over the projects not
+//     drawn yet), each project draw followed by a uniform role draw. The
+//     shuffle is undone after each fan user, so every fan user draws from the
+//     plan order. Fan users live in the first domain and issue no plan token:
+//     they are appended after the token draws.
 func (s Scenario) Generate() (*plan.Plan, error) {
 	if err := s.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid scenario: %w", err)
@@ -71,7 +79,7 @@ func (s Scenario) Generate() (*plan.Plan, error) {
 	}
 
 	// Each user draws its domain uniformly.
-	p.Users = make([]plan.User, 0, s.Resources.Users)
+	p.Users = make([]plan.User, 0, s.Resources.Users+s.Distribution.FanUsers)
 	for i := 0; i < s.Resources.Users; i++ {
 		domain := p.Domains[rng.Intn(len(p.Domains))].Name
 		p.Users = append(p.Users, plan.User{Name: fmt.Sprintf("user-%04d", i+1), Domain: domain})
@@ -140,6 +148,40 @@ func (s Scenario) Generate() (*plan.Plan, error) {
 			}
 			project := targets[rng.Intn(len(targets))]
 			p.Tokens = append(p.Tokens, plan.TokenIssue{User: u.Name, Project: project})
+		}
+	}
+
+	// Fan users come last and only when the scenario has any, keeping a plan
+	// without them byte-identical to one generated before they existed. A fan
+	// user lives in the first domain and holds grants on projects of every
+	// domain, which Keystone allows; the own-domain rule of the regular grants
+	// does not apply to it. Its n distinct projects come from a partial
+	// Fisher–Yates shuffle of one index slice: the k-th draw swaps a uniform
+	// pick among the indexes from k on into place k. Undoing the swaps in
+	// reverse restores the plan order for the next fan user, so a fan user
+	// costs O(n) draws and swaps rather than O(projects).
+	if s.Distribution.FanUsers > 0 {
+		idx := make([]int, len(p.Projects))
+		for j := range idx {
+			idx[j] = j
+		}
+		swaps := make([]int, 0, s.Distribution.FanAssignments.Max)
+		for i := 0; i < s.Distribution.FanUsers; i++ {
+			u := plan.User{Name: fmt.Sprintf("fan-%04d", i+1), Domain: p.Domains[0].Name, Fan: true}
+			p.Users = append(p.Users, u)
+			n := randRange(rng, s.Distribution.FanAssignments)
+			swaps = swaps[:0]
+			for k := 0; k < n; k++ {
+				j := k + rng.Intn(len(idx)-k)
+				idx[k], idx[j] = idx[j], idx[k]
+				swaps = append(swaps, j)
+				role := p.Roles[rng.Intn(len(p.Roles))].Name
+				p.Assignments = append(p.Assignments, plan.Assignment{User: u.Name, Role: role, Project: p.Projects[idx[k]].Name})
+			}
+			for k := n - 1; k >= 0; k-- {
+				j := swaps[k]
+				idx[k], idx[j] = idx[j], idx[k]
+			}
 		}
 	}
 

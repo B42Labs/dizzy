@@ -152,8 +152,9 @@ type Resources struct {
 }
 
 // Distribution holds the ranges and ratios that shape how projects are dealt
-// across domains, how many grants each user draws, and which grants and users
-// are domain-scoped or issue tokens.
+// across domains, how many grants each user draws, which grants and users are
+// domain-scoped or issue tokens, and how many fan users hold a grant on many
+// projects.
 type Distribution struct {
 	// ProjectsPerDomain is the clustering granularity of the round-robin deal of
 	// the fixed project count across domains, not a hard per-domain cap.
@@ -167,6 +168,12 @@ type Distribution struct {
 	// UsersIssuingTokensRatio is the fraction of users that authenticate for a
 	// project-scoped token.
 	UsersIssuingTokensRatio float64 `yaml:"users_issuing_tokens_ratio"`
+	// FanUsers is the number of fan users, appended after the resources.users
+	// users, each holding one grant on many distinct projects. 0 means none.
+	FanUsers int `yaml:"fan_users"`
+	// FanAssignments is the number of projects a fan user holds a grant on,
+	// drawn per fan user. Its max must not exceed resources.projects.
+	FanAssignments Range `yaml:"fan_assignments"`
 }
 
 // Range is an inclusive integer interval drawn from during generation.
@@ -190,7 +197,8 @@ func Parse(data []byte) (Scenario, error) {
 // individual slice preallocation and guards randRange's interval arithmetic
 // against integer overflow, mirroring the neutron and cinder scenario caps. It
 // does not by itself bound the assignment slice, whose length is bounded by
-// users × assignments_per_user.max — Validate caps that product separately.
+// users × assignments_per_user.max plus fan_users × fan_assignments.max —
+// Validate caps that sum separately.
 const maxCount = 1_000_000
 
 // Validate checks the scenario for semantic consistency, returning an
@@ -208,6 +216,7 @@ func (s Scenario) Validate() error {
 		{"resources.roles", s.Resources.Roles},
 		{"resources.projects", s.Resources.Projects},
 		{"resources.users", s.Resources.Users},
+		{"distribution.fan_users", s.Distribution.FanUsers},
 	} {
 		if c.n < 0 {
 			return fmt.Errorf("%s must not be negative, got %d", c.key, c.n)
@@ -223,6 +232,7 @@ func (s Scenario) Validate() error {
 	}{
 		{"distribution.projects_per_domain", s.Distribution.ProjectsPerDomain},
 		{"distribution.assignments_per_user", s.Distribution.AssignmentsPerUser},
+		{"distribution.fan_assignments", s.Distribution.FanAssignments},
 	} {
 		if err := validateRange(c.key, c.r); err != nil {
 			return err
@@ -241,12 +251,15 @@ func (s Scenario) Validate() error {
 		}
 	}
 
-	// Projects and users need at least one domain to hang off.
-	if (s.Resources.Projects > 0 || s.Resources.Users > 0) && s.Resources.Domains < 1 {
+	fanUsers := s.Distribution.FanUsers > 0
+	// Projects and users, fan users among them, need at least one domain to
+	// hang off.
+	if (s.Resources.Projects > 0 || s.Resources.Users > 0 || fanUsers) && s.Resources.Domains < 1 {
 		return fmt.Errorf("resources.domains must be at least 1 when projects or users are created, got %d", s.Resources.Domains)
 	}
-	// Grants need at least one role to draw from.
-	if s.Resources.Users > 0 && s.Distribution.AssignmentsPerUser.Max > 0 && s.Resources.Roles < 1 {
+	// Grants need at least one role to draw from, and a fan user always draws
+	// some.
+	if ((s.Resources.Users > 0 && s.Distribution.AssignmentsPerUser.Max > 0) || fanUsers) && s.Resources.Roles < 1 {
 		return fmt.Errorf("resources.roles must be at least 1 when users draw assignments, got %d", s.Resources.Roles)
 	}
 	// The round-robin deal must make progress, so each turn places at least one
@@ -254,11 +267,28 @@ func (s Scenario) Validate() error {
 	if s.Resources.Projects > 0 && s.Distribution.ProjectsPerDomain.Min < 1 {
 		return fmt.Errorf("distribution.projects_per_domain.min must be at least 1 when projects are created, got %d", s.Distribution.ProjectsPerDomain.Min)
 	}
+	// A fan user holds at least one grant, and each of its grants is on a
+	// distinct project. Without fan users the range is not drawn from.
+	if fanUsers && s.Distribution.FanAssignments.Min < 1 {
+		return fmt.Errorf("distribution.fan_assignments.min must be at least 1 when fan users are created, got %d", s.Distribution.FanAssignments.Min)
+	}
+	if fanUsers && s.Distribution.FanAssignments.Max > s.Resources.Projects {
+		return fmt.Errorf("distribution.fan_assignments.max (%d) exceeds resources.projects (%d); a fan user holds one grant per distinct project",
+			s.Distribution.FanAssignments.Max, s.Resources.Projects)
+	}
 
-	// The assignment slice is preallocated to users × assignments_per_user.max, a
-	// product neither per-dimension cap bounds; cap it too. Compute in int64 so
-	// the product cannot overflow int on a 32-bit platform.
-	if total := int64(s.Resources.Users) * int64(s.Distribution.AssignmentsPerUser.Max); total > maxCount {
+	// The assignment slice grows to users × assignments_per_user.max plus
+	// fan_users × fan_assignments.max, a sum no per-dimension cap bounds; cap
+	// it too. Compute in int64 so neither product can overflow int on a 32-bit
+	// platform. A scenario without fan users keeps the message that names the
+	// regular product alone.
+	regular := int64(s.Resources.Users) * int64(s.Distribution.AssignmentsPerUser.Max)
+	fan := int64(s.Distribution.FanUsers) * int64(s.Distribution.FanAssignments.Max)
+	if total := regular + fan; total > maxCount {
+		if fanUsers {
+			return fmt.Errorf("resources.users (%d) × distribution.assignments_per_user.max (%d) + distribution.fan_users (%d) × distribution.fan_assignments.max (%d) = %d exceeds the total assignment limit of %d",
+				s.Resources.Users, s.Distribution.AssignmentsPerUser.Max, s.Distribution.FanUsers, s.Distribution.FanAssignments.Max, total, maxCount)
+		}
 		return fmt.Errorf("resources.users (%d) × distribution.assignments_per_user.max (%d) = %d exceeds the total assignment limit of %d",
 			s.Resources.Users, s.Distribution.AssignmentsPerUser.Max, total, maxCount)
 	}
@@ -394,6 +424,12 @@ func (s *Scenario) Set(key, value string) error {
 		return setFloat(&s.Distribution.DomainScopedAssignmentRatio, key, value)
 	case "distribution.users_issuing_tokens_ratio":
 		return setFloat(&s.Distribution.UsersIssuingTokensRatio, key, value)
+	case "distribution.fan_users":
+		return setInt(&s.Distribution.FanUsers, key, value)
+	case "distribution.fan_assignments.min":
+		return setInt(&s.Distribution.FanAssignments.Min, key, value)
+	case "distribution.fan_assignments.max":
+		return setInt(&s.Distribution.FanAssignments.Max, key, value)
 	default:
 		return fmt.Errorf("unknown override key %q", key)
 	}
