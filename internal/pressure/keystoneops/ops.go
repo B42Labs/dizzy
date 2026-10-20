@@ -196,10 +196,11 @@ type fanGrant struct {
 // Set is the Keystone operation set of one pressure run: the client and the
 // services, the resolved pool pairs, churn grants and fan users, the token
 // pool, the fan users' tokens, their refresher and the propagation probe.
-// Build creates it, Prime fills the pools and starts the refresher and the
-// propagation probe, Operations hands the operations to pressure.Run, GrowFan
-// grows the fan users' grants between stages, ServiceStats reports what the
-// services answered, and Close stops the refresher and the probe.
+// Build creates it, GrantPool grants the pool users a role beyond the plan's,
+// Prime fills the pools and starts the refresher and the propagation probe,
+// Operations hands the operations to pressure.Run, GrowFan grows the fan
+// users' grants between stages, ServiceStats reports what the services
+// answered, and Close stops the refresher and the probe.
 type Set struct {
 	c   Keystone
 	svc Services // nil when the run sends nothing to the other services
@@ -499,6 +500,67 @@ func (r resolver) role(name string) (string, error) {
 		return "", fmt.Errorf("pressure set: no cloud id for role %q", name)
 	}
 	return id, nil
+}
+
+// GrantPool grants the existing role roleID, whose name is role, to the user
+// of every pool pair on the pair's project, for a role a pool token needs
+// beyond the plan's, such as the reader role a service's read policy asks
+// for. Neither a churn user nor a fan user gets it. Each grant runs through
+// keystoneexec.WithRetry bounded by o.OpTimeout, with at most concurrency
+// grants in flight (at least 1). After the first failure, or once ctx ended,
+// no further grant starts: GrantPool waits for the grants in flight and
+// returns the created resources, in completion order, those created before
+// the failure included, and the failure with the number granted.
+func (s *Set) GrantPool(ctx context.Context, role, roleID string, concurrency int) ([]resource.Resource, error) {
+	var (
+		mu      sync.Mutex // guards the two below
+		created = make([]resource.Resource, 0, s.poolPairs)
+		cause   error
+		wg      sync.WaitGroup
+	)
+	sem := make(chan struct{}, max(concurrency, 1))
+	for i := range s.poolPairs {
+		sem <- struct{}{}
+		mu.Lock()
+		if cause == nil && ctx.Err() != nil {
+			cause = ctx.Err()
+		}
+		stop := cause != nil
+		mu.Unlock()
+		if stop {
+			break
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			p := &s.pairs[i]
+			a := keystoneplan.Assignment{User: p.issue.User, Role: role, Project: p.issue.Project}
+			var res resource.Resource
+			err := keystoneexec.WithRetry(ctx, s.o.OpTimeout, func(ctx context.Context) error {
+				r, err := s.c.AssignRole(ctx, a, p.userID, p.projectID, p.domainID, roleID)
+				if err != nil {
+					return err
+				}
+				res = r
+				return nil
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if cause == nil {
+					cause = err
+				}
+				return
+			}
+			created = append(created, res)
+		}()
+	}
+	wg.Wait()
+	if cause != nil {
+		return created, fmt.Errorf("granting role %q to the pool users (%d of %d granted): %w", role, len(created), s.poolPairs, cause)
+	}
+	return created, nil
 }
 
 // Prime fills the pool with o.Tokens tokens, token k for pool pair k modulo

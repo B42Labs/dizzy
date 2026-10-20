@@ -205,6 +205,46 @@ func TestListDomainsByPrefixToleratesForbidden(t *testing.T) {
 	}
 }
 
+// TestFindRoleByName confirms the lookup prefers the global role over a
+// domain-scoped one of the same name, and that a name no role has fails
+// with the binder's message wrapping ErrRoleNotFound, while a failed listing
+// does not wrap it.
+func TestFindRoleByName(t *testing.T) {
+	var status atomic.Int32
+	status.Store(http.StatusOK)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/roles") {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(int(status.Load()))
+		if r.URL.Query().Get("name") == "reader" {
+			_, _ = io.WriteString(w, `{"roles":[
+				{"id":"r-domain","name":"reader","domain_id":"d1"},
+				{"id":"r-global","name":"reader","domain_id":""}
+			]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"roles":[]}`)
+	}))
+	defer ts.Close()
+	c, _ := testClient(ts)
+	ctx := context.Background()
+
+	if id, err := c.FindRoleByName(ctx, "reader"); err != nil || id != "r-global" {
+		t.Errorf("FindRoleByName(reader) = %q, %v; want the global role r-global", id, err)
+	}
+	_, err := c.FindRoleByName(ctx, "auditor")
+	const want = `role "auditor" not found; grant it to the manager or pass an existing role with --roles`
+	if err == nil || err.Error() != want || !errors.Is(err, ErrRoleNotFound) {
+		t.Errorf("FindRoleByName(auditor) error = %v, want %q wrapping ErrRoleNotFound", err, want)
+	}
+	status.Store(http.StatusServiceUnavailable)
+	if _, err := c.FindRoleByName(ctx, "reader"); err == nil || errors.Is(err, ErrRoleNotFound) || !IsRetryable(err) {
+		t.Errorf("FindRoleByName on a 503 = %v, want a retryable error that is not ErrRoleNotFound", err)
+	}
+}
+
 // TestAssignmentIDRoundTrip covers both scopes: the synthetic id built by
 // AssignRole parses back to the same fields, and a malformed id is rejected.
 func TestAssignmentIDRoundTrip(t *testing.T) {

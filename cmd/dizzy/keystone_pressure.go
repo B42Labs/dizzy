@@ -232,14 +232,22 @@ every user of that Keystone, not only for the run's own users.`,
 
 // pressureKeystone is what keystone pressure asks of Keystone once the caller
 // passed the privilege pre-check: the executor's provisioning seam, the
-// operations' seam and the teardown seam. The production *keystone.Client
-// satisfies it; a test fake stands in for it to drive a run end to end
-// without a cloud.
+// operations' seam, the teardown seam and the lookup of the cloud's reader
+// role. The production *keystone.Client satisfies it; a test fake stands in
+// for it to drive a run end to end without a cloud.
 type pressureKeystone interface {
 	keystoneexec.Keystone
 	keystoneops.Keystone
 	keystoneexec.Cleaner
+	FindRoleByName(ctx context.Context, name string) (string, error)
 }
+
+// pressureReaderRole is the role a run that sends live pool tokens to the
+// other services grants the pool users on their projects. The plan's roles
+// are the run's own and imply no other, while a service's read policy may
+// ask for reader on the token's project, as Glance's get_images does under
+// its default policy, and would refuse every probe with a 403 without it.
+const pressureReaderRole = "reader"
 
 // The production *keystone.Client must satisfy the seam.
 var _ pressureKeystone = (*keystone.Client)(nil)
@@ -290,9 +298,11 @@ type pressureRun struct {
 // runKeystonePressure is keystone pressure from its first write on, once
 // every pre-cloud check and the privilege pre-check passed. It provisions the
 // plan in the admin tier, builds the operation set over r.services, with the
-// propagation probe drawing from the plan's seed, primes the token pool and
-// logs the services the first pool token's catalog lists for a run that
-// sends to them, runs the workers from the plan's seed, with
+// propagation probe drawing from the plan's seed, grants the pool users the
+// reader role for a run that sends live pool tokens to the services
+// (grantPoolReader), the grants joining the created resources, primes the
+// token pool and logs the services the first pool token's catalog lists for
+// a run that sends to them, runs the workers from the plan's seed, with
 // keystoneops.Classify labeling their errors and a run-record checkpoint
 // every chaosCheckpointInterval, prints the metrics summary and the Pressure
 // table, writes the run record, and tears down through
@@ -351,21 +361,27 @@ func runKeystonePressure(ctx context.Context, cmd *cobra.Command, c pressureKeys
 	// out.
 	defer set.Close()
 
+	grants, err := grantPoolReader(ctx, c, set, o, r.concurrency)
+	provisioned := slices.Concat(prov.Created, grants)
+	if err != nil {
+		return setupFailed(provisioned, "granting reader role", err)
+	}
+
 	slog.Info("priming token pool", "tokens", o.Tokens, "concurrency", r.concurrency)
 	if err := set.Prime(ctx, r.concurrency); err != nil {
 		set.Close()
-		return setupFailed(prov.Created, "starting pressure run", err)
+		return setupFailed(provisioned, "starting pressure run", err)
 	}
 	if services := set.Services(); len(services) > 0 {
 		slog.Info("probe services", "services", services)
 	}
 
 	// created lists every resource the run has created: the provisioned ones
-	// and, from here on, the grants of the stage entries. A stage entry
-	// appends to it while a checkpoint may read it, so createdMu guards it,
-	// and createdSoFar returns a copy.
+	// with the reader grants and, from here on, the grants of the stage
+	// entries. A stage entry appends to it while a checkpoint may read it, so
+	// createdMu guards it, and createdSoFar returns a copy.
 	var createdMu sync.Mutex
-	created := prov.Created
+	created := provisioned
 	createdSoFar := func() []resource.Resource {
 		createdMu.Lock()
 		defer createdMu.Unlock()
@@ -469,6 +485,45 @@ func runKeystonePressure(ctx context.Context, cmd *cobra.Command, c pressureKeys
 	}
 
 	return finishKeystoneTeardown(ctx, "pressure", cmd, c, r.runID, recordPath, rec.Created, interrupted, r.noCleanup, r.opTimeout)
+}
+
+// grantPoolReader grants pressureReaderRole to every pool pair of set, before
+// the pool is primed, when the run sends live pool tokens to the other
+// services: a positive probe weight or the propagation probe. bad_token
+// needs no role, since a service refuses its tokens before any policy check.
+// It returns the grants, those made before a failure included, and the
+// failure. The role is looked up by name outside the run's metrics, through
+// keystoneexec.WithRetry bounded by o.OpTimeout as every setup call is, so a
+// transient failure on a busy Keystone does not cost the run its grants;
+// when the lookup still fails, as on a cloud without a reader role, the run
+// goes on without the grants and logs a warning, since the probes still
+// reach every service whose read policy does not ask for the role.
+func grantPoolReader(ctx context.Context, c pressureKeystone, set *keystoneops.Set, o keystoneops.Options, concurrency int) ([]resource.Resource, error) {
+	if o.Weights[keystoneops.OpProbe] <= 0 && o.Propagation.Every <= 0 {
+		return nil, nil
+	}
+	var roleID string
+	err := keystoneexec.WithRetry(ctx, o.OpTimeout, func(ctx context.Context) error {
+		id, err := c.FindRoleByName(ctx, pressureReaderRole)
+		roleID = id
+		return err
+	})
+	if err != nil {
+		if ctx.Err() == nil {
+			// The lookup's not-found error goes on to point at --roles, the
+			// domain-manager binder's flag, which keystone pressure ignores.
+			if errors.Is(err, keystone.ErrRoleNotFound) {
+				err = fmt.Errorf("role %q %w", pressureReaderRole, keystone.ErrRoleNotFound)
+			}
+			slog.Warn("pool users get no reader role; a service whose read policy asks for it refuses the probes with 403", "error", err)
+		}
+		return nil, nil
+	}
+	grants, err := set.GrantPool(ctx, pressureReaderRole, roleID, concurrency)
+	if err == nil {
+		slog.Info("granted reader role to the pool users", "grants", len(grants))
+	}
+	return grants, err
 }
 
 // parseMixFlag parses the --mix values, each "<operation>=<weight>", into
