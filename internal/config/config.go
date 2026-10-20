@@ -88,8 +88,33 @@ func NewBlockStorageClient(ctx context.Context, cloudName string) (*gophercloud.
 // NewIdentityClient authenticates against the cloud described in clouds.yaml and
 // returns an IdentityV3 (Keystone) service client. When cloudName is empty the
 // cloud is selected from the OS_CLOUD environment variable, following the
-// standard clouds.yaml search paths.
+// standard clouds.yaml search paths. It is NewIdentityStack without the
+// endpoint options, for the callers that only talk to Keystone.
 func NewIdentityClient(ctx context.Context, cloudName string) (*gophercloud.ServiceClient, error) {
+	stack, err := NewIdentityStack(ctx, cloudName)
+	if err != nil {
+		return nil, err
+	}
+
+	return stack.Identity, nil
+}
+
+// IdentityStack is the identity client of a clouds.yaml entry together with
+// the endpoint options the entry selects endpoints with: its region and
+// interface. A caller that resolves endpoints from a token's catalog applies
+// the same options.
+type IdentityStack struct {
+	Identity     *gophercloud.ServiceClient
+	EndpointOpts gophercloud.EndpointOpts
+}
+
+// NewIdentityStack authenticates against the cloud described in clouds.yaml and
+// returns its IdentityV3 (Keystone) service client with the entry's endpoint
+// options, as clouds.yaml gave them: no service type is set, so a caller sets
+// the type of each service it resolves. When cloudName is empty the cloud is
+// selected from the OS_CLOUD environment variable, following the standard
+// clouds.yaml search paths.
+func NewIdentityStack(ctx context.Context, cloudName string) (*IdentityStack, error) {
 	provider, endpointOptions, err := newProvider(ctx, cloudName)
 	if err != nil {
 		return nil, err
@@ -100,7 +125,7 @@ func NewIdentityClient(ctx context.Context, cloudName string) (*gophercloud.Serv
 		return nil, fmt.Errorf("creating identity v3 client: %w", err)
 	}
 
-	return client, nil
+	return &IdentityStack{Identity: client, EndpointOpts: endpointOptions}, nil
 }
 
 // NewImageClient authenticates against the cloud described in clouds.yaml and

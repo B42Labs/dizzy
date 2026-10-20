@@ -6,15 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -911,6 +914,9 @@ func TestIssueScopedTokenReturnsToken(t *testing.T) {
 	if want := time.Date(2030, 1, 1, 12, 30, 0, 0, time.UTC); !got.ExpiresAt.Equal(want) {
 		t.Errorf("ExpiresAt = %v, want %v", got.ExpiresAt, want)
 	}
+	if got.Endpoints != nil {
+		t.Errorf("Endpoints = %v, want nil for a client without SetEndpointOpts", got.Endpoints)
+	}
 
 	agg := m.Aggregate(time.Second)
 	if st := statsOf(agg, string(KindToken)); st.Attempted != 1 || st.Succeeded != 1 {
@@ -931,6 +937,284 @@ func TestIssueScopedTokenReturnsToken(t *testing.T) {
 	}
 	if tok := c.gc.Token(); tok != adminToken {
 		t.Errorf("admin token after the issue = %q, want %q unchanged", tok, adminToken)
+	}
+}
+
+// catalogEntry renders one service catalog entry of type typ with an internal
+// and a public endpoint in region, the internal one first so a lookup that
+// ignores the interface picks the wrong one, and the public one at publicURL.
+func catalogEntry(typ, region, publicURL string) string {
+	return fmt.Sprintf(`{"type":%q,"endpoints":[`+
+		`{"interface":"internal","region":%q,"region_id":%q,"url":"http://%s.internal:8080"},`+
+		`{"interface":"public","region":%q,"region_id":%q,"url":%q}]}`,
+		typ, region, region, typ, region, region, publicURL)
+}
+
+// catalogToken is a token-create response body whose token lists the catalog
+// entries given, or carries no catalog key at all when none is given.
+func catalogToken(entries ...string) string {
+	if len(entries) == 0 {
+		return `{"token":{"expires_at":"2030-01-01T00:00:00Z"}}`
+	}
+	return `{"token":{"expires_at":"2030-01-01T00:00:00Z","catalog":[` + strings.Join(entries, ",") + `]}}`
+}
+
+// servicesCatalog is a catalog listing identity, compute, network, volumev3
+// (the alias Cinder's own catalog entry carries) and image, with Cinder's
+// endpoints in cinderRegion and all others in RegionOne. The public URLs carry
+// no trailing "/" and Cinder's names the token's project, as a real catalog
+// does.
+func servicesCatalog(cinderRegion string) string {
+	return catalogToken(
+		catalogEntry("identity", "RegionOne", "https://keystone.example/v3"),
+		catalogEntry("compute", "RegionOne", "https://nova.example/v2.1"),
+		catalogEntry("network", "RegionOne", "https://neutron.example:9696"),
+		catalogEntry("volumev3", cinderRegion, "https://cinder.example/v3/pid1"),
+		catalogEntry("image", "RegionOne", "https://glance.example"),
+	)
+}
+
+// tokenServer is a Keystone that answers every token create with tok-123 and
+// body, and counts the requests it receives.
+func tokenServer(t *testing.T, body string) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var requests atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/auth/tokens") {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("X-Subject-Token", "tok-123")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(ts.Close)
+	return ts, &requests
+}
+
+// regionOnePublic selects the public endpoints of RegionOne, as a clouds.yaml
+// entry naming that region and interface does.
+var regionOnePublic = gophercloud.EndpointOpts{Region: "RegionOne", Availability: gophercloud.AvailabilityPublic}
+
+// issueAsUser0001 issues the token of user-0001 on pid1 through c.
+func issueAsUser0001(c *Client) (IssuedToken, error) {
+	return c.IssueScopedToken(context.Background(), keystoneplan.TokenIssue{User: "user-0001", Project: "proj-0001"}, "did1", "s3cret", "pid1")
+}
+
+// TestIssueScopedTokenResolvesEndpoints confirms a client with endpoint options
+// maps the four services to the public RegionOne URLs of the token's own
+// catalog, Cinder found under its volumev3 alias and its URL keeping the
+// token's project, every URL normalized with a trailing "/", and that reading
+// the catalog costs no request beyond the token create.
+func TestIssueScopedTokenResolvesEndpoints(t *testing.T) {
+	ts, requests := tokenServer(t, servicesCatalog("RegionOne"))
+	c, m := testClient(ts)
+	c.SetEndpointOpts(regionOnePublic)
+
+	got, err := issueAsUser0001(c)
+	if err != nil {
+		t.Fatalf("IssueScopedToken: %v", err)
+	}
+	want := map[string]string{
+		"nova":    "https://nova.example/v2.1/",
+		"neutron": "https://neutron.example:9696/",
+		"cinder":  "https://cinder.example/v3/pid1/",
+		"glance":  "https://glance.example/",
+	}
+	if !maps.Equal(got.Endpoints, want) {
+		t.Errorf("Endpoints = %v, want %v", got.Endpoints, want)
+	}
+	if got.ID != "tok-123" {
+		t.Errorf("token id = %q, want tok-123", got.ID)
+	}
+	if n := requests.Load(); n != 1 {
+		t.Errorf("requests = %d, want 1", n)
+	}
+	if st := statsOf(m.Aggregate(time.Second), string(KindToken)); st.Attempted != 1 || st.Succeeded != 1 {
+		t.Errorf("token samples = %+v, want 1 attempted and 1 succeeded", st)
+	}
+}
+
+// TestIssueScopedTokenWithoutEndpointOpts confirms a client without
+// SetEndpointOpts leaves Endpoints nil although the response carries a
+// catalog, so apply, chaos, monitor and the churn graph issue as before.
+func TestIssueScopedTokenWithoutEndpointOpts(t *testing.T) {
+	ts, _ := tokenServer(t, servicesCatalog("RegionOne"))
+	c, _ := testClient(ts)
+
+	got, err := issueAsUser0001(c)
+	if err != nil {
+		t.Fatalf("IssueScopedToken: %v", err)
+	}
+	if got.Endpoints != nil {
+		t.Errorf("Endpoints = %v, want nil", got.Endpoints)
+	}
+}
+
+// TestIssueScopedTokenCinderSkipsVolumeV2 confirms Cinder resolves to the
+// first catalog entry of type block-storage, volumev3, volume or block-store
+// and never to a volumev2 entry, whose type names an API Cinder no longer
+// serves, also when the catalog lists it first; a catalog whose only Cinder
+// entry is volumev2 lists no cinder. Each issue stays one request.
+func TestIssueScopedTokenCinderSkipsVolumeV2(t *testing.T) {
+	const v2, v3 = "https://cinder.example/v2/pid1", "https://cinder.example/v3/pid1"
+	cases := []struct {
+		name    string
+		entries []string
+		want    string // the cinder endpoint, empty for none
+	}{
+		{"volumev2 before volumev3", []string{catalogEntry("volumev2", "RegionOne", v2), catalogEntry("volumev3", "RegionOne", v3)}, v3 + "/"},
+		{"volumev2 before block-storage", []string{catalogEntry("volumev2", "RegionOne", v2), catalogEntry("block-storage", "RegionOne", v3)}, v3 + "/"},
+		{"volumev2 before volume", []string{catalogEntry("volumev2", "RegionOne", v2), catalogEntry("volume", "RegionOne", v3)}, v3 + "/"},
+		{"volumev2 before block-store", []string{catalogEntry("volumev2", "RegionOne", v2), catalogEntry("block-store", "RegionOne", v3)}, v3 + "/"},
+		{"volumev2 only", []string{catalogEntry("volumev2", "RegionOne", v2)}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := append([]string{catalogEntry("compute", "RegionOne", "https://nova.example/v2.1")}, tc.entries...)
+			ts, requests := tokenServer(t, catalogToken(entries...))
+			c, _ := testClient(ts)
+			c.SetEndpointOpts(regionOnePublic)
+
+			got, err := issueAsUser0001(c)
+			if err != nil {
+				t.Fatalf("IssueScopedToken: %v", err)
+			}
+			url, ok := got.Endpoints["cinder"]
+			if tc.want == "" && ok {
+				t.Errorf("Endpoints[cinder] = %q, want no cinder", url)
+			}
+			if tc.want != "" && url != tc.want {
+				t.Errorf("Endpoints[cinder] = %q, want %q", url, tc.want)
+			}
+			if got.Endpoints["nova"] != "https://nova.example/v2.1/" {
+				t.Errorf("Endpoints[nova] = %q, want the compute entry's URL", got.Endpoints["nova"])
+			}
+			if n := requests.Load(); n != 1 {
+				t.Errorf("requests = %d, want 1", n)
+			}
+		})
+	}
+}
+
+// TestIssueScopedTokenEndpointRegion confirms the region of the endpoint
+// options selects the endpoints: a service listed only in another region is
+// left out rather than failing the issue.
+func TestIssueScopedTokenEndpointRegion(t *testing.T) {
+	ts, _ := tokenServer(t, servicesCatalog("RegionTwo"))
+	c, _ := testClient(ts)
+	c.SetEndpointOpts(regionOnePublic)
+
+	got, err := issueAsUser0001(c)
+	if err != nil {
+		t.Fatalf("IssueScopedToken: %v", err)
+	}
+	if len(got.Endpoints) != 3 {
+		t.Errorf("Endpoints = %v, want three services", got.Endpoints)
+	}
+	if url, ok := got.Endpoints["cinder"]; ok {
+		t.Errorf("Endpoints[cinder] = %q, want no cinder outside RegionOne", url)
+	}
+}
+
+// TestIssueScopedTokenCatalogWithoutServices confirms a token whose catalog
+// lists none of the four services, or that carries no catalog at all, issues
+// successfully with an empty, non-nil Endpoints map.
+func TestIssueScopedTokenCatalogWithoutServices(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"no catalog", catalogToken()},
+		{"identity only", catalogToken(catalogEntry("identity", "RegionOne", "https://keystone.example/v3"))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, _ := tokenServer(t, tc.body)
+			c, m := testClient(ts)
+			c.SetEndpointOpts(regionOnePublic)
+
+			got, err := issueAsUser0001(c)
+			if err != nil {
+				t.Fatalf("IssueScopedToken: %v", err)
+			}
+			if got.Endpoints == nil || len(got.Endpoints) != 0 {
+				t.Errorf("Endpoints = %#v, want an empty, non-nil map", got.Endpoints)
+			}
+			if st := statsOf(m.Aggregate(time.Second), string(KindToken)); st.Succeeded != 1 {
+				t.Errorf("token samples = %+v, want 1 succeeded", st)
+			}
+		})
+	}
+}
+
+// TestIssueScopedTokenEndpointResolutionFails confirms a resolution error
+// other than a missing endpoint, here an interface gophercloud does not know,
+// fails the issue with the service named and counts the token/create sample
+// as failed, since the resolution runs inside it.
+func TestIssueScopedTokenEndpointResolutionFails(t *testing.T) {
+	ts, _ := tokenServer(t, servicesCatalog("RegionOne"))
+	c, m := testClient(ts)
+	c.SetEndpointOpts(gophercloud.EndpointOpts{Region: "RegionOne", Availability: "bogus"})
+
+	got, err := issueAsUser0001(c)
+	const wantPrefix = `issuing token for user "user-0001" on project pid1: resolving the nova endpoint from the token's catalog: `
+	if err == nil || !strings.HasPrefix(err.Error(), wantPrefix) {
+		t.Fatalf("IssueScopedToken error = %v, want it to start with %q", err, wantPrefix)
+	}
+	if !errors.As(err, new(*openstack.ErrInvalidAvailabilityProvided)) {
+		t.Errorf("IssueScopedToken error = %v, want it to wrap the invalid availability", err)
+	}
+	if got.ID != "" || got.Endpoints != nil {
+		t.Errorf("IssueScopedToken = %+v, want the zero token on error", got)
+	}
+	if st := statsOf(m.Aggregate(time.Second), string(KindToken)); st.Attempted != 1 || st.Succeeded != 0 {
+		t.Errorf("token samples = %+v, want 1 attempted and 0 succeeded", st)
+	}
+}
+
+// TestErrorKind confirms the exported label is the client's own: empty for
+// nil, the status for a response error, and the same for a redacted one.
+func TestErrorKind(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"nil", nil, ""},
+		{"404", respErr(404, ""), "http_404"},
+		{"401", respErr(401, ""), "http_401"},
+		{"unlisted status", respErr(418, ""), "http_other"},
+		{"timeout", context.DeadlineExceeded, "timeout"},
+		{"redacted 503", RedactToken(respErr(503, "tok"), "tok"), "http_503"},
+		{"transport", errors.New("connection refused"), "other"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ErrorKind(tc.err); got != tc.want {
+				t.Errorf("ErrorKind(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRedactTokenExported confirms the exported redaction replaces the token
+// in the error text and keeps the response status reachable through
+// gophercloud.ResponseCodeIs, which the probe adapter's callers classify by.
+func TestRedactTokenExported(t *testing.T) {
+	err := RedactToken(respErr(401, `{"error":{"message":"tok is not valid"}}`), "tok")
+	// The placeholder itself contains "tok", so every occurrence left must be
+	// one of a placeholder.
+	text := err.Error()
+	if !strings.Contains(text, "<token>") || strings.Count(text, "tok") != strings.Count(text, "<token>") {
+		t.Errorf("redacted error %q carries the token", text)
+	}
+	if !gophercloud.ResponseCodeIs(err, 401) {
+		t.Errorf("ResponseCodeIs(%v, 401) = false, want the status reachable", err)
+	}
+	if RedactToken(nil, "tok") != nil {
+		t.Error("RedactToken(nil) is not nil")
 	}
 }
 

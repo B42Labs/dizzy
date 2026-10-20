@@ -151,6 +151,80 @@ func TestNewIdentityClient_Errors(t *testing.T) {
 	}
 }
 
+// TestNewIdentityStack_Errors runs the cases of TestNewIdentityClient_Errors
+// against NewIdentityStack: both failure paths surface the wrapped parse error
+// and no stack, and NewIdentityClient, which delegates to it, returns the same
+// error for the same input.
+func TestNewIdentityStack_Errors(t *testing.T) {
+	tests := []struct {
+		name       string
+		cloudName  string
+		osCloud    string
+		configFile string
+	}{
+		{
+			name:      "empty cloud name and no OS_CLOUD",
+			cloudName: "",
+			osCloud:   "",
+		},
+		{
+			name:       "clouds.yaml file not found",
+			cloudName:  "does-not-exist",
+			configFile: "/nonexistent/path/clouds.yaml",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OS_CLOUD", tc.osCloud)
+			t.Setenv("OS_CLIENT_CONFIG_FILE", tc.configFile)
+
+			stack, err := NewIdentityStack(t.Context(), tc.cloudName)
+			if err == nil {
+				t.Fatalf("expected an error, got nil (stack=%v)", stack)
+			}
+			if stack != nil {
+				t.Errorf("expected nil stack on error, got %v", stack)
+			}
+			if !strings.HasPrefix(err.Error(), "parsing clouds.yaml:") {
+				t.Errorf("error %q does not start with %q", err.Error(), "parsing clouds.yaml:")
+			}
+
+			_, clientErr := NewIdentityClient(t.Context(), tc.cloudName)
+			if clientErr == nil || clientErr.Error() != err.Error() {
+				t.Errorf("NewIdentityClient error = %v, want the NewIdentityStack error %q", clientErr, err)
+			}
+		})
+	}
+}
+
+// TestNewIdentityStackKeepsEndpointOpts asserts the stack carries the region
+// and interface of the clouds.yaml entry, with no service type set, next to an
+// identity client that re-authenticates like every other constructor's.
+func TestNewIdentityStackKeepsEndpointOpts(t *testing.T) {
+	fc := newFakeCloud(t)
+	// The environment overrides the entry's region and interface, so neither
+	// may leak in from the shell running the test.
+	t.Setenv("OS_REGION_NAME", "")
+	t.Setenv("OS_INTERFACE", "")
+	writeCloudsWith(t, "region_name: RegionOne\ninterface: public\n", credentialAuth(fc.authURL()))
+
+	stack, err := NewIdentityStack(t.Context(), "fake")
+	if err != nil {
+		t.Fatalf("NewIdentityStack: %v", err)
+	}
+	want := gophercloud.EndpointOpts{Region: "RegionOne", Availability: gophercloud.AvailabilityPublic}
+	if eo := stack.EndpointOpts; eo.Region != want.Region || eo.Availability != want.Availability || eo.Type != "" || len(eo.Aliases) != 0 {
+		t.Errorf("EndpointOpts = %+v, want %+v", eo, want)
+	}
+	if want := fc.srv.URL + "/identity/v3/"; stack.Identity.Endpoint != want {
+		t.Errorf("identity endpoint = %q, want %q", stack.Identity.Endpoint, want)
+	}
+	if stack.Identity.ReauthFunc == nil {
+		t.Error("NewIdentityStack built a provider client that never re-authenticates")
+	}
+}
+
 // unauthorizedBody is the body Keystone and the services answer a 401 with.
 const unauthorizedBody = `{"error":{"code":401,"title":"Unauthorized","message":"The request you have made requires authentication."}}`
 
@@ -158,8 +232,20 @@ const unauthorizedBody = `{"error":{"code":401,"title":"Unauthorized","message":
 // carries the auth block entry, given as unindented "key: value" lines.
 func writeClouds(t *testing.T, entry string) {
 	t.Helper()
+	writeCloudsWith(t, "", entry)
+}
+
+// writeCloudsWith is writeClouds with the cloud-level settings of fake, such
+// as region_name, written above its auth block, given as unindented
+// "key: value" lines too.
+func writeCloudsWith(t *testing.T, settings, entry string) {
+	t.Helper()
 	var b strings.Builder
-	b.WriteString("clouds:\n  fake:\n    auth:\n")
+	b.WriteString("clouds:\n  fake:\n")
+	for line := range strings.Lines(settings) {
+		b.WriteString("    " + strings.TrimSuffix(line, "\n") + "\n")
+	}
+	b.WriteString("    auth:\n")
 	for line := range strings.Lines(entry) {
 		b.WriteString("      " + strings.TrimSuffix(line, "\n") + "\n")
 	}
