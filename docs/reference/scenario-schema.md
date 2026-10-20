@@ -760,8 +760,14 @@ closed-loop load the workers put on the scenario's identity resources. The
 `keystone pressure` flags override its values; an omitted key falls back to
 the command's default.
 
+The example below sets every key. Its second stage grows the fan users'
+grants, so the block validates only in a scenario with fan users. It fits the
+scenario of [A fan for C5C3/cobaltcore#1459](#a-fan-for-c5c3cobaltcore1459)
+in place of that scenario's own block, and takes its duration, workers and
+tokens from `scenarios/keystone/small.yaml`.
+
 ```yaml
-pressure:            # duration, workers and tokens of scenarios/keystone/small.yaml
+pressure:            # in place of the block of the fan-1459 scenario above
   duration: 5m       # runtime of the workers; the only hard stop besides Ctrl-C
   workers: 8         # closed-loop workers
   tokens: 20         # token pool, issued before the first worker starts
@@ -772,8 +778,11 @@ pressure:            # duration, workers and tokens of scenarios/keystone/small.
     revoke:       2
     grant_churn:  2
     issue:        1
-    probe:        0  # parsed; a positive weight is rejected by this build
-    bad_token:    0  # parsed; a positive weight is rejected by this build
+    probe:        0  # off by default; sends a pool token to Nova, Neutron, Cinder or Glance
+    bad_token:    0  # off by default; floods a service with tokens it has to reject
+  propagation:       # optional; omitted or every: 0 runs no propagation probe
+    every: 30s       # revoke one pool token at this interval and poll a service with it
+    timeout: 10m     # ceiling of one probe; a token still accepted after it is a timeout
   stages:            # optional; consecutive windows of a bounded run
     - duration: 1m          # omitted or 0: an equal share of what the others leave
     - fan_assignments: 500  # grants every fan user holds from this stage on; needs fan users
@@ -790,9 +799,10 @@ pressure:            # duration, workers and tokens of scenarios/keystone/small.
 | `mix.revoke` | int | Weight of `revoke`. Omitted falls back to `2` |
 | `mix.grant_churn` | int | Weight of `grant_churn`. Omitted falls back to `2` |
 | `mix.issue` | int | Weight of `issue`. Omitted falls back to `1` |
-| `mix.probe` | int | Parsed and rejected when positive, until later work delivers the operation. Omitted falls back to `0` |
-| `mix.bad_token` | int | Parsed and rejected when positive, until later work delivers the operation. Omitted falls back to `0` |
-| `propagation.every` | duration | Parsed and rejected when positive, until later work delivers the propagation probe. It has no flag |
+| `mix.probe` | int | Weight of `probe`: a draw sends a pool token to one of Nova, Neutron, Cinder and Glance, drawn at random among those the token's catalog lists, for the cheapest read the service offers. Omitted falls back to `0`, so a run sends no probe unless this key or `--mix probe=<n>` sets a weight |
+| `mix.bad_token` | int | Weight of `bad_token`: a draw picks a service as `probe` does and sends it a token it has to reject, a random one or a pool token the run revoked at least 5 minutes earlier, and expects a 401. It loads the services' rejection path and belongs on a lab, never on a shared cloud. Omitted falls back to `0`; `--mix bad_token=<n>` sets it from the command line |
+| `propagation.every` | duration | Interval of the propagation probe: at every interval it revokes one pool token, puts a new token for the same user and project into the pool as `revoke` does, and polls a service with the revoked token once a second until the service answers 401 or `propagation.timeout` has passed. `0` or omitted switches the probe off. `--propagation-every` overrides it, and `--propagation-every 0` switches the probe off over a block's value |
+| `propagation.timeout` | duration | Ceiling of one propagation probe: a probe whose service still accepts the revoked token after it counts as a timeout. Must not be negative. `0` or omitted falls back to `10m`. `--propagation-timeout` overrides it |
 | `bucket_width` | duration | Width of one time bucket of a run with `--duration 0`, at least `1m`. `0` or omitted falls back to `1h`. A bounded run keeps ten equal buckets of a tenth of its duration, but a value under `1m` still fails |
 | `stages[].fan_assignments` | int | The grants every fan user holds once the run has entered the stage, at least `1`. Omitted means the stage grants nothing. See [Stages](#stages) |
 | `stages[].duration` | duration | The stage's share of the run. `0` or omitted means an equal share of what the stages with a duration leave. See [Stages](#stages) |
@@ -800,16 +810,16 @@ pressure:            # duration, workers and tokens of scenarios/keystone/small.
 A worker draws an operation with probability its weight divided by the sum of
 the weights. A mix whose merged weights are all `0` fails with
 `pressure mix: every weight is 0; at least one operation needs a positive weight`.
-A positive `probe` or `bad_token` weight fails before any API call with
-`pressure mix weight "probe" is not supported by this build; supported operations: validate, effective, revoke, grant_churn, issue`,
-naming the weight, and a positive `propagation.every` with
-`pressure.propagation is not supported by this build`. The same block with
-`probe: 0`, `bad_token: 0` and no `propagation` runs.
+
+The `keystone pressure` flags override every key but `stages`, which has no
+flag: `--mix` sets one weight of `mix`, and `--propagation-every` and
+`--propagation-timeout` set the two keys of `propagation`.
 
 A negative value fails validation with a message that names its key, e.g.
 `pressure.workers must not be negative, got -1`,
-`pressure.mix.revoke must not be negative, got -1` or
-`pressure.propagation.every must not be negative, got -1s`. An unknown key
+`pressure.mix.revoke must not be negative, got -1`,
+`pressure.propagation.every must not be negative, got -1s` or
+`pressure.propagation.timeout must not be negative, got -1s`. An unknown key
 in the block fails parsing, as everywhere in a scenario.
 
 All three Keystone profiles carry a `pressure:` block with `duration`,
@@ -818,8 +828,7 @@ runs any of them with no flags. None sets `churn_users`, `mix`, `propagation`,
 `bucket_width` or `stages`, and none sets `distribution.fan_users`; the
 scenario of [A fan for C5C3/cobaltcore#1459](#a-fan-for-c5c3cobaltcore1459)
 is the starting point for a run with fan users and stages. The block has no
-`--set` keys; the `keystone pressure` flags override every key but
-`propagation.every` and `stages`, which have none. See
+`--set` keys. See
 [`pressure`](cli.md#pressure) for what each operation sends and
 [Pressure mode](../explanation/pressure-mode.md) for why the load is built
 this way.

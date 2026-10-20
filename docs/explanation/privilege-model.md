@@ -16,8 +16,19 @@ slot that the quota pre-check occupies for Neutron and Cinder — and it
 
 `pressure` accepts the admin tier only. Validating and revoking other users'
 tokens and listing their role assignments are admin operations in Keystone's
-default policy, and a tier that cannot run three of its five operations would
-measure something else. It classifies the caller only with `--privilege auto`;
+default policy, and a tier that cannot run three of its seven operations would
+measure something else. For `probe` and the propagation probe, the admin tier
+also grants the cloud's `reader` role to the pool users on their projects
+before it primes the pool. The plan's roles are the run's own and imply no
+other, while Cinder's `GET /v3/<project_id>/limits` and Glance's
+`GET /v2/images` ask for `reader` on the token's project under their default
+policies. The requests to the services themselves need no admin right:
+`probe` and the polls of the propagation probe go out to Nova, Neutron, Cinder
+and Glance with the pool users' own tokens, each a read that `reader` on the
+token's project allows, and `bad_token` sends tokens the service has to
+refuse, for which a pool user needs no role. The propagation probe's
+revocations, like those of `revoke`, go to Keystone with the admin token.
+`pressure` classifies the caller only with `--privilege auto`;
 `--privilege admin` asserts the tier without the classification call. A
 caller classified as a domain manager fails before any write, and
 `--privilege domain-manager` fails before any API call:

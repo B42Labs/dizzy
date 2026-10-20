@@ -36,10 +36,11 @@ the topology should be gone.
 
 A `keystone pressure` record renders the metrics as above, by resource kind,
 then a `Pressure` section with the workers' draws by operation: one sample per
-draw, whatever calls it made. Its percentiles, per operation, per stage and
-per bucket, are estimates within 1%, unlike a churn run's exact bucket
-percentiles. The token path moves in sub-millisecond steps, so the table
-rounds its latencies to the microsecond.
+draw, whatever calls it made. Its percentiles, per operation, per service,
+per stage and per bucket, and those of the propagation delay, are estimates
+within 1%, unlike a churn run's exact bucket percentiles. The token path
+moves in sub-millisecond steps, so the table rounds its latencies to the
+microsecond.
 
 - **table**: a `Pressure` block with the lines `workers:`, `token pool:`,
   `churn users:` (only when the run reserved any), `mix:` and
@@ -58,20 +59,48 @@ rounds its latencies to the microsecond.
   operation drawn in the stage, and every row carries the stage's number, its
   `fan_assignments` or `-` for none, and its start and end rounded to the
   millisecond. A stage's throughput divides by the time from its start to its
-  end.
+  end. After the `Operations` table, a run whose `probe` draws sent requests
+  has a `Probes` table, a run whose `bad_token` draws sent requests a
+  `Bad tokens` table, and a run with the propagation probe a `Propagation`
+  block, in that order and before a staged run's `Stages` table. The two
+  tables have one row per service the draws went to, sorted by name, and the
+  columns `SERVICE`, `OPS`, `OK`, `FAILED`, `OPS/S`, `MIN`, `MEAN`, `P50`,
+  `P90`, `P95`, `P99` and `MAX`; their `OPS/S` divides by the same wall as
+  the `Operations` table. The `Propagation` block has the lines `every:`,
+  `timeout:`, `probes:`, `timed out:` and `delay:`, the last with the
+  delay's percentiles and maximum, e.g.
+  `p50 2.1s / p95 4.8s / p99 6.2s / max 6.2s`, or `-` when no probe
+  completed, with every duration rounded to the millisecond.
 - **json**: `{"metrics": …, "pressure": …}`, with `"incomplete": true` added
   on a checkpoint. A staged run's stages are `pressure.stages`; see
-  [Run record](run-record.md#stages).
-- **csv**: the same header, with one row per operation labelled
-  `pressure/<operation>`, then, per stage, one row per operation labelled
+  [Run record](run-record.md#stages). The draws per service are
+  `pressure.probes` and `pressure.badTokens`, and the propagation probe is
+  `pressure.propagation`; see [Run record](run-record.md#probes).
+- **csv**: the same header, with the pressure rows appended after the
+  per-kind rows: one row per operation labelled `pressure/<operation>`, then
+  one row per service of the `Probes` table labelled
+  `pressure/probe/<service>`, e.g. `pressure/probe/nova`, one per service of
+  the `Bad tokens` table labelled `pressure/bad_token/<service>` and, for a
+  run with the propagation probe, one row labelled `pressure/propagation`,
+  then, per stage, one row per operation labelled
   `pressure/stage-<index>/<operation>`, e.g. `pressure/stage-2/effective`,
   and then, per bucket, one row per operation labelled
-  `pressure@<start>/<operation>`, e.g. `pressure@1m0s/validate`, appended
-  after the per-kind rows. The cumulative revocations and a stage's
-  `fan_assignments` and window have no column; the other formats carry them.
+  `pressure@<start>/<operation>`, e.g. `pressure@1m0s/validate`. The
+  attempted, succeeded and failed of the `pressure/propagation` row are the
+  completed probes, those that saw the 401 and those that timed out, and its
+  latencies are the delays. The cumulative revocations, a stage's
+  `fan_assignments` and window, and the propagation probe's interval and
+  ceiling have no column; the other formats carry them.
 - **html**: after the overall sections, a `Pressure` section with the
-  settings and the revocations and the per-operation table; for a run with
-  stages, a `Pressure stages` section with a sortable table with the columns
+  settings and the revocations and the per-operation table; a
+  `Probes by service` section for a run whose `probe` draws sent requests and
+  a `Bad tokens by service` section for one whose `bad_token` draws did, each
+  with a sortable table with one row per service and the columns of the
+  per-operation table, `service` in place of `operation`; for a run with the
+  propagation probe, a `Propagation` section with the chips `every`,
+  `timeout`, `probes`, `timed out`, `p50`, `p95`, `p99` and `max`, the four
+  latencies `-` when no probe completed; for a run with stages, a
+  `Pressure stages` section with a sortable table with the columns
   `stage`, `fan`, `start`, `end`, `operation`, `ops`, `ok`, `failed`,
   `ops/s`, `p50`, `p95` and `p99`, rows as in the text table; then per
   operation a `Pressure: <operation>` section with its throughput and latency
@@ -108,40 +137,70 @@ the percentiles of separate engines cannot be merged.
 in three formats; see [Comparing two runs](cli.md#comparing-two-runs) for
 which record is the base and when the command refuses two records. Each
 metric of an operation is a row: `p50`, `p95`, `p99` and `ops/s`, for `all`
-and then for every operation either record drew, sorted by name.
+and then for every operation either record drew, sorted by name. The `probe`
+and `bad_token` draws compare the same way per service, for every service
+either record has, sorted by name and with no `all` row, and the propagation
+probes compare by their delays and counts. Two records come from different
+loads when their propagation probes differ in interval or ceiling, or when
+only one of them ran the probe; the difference reads e.g.
+`propagation every=30s,timeout=10m0s vs off`, `off` standing for a run
+without the probe, and sits after a `mix` difference and before a `stages`
+one.
 
 - **table**: a `Comparison` block with a `base:` and an `other:` line, each
   naming the run id, with ` (incomplete)` after it for a checkpoint, and the
-  scenario, seed, workers, tokens and mix, and, when `--allow-mismatch` let
+  scenario, seed, workers, tokens and mix, followed for a run with the
+  propagation probe by its interval and ceiling, e.g.
+  `, propagation every=30s,timeout=10m0s`, and, when `--allow-mismatch` let
   differing loads through, a `loads differ:` line with the differences joined
   by `; `. Then an `Operations` table with the columns `OPERATION`, `METRIC`,
-  `BASE`, `OTHER`, `DELTA` and `CHANGE` and, when either record has stages, a
-  `Stages` table with `STAGE` and `FAN` before those columns. A latency is
-  rounded to the microsecond and a throughput has one decimal. `DELTA` is the
-  other minus the base with an explicit sign, e.g. `-420µs`, `+30µs`, `0s` or
-  `+1190.4`, and `CHANGE` is the delta as a percentage of the base value,
-  e.g. `-22.8%`. A side that lacks the operation or the stage, or drew
-  nothing in it, shows `-` in its cell, in `DELTA` and in `CHANGE`, and a base
-  value of `0` shows `-` in `CHANGE`. `FAN` is the base's `fan_assignments`,
-  or the other's when only the other has the stage, and `-` for none.
-- **json**: `{"base": …, "other": …, "mismatches": […], "operations": […], "stages": […]}`.
+  `BASE`, `OTHER`, `DELTA` and `CHANGE`; when either record has `probes`, a
+  `Probes` table, and when either has `badTokens`, a `Bad tokens` table, both
+  with `SERVICE` in place of `OPERATION`; when either record ran the
+  propagation probe, a `Propagation` table with the columns `METRIC`, `BASE`,
+  `OTHER`, `DELTA` and `CHANGE` and the rows `p50`, `p95`, `p99`, `max`,
+  `probes` and `timed out`; and, when either record has stages, a `Stages`
+  table with `STAGE` and `FAN` before the columns of the `Operations` table.
+  A latency is rounded to the microsecond and a throughput has one decimal.
+  `DELTA` is the other minus the base with an explicit sign, e.g. `-420µs`,
+  `+30µs`, `0s` or `+1190.4`, and `CHANGE` is the delta as a percentage of
+  the base value, e.g. `-22.8%`. The two counts of the `Propagation` table
+  are integers with a signed delta, e.g. `+0`. A side that lacks the
+  operation, the service or the stage, or drew nothing in it, or that ran no
+  propagation probe or completed none, shows `-` in its cell, in `DELTA` and
+  in `CHANGE`, and a base value of `0` shows `-` in `CHANGE`. `FAN` is the
+  base's `fan_assignments`, or the other's when only the other has the
+  stage, and `-` for none.
+- **json**: `{"base": …, "other": …, "mismatches": […], "operations": […], "probes": […], "badTokens": […], "propagation": {…}, "stages": […]}`.
   `base` and `other` hold `runID`, `scenario`, `seed`, `incomplete` (only
-  when `true`), `workers`, `tokens`, `mix` and `stages`, the `fan_assignments`
-  of every stage with `0` for none, omitted for a run without stages. Each
-  entry of `operations` holds `operation` and `base`, `other` and `delta`,
-  each with `p50`, `p95` and `p99` in nanoseconds and `throughput`; a side
-  that lacks the operation or the stage, or drew nothing in it, omits its
-  key, and `delta` is omitted then too.
+  when `true`), `workers`, `tokens`, `mix`, `propagationEvery` and
+  `propagationTimeout`, the propagation probe's interval and ceiling in
+  nanoseconds, omitted for a run without the probe, and `stages`, the
+  `fan_assignments` of every stage with `0` for none, omitted for a run
+  without stages. Each entry of `operations` holds `operation` and `base`,
+  `other` and `delta`, each with `p50`, `p95` and `p99` in nanoseconds and
+  `throughput`; a side that lacks the operation or the stage, or drew
+  nothing in it, omits its key, and `delta` is omitted then too. The entries
+  of `probes` and `badTokens` have the same shape, with the service as
+  `operation`. `propagation` holds `base`, `other` and `delta`, each with
+  `p50`, `p95`, `p99` and `max` in nanoseconds, `probes` and `timedOut`; a
+  side that ran no propagation probe or completed none omits its key, and
+  `delta` is omitted then too.
   Each entry of `stages` holds `index`, `fanAssignments` and its own
-  `operations`. `mismatches` and `stages` are omitted when empty.
+  `operations`. `mismatches`, `probes`, `badTokens` and `stages` are omitted
+  when empty, and `propagation` when neither record ran the probe.
 - **csv**: not available; `--compare` with `--format csv` fails.
 - **html**: a self-contained page with the heading
   `Comparison: run <base> vs run <other>`, one line of chips per run, starting
-  with `base run <id>` and `other run <id>`, a yellow `Loads differ: …` banner
-  when the loads differ, and a sortable `Operations` table and, when either
-  record has stages, a sortable `Stages` table, with the columns of the text
-  tables in lower case. The `+` of a `delta` or `change` cell is written as
-  the entity `&#43;` in the page source, which a browser shows as `+`.
+  with `base run <id>` and `other run <id>` and, for a run with the
+  propagation probe, carrying a chip with its interval and ceiling, e.g.
+  `propagation every=30s,timeout=10m0s`, a yellow `Loads differ: …` banner
+  when the loads differ, and a sortable `Operations` table, then sortable
+  `Probes`, `Bad tokens` and `Propagation` tables when the text output has
+  them and, when either record has stages, a sortable `Stages` table, with
+  the columns of the text tables in lower case. The `+` of a `delta` or
+  `change` cell is written as the entity `&#43;` in the page source, which a
+  browser shows as `+`.
 
 ## OpenTelemetry export
 
@@ -210,11 +269,11 @@ Every value set is bounded.
 
 | Attribute | Values |
 |---|---|
-| `kind` | **neutron:** `address-scope`, `subnet-pool`, `network`, `subnet`, `router`, `router-interface`, `security-group`, `security-group-rule`, `port`, `floating-ip` — **cinder:** `volume`, `snapshot` — **keystone:** `domain`, `project`, `user`, `role`, `role_assignment`, `token` — **nova:** `server`, `network`, `subnet`, `port`, `volume`, `server_group` (only the `mix` Gardener persona creates server groups) — **glance:** `image` |
-| `operation` | `create`, `delete`, `get`, `list`, `tag`, `attach`, `detach`, `extend` (cinder resize), `update` (keystone domain disable-before-delete; glance property churn), `validate`, `revoke` (keystone token validation and revocation; `keystone pressure` only), `stop`, `start`, `reboot`, `resize`, `confirm-resize`, `live-migrate`, `cold-migrate` (nova server lifecycle; `cold-migrate` only for the `mix` Legacy persona), `upload`, `visibility`, `deactivate`, `reactivate`, `member-add`, `member-accept`, `member-remove` (glance image lifecycle) |
-| `outcome` | `success`, `error`, `timeout` for an operation; `success`, `timeout` for time-to-ready; `success`, `failure` for an iteration |
+| `kind` | **neutron:** `address-scope`, `subnet-pool`, `network`, `subnet`, `router`, `router-interface`, `security-group`, `security-group-rule`, `port`, `floating-ip` — **cinder:** `volume`, `snapshot` — **keystone:** `domain`, `project`, `user`, `role`, `role_assignment`, `token`, and for `keystone pressure` also `probe`, `bad_token` and `propagation` (a request to Nova, Neutron, Cinder or Glance) and, on `dizzy.resource.time_to_ready` only, `revocation` (the propagation delay) — **nova:** `server`, `network`, `subnet`, `port`, `volume`, `server_group` (only the `mix` Gardener persona creates server groups) — **glance:** `image` |
+| `operation` | `create`, `delete`, `get`, `list`, `tag`, `attach`, `detach`, `extend` (cinder resize), `update` (keystone domain disable-before-delete; glance property churn), `validate`, `revoke` (keystone token validation and revocation; `keystone pressure` only), `stop`, `start`, `reboot`, `resize`, `confirm-resize`, `live-migrate`, `cold-migrate` (nova server lifecycle; `cold-migrate` only for the `mix` Legacy persona), `upload`, `visibility`, `deactivate`, `reactivate`, `member-add`, `member-accept`, `member-remove` (glance image lifecycle), `nova`, `neutron`, `cinder`, `glance` (the service a `probe`, `bad_token` or `propagation` request went to; `keystone pressure` only) |
+| `outcome` | `success`, `error`, `timeout` for an operation; `success`, `timeout` for time-to-ready, where `timeout` under `kind=revocation` is a propagation probe that reached its ceiling; `success`, `failure` for an iteration |
 | `result` | `attempted`, `succeeded`, `failed` |
-| `error.kind` | `quota`, `timeout`, `canceled`, `other`, `http_<status>` for the statuses the service returns, `http_other` for the rest |
+| `error.kind` | `quota`, `timeout`, `canceled`, `other`, `http_<status>` for the statuses the service returns, `http_other` for the rest, `accepted` for a `bad_token` request that a service answered with a 2xx |
 
 > **Cardinality rule.** Run IDs, resource IDs, and resource names are **never**
 > metric attributes. They live in the run records and the logs.
@@ -224,15 +283,29 @@ It is recorded **only for failed operations**, so a healthy run emits no series
 at all — its absence is the steady state, not a missing metric.
 
 Keystone creates and deletes are synchronous, so `resource.time_to_ready` is
-largely unused there. The one exception is **token-issue latency**, recorded with
-`kind=token` in addition to the `token`/`create` operation histogram.
+largely unused there. One exception is **token-issue latency**, recorded with
+`kind=token` in addition to the `token`/`create` operation histogram; the
+other is the propagation delay of `keystone pressure`, below.
 `keystone pressure` adds two operations under `kind=token`, `validate` and
 `revoke`, which record no time-to-ready; its pool issues record as
 `token`/`create` like any token issue, the three listings of its `effective`
-operation as `role_assignment`/`list` and `project`/`list`, and the grants of
-its stages as `role_assignment`/`create` like any grant. The per-draw samples
-of its `Pressure` section stay in the run record and are not exported, so no
-call is exported twice.
+operation as `role_assignment`/`list` and `project`/`list`, and the `reader`
+grants of its pool users and the grants of its stages as
+`role_assignment`/`create` like any grant.
+
+Each request of a `probe` or `bad_token` draw and each poll of the
+propagation probe records on `dizzy.operation.duration` and, when it fails,
+on `dizzy.operation.errors`, under `kind=probe`, `kind=bad_token` or
+`kind=propagation` with the service as `operation`. A `bad_token` request
+that a service answers with 401 records `outcome=success`, and one it
+answers with a 2xx records `outcome=error` and `error.kind=accepted`; a poll
+records `outcome=success` for a 401 and a 2xx alike. The propagation probe's
+revocations and reissues record as `token`/`revoke` and `token`/`create`,
+and its delays on `dizzy.resource.time_to_ready` under `kind=revocation`,
+with `outcome=timeout` for a probe that reached its ceiling. The per-draw
+samples of the `Pressure` section and the per-service samples of the
+`pressure` object stay in the run record and are not exported, so no call
+is exported twice.
 
 ### Prometheus naming
 
