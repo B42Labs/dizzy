@@ -72,8 +72,9 @@ revokes it, and puts a fresh token for the same user and project back, so the
 pool keeps its size while the revocation events accumulate. `issue` replaces a
 token without revoking the old one, so it measures the login alone. The users
 whose grants `grant_churn` unassigns and assigns again are reserved from the
-end of the plan and never enter the pool, so a validation never fails because
-another worker took its user's role away a moment before.
+end of the plan's regular users and never enter the pool, so a validation
+never fails because another worker took its user's role away a moment
+before.
 
 ## Two generators per worker
 
@@ -106,7 +107,7 @@ rows this build can run:
 | C5C3/cobaltcore#1457, a narrow revocation lookup and no cache flush per logout | `validate` while `revoke` accumulates revocation events | Validate latency per bucket against the cumulative revocations: before the change a slope and a jump after every revocation, after it a flat line |
 | C5C3/cobaltcore#1458, one validation and one role resolution per request | `validate` under `grant_churn`, which keeps Keystone's role caches cold | Validate p50 and p95 under churn |
 | C5C3/cobaltcore#1461, fewer cache round trips and an in-process cache tier | `validate` warm, with `revoke` and `grant_churn` at weight 0 and 128 workers | Validate p50, and the throughput at a fixed worker count |
-| C5C3/cobaltcore#1459, linear implied-role expansion and a bulk role lookup | `effective` | Listing latency as the number of grants grows |
+| C5C3/cobaltcore#1459, linear implied-role expansion and a bulk role lookup | `effective` for a fan user over the stages 500 to 4000 grants | The `effective` latency per stage: before the change it grows about fourfold per doubling of the grants, after it about twofold |
 
 The first row is why the report's bucket table carries the cumulative
 revocations next to each bucket's latency: the revocation lookup's cost grows
@@ -115,18 +116,86 @@ revocation count is the signature of the unpatched lookup. The third row needs
 a warm cache, so a mix without the two operations that flush it, e.g.
 `--mix revoke=0 --mix grant_churn=0 --workers 128`.
 
-The `effective` row shows little in this build. Its users are the pool users
-with the one to three grants the plan draws for them, and the change shows
-when a user holds hundreds to thousands; #94 adds those users, the stages that
-grow their grants during a run, and the comparison of two run records. Until
-then, compare two reports side by side.
-
 The remaining rows of #92 cover the middleware changes C5C3/cobaltcore#1463,
 C5C3/cobaltcore#1464 and C5C3/cobaltcore#1465, which only show when a pool
 token goes to Nova, Neutron, Cinder or Glance. #95 adds the `probe` and
 `bad_token` operations and the propagation probe for them. Their scenario keys
 parse today, and a positive value is rejected, so a scenario written for a
 later release fails loudly instead of running a different load.
+
+## Fan users and stages
+
+The `effective` row needs a user with hundreds to thousands of grants, and a
+plan's regular users hold the one to three that `assignments_per_user` draws
+for them. A scenario's `distribution.fan_users` adds users with that many
+grants, and the stages of its `pressure:` block grow their grants while the
+run goes on, so one run measures the listing at several sizes. Without
+stages, the 500, 1000, 2000 and 4000 grants of the table would be four runs,
+four records and four provisionings of 4000 projects. See
+[Fan users](../reference/scenario-schema.md#fan-users) for the keys and a
+scenario for C5C3/cobaltcore#1459.
+
+The fan users are extra users, not pool users given more grants. They are
+drawn after everything else in the plan, so a scenario with fan users keeps
+the regular users, their grants and with them the token pool it had without
+them, and the other operations go to the same users either way. A fan user
+holds a token of its own outside the pool, which no `revoke` or `issue` takes
+away, and `grant_churn` never touches its grants. The count an `effective`
+draw lists is therefore the count its stage set, and not one a worker changed
+a moment before.
+
+A stage's grants are hundreds to thousands of writes to Keystone. A draw that
+ran beside them would measure Keystone under that write load, and a listing in
+their middle would see a count between two stages. So at the end of a window
+the workers finish the draws they have in flight and wait, the run makes the
+grants with no draw in flight, and the workers resume in the next stage: every
+draw of a stage lists the count the stage names. The pause costs time, not
+accuracy: the grants' time comes out of the stage's window, and the stage's
+throughput divides by the time after them.
+
+A stage only adds grants. A fan user starts the run with a count drawn from
+`fan_assignments`, anywhere up to `fan_assignments.max`, and a first stage
+below that maximum could leave a fan user holding more than the stage names.
+So the first stage that sets `fan_assignments` sets at least
+`fan_assignments.max`, every later one at least the one before, and the
+stage's `fan_assignments` is the count every fan user holds while the stage
+runs. With `min` equal to `max`, every fan user starts at that count.
+
+The grants of a stage are not drawn. Each fan user gets the first projects in
+plan order that it holds no grant on, with the plan's roles in turn, so two
+runs of the same scenario and seed grant the same projects with the same roles
+at every stage, whatever order Keystone answered the grants in. Their
+listings then work on the same grants, which is what a comparison of the two
+runs needs.
+
+## Comparing two runs
+
+Every proof in #92 comes down to the same scenario and seed, run once against
+a build with a CobaltCore change and once against a build without it.
+`keystone report --run <without>.json --compare <with>.json` reads the two
+records and prints both runs' p50, p95, p99 and throughput per operation and
+per stage, with the difference; see
+[Comparing two runs](../reference/cli.md#comparing-two-runs).
+
+The comparison first checks that the two runs sent the same load: the
+scenario, the seed, the workers, the token pool, the mix and the stages, their
+number and each one's `fan_assignments`. Each of them changes what the
+workers send, and a delta between two runs that differ in one would mix the
+change under test with the change of the load. The command refuses such
+records and names every difference. `--allow-mismatch` compares them anyway,
+for a reader who changed one on purpose, and prints the differences above the
+tables. What the comparison cannot check is the build each run measured; the
+records do not carry it.
+
+Every delta is the other run minus the base. With the build without the
+change as the base, a negative latency delta and a positive `ops/s` delta are
+the change's effect, and `CHANGE` puts the delta in proportion to the base
+value. Each percentile is an estimate within 1% of the exact value, so a
+change of a percent or two is inside the error of the two estimates. Two runs
+of the same build differ as well; run the base twice to see by how much,
+since a delta below that spread says nothing about the change. In a staged
+run, read the `Stages` table: each of its stages compares the two runs at the
+same number of grants.
 
 ## What a client cannot see
 

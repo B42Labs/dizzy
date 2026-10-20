@@ -60,6 +60,11 @@ and then every lane's, lane by lane, each lane with the resources it created
 before its engine started (the Keystone lane's domains and roles) first. An
 empty run writes `"created": []`.
 
+On a `keystone pressure` record the list also holds the role assignments the
+run granted while it entered its [stages](#stages), after the provisioned
+resources. A run that failed while it entered a stage lists the grants made up
+to the failure, so `cleanup` reclaims them like any other grant.
+
 This list is `cleanup`'s belt-and-suspenders handle. It is the *only* handle for
 resources that cannot be discovered by tag — Neutron address scopes, and Keystone
 role assignments.
@@ -93,8 +98,8 @@ nanoseconds, as Go encodes `time.Duration`.
 Under `metrics`, `median`, `p90`, `p95` and `p99` are estimates within 1% of the
 exact value, since the collector keeps a fixed-size histogram instead of every
 sample. `min`, `mean` and `max` are exact, and so is every value in
-`chaos.buckets[]`. Under `pressure`, the percentiles of `operations` and of
-every bucket are estimates within 1% as well.
+`chaos.buckets[]`. Under `pressure`, the percentiles of `operations`, of
+every bucket and of every stage are estimates within 1% as well.
 
 ### Error kinds
 
@@ -144,11 +149,12 @@ by any other command, or by a release that predates the verb, has no
 
 The top-level `metrics` count, by resource kind, every call the run's
 Keystone client made before the record was written: the provisioning, the
-token pool's issues and refreshes, and every call of a draw. A validation and
-a revocation both count under `token`. `pressure` counts the workers' draws by
-operation: one sample per draw, whatever calls it made. A `revoke` sample
-therefore covers the revocation and the reissue together; the revocation call
-alone is the `token`/`revoke` series of the `--otel` export.
+token pool's issues and refreshes, the grants of the stages, and every call
+of a draw. A validation and a revocation both count under `token`.
+`pressure` counts the workers' draws by operation: one sample per draw,
+whatever calls it made. A `revoke` sample therefore covers the revocation and
+the reissue together; the revocation call alone is the `token`/`revoke`
+series of the `--otel` export.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -156,17 +162,18 @@ alone is the `token`/`revoke` series of the `--otel` export.
 | `tokens` | int | Size of the token pool |
 | `churnUsers` | int | Users reserved for `grant_churn`. `0`, and so omitted, when the run reserved none, which includes every run whose `grant_churn` weight is `0` |
 | `mix` | array | `{operation, weight}` for every operation with a positive weight, sorted by operation |
-| `operations` | object | The run's draws, shaped like [`metrics`](#metrics), with one `byType` entry per operation drawn; `type` is the operation name and `wall` the time the workers ran |
+| `operations` | object | The run's draws, shaped like [`metrics`](#metrics), with one `byType` entry per operation drawn; `type` is the operation name and `wall` the time from the start of the run, from which the bucket offsets count, to its end, so in a staged run it includes the time the stages took to enter |
 | `revocations` | int | `revoke` draws that succeeded |
 | `buckets` | array | Time-sliced stats; see below |
 | `bucketWidth` | duration | Width of every bucket of a run with `--duration 0`, in nanoseconds. Omitted for a bounded run |
+| `stages` | array | One entry per stage the run entered, in stage order; see below. Omitted for a run without stages |
 
-The median, p90, p95 and p99 in `operations` and in every bucket are the
-collector's estimates within 1% of the exact value; `min`, `mean` and `max`
-are exact. Their `errors[]` label a failure `canceled`, `timeout`,
-`forbidden`, `not-found`, `transient` (a 500, 502, 503, 504 or 429), `other`
-(any other failure, a 400 or a 501 among them) or `pool-empty` (a draw found
-the token pool empty), where the top-level `metrics` use the
+The median, p90, p95 and p99 in `operations`, in every bucket and in every
+stage are the collector's estimates within 1% of the exact value; `min`,
+`mean` and `max` are exact. Their `errors[]` label a failure `canceled`,
+`timeout`, `forbidden`, `not-found`, `transient` (a 500, 502, 503, 504 or
+429), `other` (any other failure, a 400 or a 501 among them) or `pool-empty`
+(a draw found the token pool empty), where the top-level `metrics` use the
 [error kinds](#error-kinds) above.
 
 The record carries no token and no password: the token pool and the users'
@@ -180,13 +187,32 @@ accumulated by then. A bounded run has ten buckets of equal width, and a draw
 that starts at or after the end lands in the last one. A run with
 `--duration 0` has one bucket per `bucketWidth`, starting at offset 0,
 including buckets without draws; its last bucket may be partial, and its
-throughput still divides by the full width.
+throughput still divides by the full width. In a staged run the offsets count
+from the moment the run began entering its first stage, so a bucket that
+falls within that entry holds no draws.
 
 | Field | Type | Notes |
 |---|---|---|
-| `start` | duration | Offset from the start of the workers |
+| `start` | duration | Offset from the start of the run: the moment the workers start or, in a staged run, the moment the run began entering its first stage |
 | `operations` | object | The draws that started in this bucket, shaped like [`metrics`](#metrics), with one `byType` entry per operation drawn in it; `wall` is the bucket width, and `errors` the bucket's error breakdown |
 | `revocations` | int | Cumulative: the `revoke` draws that succeeded in this bucket and in every earlier one |
+
+### `stages[]`
+
+Present only on the record of a run whose `pressure:` block has
+[stages](scenario-schema.md#stages). Every draw lands in the stage it started
+in, as well as in its bucket and in `operations`. A checkpoint lists the
+stages entered so far, and so does the record of an interrupted run or of a
+run whose duration ended while it was entering a stage; see
+[`pressure`](cli.md#pressure).
+
+| Field | Type | Notes |
+|---|---|---|
+| `index` | int | The stage's number, from 1 |
+| `fanAssignments` | int | The stage's `fan_assignments`: the grants every fan user holds in the stage. `0`, and so omitted, when the stage set none |
+| `start` | duration | Offset in nanoseconds, counted like a bucket's `start`, at which the workers resumed after the run entered the stage. For the first stage it is the time that stage took to enter, since the offsets count from the moment the run began entering it and the workers start after it. Equals `end` for a stage entered after its window ended |
+| `end` | duration | Offset at which the stage's window ended. For the stage the run was in when a checkpoint was written or when it was interrupted, the offset at that time |
+| `operations` | object | The draws that started between `start` and `end`, shaped like [`metrics`](#metrics), with one `byType` entry per operation drawn in the stage; `wall` is `end` minus `start` |
 
 ## `personas[]`
 

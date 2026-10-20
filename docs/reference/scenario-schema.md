@@ -193,6 +193,8 @@ pressure:          # read only by `keystone pressure`; see "The pressure: block"
 | `distribution.assignments_per_user` | range | `(user, target, role)` grants drawn per user |
 | `distribution.domain_scoped_assignment_ratio` | ratio | Fraction of grants targeting the domain rather than a project |
 | `distribution.users_issuing_tokens_ratio` | ratio | Fraction of users that authenticate for a scoped token |
+| `distribution.fan_users` | int | Fan users, appended after the `resources.users` users, each holding a grant on many projects; see [Fan users](#fan-users). Omitted or `0` means none |
+| `distribution.fan_assignments` | range | Distinct projects drawn per fan user, each holding one grant of the fan user; `min >= 1` and `max <= resources.projects` when `fan_users > 0` |
 
 `projects_per_domain` shapes how projects cluster, while the total stays exactly
 `resources.projects`: each turn of the deal cycles to the next domain and assigns
@@ -208,6 +210,114 @@ assignments instead.
 a random value generated when the run creates the users and held only in
 memory, for the token-issue step and, in `keystone pressure`, for the token
 pool, so the plan stays reproducible without persisting a credential.
+
+### Fan users
+
+A fan user is a user with a grant on many projects, the user the `effective`
+operation of `keystone pressure` lists when a scenario has one.
+`distribution.fan_users` adds that many fan users to the plan, named
+`fan-0001`, `fan-0002` and so on, after the `resources.users` users and in the
+first domain. Each fan user draws a count from `distribution.fan_assignments`
+and holds one grant on that many distinct projects, drawn uniformly from the
+projects of every domain, with a role drawn uniformly from the plan's roles
+for each grant. Keystone allows a grant on a project of another domain, so the
+rule that keeps a regular user's grants in its own domain does not apply to a
+fan user. The fan users are drawn after everything else, so adding them to a
+scenario leaves the rest of its plan as it was.
+
+A fan user never issues a plan token, and in `keystone pressure` it is never a
+pool user or a churn user: `effective` lists its grants with a token of its
+own, and the [stages](#stages) of the `pressure:` block grow them. `apply`
+creates fan users and their grants like any other user and grant, and `chaos`
+churns them the same way. `apply --dry-run` prints a `fan users:` line when
+the plan has any, and its `users:` line counts them too.
+`--set distribution.fan_users=<n>`,
+`--set distribution.fan_assignments.min=<n>` and
+`--set distribution.fan_assignments.max=<n>` override the keys.
+
+A negative count fails like any other, e.g.
+`distribution.fan_users must not be negative, got -1`. With `fan_users` above
+`0`, validation also reports, in this order:
+
+- `resources.domains must be at least 1 when projects or users are created, got 0`
+- `resources.roles must be at least 1 when users draw assignments, got 0`
+- `distribution.fan_assignments.min must be at least 1 when fan users are created, got 0`
+- `distribution.fan_assignments.max (4001) exceeds resources.projects (4000); a fan user holds one grant per distinct project`
+
+Validation caps the assignments a plan can draw at 1,000,000:
+`resources.users` × `assignments_per_user.max`, plus, with fan users,
+`fan_users` × `fan_assignments.max`. With fan users the message names both
+terms, e.g.
+`resources.users (20) × distribution.assignments_per_user.max (3) + distribution.fan_users (1000) × distribution.fan_assignments.max (1000) = 1000060 exceeds the total assignment limit of 1000000`;
+without them it names the first alone.
+
+### A fan for C5C3/cobaltcore#1459
+
+C5C3/cobaltcore#1459 makes the effective-assignment listing linear in the
+number of grants. Showing that takes one user with thousands of grants and a
+measurement at several sizes. This scenario gives one fan user 500 grants and
+grows them to 1000, 2000 and 4000 in four stages of 5 minutes each, while the
+workers draw `validate` and `effective` only:
+
+```yaml
+name: fan-1459
+seed: 42
+
+resources:
+  domains:  1
+  roles:    2
+  projects: 4000
+  users:    20
+
+distribution:
+  projects_per_domain:            { min: 1, max: 3 }
+  assignments_per_user:           { min: 1, max: 3 }
+  domain_scoped_assignment_ratio: 0.1
+  users_issuing_tokens_ratio:     0.5
+  fan_users:                      1
+  fan_assignments:                { min: 500, max: 500 }
+
+pressure:
+  duration: 20m
+  mix:
+    validate:    10
+    effective:   20
+    revoke:       0
+    grant_churn:  0
+    issue:        0
+  stages:          # four windows of 5m each
+    - fan_assignments: 500
+    - fan_assignments: 1000
+    - fan_assignments: 2000
+    - fan_assignments: 4000
+```
+
+```console
+$ dizzy keystone apply --scenario fan-1459.yaml --dry-run
+Plan for scenario "fan-1459" (seed 42)
+  domains:         1
+  roles:           2
+  projects:        4000
+  users:           21
+  fan users:       1
+  assignments:     542 (1 domain-scoped)
+  token issues:    11
+```
+
+`keystone pressure --scenario fan-1459.yaml` then prints a `Stages` table with
+an `effective` row per stage: the listing latency at 500, 1000, 2000 and 4000
+grants, one under the other. The first stage's `fan_assignments` equals
+`fan_assignments.max`, so entering it grants nothing. The price is the size of
+the run. It provisions 4000 projects and the fan user's 500 grants before the
+first worker starts, and grows the fan by 3500 grants while it runs: 500, 1000
+and 2000 at the start of stages 2, 3 and 4, each with at most `--concurrency`
+grants in flight. The grants come out of their stages' windows, so the 2000
+grants of stage 4 shorten its draws the most. When they take too much of a
+window, raise `--concurrency` to grant faster or give the last stage a longer
+`duration`. A stage whose grants are still running when the run's duration
+ends is missing from the `Stages` table. The teardown deletes all of it
+again. See [`pressure`](cli.md#pressure) for how a run enters its stages and
+what it records of a stage whose grants outlast the run.
 
 ### Profiles
 
@@ -655,7 +765,7 @@ pressure:            # duration, workers and tokens of scenarios/keystone/small.
   duration: 5m       # runtime of the workers; the only hard stop besides Ctrl-C
   workers: 8         # closed-loop workers
   tokens: 20         # token pool, issued before the first worker starts
-  churn_users: 1     # users reserved for grant_churn, from the end of the plan
+  churn_users: 1     # users reserved for grant_churn, from the end of the plan's regular users
   mix:               # an omitted key keeps its default; 0 switches it off
     validate:    60
     effective:    5
@@ -664,6 +774,9 @@ pressure:            # duration, workers and tokens of scenarios/keystone/small.
     issue:        1
     probe:        0  # parsed; a positive weight is rejected by this build
     bad_token:    0  # parsed; a positive weight is rejected by this build
+  stages:            # optional; consecutive windows of a bounded run
+    - duration: 1m          # omitted or 0: an equal share of what the others leave
+    - fan_assignments: 500  # grants every fan user holds from this stage on; needs fan users
 ```
 
 | Key | Type | Meaning |
@@ -671,7 +784,7 @@ pressure:            # duration, workers and tokens of scenarios/keystone/small.
 | `duration` | duration | Total wall-clock runtime of the workers. `0` or omitted means unset; only `--duration 0` selects a run without an end |
 | `workers` | int | Closed-loop workers; the merged value must lie between 1 and 1024. `0` or omitted falls back to `16` |
 | `tokens` | int | Size of the token pool. `0` or omitted falls back to `100` |
-| `churn_users` | int | Users reserved for `grant_churn`, taken from the end of the plan; they never enter the token pool. Reserved only when `grant_churn` has a positive weight. Omitted falls back to `1`; `0` reserves none and then needs a `grant_churn` weight of `0` |
+| `churn_users` | int | Users reserved for `grant_churn`, taken from the end of the plan's regular users, so a fan user is never one; they never enter the token pool. Reserved only when `grant_churn` has a positive weight. Omitted falls back to `1`; `0` reserves none and then needs a `grant_churn` weight of `0` |
 | `mix.validate` | int | Weight of `validate`. Omitted falls back to `60` |
 | `mix.effective` | int | Weight of `effective`. Omitted falls back to `5` |
 | `mix.revoke` | int | Weight of `revoke`. Omitted falls back to `2` |
@@ -679,8 +792,10 @@ pressure:            # duration, workers and tokens of scenarios/keystone/small.
 | `mix.issue` | int | Weight of `issue`. Omitted falls back to `1` |
 | `mix.probe` | int | Parsed and rejected when positive, until later work delivers the operation. Omitted falls back to `0` |
 | `mix.bad_token` | int | Parsed and rejected when positive, until later work delivers the operation. Omitted falls back to `0` |
-| `propagation.every` | duration | Parsed and rejected when positive, until later work delivers the propagation probe. It is the one key without a flag |
+| `propagation.every` | duration | Parsed and rejected when positive, until later work delivers the propagation probe. It has no flag |
 | `bucket_width` | duration | Width of one time bucket of a run with `--duration 0`, at least `1m`. `0` or omitted falls back to `1h`. A bounded run keeps ten equal buckets of a tenth of its duration, but a value under `1m` still fails |
+| `stages[].fan_assignments` | int | The grants every fan user holds once the run has entered the stage, at least `1`. Omitted means the stage grants nothing. See [Stages](#stages) |
+| `stages[].duration` | duration | The stage's share of the run. `0` or omitted means an equal share of what the stages with a duration leave. See [Stages](#stages) |
 
 A worker draws an operation with probability its weight divided by the sum of
 the weights. A mix whose merged weights are all `0` fails with
@@ -699,8 +814,45 @@ in the block fails parsing, as everywhere in a scenario.
 
 All three Keystone profiles carry a `pressure:` block with `duration`,
 `workers` and `tokens` (see [Keystone](#keystone)), so `keystone pressure`
-runs any of them with no flags. None sets `churn_users`, `mix`, `propagation`
-or `bucket_width`. The block has no `--set` keys; the `keystone pressure`
-flags override it. See [`pressure`](cli.md#pressure) for what each operation
-sends and [Pressure mode](../explanation/pressure-mode.md) for why the load
-is built this way.
+runs any of them with no flags. None sets `churn_users`, `mix`, `propagation`,
+`bucket_width` or `stages`, and none sets `distribution.fan_users`; the
+scenario of [A fan for C5C3/cobaltcore#1459](#a-fan-for-c5c3cobaltcore1459)
+is the starting point for a run with fan users and stages. The block has no
+`--set` keys; the `keystone pressure` flags override every key but
+`propagation.every` and `stages`, which have none. See
+[`pressure`](cli.md#pressure) for what each operation sends and
+[Pressure mode](../explanation/pressure-mode.md) for why the load is built
+this way.
+
+### Stages
+
+`stages` divides a bounded run into consecutive stages, in list order. A
+stage with a `duration` keeps it as its window; the stages without one share
+equally what the others leave of the run duration, and when every stage has a
+`duration` and they add up to less, the last stage runs to the end. A stage
+with `fan_assignments` grows every fan user's grants to that count when the
+run enters it, and a stage without one is a window with no override. A stage
+never removes a grant. See [`pressure`](cli.md#pressure) for how the command
+resolves the windows against the run duration and enters each stage.
+
+Validation names a stage by its 0-based index in the list, while the run's
+log lines, record and reports number the stages from 1. It reports the first
+failure of these checks, made on each stage in turn:
+
+- `pressure.stages[0].duration must not be negative, got -1m0s`
+- `pressure.stages[0].fan_assignments must be at least 1, got 0`
+
+and then of these, made in turn on the stages that set `fan_assignments`:
+
+- `pressure.stages[0] sets fan_assignments but distribution.fan_users is 0`
+- `pressure.stages[0].fan_assignments (6) exceeds resources.projects (5)`
+- `pressure.stages[0].fan_assignments (2) is below distribution.fan_assignments.max (3), which a fan user may already hold`,
+  for the first stage that sets one
+- `pressure.stages[1].fan_assignments (3) is below stage 0's (4); a stage never removes assignments`,
+  for a later one, which is held to the previous stage that set one
+
+So the first stage that sets `fan_assignments` sets at least
+`distribution.fan_assignments.max`, and every later one at least the value
+before it, and a stage's `fan_assignments` is the count every fan user holds
+in it. The checks against the run duration, a run without an end among them,
+belong to the command; see [`pressure`](cli.md#pressure).

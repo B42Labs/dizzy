@@ -210,9 +210,10 @@ a password login. See [Pressure mode](../explanation/pressure-mode.md).
 > [`devstack-c5c3`](../how-to/run-against-devstack-c5c3.md) stack.
 
 A `pressure:` block in the scenario YAML sets the duration, the bucket width,
-the workers, the token pool, the churn users and the mix; the flags override
-it. Every built-in Keystone profile ships such a block, so `pressure` runs them
-with no extra flags. See
+the workers, the token pool, the churn users, the mix and the stages; the flags
+override all of these but the stages, which have no flag. Every built-in
+Keystone profile ships such a block, so `pressure` runs them with no extra
+flags. See
 [The `pressure:` block](scenario-schema.md#the-pressure-block).
 
 | Flag | Default | Description |
@@ -223,7 +224,7 @@ with no extra flags. See
 | `--bucket-width <duration>` | `1h` | Width of one time bucket in the series of a run with `--duration 0`, at least `1m`. A bounded run keeps ten equal buckets of a tenth of its duration, but a value under `1m` still fails, e.g. `pressure bucket-width must be at least 1m0s, got 30s` |
 | `--workers <n>` | `16` | Closed-loop workers, 1 to 1024. `0` takes the block's value or the default |
 | `--tokens <n>` | `100` | Size of the token pool. `0` takes the block's value or the default |
-| `--churn-users <n>` | `1` | Users reserved for `grant_churn`, taken from the end of the plan; they never enter the token pool. Reserved only when `grant_churn` has a positive weight; `0` reserves none and then needs a `grant_churn` weight of `0`. A negative value fails with `--churn-users must not be negative, got -1` |
+| `--churn-users <n>` | `1` | Users reserved for `grant_churn`, taken from the end of the plan's regular users, so a fan user is never one; they never enter the token pool. Reserved only when `grant_churn` has a positive weight; `0` reserves none and then needs a `grant_churn` weight of `0`. A negative value fails with `--churn-users must not be negative, got -1` |
 | `--mix <operation>=<weight>` | see below | Weight of one operation; repeatable |
 | `--no-cleanup` | off | Leave resources in place at the end of the run, on interrupt *and* after a failed setup |
 | `--privilege auto\|admin\|domain-manager` | `auto` | Privilege tier. `auto` classifies the caller's token, `admin` asserts the admin tier without classifying it, and `domain-manager` fails before any API call. Only the admin tier runs |
@@ -238,7 +239,7 @@ when two `--mix` values name the same operation, the later one wins.
 | Operation | Default weight | What one draw sends |
 |---|---|---|
 | `validate` | `60` | `GET /v3/auth/tokens` with the admin token as `X-Auth-Token` and a pool token as `X-Subject-Token`, the request keystonemiddleware makes on a cache miss |
-| `effective` | `5` | For the user of a pool token: `GET /v3/role_assignments?user.id=<id>&effective=true`, then `GET /v3/users/<id>/projects`, then `GET /v3/auth/projects` sent with the pool token. The first error ends the draw |
+| `effective` | `5` | For a fan user when the scenario has one, otherwise for the user of a pool token: `GET /v3/role_assignments?user.id=<id>&effective=true`, then `GET /v3/users/<id>/projects`, then `GET /v3/auth/projects` sent with that user's token. With fan users, a draw picks one at random, and the token is the fan user's own, outside the pool. The first error ends the draw |
 | `revoke` | `2` | Takes a token out of the pool and sends `DELETE /v3/auth/tokens` with it as `X-Subject-Token`, then a password login (`POST /v3/auth/tokens`) for the same user and project, whose token goes back into the pool. The login runs even when the revocation failed. The draw succeeds only when both calls do |
 | `grant_churn` | `2` | Unassigns one of the churn users' role assignments (`DELETE /v3/projects/<project>/users/<user>/roles/<role>`, or `/v3/domains/<domain>/...` for a domain-scoped one) and assigns it again with a `PUT` to the same path, so Keystone's assignment caches keep being invalidated. The `PUT` runs even when the `DELETE` failed, and the draw fails with the first error. One worker at a time churns a given assignment |
 | `issue` | `1` | A password login (`POST /v3/auth/tokens`) for the user and project of a pool token, whose new token replaces it. The old token is not revoked, so the draw measures the login alone. When the login fails, the old token goes back into the pool |
@@ -289,17 +290,22 @@ A run goes through these steps:
 
 2. **Provisioning.** Creates the plan's domains, roles, projects, users and
    role assignments exactly as `apply` does, without `apply`'s token stage.
+   The fan users and their grants are among them.
 3. **Priming the token pool.** Issues `--tokens` project-scoped tokens, round
    robin over the distinct `(user, project)` pairs of the plan's
-   project-scoped role assignments in plan order, leaving out the churn users.
-   Each issue is a password login, which Keystone spends about 175 ms on in
-   bcrypt, with at most `--concurrency` issues in flight: 1000 tokens at the
-   default `--concurrency 8` take about 22 s before the first worker starts.
-   The first failed issue stops the priming, e.g.
-   `priming token pool (3 of 7 issued): …`.
+   project-scoped role assignments in plan order, leaving out the churn users
+   and the fan users. Then it issues one more token per fan user, scoped to
+   the project of the fan user's first project-scoped grant in plan order;
+   these tokens stay outside the pool. Each issue is a password login, which
+   Keystone spends about 175 ms on in bcrypt, with at most `--concurrency`
+   issues in flight: 1000 tokens at the default `--concurrency 8` take about
+   22 s before the first worker starts. The first failed issue stops the
+   priming, e.g. `priming token pool (3 of 7 issued): …`, whose counts include
+   the fan users' tokens.
 4. **The workers** run for the duration, or with `--duration 0` until SIGINT
    or SIGTERM. A draw in flight when the run ends finishes or times out on
-   its own, and the run waits for it.
+   its own, and the run waits for it. A run with stages runs them one after
+   the other; see **Stages** below.
 5. **Results.** Prints the metrics summary and the `Pressure` table to stdout,
    writes `run-<id>.json` with a `pressure` object and prints
    `run record written to run-<id>.json`. See
@@ -312,35 +318,105 @@ A run goes through these steps:
 **The token pool.** A draw that needs a token picks one from the pool at
 random. The pool lives in process memory only: no token and no password
 reaches the run record, the logs or a checkpoint, so a killed run cannot
-resume its pool. A refresher re-issues every pool token that comes within a
-margin of its expiry, the smaller of 5 minutes and a quarter of the token
-lifetime, so a run longer than the lifetime keeps a valid pool. The lifetime
-is that of the first pool token. The refresher looks every half margin, with
-at most `--concurrency` issues in flight, and swaps a new token in only after
-its issue succeeded; a failed issue keeps the old token until the next look.
-When the first pool token reports no usable expiry, the refresher does not
-start and the run logs a warning. The issues of the priming and of the
-refresher count as `token` calls in the metrics summary and are no pressure
-operation.
+resume its pool. A refresher re-issues every pool token and every fan user's
+token that comes within a margin of its expiry, the smaller of 5 minutes and
+a quarter of the token lifetime, so a run longer than the lifetime keeps
+valid tokens. The lifetime is that of the first pool token. The refresher
+looks every half margin, with at most `--concurrency` issues in flight, and
+swaps a new token in only after its issue succeeded; a failed issue keeps the
+old token until the next look. When the first pool token reports no usable
+expiry, the refresher does not start and the run logs a warning. The issues
+of the priming and of the refresher count as `token` calls in the metrics
+summary and are no pressure operation. `validate`, `revoke` and `issue` draw
+from the pool only, so a fan user's token is never validated, revoked or
+replaced by a draw, and `grant_churn` never touches a fan user's grant.
 
 After provisioning and before the priming, the command checks the plan
 against the options, and each failure goes through the setup-failure path
 below:
 
-- `pressure needs at least one project-scoped assignment outside the churn users to issue pool tokens from; the plan has none`
+- `pressure needs at least one project-scoped assignment outside the churn and fan users to issue pool tokens from; the plan has none`
+- `pressure fan user "<name>" holds no project-scoped assignment to scope its token to`
 - `pressure.churn_users (<n>) must leave at least one user outside the churn set; the plan has <m> users`,
-  while `grant_churn` has a positive weight
-- `pressure grant_churn needs the churn users to hold at least one assignment; the last <n> user(s) of the plan hold none`,
+  where `<m>` counts the regular users, while `grant_churn` has a positive
+  weight
+- `pressure grant_churn needs the churn users to hold at least one assignment; the last <n> regular user(s) of the plan hold none`,
   while `grant_churn` has a positive weight, so a run with `--churn-users 0`
   needs a `grant_churn` weight of `0`
 
+**Stages.** A `stages:` list in the `pressure:` block divides a bounded run
+into consecutive stages, each of which can grow the fan users' grants; see
+[Stages](scenario-schema.md#stages) for its keys and checks. There is no flag
+for it. The command gives each stage a window of the run duration, from the
+flag or the block. A stage with a `duration` keeps it. The stages without one
+share what the others leave equally, the last of them taking the remainder of
+the division. When every stage has a duration and they add up to less than
+the run duration, the last stage runs to the end. Four stages without a
+duration over `--duration 20m` run 5m each, a stage of `2m` and two without a
+duration over `5m` run 2m, 1m30s and 1m30s, and stages of `1m` and `1m` over
+`3m` run 1m and 2m.
+
+The run enters the first stage before the first worker starts. At the end of
+every later window, each worker finishes the draw it has in flight and waits,
+so no draw is in flight while the run enters the next stage; the workers
+resume once it is entered. Entering a stage with `fan_assignments` grants
+every fan user a role on more projects until it holds that many: on the first
+projects in plan order it holds no grant on, with the plan's roles in turn.
+A grant retries a transient failure as a provisioning grant does. The time a
+stage takes to enter comes out of its window, so the run still lasts its
+duration. A stage entered after its window ended records no operations, and
+the run logs
+`stage entered after its window ended; it records no operations`. A stage
+whose entry is still running when the run's duration ends is not recorded:
+the run logs
+`the run ended while a stage was being entered; the stage is not recorded`,
+the record and the `Stages` table list only the stages before it, the grants
+that entry made are in [`created`](run-record.md#created) and are torn down
+with the rest, and the run counts as completed. Size the stage windows so
+that their grants fit. Each stage logs `entering stage` with `run` and
+`stage`, numbered from 1, and a stage with `fan_assignments` adds
+`fanAssignments`, `granted`, the grants it made, and `took`:
+
+```text
+level=INFO msg="entering stage" run=1a2b3c4d stage=2 fanAssignments=1000 granted=500 took=6.728945112s
+```
+
+The `starting pressure run` log line carries `stages`, the number of stages.
+A staged run prints a `Stages` table after the `Operations` table, with an
+`all` row and one row per operation for each stage, e.g. for stages of
+`fan_assignments` 500 and 1000 over `--duration 4m`:
+
+```text
+Stages
+STAGE   FAN  START     END   OPERATION     OPS      OK  FAILED   OPS/S     P50     P95     P99
+    1   500  2ms       2m0s  all        214920  214920       0  1791.0  11.8ms  15.6ms  19.4ms
+    1   500  2ms       2m0s  effective  143280  143280       0  1194.0  12.4ms  15.9ms  19.7ms
+    1   500  2ms       2m0s  validate    71640   71640       0   597.0  2.01ms  2.84ms  3.66ms
+    2  1000  2m6.731s  4m0s  all         63560   63560       0   561.1  40.2ms  47.8ms  55.1ms
+    2  1000  2m6.731s  4m0s  effective   42373   42373       0   374.1  41.7ms  48.3ms  55.6ms
+    2  1000  2m6.731s  4m0s  validate    21187   21187       0   187.0  2.09ms  2.95ms  3.82ms
+```
+
+`START` is the offset at which the workers resumed in the stage and `END` the
+end of its window; see [What `report` renders](metrics.md#what-report-renders).
+The command checks the stages against the run duration before it makes any
+API call:
+
+- `pressure.stages need a bounded run; --duration 0 selects a run without an end`
+- `pressure.stages: the stage durations add up to 4m0s, more than the run duration 3m0s`
+- `pressure.stages: the stages with a duration fill the run duration 3m0s, leaving nothing for the 1 stage(s) without one`
+
+A stage that fails to enter ends the run like a failed setup; see the table
+below.
+
 **Global flags.** `--concurrency` bounds the provisioning, the priming of the
-pool and the refresher, not the workers; `--workers` sets their number.
-`--timeout` bounds each draw of a worker, all of its calls together, each
-issue of the priming and the refresher, and each provisioning and teardown
-call. `--seed` overrides the scenario seed, which also seeds the workers'
-generators. `--otel` exports the client's calls, among them `token`/`validate`
-and `token`/`revoke`; see [Metrics](metrics.md).
+pool, the refresher and the grants of a stage, not the workers; `--workers`
+sets their number. `--timeout` bounds each draw of a worker, all of its calls
+together, each issue of the priming and the refresher, each provisioning and
+teardown call, and each attempt of a stage grant. `--seed` overrides the
+scenario seed, which also seeds the workers' generators. `--otel` exports the
+client's calls, among them `token`/`validate` and `token`/`revoke`; see
+[Metrics](metrics.md).
 
 **Connections.** The identity client keeps up to `--workers` plus
 `--concurrency` idle connections to the Keystone endpoint, where other verbs
@@ -366,24 +442,31 @@ set and the resources created so far and prints its path. It then tears
 those resources down and prints `deleted <n> resource(s) for run <id>`, with
 no leak check, or with `--no-cleanup` prints
 `pressure setup failed; resources left in place — reclaim with: keystone cleanup --run run-<id>.json`.
-The command exits non-zero with an error that names the step and the run id:
+A stage that fails to enter, because one of its grants failed, takes the same
+path: the run ends there, and the record carries no `pressure` object and
+lists the grants the stages made so far among the resources, so the teardown
+removes them too. The command exits non-zero with an error that names the
+step and the run id:
 
 | Step | Error |
 |---|---|
 | Provisioning | `provisioning plan (run <id>): …` |
 | Checking the plan against the options | `building pressure set (run <id>): …` |
 | Priming | `starting pressure run (run <id>): priming token pool (<n> of <m> issued): …` |
+| Entering a stage | `running pressure (run <id>): entering stage <n>: …`, e.g. `running pressure (run <id>): entering stage 2: growing fan user "fan-0001" to 1000 assignments (0 granted): …` |
 
 A teardown that fails partway appends
 `; teardown incomplete after deleting <n> resource(s): …` and the
 `keystone cleanup` hint to the error.
 
-While the workers run, the command rewrites `run-<id>.json` once a minute,
-starting one minute after the workers start, marked `"incomplete": true`, as
-`chaos` does. It writes no checkpoint during provisioning or priming, and
-none once the workers stop, a signal included; the final record follows once
-the draws in flight have returned. A checkpoint that cannot be written logs a
-warning and the run goes on.
+While the run goes on, the command rewrites `run-<id>.json` once a minute,
+starting one minute after the run starts, marked `"incomplete": true`, as
+`chaos` does. The run starts when the workers start or, in a staged run, when
+it begins entering the first stage, so a checkpoint can fall while the first
+stage's grants are made and then lists no stage. It writes no checkpoint
+during provisioning or priming, and none once the run ends, a signal
+included; the final record follows once the draws in flight have returned. A
+checkpoint that cannot be written logs a warning and the run goes on.
 
 ## `monitor`
 
@@ -449,6 +532,8 @@ builder backs all six namespaces, so `dizzy cinder report` and
 |---|---|---|
 | `--run <path>` | — | Path to the run record to report on (**required**) |
 | `--format <fmt>` | `table` | `table`, `json`, `csv`, or `html` |
+| `--compare <path>` | — | Path to a second `keystone pressure` run record; the report then prints both records' percentiles and throughput per operation and per stage, and the second minus the first as the difference. See [Comparing two runs](#comparing-two-runs) |
+| `--allow-mismatch` | off | Compare two records whose scenario, seed, workers, token pool, mix or stages differ. Needs `--compare` |
 
 - **table** — human-readable, one row per resource kind plus an overall row.
 - **json** — the aggregate metrics, machine-readable.
@@ -471,6 +556,62 @@ A record a churn or pressure run wrote while it was still running
 - **csv** — unchanged; the format has no place for a marker.
 - **html** — a yellow `Run incomplete` banner with the checkpoint time instead of
   `Run completed`. A record that carries an error still shows `Run failed`.
+
+### Comparing two runs
+
+With `--compare`, `report` reads two `keystone pressure` records and prints
+their comparison instead of the `--run` record's report. The `--run` record is
+the base and the `--compare` record the other, and every delta is the other
+minus the base. With the build without a change as `--run` and the build with
+it as `--compare`, a negative latency delta and a positive `ops/s` delta mean
+the change made the path faster.
+
+```console
+$ dizzy keystone report --run run-1a2b3c4d.json --compare run-5e6f7a8b.json
+Comparison
+  base:  run 1a2b3c4d, scenario small, seed 42, workers 8, tokens 20, mix validate=60
+  other: run 5e6f7a8b, scenario small, seed 42, workers 8, tokens 20, mix validate=60
+
+Operations
+OPERATION  METRIC    BASE   OTHER    DELTA  CHANGE
+all        p50     1.84ms  1.42ms   -420µs  -22.8%
+all        p95     2.61ms  2.05ms   -560µs  -21.5%
+all        p99     3.48ms  3.51ms    +30µs   +0.9%
+all        ops/s   4120.0  5310.4  +1190.4  +28.9%
+validate   p50     1.84ms  1.42ms   -420µs  -22.8%
+validate   p95     2.61ms  2.05ms   -560µs  -21.5%
+validate   p99     3.48ms  3.51ms    +30µs   +0.9%
+validate   ops/s   4120.0  5310.4  +1190.4  +28.9%
+```
+
+The `Operations` table has four rows per operation, `p50`, `p95`, `p99` and
+`ops/s`: first for `all`, the run's draws together, then for every operation
+either record drew, sorted by name. When either record has stages, a `Stages`
+table follows with the same rows per stage and operation, the stages of the
+two records paired by their index. A record written as a checkpoint
+(`"incomplete": true`) compares like a final one, and its line under
+`Comparison` carries ` (incomplete)` after the run id. See
+[Comparing two runs](metrics.md#comparing-two-runs) for every format.
+
+The two records have to come from the same load. When their scenario, seed,
+workers, token pool, mix, number of stages or a stage's `fan_assignments`
+differ, the command names every difference and fails:
+
+```console
+$ dizzy keystone report --run run-1a2b3c4d.json --compare run-9c0d1e2f.json
+error: comparing run-1a2b3c4d.json with run-9c0d1e2f.json: the records come from different loads (seed 42 vs 43; workers 8 vs 16); pass --allow-mismatch to compare them anyway
+```
+
+`--allow-mismatch` compares them anyway and prints the differences on a
+`loads differ:` line under the two runs. Only `keystone pressure` records
+compare. The flags exist on the `report` of every namespace, since all share
+one builder, and a record without pressure statistics fails with
+`run <id> has no pressure statistics; the comparison needs two keystone pressure records`.
+An error of the comparison is wrapped as `comparing <run> with <compare>: …`,
+with the two paths as given. Before it reads either record, the command
+rejects `--allow-mismatch` without `--compare` with
+`--allow-mismatch needs --compare`, and `--compare` with `--format csv` with
+`--compare is not available for --format csv; use table, json or html`.
 
 ## `cleanup`
 
