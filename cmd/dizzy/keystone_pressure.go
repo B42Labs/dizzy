@@ -30,6 +30,7 @@ import (
 	"github.com/B42Labs/dizzy/internal/metrics"
 	"github.com/B42Labs/dizzy/internal/pressure"
 	"github.com/B42Labs/dizzy/internal/pressure/keystoneops"
+	"github.com/B42Labs/dizzy/internal/pressure/probe"
 	"github.com/B42Labs/dizzy/internal/resource"
 	"github.com/B42Labs/dizzy/internal/run"
 	"github.com/B42Labs/dizzy/internal/telemetry"
@@ -38,36 +39,22 @@ import (
 // Built-in defaults for the keystone pressure knobs, used when neither the
 // scenario's pressure block nor a flag supplies a value. As for chaos there is
 // no default duration: the block or --duration must set it. The bucket width
-// default is the chaos one, defaultChaosBucketWidth.
+// default is the chaos one, defaultChaosBucketWidth. The propagation probe is
+// off by default; defaultPropagationTimeout is its ceiling once an interval
+// switches it on.
 const (
 	defaultPressureWorkers    = 16
 	defaultPressureTokens     = 100
 	defaultPressureChurnUsers = 1
+	defaultPropagationTimeout = 10 * time.Minute
 )
-
-// The names of the two mix keys the scenario and --mix accept but this build
-// does not run. A later release delivers them; until then a positive weight is
-// rejected before any cloud call.
-const (
-	opProbe    = "probe"
-	opBadToken = "bad_token"
-)
-
-// supportedPressureOps are the operations this build runs, in the order the
-// rejection of an unsupported weight lists them.
-var supportedPressureOps = []string{
-	keystoneops.OpValidate,
-	keystoneops.OpEffective,
-	keystoneops.OpRevoke,
-	keystoneops.OpGrantChurn,
-	keystoneops.OpIssue,
-}
 
 // defaultPressureMix returns the built-in operation weights: mostly token
 // validations, the request the CobaltCore patches speed up, with a trickle of
 // effective listings, revocations, grant churn and issues. probe and bad_token
-// are listed with weight 0 so every mix key has a default. It returns a fresh
-// map on every call, so a caller may change it.
+// are listed with weight 0, so every mix key has a default and neither sends
+// a request to another service unless the scenario or --mix gives it a
+// weight. It returns a fresh map on every call, so a caller may change it.
 func defaultPressureMix() map[string]int {
 	return map[string]int{
 		keystoneops.OpValidate:   60,
@@ -75,33 +62,37 @@ func defaultPressureMix() map[string]int {
 		keystoneops.OpRevoke:     2,
 		keystoneops.OpGrantChurn: 2,
 		keystoneops.OpIssue:      1,
-		opProbe:                  0,
-		opBadToken:               0,
+		keystoneops.OpProbe:      0,
+		keystoneops.OpBadToken:   0,
 	}
 }
 
 // pressureFlags holds the dedicated keystone pressure flag values; whether
 // each one overrides the scenario block is decided by cmd.Flags().Changed.
 type pressureFlags struct {
-	duration    time.Duration
-	bucketWidth time.Duration
-	workers     int
-	tokens      int
-	churnUsers  int
-	mix         []string
+	duration           time.Duration
+	bucketWidth        time.Duration
+	workers            int
+	tokens             int
+	churnUsers         int
+	mix                []string
+	propagationEvery   time.Duration
+	propagationTimeout time.Duration
 }
 
 // newKeystonePressureCmd builds "keystone pressure": a closed-loop load on
-// Keystone's token validation, revocation and role-listing path. It
-// provisions the plan's domains, roles, projects, users and role assignments,
-// primes a pool of project-scoped tokens, and runs a fixed number of workers
-// that each send one weighted operation after another for the configured
-// duration, or until it is stopped (--duration 0). It rewrites its run record
-// every chaosCheckpointInterval while the workers run, prints the metrics
-// summary and the Pressure table, records the run, and, unless --no-cleanup,
-// tears the resources down and reports any leak, as keystone chaos does. Only
-// the admin tier runs, and everything this build cannot run is rejected
-// before the first cloud call.
+// Keystone's token validation, revocation and role-listing path and, through
+// probe, bad_token and the propagation probe, on the token validation inside
+// Nova, Neutron, Cinder and Glance. It provisions the plan's domains, roles,
+// projects, users and role assignments, primes a pool of project-scoped
+// tokens, and runs a fixed number of workers that each send one weighted
+// operation after another for the configured duration, or until it is
+// stopped (--duration 0). It rewrites its run record every
+// chaosCheckpointInterval while the workers run, prints the metrics summary
+// and the Pressure table, records the run, and, unless --no-cleanup, tears
+// the resources down and reports any leak, as keystone chaos does. Only the
+// admin tier runs, and everything the engine would refuse is rejected before
+// the first cloud call.
 func newKeystonePressureCmd(opts *globalOptions) *cobra.Command {
 	var (
 		scenarioPath string
@@ -118,12 +109,20 @@ func newKeystonePressureCmd(opts *globalOptions) *cobra.Command {
 role-listing path. The command provisions the scenario's domains, roles,
 projects, users and role assignments, primes a pool of project-scoped tokens,
 and runs a fixed number of workers that each send one request after another,
-drawn by weight from validate, effective, revoke, grant_churn and issue, for
-the configured duration or, with --duration 0, until it is interrupted. It
-prints the metrics summary and the Pressure table, writes run-<id>.json, and
-tears its resources down unless --no-cleanup is given. Only the admin tier
-runs: validating and revoking other users' tokens and listing their role
-assignments are admin operations.
+drawn by weight from validate, effective, revoke, grant_churn, issue, probe
+and bad_token, for the configured duration or, with --duration 0, until it is
+interrupted. It prints the metrics summary and the Pressure table, writes
+run-<id>.json, and tears its resources down unless --no-cleanup is given.
+Only the admin tier runs: validating and revoking other users' tokens and
+listing their role assignments are admin operations.
+
+probe sends a pool token to Nova, Neutron, Cinder or Glance, as far as the
+token's catalog lists them, for the cheapest read the service offers.
+bad_token, off by default, floods a service with tokens it has to reject and
+exists to load the services' rejection path. The propagation probe
+(--propagation-every) revokes a pool token and measures how long a service
+keeps accepting it. All three, like revoke, belong on a lab, never on a
+shared cloud.
 
 Run it on a lab, never on a shared cloud. Every revoke is a real revocation
 event, and on Keystone 2026.2 each one flushes the token validation cache for
@@ -138,9 +137,6 @@ every user of that Keystone, not only for the run's own users.`,
 
 			cfg, o, stages, err := mergePressureConfig(cmd, opts, s, f)
 			if err != nil {
-				return err
-			}
-			if err := checkPressureSupported(o, s); err != nil {
 				return err
 			}
 			switch priv.privilege {
@@ -180,13 +176,17 @@ every user of that Keystone, not only for the run's own users.`,
 				return err
 			}
 
-			gc, err := config.NewIdentityClient(ctx, opts.osCloud)
+			stack, err := config.NewIdentityStack(ctx, opts.osCloud)
 			if err != nil {
 				return fmt.Errorf("creating identity client: %w", err)
 			}
+			gc := stack.Identity
 			// The workers and the token refresher, whose reissues run next
 			// to them with up to --concurrency in flight, all go to the one
 			// Keystone endpoint, as provisioning and priming do before them.
+			// The probes share the identity client's transport: its per-host
+			// cap applies to each service host too, while its total cap is
+			// shared by Keystone and the services.
 			sizeConnectionPool(gc, cfg.Workers+opts.concurrency)
 
 			if _, err := resolvePressureTier(ctx, gc, priv); err != nil {
@@ -194,8 +194,7 @@ every user of that Keystone, not only for the run's own users.`,
 			}
 
 			collector := metrics.NewCollector()
-			client := keystone.New(gc, runID, collector)
-			client.SetTelemetry(tel)
+			client, svc := newPressureClients(gc, stack.EndpointOpts, runID, collector, tel)
 			return runKeystonePressure(ctx, cmd, client, pressureRun{
 				runID:       runID,
 				plan:        p,
@@ -207,6 +206,7 @@ every user of that Keystone, not only for the run's own users.`,
 				noCleanup:   noCleanup,
 				collector:   collector,
 				tel:         tel,
+				services:    svc,
 			})
 		},
 	}
@@ -219,7 +219,9 @@ every user of that Keystone, not only for the run's own users.`,
 	flags.IntVar(&f.workers, "workers", 0, fmt.Sprintf("closed-loop workers, 1 to 1024; 0 takes the scenario pressure block's value or %d", defaultPressureWorkers))
 	flags.IntVar(&f.tokens, "tokens", 0, fmt.Sprintf("size of the token pool; 0 takes the scenario pressure block's value or %d", defaultPressureTokens))
 	flags.IntVar(&f.churnUsers, "churn-users", defaultPressureChurnUsers, "users reserved for grant_churn, taken from the end of the plan's regular users, never a fan user; they hold no pool token")
-	flags.StringArrayVar(&f.mix, "mix", nil, "weight of one operation as <operation>=<weight>, e.g. --mix revoke=0; operations: "+strings.Join(supportedPressureOps, ", ")+" (repeatable)")
+	flags.StringArrayVar(&f.mix, "mix", nil, "weight of one operation as <operation>=<weight>, e.g. --mix revoke=0; operations: "+strings.Join(keystoneops.OperationNames, ", ")+" (repeatable)")
+	flags.DurationVar(&f.propagationEvery, "propagation-every", 0, "revoke one pool token at this interval and poll a service with it until it answers 401; 0 switches the propagation probe off, also when given as a flag over a scenario block")
+	flags.DurationVar(&f.propagationTimeout, "propagation-timeout", defaultPropagationTimeout, "ceiling of one propagation probe; a probe still accepted after it counts as a timeout")
 	flags.BoolVar(&noCleanup, "no-cleanup", false, "leave the identity resources in place — at the end of the run, on interrupt or after a failed setup — instead of tearing them down by name prefix")
 	priv.register(flags)
 	// MarkFlagRequired only fails for an unknown flag; "scenario" was just added.
@@ -242,15 +244,35 @@ type pressureKeystone interface {
 // The production *keystone.Client must satisfy the seam.
 var _ pressureKeystone = (*keystone.Client)(nil)
 
+// newPressureClients builds the two clients a pressure run sends through, both
+// over gc and both recording into collector and tel: the Keystone client,
+// which names the run's resources after runID and reads every pool token's
+// endpoints from the token's own catalog, selected with eo, the region and
+// interface of the clouds.yaml entry; and the probe client, with which probe,
+// bad_token and the propagation probe send those tokens to the other
+// services. The probe client shares gc's HTTP client, and with it the
+// transport sizeConnectionPool sized. A nil tel is the disabled export.
+func newPressureClients(gc *gophercloud.ServiceClient, eo gophercloud.EndpointOpts, runID string, collector *metrics.Collector, tel *telemetry.Telemetry) (*keystone.Client, *probe.Client) {
+	client := keystone.New(gc, runID, collector)
+	client.SetEndpointOpts(eo)
+	client.SetTelemetry(tel)
+	svc := probe.New(gc, collector)
+	svc.SetTelemetry(tel)
+	return client, svc
+}
+
 // pressureRun carries what runKeystonePressure needs besides Keystone: the run
 // id, the plan, the engine config, the stages' fan_assignments targets and the
 // operation options that passed every pre-cloud check, the global concurrency
-// and per-operation timeout, --no-cleanup, and the collector and telemetry the
-// Keystone client records into. cfg and stages come as mergePressureConfig
-// returns them: cfg without the seed, the classifier, the checkpoint and the
-// stages' Enter, which runKeystonePressure sets, and stages with one target
-// per stage of cfg, 0 for a stage without one. A nil tel is the disabled
-// export.
+// and per-operation timeout, --no-cleanup, the collector and telemetry the
+// Keystone client and the services record into, and the services seam probe,
+// bad_token and the propagation probe send through. cfg and stages come as
+// mergePressureConfig returns them: cfg without the seed, the classifier, the
+// checkpoint and the stages' Enter, which runKeystonePressure sets, and stages
+// with one target per stage of cfg, 0 for a stage without one; o comes
+// without the seed, which runKeystonePressure sets too. A nil tel is the
+// disabled export. A nil services is accepted only for a run that sends
+// nothing to the other services, as keystoneops.Build accepts it.
 type pressureRun struct {
 	runID       string
 	plan        *keystoneplan.Plan
@@ -262,22 +284,26 @@ type pressureRun struct {
 	noCleanup   bool
 	collector   *metrics.Collector
 	tel         *telemetry.Telemetry
+	services    keystoneops.Services
 }
 
 // runKeystonePressure is keystone pressure from its first write on, once
 // every pre-cloud check and the privilege pre-check passed. It provisions the
-// plan in the admin tier, builds the operation set, primes the token pool,
-// runs the workers from the plan's seed, with keystoneops.Classify labeling
-// their errors and a run-record checkpoint every chaosCheckpointInterval,
-// prints the metrics summary and the Pressure table, writes the run record,
-// and tears down through finishKeystoneTeardown. In a staged run, entering a
-// stage with a fan_assignments target grows every fan user to it through
+// plan in the admin tier, builds the operation set over r.services, with the
+// propagation probe drawing from the plan's seed, primes the token pool and
+// logs the services the first pool token's catalog lists for a run that
+// sends to them, runs the workers from the plan's seed, with
+// keystoneops.Classify labeling their errors and a run-record checkpoint
+// every chaosCheckpointInterval, prints the metrics summary and the Pressure
+// table, writes the run record, and tears down through
+// finishKeystoneTeardown. In a staged run, entering a stage with a
+// fan_assignments target grows every fan user to it through
 // keystoneops.Set.GrowFan while no operation is in flight, and the grants
 // join the run's created resources. A failure before the workers finish, a
 // failed stage entry included, goes through failPressureSetup, which writes a
 // record whose error names the failure and tears down what was created so
 // far. It is split from the command so a test can drive it with a fake
-// Keystone; it prints to cmd's output.
+// Keystone and fake services; it prints to cmd's output.
 func runKeystonePressure(ctx context.Context, cmd *cobra.Command, c pressureKeystone, r pressureRun) error {
 	p, cfg, o := r.plan, r.cfg, r.o
 	out := cmd.OutOrStdout()
@@ -311,18 +337,27 @@ func runKeystonePressure(ctx context.Context, cmd *cobra.Command, c pressureKeys
 		return setupFailed(prov.Created, "provisioning plan", err)
 	}
 
-	set, err := keystoneops.Build(p, c, nil, prov.Bindings, prov.IDs, prov.Passwords, o)
+	// The propagation probe draws the tokens it revokes from the plan's seed.
+	// Which token a draw picks also depends on the pool as the workers left
+	// it, so the seed reproduces the workers' operations but not the probe's
+	// tokens.
+	o.Seed = p.Seed
+	set, err := keystoneops.Build(p, c, r.services, prov.Bindings, prov.IDs, prov.Passwords, o)
 	if err != nil {
 		return setupFailed(prov.Created, "building pressure set", err)
 	}
-	// Close is idempotent; the explicit calls below stop the refresher before
-	// the teardown, this one covers any other way out.
+	// Close is idempotent; the explicit calls below stop the refresher and the
+	// propagation probe before the teardown, this one covers any other way
+	// out.
 	defer set.Close()
 
 	slog.Info("priming token pool", "tokens", o.Tokens, "concurrency", r.concurrency)
 	if err := set.Prime(ctx, r.concurrency); err != nil {
 		set.Close()
 		return setupFailed(prov.Created, "starting pressure run", err)
+	}
+	if services := set.Services(); len(services) > 0 {
+		slog.Info("probe services", "services", services)
 	}
 
 	// created lists every resource the run has created: the provisioned ones
@@ -338,7 +373,16 @@ func runKeystonePressure(ctx context.Context, cmd *cobra.Command, c pressureKeys
 	}
 
 	// buildRecord builds the run record as of finished, for the checkpoints
-	// written while the workers run and for the final record.
+	// written while the workers run and for the final record. The probe and
+	// bad-token samples are aggregated over the engine's wall,
+	// res.Operations.Wall, not over finished minus start, which takes in the
+	// provisioning and the priming, so the OPS/S of the Probes and Bad tokens
+	// tables divides by the time the Operations table's does. In the final
+	// record a service's rows add up to the operation's, but for the draws
+	// that failed before any request, on an empty pool or a catalog without
+	// the four services, which only the operation counts. A checkpoint reads
+	// the set after the engine's snapshot while the workers keep drawing, so
+	// its service rows may be a few draws ahead of the operation's.
 	buildRecord := func(res *pressure.Result, finished time.Time) *run.Record {
 		return &run.Record{
 			RunID:      r.runID,
@@ -349,7 +393,7 @@ func runKeystonePressure(ctx context.Context, cmd *cobra.Command, c pressureKeys
 			FinishedAt: finished,
 			Created:    createdSoFar(),
 			Metrics:    r.collector.Aggregate(finished.Sub(start)),
-			Pressure:   pressureStats(res, o, r.stages),
+			Pressure:   pressureStats(res, o, r.stages, set.ServiceStats(res.Operations.Wall)),
 		}
 	}
 	// The engine settings that make the run this command's run are set here,
@@ -390,7 +434,8 @@ func runKeystonePressure(ctx context.Context, cmd *cobra.Command, c pressureKeys
 	duration := pressureDurationLabel(cfg)
 	slog.Info("starting pressure run", "run", r.runID, "scenario", p.Scenario, "duration", duration,
 		"workers", cfg.Workers, "tokens", o.Tokens, "churnUsers", pressureChurnUsers(o),
-		"mix", pressureMixLabel(o.Weights), "stages", len(cfg.Stages), "concurrency", r.concurrency)
+		"mix", pressureMixLabel(o.Weights), "propagation", pressurePropagationLabel(o), "stages", len(cfg.Stages),
+		"concurrency", r.concurrency)
 
 	hb := startHeartbeat(ctx, "pressure in progress", collectorSnapshot(r.collector, start, "duration", duration))
 	result, runErr := pressure.Run(ctx, set.Operations(), cfg)
@@ -428,9 +473,8 @@ func runKeystonePressure(ctx context.Context, cmd *cobra.Command, c pressureKeys
 
 // parseMixFlag parses the --mix values, each "<operation>=<weight>", into
 // operation weights. The operation must be one of the mix keys of the
-// scenario's pressure block, probe and bad_token included, so they reach the
-// support check with their own message; the weight must be a non-negative
-// integer. A later value for the same operation wins.
+// scenario's pressure block, the seven operations of keystoneops; the weight
+// must be a non-negative integer. A later value for the same operation wins.
 func parseMixFlag(values []string) (map[string]int, error) {
 	known := defaultPressureMix()
 	weights := make(map[string]int, len(values))
@@ -464,6 +508,16 @@ func parseMixFlag(values []string) (map[string]int, error) {
 // provisioned; pressure.Config.Validate does not read them while OnCheckpoint
 // is unset, so the command's pre-cloud check is the same without them.
 //
+// The propagation probe takes the same layers: off with a ceiling of
+// defaultPropagationTimeout by default, then the block's propagation.every and
+// propagation.timeout where positive, a block's timeout 0 meaning the
+// default, then --propagation-every and --propagation-timeout where set, so
+// --propagation-every 0 switches off a block's probe. Once every layer is
+// applied, a negative interval fails, as a negative block value does, rather
+// than switching the probe off unnoticed; a negative ceiling fails, and so
+// does one that is not positive while the probe is on. A block's negative
+// value never gets here, since the scenario's own validation rejects it.
+//
 // The block's stages, which no flag overrides, divide the merged duration:
 // once every duration layer is applied, stageWindows resolves their windows
 // into cfg.Stages, each with a nil Enter for runKeystonePressure to set, and
@@ -478,10 +532,11 @@ func mergePressureConfig(cmd *cobra.Command, opts *globalOptions, s keystonescen
 		OpTimeout:   opts.timeout,
 	}
 	o := keystoneops.Options{
-		Tokens:     defaultPressureTokens,
-		ChurnUsers: defaultPressureChurnUsers,
-		Weights:    defaultPressureMix(),
-		OpTimeout:  opts.timeout,
+		Tokens:      defaultPressureTokens,
+		ChurnUsers:  defaultPressureChurnUsers,
+		Weights:     defaultPressureMix(),
+		OpTimeout:   opts.timeout,
+		Propagation: keystoneops.Propagation{Timeout: defaultPropagationTimeout},
 	}
 
 	if b := s.Pressure; b != nil {
@@ -503,16 +558,24 @@ func mergePressureConfig(cmd *cobra.Command, opts *globalOptions, s keystonescen
 		if m := b.Mix; m != nil {
 			for name, w := range map[string]*int{
 				keystoneops.OpValidate:   m.Validate,
-				opProbe:                  m.Probe,
+				keystoneops.OpProbe:      m.Probe,
 				keystoneops.OpEffective:  m.Effective,
 				keystoneops.OpRevoke:     m.Revoke,
 				keystoneops.OpGrantChurn: m.GrantChurn,
 				keystoneops.OpIssue:      m.Issue,
-				opBadToken:               m.BadToken,
+				keystoneops.OpBadToken:   m.BadToken,
 			} {
 				if w != nil {
 					o.Weights[name] = *w
 				}
+			}
+		}
+		if pr := b.Propagation; pr != nil {
+			if pr.Every > 0 {
+				o.Propagation.Every = time.Duration(pr.Every)
+			}
+			if pr.Timeout > 0 {
+				o.Propagation.Timeout = time.Duration(pr.Timeout)
 			}
 		}
 	}
@@ -543,12 +606,24 @@ func mergePressureConfig(cmd *cobra.Command, opts *globalOptions, s keystonescen
 			o.Weights[name] = w
 		}
 	}
+	if flags.Changed("propagation-every") {
+		o.Propagation.Every = f.propagationEvery
+	}
+	if flags.Changed("propagation-timeout") {
+		o.Propagation.Timeout = f.propagationTimeout
+	}
 
 	if o.ChurnUsers < 0 {
 		return pressure.Config{}, keystoneops.Options{}, nil, fmt.Errorf("--churn-users must not be negative, got %d", o.ChurnUsers)
 	}
 	if o.Tokens < 1 {
 		return pressure.Config{}, keystoneops.Options{}, nil, fmt.Errorf("pressure tokens must be at least 1, got %d", o.Tokens)
+	}
+	if o.Propagation.Every < 0 {
+		return pressure.Config{}, keystoneops.Options{}, nil, fmt.Errorf("--propagation-every must not be negative, got %s", o.Propagation.Every)
+	}
+	if t := o.Propagation.Timeout; t < 0 || (o.Propagation.Every > 0 && t <= 0) {
+		return pressure.Config{}, keystoneops.Options{}, nil, fmt.Errorf("--propagation-timeout must be positive, got %s", t)
 	}
 
 	var targets []int
@@ -622,22 +697,6 @@ func stageWindows(stages []keystonescenario.Stage, duration time.Duration) ([]ti
 	}
 	windows[open[len(open)-1]] += rest % n
 	return windows, nil
-}
-
-// checkPressureSupported rejects what the scenario and the flags may set but
-// this build does not run: a positive probe or bad_token weight and a
-// propagation probe. The keys parse so a scenario written for a later release
-// loads, and fail here, before any cloud call, rather than being ignored.
-func checkPressureSupported(o keystoneops.Options, s keystonescenario.Scenario) error {
-	for _, name := range []string{opProbe, opBadToken} {
-		if o.Weights[name] > 0 {
-			return fmt.Errorf("pressure mix weight %q is not supported by this build; supported operations: %s", name, strings.Join(supportedPressureOps, ", "))
-		}
-	}
-	if b := s.Pressure; b != nil && b.Propagation != nil && b.Propagation.Every > 0 {
-		return errors.New("pressure.propagation is not supported by this build")
-	}
-	return nil
 }
 
 // requirePressureAdminTier rejects every tier but the admin one: validating
@@ -718,15 +777,19 @@ func failPressureSetup(ctx context.Context, out io.Writer, c keystoneexec.Cleane
 	return fmt.Errorf("%s (run %s): %w", what, runID, cause)
 }
 
-// pressureStats maps the engine result and the merged options onto the
-// persisted run-record schema. Revocations counts the run's succeeded revoke
-// operations, and each bucket's Revocations those of that bucket and every
-// earlier one, so a latency change reads next to the revocations that had
-// piled up by then. ChurnUsers is 0 when grant_churn is off, since no user is
+// pressureStats maps the engine result, the merged options and the set's
+// service statistics onto the persisted run-record schema. Revocations counts
+// the run's succeeded revoke operations, and each bucket's Revocations those
+// of that bucket and every earlier one, so a latency change reads next to the
+// revocations that had piled up by then; the propagation probe's revocations
+// are in neither. ChurnUsers is 0 when grant_churn is off, since no user is
 // reserved then. Stages holds the stages the run entered, in order, each with
 // its 1-based index and its fan_assignments target from stages, 0 for a stage
-// without one; it is nil for a run without stages.
-func pressureStats(r *pressure.Result, o keystoneops.Options, stages []int) *run.PressureStats {
+// without one; it is nil for a run without stages. Probes and BadTokens hold
+// ss's probe and bad_token draws per service, nil when the run drew none, and
+// Propagation the propagation probe's settings and outcome from ss while
+// o.Propagation.Every is positive; it is nil for a run without the probe.
+func pressureStats(r *pressure.Result, o keystoneops.Options, stages []int, ss keystoneops.ServiceStats) *run.PressureStats {
 	ps := &run.PressureStats{
 		Workers:     r.Workers,
 		Tokens:      o.Tokens,
@@ -734,7 +797,19 @@ func pressureStats(r *pressure.Result, o keystoneops.Options, stages []int) *run
 		Mix:         pressureMix(o.Weights),
 		Operations:  r.Operations,
 		Revocations: succeededRevocations(r.Operations),
+		Probes:      ss.Probes.ByType,
+		BadTokens:   ss.BadTokens.ByType,
 		BucketWidth: r.BucketWidth,
+	}
+	if o.Propagation.Every > 0 {
+		pp := ss.Propagation
+		ps.Propagation = &run.PressurePropagation{
+			Every:    pp.Every,
+			Timeout:  pp.Timeout,
+			Probes:   pp.Probes,
+			TimedOut: pp.TimedOut,
+			Delay:    pp.Delay,
+		}
 	}
 	cumulative := 0
 	for _, b := range r.Buckets {
@@ -813,13 +888,12 @@ func pressureMixLabel(weights map[string]int) []string {
 // engine would refuse fails here rather than after the plan is provisioned and
 // the pool primed: at least one weight must be positive (pressure.ErrNoWeight
 // otherwise) and the weights must not sum past the largest int. The list holds
-// the five operations keystoneops.Set.Operations returns, with the merged
-// weights; their Do is never called, as the check reads only names and
-// weights. probe and bad_token are left out: checkPressureSupported has
-// rejected a positive weight for either by then.
+// the seven operations keystoneops.Set.Operations returns, named by
+// keystoneops.OperationNames, with the merged weights; their Do is never
+// called, as the check reads only names and weights.
 func checkPressureMix(weights map[string]int) error {
-	ops := make([]pressure.Operation, 0, len(supportedPressureOps))
-	for _, name := range supportedPressureOps {
+	ops := make([]pressure.Operation, 0, len(keystoneops.OperationNames))
+	for _, name := range keystoneops.OperationNames {
 		ops = append(ops, pressure.Operation{
 			Name:   name,
 			Weight: weights[name],
@@ -836,7 +910,9 @@ func checkPressureMix(weights map[string]int) error {
 // churn connections: a request that finds no idle connection opens a new TCP
 // and TLS connection, and the latency samples include handshakes rather than
 // measuring Keystone alone. The pool-token calls share this transport, since
-// they copy gc's HTTP client.
+// they copy gc's HTTP client, and so do the probes at the other services:
+// each service host gets the per-host cap below, and all hosts, Keystone's
+// included, share the total one.
 //
 // A nil transport, which stands for http.DefaultTransport, and an
 // *http.Transport are both replaced by a clone, so neither the process-wide
@@ -873,4 +949,13 @@ func pressureDurationLabel(cfg pressure.Config) any {
 		return "unbounded"
 	}
 	return cfg.Duration
+}
+
+// pressurePropagationLabel is the propagation probe a pressure run logs: its
+// interval, or "off" for a run without the probe.
+func pressurePropagationLabel(o keystoneops.Options) any {
+	if o.Propagation.Every > 0 {
+		return o.Propagation.Every
+	}
+	return "off"
 }
