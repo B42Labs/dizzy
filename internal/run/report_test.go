@@ -1240,3 +1240,230 @@ func TestWriteJSONPressureStages(t *testing.T) {
 		t.Errorf("JSON report of a run without stages carries a stages key:\n%s", plain.String())
 	}
 }
+
+// pressureServicesRecord builds the record of a staged keystone pressure run
+// that also sent its pool tokens to the other services: pressureStagesRecord
+// with probes at glance and nova, bad tokens at nova only, and a propagation
+// probe every 30s with a 10m ceiling that completed 12 probes, none timed
+// out, at a delay of p50 2.1s, p95 4.8s, p99 6.2s and max 6.2s. Its p95 lies
+// 200µs above 4.8s and nova's probe p99 300ns above 3.1ms, so the rounding of
+// the reports shows. The operation aggregate stays pressureStagesRecord's:
+// the reports render the per-service lists on their own.
+func pressureServicesRecord() *Record {
+	r := pressureStagesRecord()
+	p := r.Pressure
+	p.Probes = []metrics.Stats{
+		{Type: "glance", Attempted: 60, Succeeded: 60, Throughput: 0.67, Latency: metrics.Latency{
+			Min: 2100 * time.Microsecond, Mean: 3400 * time.Microsecond, Median: 3100 * time.Microsecond,
+			P90: 4800 * time.Microsecond, P95: 5500 * time.Microsecond, P99: 7200 * time.Microsecond, Max: 9 * time.Millisecond}},
+		{Type: "nova", Attempted: 64, Succeeded: 63, Failed: 1, Throughput: 0.71, Latency: metrics.Latency{
+			Min: 800 * time.Microsecond, Mean: 1350 * time.Microsecond, Median: 1200 * time.Microsecond,
+			P90: 2 * time.Millisecond, P95: 2400 * time.Microsecond, P99: 3100*time.Microsecond + 300, Max: 4200 * time.Microsecond}},
+	}
+	p.BadTokens = []metrics.Stats{
+		{Type: "nova", Attempted: 30, Succeeded: 29, Failed: 1, Throughput: 0.33, Latency: metrics.Latency{
+			Min: 600 * time.Microsecond, Mean: 950 * time.Microsecond, Median: 900 * time.Microsecond,
+			P90: 1400 * time.Microsecond, P95: 1600 * time.Microsecond, P99: 2 * time.Millisecond, Max: 2300 * time.Microsecond}},
+	}
+	p.Propagation = &PressurePropagation{
+		Every:   30 * time.Second,
+		Timeout: 10 * time.Minute,
+		Probes:  12,
+		Delay: metrics.Latency{
+			Min: 1200 * time.Millisecond, Mean: 2600 * time.Millisecond, Median: 2100 * time.Millisecond,
+			P90: 4100 * time.Millisecond, P95: 4800*time.Millisecond + 200*time.Microsecond,
+			P99: 6200 * time.Millisecond, Max: 6200 * time.Millisecond},
+	}
+	return r
+}
+
+// TestWritePressureTableServices confirms a run with probes, bad tokens and
+// the propagation probe gets, between the Operations and the Stages table, a
+// Probes table with one row per service in the columns of the operation
+// table, a Bad tokens table the same way and the Propagation block with its
+// durations rounded to the millisecond, and that the rest of the report is
+// the report of the same run without them, line for line.
+func TestWritePressureTableServices(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteTable(&buf, pressureServicesRecord()); err != nil {
+		t.Fatalf("WriteTable: %v", err)
+	}
+	lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+	titles := []string{"Operations", "Probes", "Bad tokens", "Propagation", "Stages"}
+	at := make([]int, len(titles))
+	for i, title := range titles {
+		at[i] = slices.Index(lines, title)
+		if at[i] < 1 || lines[at[i]-1] != "" {
+			t.Fatalf("report lacks the %q title after a blank line:\n%s", title, buf.String())
+		}
+		if i > 0 && at[i] < at[i-1] {
+			t.Fatalf("%q at line %d precedes %q at line %d:\n%s", title, at[i], titles[i-1], at[i-1], buf.String())
+		}
+	}
+	probes, bad, propagation, stages := at[1], at[2], at[3], at[4]
+
+	header := []string{"SERVICE", "OPS", "OK", "FAILED", "OPS/S", "MIN", "MEAN", "P50", "P90", "P95", "P99", "MAX"}
+	for _, tc := range []struct {
+		title string
+		rows  []string
+		want  [][]string
+	}{
+		{"Probes", lines[probes+1 : bad-1], [][]string{
+			header,
+			{"glance", "60", "60", "0", "0.7", "2.1ms", "3.4ms", "3.1ms", "4.8ms", "5.5ms", "7.2ms", "9ms"},
+			{"nova", "64", "63", "1", "0.7", "800µs", "1.35ms", "1.2ms", "2ms", "2.4ms", "3.1ms", "4.2ms"},
+		}},
+		{"Bad tokens", lines[bad+1 : propagation-1], [][]string{
+			header,
+			{"nova", "30", "29", "1", "0.3", "600µs", "950µs", "900µs", "1.4ms", "1.6ms", "2ms", "2.3ms"},
+		}},
+	} {
+		if len(tc.rows) != len(tc.want) {
+			t.Errorf("%s table has %d lines, want %d:\n%s", tc.title, len(tc.rows), len(tc.want), buf.String())
+			continue
+		}
+		for i, w := range tc.want {
+			if got := strings.Fields(tc.rows[i]); !reflect.DeepEqual(got, w) {
+				t.Errorf("%s row %d = %q, want %q", tc.title, i, got, w)
+			}
+		}
+		if !strings.HasPrefix(tc.rows[0], "SERVICE  ") {
+			t.Errorf("%s header %q does not start with the left-aligned SERVICE column", tc.title, tc.rows[0])
+		}
+	}
+
+	wantPropagation := []string{
+		"  every:     30s",
+		"  timeout:   10m0s",
+		"  probes:    12",
+		"  timed out: 0",
+		"  delay:     p50 2.1s / p95 4.8s / p99 6.2s / max 6.2s",
+	}
+	if got := lines[propagation+1 : stages-1]; !reflect.DeepEqual(got, wantPropagation) {
+		t.Errorf("propagation block = %q, want %q", got, wantPropagation)
+	}
+
+	var plain bytes.Buffer
+	if err := WriteTable(&plain, pressureStagesRecord()); err != nil {
+		t.Fatalf("WriteTable(without services): %v", err)
+	}
+	// Cutting the three new sections, from the blank line before Probes up to
+	// the blank line before Stages, leaves the report of the run without them.
+	if got, want := strings.Join(slices.Concat(lines[:probes-1], lines[stages-1:]), "\n")+"\n", plain.String(); got != want {
+		t.Errorf("report without its service sections differs from the report of the run without them:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestWritePressureTablePropagationWithoutProbes confirms a run with the
+// propagation probe that completed no probe shows its block with "-" as the
+// delay rather than 0s percentiles, and that a run without probe and
+// bad-token draws gets neither table.
+func TestWritePressureTablePropagationWithoutProbes(t *testing.T) {
+	p := pressureRecord().Pressure
+	p.Propagation = &PressurePropagation{Every: 30 * time.Second, Timeout: 10 * time.Minute}
+	var buf bytes.Buffer
+	if err := WritePressureTable(&buf, p); err != nil {
+		t.Fatalf("WritePressureTable: %v", err)
+	}
+	out := buf.String()
+	const want = "\n\nPropagation\n  every:     30s\n  timeout:   10m0s\n  probes:    0\n  timed out: 0\n  delay:     -\n\nLatency and errors over time\n"
+	if !strings.Contains(out, want) {
+		t.Errorf("pressure table lacks the propagation block %q between the operation and the bucket table:\n%s", want, out)
+	}
+	for _, title := range []string{"\nProbes\n", "\nBad tokens\n"} {
+		if strings.Contains(out, title) {
+			t.Errorf("pressure table of a run without such draws has the %q table:\n%s", strings.TrimSpace(title), out)
+		}
+	}
+}
+
+// TestWriteCSVPressureServices confirms a run with probes, bad tokens and
+// the propagation probe gets one row per service labelled
+// pressure/probe/<service> and pressure/bad_token/<service>, and one row
+// pressure/propagation counting the completed probes as attempted, the
+// timed-out ones as failed and carrying the delays, all after the operation
+// rows and before the stage and bucket rows.
+func TestWriteCSVPressureServices(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteCSV(&buf, pressureServicesRecord()); err != nil {
+		t.Fatalf("WriteCSV: %v", err)
+	}
+	records, err := csv.NewReader(&buf).ReadAll()
+	if err != nil {
+		t.Fatalf("parsing csv: %v", err)
+	}
+	var labels []string
+	for _, rec := range records[1:] {
+		labels = append(labels, rec[0])
+	}
+	want := []string{
+		"overall", "project", "token",
+		"pressure/effective", "pressure/validate",
+		"pressure/probe/glance", "pressure/probe/nova", "pressure/bad_token/nova", "pressure/propagation",
+		"pressure/stage-1/effective", "pressure/stage-1/validate",
+		"pressure/stage-2/effective", "pressure/stage-2/validate",
+		"pressure@0s/effective", "pressure@0s/validate",
+		"pressure@1m0s/effective", "pressure@1m0s/validate",
+	}
+	if !reflect.DeepEqual(labels, want) {
+		t.Fatalf("row labels = %v, want %v", labels, want)
+	}
+	row := records[1+slices.Index(labels, "pressure/propagation")]
+	if got := row[1:4]; !reflect.DeepEqual(got, []string{"12", "12", "0"}) {
+		t.Errorf("pressure/propagation attempted, succeeded, failed = %v, want [12 12 0]", got)
+	}
+	if row[7] != "2100.000" || row[11] != "6200.000" {
+		t.Errorf("pressure/propagation row = %v, want median_ms 2100.000 and max_ms 6200.000", row)
+	}
+	// pressure/probe/nova: 64 attempted, 1 failed, p50 1.200 ms.
+	if row := records[1+slices.Index(labels, "pressure/probe/nova")]; row[1] != "64" || row[3] != "1" || row[7] != "1.200" {
+		t.Errorf("pressure/probe/nova row = %v, want attempted 64, failed 1, median 1.200", row)
+	}
+}
+
+// TestWriteJSONPressureServices confirms a run with probes, bad tokens and
+// the propagation probe carries them inside the pressure object of the JSON
+// report, the probes sorted by service and the propagation with its probe
+// count, and that the pressure object decodes back to the record's.
+func TestWriteJSONPressureServices(t *testing.T) {
+	rec := pressureServicesRecord()
+	var buf bytes.Buffer
+	if err := WriteJSON(&buf, rec); err != nil {
+		t.Fatalf("WriteJSON: %v", err)
+	}
+	var got struct {
+		Pressure struct {
+			Probes []struct {
+				Type string `json:"type"`
+			} `json:"probes"`
+			BadTokens []struct {
+				Type string `json:"type"`
+			} `json:"badTokens"`
+			Propagation struct {
+				Probes int `json:"probes"`
+			} `json:"propagation"`
+		} `json:"pressure"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("report JSON does not decode: %v", err)
+	}
+	if len(got.Pressure.Probes) != 2 || got.Pressure.Probes[0].Type != "glance" || got.Pressure.Probes[1].Type != "nova" {
+		t.Errorf(".pressure.probes = %+v, want glance and nova", got.Pressure.Probes)
+	}
+	if len(got.Pressure.BadTokens) != 1 || got.Pressure.BadTokens[0].Type != "nova" {
+		t.Errorf(".pressure.badTokens = %+v, want nova", got.Pressure.BadTokens)
+	}
+	if got.Pressure.Propagation.Probes != 12 {
+		t.Errorf(".pressure.propagation.probes = %d, want 12", got.Pressure.Propagation.Probes)
+	}
+
+	var whole struct {
+		Pressure *PressureStats `json:"pressure"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &whole); err != nil {
+		t.Fatalf("decoding .pressure: %v", err)
+	}
+	if !reflect.DeepEqual(whole.Pressure, rec.Pressure) {
+		t.Errorf(".pressure = %+v, want %+v", whole.Pressure, rec.Pressure)
+	}
+}

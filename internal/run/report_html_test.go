@@ -592,3 +592,129 @@ func TestWriteHTMLEscapesPressureOperation(t *testing.T) {
 		t.Error("series heading lacks the escaped operation name")
 	}
 }
+
+// TestWriteHTMLGoldenPressureServices locks the rendered HTML for a staged
+// pressure record with probes, bad tokens and the propagation probe: the
+// probe and bad-token tables by service and the propagation chips between
+// the per-operation table and the stage table.
+func TestWriteHTMLGoldenPressureServices(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteHTML(&buf, pressureServicesRecord()); err != nil {
+		t.Fatalf("WriteHTML: %v", err)
+	}
+	checkGolden(t, "report-pressure-services.html", buf.Bytes())
+}
+
+// TestWriteHTMLPressureServicesTables confirms the pressure section of a run
+// with probes, bad tokens and the propagation probe carries, in this order
+// after the per-operation table and before the stage table, a "Probes by
+// service" and a "Bad tokens by service" heading, each over a sortable table
+// with "service" as the first column and one row per service, and a
+// "Propagation" heading with its chips, the delays humanized; that a run
+// whose propagation probe completed nothing shows "-" for every delay; that
+// the page stays self-contained; and that a run without them has none of the
+// headings.
+func TestWriteHTMLPressureServicesTables(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteHTML(&buf, pressureServicesRecord()); err != nil {
+		t.Fatalf("WriteHTML: %v", err)
+	}
+	section := pressureSection(buf.String())
+	headings := []string{"<h2>Probes by service</h2>", "<h2>Bad tokens by service</h2>", "<h2>Propagation</h2>"}
+	prev := strings.Index(section, "<thead><tr><th>operation</th><th>ops</th>")
+	if prev < 0 {
+		t.Fatalf("pressure section lacks the per-operation table:\n%s", section)
+	}
+	for _, h := range headings {
+		if got := strings.Count(section, h); got != 1 {
+			t.Fatalf("pressure section has %d %q headings, want 1:\n%s", got, h, section)
+		}
+		at := strings.Index(section, h)
+		if at < prev {
+			t.Errorf("%q at %d does not follow the previous table or heading at %d", h, at, prev)
+		}
+		prev = at
+	}
+	if stages := strings.Index(section, "<h2>Pressure stages</h2>"); stages < prev {
+		t.Errorf("stage heading at %d does not follow the propagation heading at %d", stages, prev)
+	}
+
+	for i, tc := range []struct {
+		services []string
+	}{
+		{[]string{"glance", "nova"}},
+		{[]string{"nova"}},
+	} {
+		table := section[strings.Index(section, headings[i])+len(headings[i]):]
+		table = table[:strings.Index(table, "</table>")]
+		if !strings.HasPrefix(table, "\n<table class=\"sortable\">\n  <thead><tr><th>service</th><th>ops</th><th>ok</th><th>failed</th><th>success</th>") {
+			t.Errorf("%q is not followed by the sortable service table:\n%s", headings[i], table)
+		}
+		if got := strings.Count(table, "<tr><td"); got != len(tc.services) {
+			t.Errorf("%q table has %d rows, want %d:\n%s", headings[i], got, len(tc.services), table)
+		}
+		for _, svc := range tc.services {
+			if !strings.Contains(table, `<tr><td data-sort="`+svc+`">`+svc+`</td>`) {
+				t.Errorf("%q table lacks the %s row:\n%s", headings[i], svc, table)
+			}
+		}
+	}
+	probes := section[strings.Index(section, headings[0]):strings.Index(section, headings[1])]
+	if want := `<td data-sort="1200000">1.20ms</td>`; !strings.Contains(probes, want) {
+		t.Errorf("probe table lacks nova's p50 cell %q:\n%s", want, probes)
+	}
+
+	propagation := section[strings.Index(section, headings[2]):strings.Index(section, "<h2>Pressure stages</h2>")]
+	for _, chip := range []string{"every 30s", "timeout 10m0s", "probes 12", "timed out 0", "p50 2.10s", "p95 4.80s", "p99 6.20s", "max 6.20s"} {
+		if !strings.Contains(propagation, `<span class="chip">`+chip+`</span>`) {
+			t.Errorf("propagation section lacks the chip %q:\n%s", chip, propagation)
+		}
+	}
+	for _, bad := range []string{"http://", "https://", "<link ", "src=", "url(http", "@import"} {
+		if strings.Contains(buf.String(), bad) {
+			t.Errorf("report contains external reference %q, expected a self-contained file", bad)
+		}
+	}
+
+	none := pressureServicesRecord()
+	none.Pressure.Propagation.Probes, none.Pressure.Propagation.Delay = 0, metrics.Latency{}
+	buf.Reset()
+	if err := WriteHTML(&buf, none); err != nil {
+		t.Fatalf("WriteHTML(no probe completed): %v", err)
+	}
+	for _, chip := range []string{"probes 0", "p50 -", "p95 -", "p99 -", "max -"} {
+		if !strings.Contains(buf.String(), `<span class="chip">`+chip+`</span>`) {
+			t.Errorf("propagation section without a completed probe lacks the chip %q", chip)
+		}
+	}
+
+	buf.Reset()
+	if err := WriteHTML(&buf, pressureStagesRecord()); err != nil {
+		t.Fatalf("WriteHTML(without services): %v", err)
+	}
+	for _, h := range headings {
+		if strings.Contains(buf.String(), h) {
+			t.Errorf("report of a run without probes, bad tokens or propagation has %q", h)
+		}
+	}
+}
+
+// TestWriteHTMLEscapesProbeService confirms a service name carrying markup is
+// HTML-escaped in the probe and bad-token tables.
+func TestWriteHTMLEscapesProbeService(t *testing.T) {
+	rec := pressureServicesRecord()
+	const name = "<b>x</b>"
+	rec.Pressure.Probes[0].Type = name
+	rec.Pressure.BadTokens[0].Type = name
+	var buf bytes.Buffer
+	if err := WriteHTML(&buf, rec); err != nil {
+		t.Fatalf("WriteHTML: %v", err)
+	}
+	if strings.Contains(buf.String(), name) {
+		t.Error("service name rendered without escaping")
+	}
+	const escaped = `<tr><td data-sort="&lt;b&gt;x&lt;/b&gt;">&lt;b&gt;x&lt;/b&gt;</td>`
+	if got := strings.Count(buf.String(), escaped); got != 2 {
+		t.Errorf("report has %d rows with the escaped service name, want 2, one per table", got)
+	}
+}
