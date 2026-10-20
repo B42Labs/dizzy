@@ -1265,6 +1265,8 @@ type fakePressureKeystone struct {
 	assignOK     int
 	issueErr     error
 	validateErr  error
+	readerErr    error
+	readerFails  int
 	endpoints    map[string]string
 	validateHold <-chan struct{}
 
@@ -1284,6 +1286,7 @@ type fakePressureKeystone struct {
 	assigns            int            // every AssignRole call
 	assigned           map[string]int // AssignRole calls by user id
 	revoked            []string       // the token of every RevokeToken call
+	roleLookups        []string       // the name of every FindRoleByName call
 	deleted            []resource.Resource
 	recordBeforeDelete bool
 	drawn              []string
@@ -1357,6 +1360,29 @@ func (f *fakePressureKeystone) assignCalls(userID string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.assigned[userID]
+}
+
+// FindRoleByName notes the name and finds fakeReaderRoleID for every name,
+// or fails with readerErr: every call while readerFails is 0, the first
+// readerFails calls otherwise.
+func (f *fakePressureKeystone) FindRoleByName(_ context.Context, name string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.roleLookups = append(f.roleLookups, name)
+	if f.readerErr != nil && (f.readerFails == 0 || len(f.roleLookups) <= f.readerFails) {
+		return "", f.readerErr
+	}
+	return fakeReaderRoleID, nil
+}
+
+// fakeReaderRoleID is the id fakePressureKeystone finds a role by name with.
+const fakeReaderRoleID = "id-reader"
+
+// lookedUpRoles returns a copy of the names of the FindRoleByName calls.
+func (f *fakePressureKeystone) lookedUpRoles() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.roleLookups)
 }
 
 // IssueToken completes the executor seam; Provision never calls it.
@@ -1489,11 +1515,8 @@ var probeTestEndpoints = map[string]string{
 // it. Poll counts the polls of each token and answers that the service
 // refused the token from its rejectAt-th poll on and accepted it before
 // that, or always while rejectAt is 0. It answers by that count alone,
-// whatever its context: the propagation probe polls once a second, an
-// interval keystoneops does not export, so a probe whose timeout is shorter
-// sends its second poll at its deadline, on a context that has already
-// ended, and the fake still answers it. RecordRevocationDelay mirrors the
-// adapter's, probe.Client.RecordRevocationDelay: it records the delay into
+// whatever its context. RecordRevocationDelay mirrors the adapter's,
+// probe.Client.RecordRevocationDelay: it records the delay into
 // collector, the run's collector, as a time-to-ready record of kind
 // probe.KindRevocation, so the record's metrics carry it as they do in
 // production, and it notes the call; at the first one it calls stop, when
@@ -1737,6 +1760,9 @@ func TestRunKeystonePressureCompletes(t *testing.T) {
 	if len(rec.Created) != wantCreated {
 		t.Errorf("record lists %d created resources, want %d", len(rec.Created), wantCreated)
 	}
+	if got := f.lookedUpRoles(); len(got) != 0 {
+		t.Errorf("a run without probe and the propagation probe looked up the roles %v, want none", got)
+	}
 	ps := rec.Pressure
 	if ps == nil {
 		t.Fatal("record has no pressure statistics")
@@ -1772,20 +1798,22 @@ func TestRunKeystonePressureCompletes(t *testing.T) {
 }
 
 // TestRunKeystonePressureSetupFailures proves that every failure after the
-// first write, in provisioning, Build, Prime or the engine, writes a record
-// whose error names the failure and lists what was created, tears that down
-// after the record exists (or leaves it with --no-cleanup), and returns
-// "<what> (run <id>): <cause>".
+// first write, in provisioning, Build, the reader grants, Prime or the engine,
+// writes a record whose error names the failure and lists what was created,
+// tears that down after the record exists (or leaves it with --no-cleanup),
+// and returns "<what> (run <id>): <cause>".
 func TestRunKeystonePressureSetupFailures(t *testing.T) {
 	p := pressureTestPlan(t)
 	roots := len(p.Domains) + len(p.Roles) + len(p.Projects) + len(p.Users)
 	all := roots + len(p.Assignments)
 	forbidden := fmt.Errorf("assigning role: %w", keystone.ErrForbidden)
 	issueErr := errors.New("issue boom")
+	grantErr := errors.New("grant boom")
 
 	tests := []struct {
 		name        string
 		assignErr   error
+		assignOK    int // the grants that succeed before assignErr applies
 		issueErr    error
 		adjust      func(*pressureRun)
 		noCleanup   bool
@@ -1807,6 +1835,19 @@ func TestRunKeystonePressureSetupFailures(t *testing.T) {
 			wantCreated: all,
 		},
 		{
+			name: "a reader grant error", assignErr: grantErr, assignOK: len(p.Assignments),
+			adjust: func(r *pressureRun) { r.o.Weights = map[string]int{keystoneops.OpValidate: 9, keystoneops.OpProbe: 1} },
+			what:   "granting reader role", wantCause: `granting role "reader" to the pool users (0 of `, wantIs: grantErr, wantCreated: all,
+		},
+		{
+			// The first reader grant succeeds and the next fails, whatever
+			// the concurrency, so the record and the teardown take in that
+			// one grant.
+			name: "a reader grant error after a grant", assignErr: grantErr, assignOK: len(p.Assignments) + 1,
+			adjust: func(r *pressureRun) { r.o.Weights = map[string]int{keystoneops.OpValidate: 9, keystoneops.OpProbe: 1} },
+			what:   "granting reader role", wantCause: `granting role "reader" to the pool users (1 of `, wantIs: grantErr, wantCreated: all + 1,
+		},
+		{
 			name: "a Prime error", issueErr: issueErr,
 			what: "starting pressure run", wantCause: "priming token pool (", wantIs: issueErr, wantCreated: all,
 		},
@@ -1823,7 +1864,7 @@ func TestRunKeystonePressureSetupFailures(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Chdir(t.TempDir())
-			f := &fakePressureKeystone{assignErr: tc.assignErr, issueErr: tc.issueErr}
+			f := &fakePressureKeystone{assignErr: tc.assignErr, assignOK: tc.assignOK, issueErr: tc.issueErr}
 			r := pressureTestRun(t, p)
 			r.noCleanup = tc.noCleanup
 			if tc.adjust != nil {
@@ -2214,15 +2255,51 @@ func wantTornDown(t *testing.T, f *fakePressureKeystone, out string, created []r
 	}
 }
 
+// wantReaderGrants checks that created holds one grant of the reader role
+// fakePressureKeystone finds, once, for each project-scoped (user, project)
+// pair of p's regular users, the pool pairs of a run that reserves no churn
+// user, and no other, and returns how many pairs there are.
+func wantReaderGrants(t *testing.T, p *keystoneplan.Plan, created []resource.Resource) int {
+	t.Helper()
+	fan := make(map[string]bool)
+	for _, u := range p.Users {
+		if u.Fan {
+			fan[u.Name] = true
+		}
+	}
+	want := make(map[string]bool)
+	for _, a := range p.Assignments {
+		if a.Project != "" && !fan[a.User] {
+			want[a.User+"->"+a.Project+"/"+pressureReaderRole] = true
+		}
+	}
+	got := make(map[string]bool)
+	for _, res := range created {
+		if res.Kind != keystone.KindAssignment || !strings.HasSuffix(res.ID, ":"+fakeReaderRoleID) {
+			continue
+		}
+		if got[res.Logical] {
+			t.Errorf("created lists the reader grant %s twice", res.Logical)
+		}
+		got[res.Logical] = true
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("created lists the reader grants %v, want one per pool pair %v", slices.Sorted(maps.Keys(got)), slices.Sorted(maps.Keys(want)))
+	}
+	return len(want)
+}
+
 // TestRunKeystonePressureProbes drives a run with probe and bad_token against
 // the fake, whose tokens list nova and glance, and services at which glance
 // answers every request with a 503. The record lists the probes and the bad
 // tokens of exactly those two services, the services' draws and throughputs
 // add up to their operation's in the Operations table, glance's draws fail
 // under keystoneops' label while nova's succeed, and every request went to the
-// endpoint the token's catalog names for its service. The run has no
-// propagation probe, the output carries the Probes and Bad tokens tables, the
-// log names the services, and the teardown deletes every created resource.
+// endpoint the token's catalog names for its service. Before the priming,
+// the run granted the reader role to every pool pair, and the record lists
+// the grants. The run has no propagation probe, the output carries the
+// Probes and Bad tokens tables, the log names the services and the grants,
+// and the teardown deletes every created resource.
 func TestRunKeystonePressureProbes(t *testing.T) {
 	t.Chdir(t.TempDir())
 	logs := captureLogs(t)
@@ -2356,7 +2433,12 @@ func TestRunKeystonePressureProbes(t *testing.T) {
 	if strings.Contains(out.String(), "\nPropagation\n") {
 		t.Errorf("output %q has a Propagation block for a run without the probe", out.String())
 	}
-	for _, want := range []string{`msg="probe services" services="[nova glance]"`, "propagation=off"} {
+	if got := f.lookedUpRoles(); !slices.Equal(got, []string{pressureReaderRole}) {
+		t.Errorf("the fake looked up the roles %v, want the reader role once", got)
+	}
+	grants := wantReaderGrants(t, p, rec.Created)
+	for _, want := range []string{`msg="probe services" services="[nova glance]"`, "propagation=off",
+		fmt.Sprintf(`msg="granted reader role to the pool users" grants=%d`, grants)} {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("log %q missing %q", logs.String(), want)
 		}
@@ -2368,8 +2450,8 @@ func TestRunKeystonePressureProbes(t *testing.T) {
 // bad_token whose pool tokens' catalog lists none of the four services fails
 // at the priming, before any worker starts: the command returns the priming
 // failure, the record carries it and no pressure statistics, nothing reached
-// the services, and the teardown deletes every created resource once the
-// record is written.
+// the services, and the teardown deletes every created resource, the reader
+// grants made before the priming included, once the record is written.
 func TestRunKeystonePressureNoProbeService(t *testing.T) {
 	t.Chdir(t.TempDir())
 	logs := captureLogs(t)
@@ -2395,7 +2477,8 @@ func TestRunKeystonePressureNoProbeService(t *testing.T) {
 	if rec.Pressure != nil {
 		t.Error("a failed priming recorded pressure statistics")
 	}
-	if want := len(p.Domains) + len(p.Roles) + len(p.Projects) + len(p.Users) + len(p.Assignments); len(rec.Created) != want {
+	grants := wantReaderGrants(t, p, rec.Created)
+	if want := len(p.Domains) + len(p.Roles) + len(p.Projects) + len(p.Users) + len(p.Assignments) + grants; len(rec.Created) != want {
 		t.Errorf("record lists %d created resources, want %d", len(rec.Created), want)
 	}
 	if !f.recordBeforeDelete {
@@ -2407,6 +2490,90 @@ func TestRunKeystonePressureNoProbeService(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "probe services") {
 		t.Errorf("log %q names probe services for a catalog without any", logs.String())
+	}
+}
+
+// TestRunKeystonePressureReaderRole covers the outcomes of the reader role
+// lookup. A run whose only service operation is bad_token neither looks the
+// role up nor grants it, since a service refuses a bad token before any
+// policy check. A run with probe on a cloud where the lookup finds no reader
+// role looks it up once, grants nothing, logs a warning whose error leaves
+// out the lookup's advice to pass --roles, a flag keystone pressure ignores,
+// and still probes the services. A run whose lookup fails once with a 503
+// looks the role up again and grants it to every pool pair. All complete,
+// and the teardown deletes every created resource.
+func TestRunKeystonePressureReaderRole(t *testing.T) {
+	const warning = "pool users get no reader role; a service whose read policy asks for it refuses the probes with 403"
+	probeMix := map[string]int{keystoneops.OpValidate: 9, keystoneops.OpProbe: 1}
+	notFound := fmt.Errorf("role %q %w; grant it to the manager or pass an existing role with --roles", pressureReaderRole, keystone.ErrRoleNotFound)
+	unavailable := fmt.Errorf("listing roles named %q: %w", pressureReaderRole, gophercloud.ErrUnexpectedResponseCode{
+		Method: http.MethodGet, URL: "roles", Expected: []int{http.StatusOK}, Actual: http.StatusServiceUnavailable})
+	for _, tc := range []struct {
+		name        string
+		weights     map[string]int
+		readerErr   error
+		readerFails int      // the lookups that fail with readerErr, every one while 0
+		lookups     []string // the roles the run looks up
+		grants      bool     // whether the run grants the reader role
+		warnErr     string   // the error the warning logs, empty for no warning
+		method      string   // the services method the run's draws call
+	}{
+		{"bad_token alone", map[string]int{keystoneops.OpValidate: 9, keystoneops.OpBadToken: 1}, nil, 0, nil, false, "", "Reject"},
+		{"no reader role", probeMix, notFound, 0, []string{pressureReaderRole}, false, `role "reader" not found`, "Probe"},
+		{"a transient lookup error", probeMix, unavailable, 1, []string{pressureReaderRole, pressureReaderRole}, true, "", "Probe"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			logs := captureLogs(t)
+			p := pressureTestPlan(t)
+			f := &fakePressureKeystone{endpoints: probeTestEndpoints, readerErr: tc.readerErr, readerFails: tc.readerFails}
+			r := pressureTestRun(t, p)
+			r.cfg.Duration = 60 * time.Millisecond
+			r.o.Weights = tc.weights
+			svc := newFakePressureServices(r.collector)
+			r.services = svc
+			cmd := &cobra.Command{}
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+
+			if err := runKeystonePressure(context.Background(), cmd, f, r); err != nil {
+				t.Fatalf("runKeystonePressure: %v", err)
+			}
+
+			rec := loadPressureTestRecord(t)
+			if got := f.lookedUpRoles(); !slices.Equal(got, tc.lookups) {
+				t.Errorf("the fake looked up the roles %v, want %v", got, tc.lookups)
+			}
+			want := len(p.Domains) + len(p.Roles) + len(p.Projects) + len(p.Users) + len(p.Assignments)
+			if tc.grants {
+				want += wantReaderGrants(t, p, rec.Created)
+			}
+			if len(rec.Created) != want {
+				t.Errorf("record lists %d created resources, want %d", len(rec.Created), want)
+			}
+			if got := strings.Contains(logs.String(), warning); got != (tc.warnErr != "") {
+				t.Errorf("log %q has the warning %q: %v, want %v", logs.String(), warning, got, tc.warnErr != "")
+			}
+			if tc.warnErr != "" && !strings.Contains(logs.String(), fmt.Sprintf("msg=%q error=%q\n", warning, tc.warnErr)) {
+				t.Errorf("log %q missing the warning with the error %q", logs.String(), tc.warnErr)
+			}
+			if strings.Contains(logs.String(), "--roles") {
+				t.Errorf("log %q advises --roles, which keystone pressure ignores", logs.String())
+			}
+			if got := strings.Contains(logs.String(), "granted reader role"); got != tc.grants {
+				t.Errorf("log %q reports reader grants: %v, want %v", logs.String(), got, tc.grants)
+			}
+			sent := 0
+			for c, n := range svc.counted() {
+				if c.method == tc.method {
+					sent += n
+				}
+			}
+			if sent == 0 {
+				t.Errorf("the services saw no %s call, want the run's draws", tc.method)
+			}
+			wantTornDown(t, f, out.String(), rec.Created)
+		})
 	}
 }
 
@@ -2424,8 +2591,9 @@ func TestRunKeystonePressureNoProbeService(t *testing.T) {
 // worker sends one validation and then idles until the run ends. The record
 // carries the probe's settings, its completed probes, none timed out and a
 // positive maximum delay, the run's metrics carry the same probes as their
-// revocation readiness, and revocations counts the revoke draws only: the mix
-// has none, while the fake saw the probes' revocations.
+// revocation readiness, revocations counts the revoke draws only: the mix has
+// none, while the fake saw the probes' revocations, and the pool users got
+// the reader role the probe needs.
 func TestRunKeystonePressurePropagation(t *testing.T) {
 	t.Chdir(t.TempDir())
 	logs := captureLogs(t)
@@ -2512,6 +2680,7 @@ func TestRunKeystonePressurePropagation(t *testing.T) {
 				t.Errorf("output %q missing %q", out.String(), want)
 			}
 		}
+		wantReaderGrants(t, p, rec.Created)
 		if !strings.Contains(logs.String(), "propagation=10ms") {
 			t.Errorf("log %q missing the propagation interval on the start line", logs.String())
 		}

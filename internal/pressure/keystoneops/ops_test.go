@@ -2828,3 +2828,142 @@ func TestRunWithEngine(t *testing.T) {
 		}
 	}
 }
+
+// TestGrantPool checks GrantPool over pressurePlan with user-0004 as the
+// churn user: it grants the role to the user of each of the three pool pairs
+// on the pair's project, never to the churn user, each grant bounded by
+// OpTimeout, and returns their assignment resources; over a fan plan it
+// skips the fan user. A failed grant stops further grants and comes back
+// with the grants made before it, a cancelled context grants nothing, and at
+// most concurrency grants are in flight at once, at least one.
+func TestGrantPool(t *testing.T) {
+	ctx := context.Background()
+	const role, roleID = "reader", "rid-reader"
+	// poolGrant is one grant GrantPool should make over pressurePlan.
+	type poolGrant struct{ user, userID, project, projectID, domainID string }
+	poolGrants := []poolGrant{
+		{"user-0001", "uid-1", "proj-0001", "pid-1", "did-1"},
+		{"user-0002", "uid-2", "proj-0002", "pid-2", "did-2"},
+		{"user-0003", "uid-3", "proj-0001", "pid-1", "did-1"},
+	}
+
+	t.Run("grants the pool pairs only", func(t *testing.T) {
+		f := newFake(newFakeClock(), time.Hour)
+		o := fixtureOptions(3, churnOn)
+		s := buildSet(t, f, o)
+		began := time.Now()
+		res, err := s.GrantPool(ctx, role, roleID, 2)
+		if err != nil {
+			t.Fatalf("GrantPool: %v", err)
+		}
+		want := make(map[poolGrant]bool, len(poolGrants))
+		wantRes := make(map[resource.Resource]bool, len(poolGrants))
+		for _, g := range poolGrants {
+			want[g] = true
+			wantRes[keystone.AssignmentResource(keystoneplan.Assignment{User: g.user, Role: role, Project: g.project}, g.userID, g.projectID, g.domainID, roleID)] = true
+		}
+		calls := f.recorded(kindAssign)
+		if len(calls) != len(poolGrants) {
+			t.Fatalf("the fake saw %d grants, want one per pool pair (%d)", len(calls), len(poolGrants))
+		}
+		for _, c := range calls {
+			g := poolGrant{c.a.User, c.userID, c.a.Project, c.projectID, c.domainID}
+			if !want[g] || c.a.Role != role || c.roleID != roleID {
+				t.Errorf("granted %+v the role %q (%s), want a pool pair granted %q (%s)", g, c.a.Role, c.roleID, role, roleID)
+			}
+			delete(want, g)
+			if c.deadline.Before(began.Add(o.OpTimeout)) || c.deadline.After(time.Now().Add(o.OpTimeout)) {
+				t.Errorf("the grant of %s ran with deadline %v, want it bounded by the op timeout %s", g.user, c.deadline, o.OpTimeout)
+			}
+		}
+		got := make(map[resource.Resource]bool, len(res))
+		for _, r := range res {
+			got[r] = true
+		}
+		if len(res) != len(poolGrants) || !maps.Equal(got, wantRes) {
+			t.Errorf("GrantPool returned %+v, want the assignment resources %+v", res, wantRes)
+		}
+	})
+
+	t.Run("skips the fan users", func(t *testing.T) {
+		f := newFake(newFakeClock(), time.Hour)
+		s := buildFanSet(t, f, fanPlan(3, []string{"proj-0001", "proj-0002"}), fixtureOptions(1, churnOff))
+		res, err := s.GrantPool(ctx, role, roleID, 2)
+		if err != nil || len(res) != 3 {
+			t.Fatalf("GrantPool = %d resources, %v; want one for each of the three regular users", len(res), err)
+		}
+		for _, c := range f.recorded(kindAssign) {
+			if c.a.User == "fan-0001" {
+				t.Errorf("granted the fan user %+v", c.a)
+			}
+		}
+	})
+
+	t.Run("a failure stops further grants", func(t *testing.T) {
+		f := newFake(newFakeClock(), time.Hour)
+		f.failNth(kindAssign, 2, errFake)
+		s := buildSet(t, f, fixtureOptions(3, churnOn))
+		res, err := s.GrantPool(ctx, role, roleID, 1)
+		const want = `granting role "reader" to the pool users (1 of 3 granted): fake: injected failure`
+		if err == nil || err.Error() != want || !errors.Is(err, errFake) {
+			t.Errorf("GrantPool error = %v, want %q wrapping the failure", err, want)
+		}
+		if len(res) != 1 {
+			t.Errorf("GrantPool returned %d resources, want the one granted before the failure", len(res))
+		}
+		if calls := f.recorded(kindAssign); len(calls) != 2 {
+			t.Errorf("the fake saw %d grants, want none after the failed second", len(calls))
+		}
+	})
+
+	t.Run("a cancelled context grants nothing", func(t *testing.T) {
+		f := newFake(newFakeClock(), time.Hour)
+		s := buildSet(t, f, fixtureOptions(3, churnOn))
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		res, err := s.GrantPool(cancelled, role, roleID, 2)
+		if !errors.Is(err, context.Canceled) || len(res) != 0 {
+			t.Errorf("GrantPool = %d resources, %v; want none and context.Canceled", len(res), err)
+		}
+		if calls := f.recorded(kindAssign); len(calls) != 0 {
+			t.Errorf("the fake saw %d grants, want none", len(calls))
+		}
+	})
+
+	// In a synctest bubble the fake holds every grant at its gate and the test
+	// lets them through one at a time, counting the grants in flight once
+	// every goroutine is blocked.
+	for _, tt := range []struct{ concurrency, want int }{{2, 2}, {0, 1}} {
+		t.Run(fmt.Sprintf("concurrency %d", tt.concurrency), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newFake(newFakeClock(), time.Hour)
+				f.gateAssigns(t)
+				s := buildSet(t, f, fixtureOptions(3, churnOn))
+				granted := make(chan error, 1)
+				go func() {
+					_, err := s.GrantPool(ctx, role, roleID, tt.concurrency)
+					granted <- err
+				}()
+				for released := range len(poolGrants) {
+					synctest.Wait()
+					if n, want := f.assignsInFlight(), min(tt.want, len(poolGrants)-released); n != want {
+						t.Fatalf("%d grants in flight with %d of %d let through, want %d", n, released, len(poolGrants), want)
+					}
+					f.releaseAssign(t)
+				}
+				synctest.Wait()
+				select {
+				case err := <-granted:
+					if err != nil {
+						t.Errorf("GrantPool: %v", err)
+					}
+				default:
+					t.Fatal("GrantPool did not return after every grant was let through")
+				}
+				if n := f.maxAssignsInFlight(); n != tt.want {
+					t.Errorf("at most %d grants were in flight at once, want %d", n, tt.want)
+				}
+			})
+		})
+	}
+}

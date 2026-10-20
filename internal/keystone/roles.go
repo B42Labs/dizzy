@@ -2,6 +2,7 @@ package keystone
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -34,11 +35,17 @@ func (c *Client) CreateRole(ctx context.Context, r keystoneplan.Role) (resource.
 	return resource.Resource{Kind: KindRole, Logical: r.Name, Name: name, ID: id}, nil
 }
 
+// ErrRoleNotFound is what FindRoleByName's error wraps when no role has the
+// name, so a caller can tell a missing role from a failed listing. Its text is
+// the "not found" of that error's message.
+var ErrRoleNotFound = errors.New("not found")
+
 // FindRoleByName resolves an existing role by name, preferring a global role (no
 // domain) over a domain-scoped one. It is the domain-manager binder's resolver
 // for the reusable roles the run assigns; a plain API call, kept out of the run
 // metrics because it is discovery, not part of the workload. It errors when no
-// role matches, so a typo in --roles fails clearly before any assignment.
+// role matches, wrapping ErrRoleNotFound, so a typo in --roles fails clearly
+// before any assignment.
 func (c *Client) FindRoleByName(ctx context.Context, name string) (string, error) {
 	var (
 		globalID string
@@ -69,7 +76,7 @@ func (c *Client) FindRoleByName(ctx context.Context, name string) (string, error
 	case anyID != "":
 		return anyID, nil
 	default:
-		return "", fmt.Errorf("role %q not found; grant it to the manager or pass an existing role with --roles", name)
+		return "", fmt.Errorf("role %q %w; grant it to the manager or pass an existing role with --roles", name, ErrRoleNotFound)
 	}
 }
 
