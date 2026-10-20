@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/rand"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/B42Labs/dizzy/internal/metrics"
@@ -118,6 +121,98 @@ func TestConfigValidate(t *testing.T) {
 			name:    "duration is checked before workers",
 			mutate:  func(c *Config) { c.Duration = 0; c.Workers = 0 },
 			wantErr: "pressure duration must be set and positive, got 0s",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validConfig()
+			tc.mutate(&cfg)
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != tc.wantErr {
+				t.Errorf("Validate() = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// stagesOf returns stages of the given durations without an Enter.
+func stagesOf(durations ...time.Duration) []Stage {
+	out := make([]Stage, len(durations))
+	for i, d := range durations {
+		out[i] = Stage{Duration: d}
+	}
+	return out
+}
+
+// TestConfigValidateStages covers the stage rules of Config.Validate with
+// their exact messages, that every other rule is checked before them, and
+// the staged configs it accepts.
+func TestConfigValidateStages(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{name: "valid single stage", mutate: func(c *Config) { c.Stages = stagesOf(time.Second) }},
+		{
+			name: "valid stages",
+			mutate: func(c *Config) {
+				c.Duration, c.Stages = 2*time.Minute, stagesOf(time.Minute, 30*time.Second, 30*time.Second)
+			},
+		},
+		{
+			name: "unbounded",
+			mutate: func(c *Config) {
+				c.Unbounded, c.Duration, c.BucketWidth = true, 0, time.Hour
+				c.Stages = stagesOf(time.Minute)
+			},
+			wantErr: "pressure stages need a bounded run",
+		},
+		{
+			name:    "zero stage duration",
+			mutate:  func(c *Config) { c.Duration, c.Stages = 2*time.Minute, stagesOf(time.Minute, 0) },
+			wantErr: "pressure stage 2 must have a positive duration, got 0s",
+		},
+		{
+			name:    "negative stage duration",
+			mutate:  func(c *Config) { c.Duration, c.Stages = 2*time.Minute, stagesOf(-time.Second, 2*time.Minute) },
+			wantErr: "pressure stage 1 must have a positive duration, got -1s",
+		},
+		{
+			name:    "stages short of the duration",
+			mutate:  func(c *Config) { c.Duration, c.Stages = 2*time.Minute, stagesOf(time.Minute, 30*time.Second) },
+			wantErr: "pressure stages must add up to the duration: the stages sum to 1m30s, the duration is 2m0s",
+		},
+		{
+			name:    "stages past the duration",
+			mutate:  func(c *Config) { c.Duration, c.Stages = 2*time.Minute, stagesOf(time.Minute, time.Minute, time.Second) },
+			wantErr: "pressure stages must add up to the duration: the stages sum to 2m1s, the duration is 2m0s",
+		},
+		{
+			// Added up in int64, these wrap around to exactly 2m.
+			name: "stages that overflow the sum",
+			mutate: func(c *Config) {
+				c.Duration = 2 * time.Minute
+				c.Stages = stagesOf(math.MaxInt64, math.MaxInt64, 2*time.Minute+2)
+			},
+			wantErr: "pressure stages must add up to the duration: the stages sum to 2562047h47m16.854775807s, the duration is 2m0s",
+		},
+		{
+			name:    "duration is checked before the stages",
+			mutate:  func(c *Config) { c.Duration, c.Stages = 0, stagesOf(time.Minute) },
+			wantErr: "pressure duration must be set and positive, got 0s",
+		},
+		{
+			name:    "op-timeout is checked before the stages",
+			mutate:  func(c *Config) { c.OpTimeout, c.Stages = 0, stagesOf(0) },
+			wantErr: "pressure op-timeout must be positive, got 0s",
 		},
 	}
 	for _, tc := range tests {
@@ -257,17 +352,19 @@ func TestRunRejectsInvalidInputBeforeAnyCall(t *testing.T) {
 // drawnNames runs a one-worker run with seed until the worker has drawn n
 // operations and returns their names in draw order. extraDraws is how many
 // values each Do draws from its generator, standing in for an operation whose
-// use of the generator depends on the cloud's answers.
-func drawnNames(t *testing.T, ops []Operation, seed int64, n, extraDraws int) []string {
+// use of the generator depends on the cloud's answers; each Do then calls the
+// operation's own Do. stages, when given, run the worker through those
+// stages, the run lasting their sum, and otherwise the run lasts an hour.
+func drawnNames(t *testing.T, ops []Operation, seed int64, n, extraDraws int, stages ...Stage) []string {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var names []string // only the single worker appends, and Run's return orders the read
 	wrapped := make([]Operation, len(ops))
 	for i, op := range ops {
-		name := op.Name
+		name, do := op.Name, op.Do
 		wrapped[i] = op
-		wrapped[i].Do = func(_ context.Context, rng *rand.Rand) error {
+		wrapped[i].Do = func(opCtx context.Context, rng *rand.Rand) error {
 			for range extraDraws {
 				rng.Int63()
 			}
@@ -277,10 +374,16 @@ func drawnNames(t *testing.T, ops []Operation, seed int64, n, extraDraws int) []
 			if len(names) == n {
 				cancel()
 			}
-			return nil
+			return do(opCtx, rng)
 		}
 	}
-	cfg := Config{Duration: time.Hour, Workers: 1, Seed: seed, OpTimeout: time.Second}
+	cfg := Config{Duration: time.Hour, Workers: 1, Seed: seed, OpTimeout: time.Second, Stages: stages}
+	if len(stages) > 0 {
+		cfg.Duration = 0
+		for _, st := range stages {
+			cfg.Duration += st.Duration
+		}
+	}
 	if _, err := Run(ctx, wrapped, cfg); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -760,4 +863,661 @@ func TestDefaultClassify(t *testing.T) {
 			t.Errorf("defaultClassify(%v) = %q, want %q", tc.err, got, tc.want)
 		}
 	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the concurrent writes of a log
+// handler and the test's reads.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+// Write appends p.
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+// String returns everything written so far.
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
+}
+
+// captureLogs routes the default logger into a buffer until the test ends.
+// The tests that use it do not run in parallel, since the default logger is
+// process-wide.
+func captureLogs(t *testing.T) *syncBuffer {
+	t.Helper()
+	buf := &syncBuffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return buf
+}
+
+// sleepEnter returns a stage Enter that waits d or until its context ends.
+func sleepEnter(d time.Duration) func(context.Context) error {
+	sleep := sleepFor(d)
+	return func(ctx context.Context) error { return sleep(ctx, nil) }
+}
+
+// TestRunStagesWallClock confirms the stage windows hold on the wall clock,
+// where the run's deadline and the controller's timer are real: the first
+// stage ends at its window's end, the second starts no earlier than its
+// Enter returned, and the last stage ends at the run's duration exactly. The
+// operations return at once, so a worker leaves the moment the run ends; the
+// deadline is the engine's start plus the duration, so that moment is never
+// before the last window's end.
+func TestRunStagesWallClock(t *testing.T) {
+	ops := []Operation{{Name: "validate", Weight: 1, Do: noop}}
+	cfg := validConfig()
+	cfg.Workers = 2
+	cfg.Duration = 40 * time.Millisecond
+	cfg.Stages = []Stage{{Duration: 20 * time.Millisecond}, {Duration: 20 * time.Millisecond, Enter: sleepEnter(5 * time.Millisecond)}}
+	res, err := Run(context.Background(), ops, cfg)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(res.Stages) != 2 {
+		t.Fatalf("got %d stages, want 2", len(res.Stages))
+	}
+	first, second := res.Stages[0], res.Stages[1]
+	if first.Start != 0 || first.End != 20*time.Millisecond {
+		t.Errorf("stage 1 runs from %s to %s, want 0s to 20ms", first.Start, first.End)
+	}
+	if second.Start < 25*time.Millisecond || second.End != 40*time.Millisecond {
+		t.Errorf("stage 2 runs from %s to %s, want from at least 25ms, after the 5ms Enter, to 40ms", second.Start, second.End)
+	}
+	sum := first.Operations.Overall.Attempted + second.Operations.Overall.Attempted
+	if total := res.Operations.Overall.Attempted; total != sum || first.Operations.Overall.Attempted == 0 {
+		t.Errorf("run total %d, stages %d with %d in stage 1; want the same count and a busy stage 1", total, sum, first.Operations.Overall.Attempted)
+	}
+}
+
+// The staged runs below run in a synctest bubble. Its clock moves only while
+// every goroutine of the bubble waits, so a 1ms operation takes exactly 1ms,
+// an offset the test records equals the one the engine took, and the windows,
+// starts and counts are exact. synctest.Test also returns only once every
+// goroutine the run started has exited, and fails the test when one is left
+// blocked, so a worker that stays parked at the gate fails it.
+
+// TestRunStages confirms a run of two 50ms stages pauses its three workers at
+// the end of the first window while the second stage's Enter runs: Enter runs
+// once with no operation in flight, the stages report their windows and the
+// offset the workers resumed at, every operation is counted in the stage it
+// started in, none started during the pause, and the stages add up to the
+// run total. Every operation takes 3ms, so one is in flight across the first
+// window's end at 50ms, and Enter runs only once it returned at 51ms.
+func TestRunStages(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var (
+			mu        sync.Mutex
+			offsets   []time.Duration // each Do's entry offset from start
+			inFlight  atomic.Int64
+			enters    int
+			atEnter   int64 // the operations in flight when Enter ran
+			enterAt   time.Duration
+			enterDone time.Duration
+		)
+		start := time.Now()
+		sleep := sleepFor(3 * time.Millisecond)
+		do := func(ctx context.Context, rng *rand.Rand) error {
+			inFlight.Add(1)
+			defer inFlight.Add(-1)
+			mu.Lock()
+			offsets = append(offsets, time.Since(start))
+			mu.Unlock()
+			return sleep(ctx, rng)
+		}
+		pause := sleepEnter(20 * time.Millisecond)
+		enter := func(ctx context.Context) error {
+			mu.Lock()
+			enters++
+			enterAt = time.Since(start)
+			atEnter = inFlight.Load()
+			mu.Unlock()
+			err := pause(ctx)
+			mu.Lock()
+			enterDone = time.Since(start)
+			mu.Unlock()
+			return err
+		}
+		ops := []Operation{
+			{Name: "validate", Weight: 1, Do: do},
+			{Name: "revoke", Weight: 1, Do: do},
+		}
+		cfg := validConfig()
+		cfg.Duration = 100 * time.Millisecond
+		cfg.Workers = 3
+		cfg.Stages = []Stage{{Duration: 50 * time.Millisecond}, {Duration: 50 * time.Millisecond, Enter: enter}}
+		res, err := Run(context.Background(), ops, cfg)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if enters != 1 || atEnter != 0 {
+			t.Errorf("Enter ran %d times with %d operations in flight, want once with none", enters, atEnter)
+		}
+		if enterAt != 51*time.Millisecond || enterDone != 71*time.Millisecond {
+			t.Errorf("Enter ran from %s to %s, want from 51ms, when the operations in flight at the window's end 50ms returned, to 71ms", enterAt, enterDone)
+		}
+		if len(res.Stages) != 2 {
+			t.Fatalf("got %d stages, want 2", len(res.Stages))
+		}
+		first, second := res.Stages[0], res.Stages[1]
+		if first.Start != 0 || first.End != 50*time.Millisecond {
+			t.Errorf("stage 1 runs from %s to %s, want 0s to 50ms", first.Start, first.End)
+		}
+		if second.Start != 71*time.Millisecond || second.End != 100*time.Millisecond {
+			t.Errorf("stage 2 runs from %s to %s, want from 71ms, after the 20ms Enter, to 100ms", second.Start, second.End)
+		}
+		for i, s := range res.Stages {
+			if s.Operations.Wall != s.End-s.Start {
+				t.Errorf("stage %d wall = %s, want End minus Start %s", i+1, s.Operations.Wall, s.End-s.Start)
+			}
+		}
+
+		var counts [2]int
+		for _, o := range offsets {
+			switch {
+			case o >= first.Start && o < first.End:
+				counts[0]++
+			case o >= second.Start && o < second.End:
+				counts[1]++
+			default:
+				t.Errorf("an operation started at %s, outside both stages; the pause runs from %s to %s", o, first.End, second.Start)
+			}
+		}
+		// Three workers drawing a 3ms operation back to back start 17 draws
+		// each in stage 1, at 0ms to 48ms; the last returns at 51ms. From
+		// 71ms, when Enter returned, each starts 10 more, at 71ms to 98ms,
+		// before the run ends at 100ms.
+		for i, want := range []int{51, 30} {
+			if got := res.Stages[i].Operations.Overall.Attempted; got != counts[i] || got != want {
+				t.Errorf("stage %d counts %d operations, %d started in it; want %d", i+1, got, counts[i], want)
+			}
+		}
+		sum := first.Operations.Overall.Attempted + second.Operations.Overall.Attempted
+		if total := res.Operations.Overall.Attempted; total != sum || total != len(offsets) {
+			t.Errorf("run total %d, stages %d, Do entered %d times; want the same count", total, sum, len(offsets))
+		}
+	})
+}
+
+// TestRunStagesKeepWorkerSequence confirms a pause between stages does not
+// shift the operations a worker draws: one worker draws the same 30 names
+// with and without three stages whose Enter sleeps 10ms. Every operation
+// takes 1ms, so the 10ms each of the first two 20ms windows leaves after its
+// Enter holds ten draws, and the 30 draws span both pauses.
+func TestRunStagesKeepWorkerSequence(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const n = 30
+		var (
+			entered  atomic.Int64 // the Enter calls so far
+			lastSeen atomic.Int64 // the Enter calls made before the latest draw
+		)
+		sleep := sleepFor(time.Millisecond)
+		do := func(ctx context.Context, rng *rand.Rand) error {
+			lastSeen.Store(entered.Load())
+			return sleep(ctx, rng)
+		}
+		ops := []Operation{
+			{Name: "validate", Weight: 6, Do: do},
+			{Name: "effective", Weight: 3, Do: do},
+			{Name: "revoke", Weight: 1, Do: do},
+		}
+		plain := drawnNames(t, ops, 42, n, 0)
+
+		pause := sleepEnter(10 * time.Millisecond)
+		enter := func(ctx context.Context) error {
+			entered.Add(1)
+			return pause(ctx)
+		}
+		staged := drawnNames(t, ops, 42, n, 0,
+			Stage{Duration: 20 * time.Millisecond, Enter: enter},
+			Stage{Duration: 20 * time.Millisecond, Enter: enter},
+			Stage{Duration: time.Hour, Enter: enter},
+		)
+		if got := lastSeen.Load(); got != 3 {
+			t.Fatalf("draw %d came after %d stage entries, want 3: the draws did not span both pauses", n, got)
+		}
+		if !reflect.DeepEqual(plain, staged) {
+			t.Errorf("the staged run drew %v, the run without stages %v; want the same sequence", staged, plain)
+		}
+	})
+}
+
+// TestRunStageEnterError confirms an Enter error ends the run at once: Run
+// returns the error wrapped with the stage's number together with the result
+// so far, which lists the stages entered before it, and every worker, the
+// parked ones included, returns. A failing first stage starts no worker.
+func TestRunStageEnterError(t *testing.T) {
+	boom := errors.New("boom")
+	fail := func(context.Context) error { return boom }
+	tests := []struct {
+		name        string
+		stages      []Stage
+		wantErr     string
+		wantStages  int
+		wantElapsed time.Duration
+	}{
+		{
+			name:        "second stage",
+			stages:      []Stage{{Duration: 20 * time.Millisecond}, {Duration: time.Hour, Enter: fail}},
+			wantErr:     "entering stage 2: boom",
+			wantStages:  1,
+			wantElapsed: 20 * time.Millisecond,
+		},
+		{
+			name:       "first stage",
+			stages:     []Stage{{Duration: 20 * time.Millisecond, Enter: fail}, {Duration: time.Hour}},
+			wantErr:    "entering stage 1: boom",
+			wantStages: 0,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var calls, inFlight atomic.Int64
+				sleep := sleepFor(time.Millisecond)
+				ops := []Operation{{Name: "validate", Weight: 1, Do: func(ctx context.Context, rng *rand.Rand) error {
+					calls.Add(1)
+					inFlight.Add(1)
+					defer inFlight.Add(-1)
+					return sleep(ctx, rng)
+				}}}
+				cfg := validConfig()
+				cfg.Workers = 3
+				cfg.Duration = 20*time.Millisecond + time.Hour
+				cfg.Stages = tc.stages
+				began := time.Now()
+				res, err := Run(context.Background(), ops, cfg)
+				if elapsed := time.Since(began); elapsed != tc.wantElapsed {
+					t.Errorf("Run returned after %s, want %s: the error ends the hour-long run", elapsed, tc.wantElapsed)
+				}
+				if err == nil || err.Error() != tc.wantErr {
+					t.Errorf("Run() error = %v, want %q", err, tc.wantErr)
+				}
+				if !errors.Is(err, boom) {
+					t.Errorf("errors.Is(%v, boom) = false, want true", err)
+				}
+				if n := inFlight.Load(); n != 0 {
+					t.Errorf("%d operations still in flight after Run returned", n)
+				}
+				if res == nil {
+					t.Fatal("Run() result = nil, want the result so far")
+				}
+				if len(res.Stages) != tc.wantStages {
+					t.Fatalf("got %d stages, want %d", len(res.Stages), tc.wantStages)
+				}
+				total := res.Operations.Overall.Attempted
+				if int64(total) != calls.Load() {
+					t.Errorf("run total %d, Do called %d times; want the same count", total, calls.Load())
+				}
+				if tc.wantStages == 0 {
+					if total != 0 {
+						t.Errorf("run total %d, want 0: no worker starts when the first stage fails", total)
+					}
+					return
+				}
+				if s := res.Stages[0]; s.Start != 0 || s.End != 20*time.Millisecond || s.Operations.Overall.Attempted != total || total != 60 {
+					t.Errorf("stage 1 = %s to %s with %d of the run's %d operations, want 0s to 20ms with all 60", s.Start, s.End, s.Operations.Overall.Attempted, total)
+				}
+			})
+		})
+	}
+}
+
+// TestRunStageEnterInterrupted confirms an Enter that fails because ctx was
+// cancelled while it ran ends the run like any interruption: Run returns no
+// error and a result that lists the stages entered before it, and the
+// cancellation is not logged as a stage the run could not record.
+func TestRunStageEnterInterrupted(t *testing.T) {
+	logs := captureLogs(t)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		blocking := make(chan struct{})
+		go func() {
+			select {
+			case <-blocking:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+		enter := func(ctx context.Context) error {
+			close(blocking)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		ops := []Operation{{Name: "validate", Weight: 1, Do: sleepFor(time.Millisecond)}}
+		cfg := validConfig()
+		cfg.Workers = 2
+		cfg.Duration = 20*time.Millisecond + time.Hour
+		cfg.Stages = []Stage{{Duration: 20 * time.Millisecond}, {Duration: time.Hour, Enter: enter}}
+		res, err := Run(ctx, ops, cfg)
+		if err != nil {
+			t.Fatalf("Run() error = %v, want nil for an interrupted run", err)
+		}
+		if len(res.Stages) != 1 {
+			t.Fatalf("got %d stages, want 1", len(res.Stages))
+		}
+		if s := res.Stages[0]; s.End != 20*time.Millisecond || s.Operations.Overall.Attempted != res.Operations.Overall.Attempted {
+			t.Errorf("stage 1 ends at %s with %d of the run's %d operations, want 20ms with all of them", s.End, s.Operations.Overall.Attempted, res.Operations.Overall.Attempted)
+		}
+	})
+	if out := logs.String(); strings.Contains(out, "the stage is not recorded") {
+		t.Errorf("logs = %q, want no line about an unrecorded stage for a cancelled run", out)
+	}
+}
+
+// TestRunStageEnterOutlastsWindow confirms a stage whose Enter returns after
+// its window ended is logged, starts where its window ended and records no
+// operation, and that the next stage starts where the workers resumed.
+func TestRunStageEnterOutlastsWindow(t *testing.T) {
+	logs := captureLogs(t)
+	synctest.Test(t, func(t *testing.T) {
+		ops := []Operation{{Name: "validate", Weight: 1, Do: sleepFor(time.Millisecond)}}
+		cfg := validConfig()
+		cfg.Workers = 2
+		cfg.Duration = 80 * time.Millisecond
+		cfg.Stages = []Stage{
+			{Duration: 20 * time.Millisecond},
+			{Duration: 20 * time.Millisecond, Enter: sleepEnter(30 * time.Millisecond)},
+			{Duration: 40 * time.Millisecond},
+		}
+		res, err := Run(context.Background(), ops, cfg)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if len(res.Stages) != 3 {
+			t.Fatalf("got %d stages, want 3", len(res.Stages))
+		}
+		late := res.Stages[1]
+		if late.Start != 40*time.Millisecond || late.End != 40*time.Millisecond {
+			t.Errorf("stage 2 runs from %s to %s, want both at its window's end 40ms", late.Start, late.End)
+		}
+		if late.Operations.Overall.Attempted != 0 || late.Operations.Wall != 0 {
+			t.Errorf("stage 2 records %d operations over %s, want none over 0s", late.Operations.Overall.Attempted, late.Operations.Wall)
+		}
+		// Stage 2's Enter ran from 20ms to 50ms, where the workers resumed:
+		// stage 3 holds two workers' 30ms of 1ms draws.
+		next := res.Stages[2]
+		if next.Start != 50*time.Millisecond || next.End != 80*time.Millisecond {
+			t.Errorf("stage 3 runs from %s to %s, want from 50ms, where the workers resumed, to 80ms", next.Start, next.End)
+		}
+		if got := next.Operations.Overall.Attempted; got != 60 {
+			t.Errorf("stage 3 records %d operations, want 60", got)
+		}
+		sum := 0
+		for _, s := range res.Stages {
+			sum += s.Operations.Overall.Attempted
+		}
+		if total := res.Operations.Overall.Attempted; total != sum {
+			t.Errorf("run total %d, stages %d; want the same count", total, sum)
+		}
+	})
+	want := `level=WARN msg="stage entered after its window ended; it records no operations" stage=2 took=30ms`
+	if out := logs.String(); !strings.Contains(out, want) {
+		t.Errorf("logs = %q, want a line containing %q", out, want)
+	}
+}
+
+// TestRunStageEnterOutlastsRun confirms a stage whose Enter is still running
+// when the run's duration ends is not recorded and is logged: Run returns no
+// error and a result that lists only the stage before it.
+func TestRunStageEnterOutlastsRun(t *testing.T) {
+	logs := captureLogs(t)
+	synctest.Test(t, func(t *testing.T) {
+		enter := func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		ops := []Operation{{Name: "validate", Weight: 1, Do: sleepFor(time.Millisecond)}}
+		cfg := validConfig()
+		cfg.Workers = 2
+		cfg.Duration = 40 * time.Millisecond
+		cfg.Stages = []Stage{{Duration: 20 * time.Millisecond}, {Duration: 20 * time.Millisecond, Enter: enter}}
+		res, err := Run(context.Background(), ops, cfg)
+		if err != nil {
+			t.Fatalf("Run() error = %v, want nil for a run that reached its end", err)
+		}
+		if len(res.Stages) != 1 {
+			t.Fatalf("got %d stages, want 1: stage 2 was still being entered when the run ended", len(res.Stages))
+		}
+		if s := res.Stages[0]; s.End != 20*time.Millisecond || s.Operations.Overall.Attempted != res.Operations.Overall.Attempted {
+			t.Errorf("stage 1 ends at %s with %d of the run's %d operations, want 20ms with all of them", s.End, s.Operations.Overall.Attempted, res.Operations.Overall.Attempted)
+		}
+	})
+	want := `level=WARN msg="the run ended while a stage was being entered; the stage is not recorded" stage=2 took=20ms error="context deadline exceeded"`
+	if out := logs.String(); !strings.Contains(out, want) {
+		t.Errorf("logs = %q, want a line containing %q", out, want)
+	}
+}
+
+// TestRunStagesInterruptedWhileParking confirms a cancellation that arrives
+// while the controller waits for the workers to park ends the run: the
+// operations in flight at the first window's end ignore their context and
+// return at 100ms, after the cancellation at 30ms, so the workers stop rather
+// than park, and Run returns then, with no error and only stage 1. A
+// cancellation is not logged as a stage the run could not record.
+func TestRunStagesInterruptedWhileParking(t *testing.T) {
+	logs := captureLogs(t)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		time.AfterFunc(30*time.Millisecond, cancel)
+		slow := func(context.Context, *rand.Rand) error {
+			time.Sleep(100 * time.Millisecond)
+			return nil
+		}
+		ops := []Operation{{Name: "validate", Weight: 1, Do: slow}}
+		cfg := validConfig()
+		cfg.Workers = 2
+		cfg.OpTimeout = time.Hour
+		cfg.Duration = 20*time.Millisecond + time.Hour
+		cfg.Stages = []Stage{{Duration: 20 * time.Millisecond}, {Duration: time.Hour, Enter: func(context.Context) error { return nil }}}
+		began := time.Now()
+		res, err := Run(ctx, ops, cfg)
+		if err != nil {
+			t.Fatalf("Run() error = %v, want nil for an interrupted run", err)
+		}
+		if elapsed := time.Since(began); elapsed != 100*time.Millisecond {
+			t.Errorf("Run returned after %s, want 100ms, when the operations in flight returned", elapsed)
+		}
+		if len(res.Stages) != 1 {
+			t.Fatalf("got %d stages, want 1", len(res.Stages))
+		}
+	})
+	if out := logs.String(); strings.Contains(out, "the stage is not recorded") {
+		t.Errorf("logs = %q, want no line about an unrecorded stage for a cancelled run", out)
+	}
+}
+
+// TestRunStagesInterruptedInFirstWindow confirms a cancellation during the
+// first of two hour-long windows ends the run at once: the controller, which
+// waits for that window's end, returns with the cancellation, and Run returns
+// no error and only stage 1 once the operation in flight returned.
+func TestRunStagesInterruptedInFirstWindow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		time.AfterFunc(10*time.Millisecond, cancel)
+		ops := []Operation{{Name: "validate", Weight: 1, Do: sleepFor(time.Millisecond)}}
+		cfg := validConfig()
+		cfg.Workers = 2
+		cfg.Duration = 2 * time.Hour
+		cfg.Stages = []Stage{{Duration: time.Hour}, {Duration: time.Hour, Enter: func(context.Context) error { return nil }}}
+		began := time.Now()
+		res, err := Run(ctx, ops, cfg)
+		if err != nil {
+			t.Fatalf("Run() error = %v, want nil for an interrupted run", err)
+		}
+		if elapsed := time.Since(began); elapsed > 11*time.Millisecond {
+			t.Errorf("Run returned after %s, want at most 11ms: the cancellation at 10ms ends the run", elapsed)
+		}
+		if len(res.Stages) != 1 {
+			t.Fatalf("got %d stages, want 1", len(res.Stages))
+		}
+	})
+}
+
+// TestRunFirstStageEnterDelaysTheWorkers confirms the first stage's Enter
+// runs before any worker starts and that the run's offsets count from the
+// start of the run, before that entry: stage 1 starts at the 20ms its Enter
+// took, no operation starts before it, the 10ms buckets still begin at 0 so
+// the first two hold no operation, the run's wall includes the entry, and a
+// checkpoint taken during the entry lists no operation and no stage.
+func TestRunFirstStageEnterDelaysTheWorkers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var (
+			mu      sync.Mutex
+			offsets []time.Duration // each Do's entry offset from start
+			during  []*Result       // the checkpoints taken while Enter ran
+		)
+		start := time.Now()
+		sleep := sleepFor(time.Millisecond)
+		do := func(ctx context.Context, rng *rand.Rand) error {
+			mu.Lock()
+			offsets = append(offsets, time.Since(start))
+			mu.Unlock()
+			return sleep(ctx, rng)
+		}
+		ops := []Operation{{Name: "validate", Weight: 1, Do: do}}
+		cfg := validConfig()
+		cfg.Workers = 2
+		cfg.Duration = 100 * time.Millisecond
+		cfg.Stages = []Stage{{Duration: 100 * time.Millisecond, Enter: sleepEnter(20 * time.Millisecond)}}
+		cfg.CheckpointInterval = 10 * time.Millisecond
+		cfg.OnCheckpoint = func(r *Result) {
+			if time.Since(start) < 20*time.Millisecond {
+				mu.Lock()
+				during = append(during, r)
+				mu.Unlock()
+			}
+		}
+		res, err := Run(context.Background(), ops, cfg)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(res.Stages) != 1 {
+			t.Fatalf("got %d stages, want 1", len(res.Stages))
+		}
+		if s := res.Stages[0]; s.Start != 20*time.Millisecond || s.End != 100*time.Millisecond || s.Operations.Wall != 80*time.Millisecond {
+			t.Errorf("stage 1 runs from %s to %s over %s, want from 20ms, after the 20ms Enter, to 100ms over 80ms", s.Start, s.End, s.Operations.Wall)
+		}
+		for _, o := range offsets {
+			if o < 20*time.Millisecond {
+				t.Errorf("an operation started at %s, before stage 1's Enter returned at 20ms", o)
+			}
+		}
+		// Two workers drawing a 1ms operation back to back from 20ms to
+		// 100ms start 160 draws, 20 of them in the bucket from 20ms.
+		if total := res.Operations.Overall.Attempted; total != 160 || total != len(offsets) {
+			t.Errorf("run total %d, Do entered %d times; want 160", total, len(offsets))
+		}
+		if res.Operations.Wall != 100*time.Millisecond {
+			t.Errorf("run wall = %s, want 100ms, the entry included", res.Operations.Wall)
+		}
+		if len(res.Buckets) != bucketCount {
+			t.Fatalf("got %d buckets, want %d", len(res.Buckets), bucketCount)
+		}
+		for i, want := range []struct {
+			start     time.Duration
+			attempted int
+		}{{0, 0}, {10 * time.Millisecond, 0}, {20 * time.Millisecond, 20}} {
+			if b := res.Buckets[i]; b.Start != want.start || b.Operations.Overall.Attempted != want.attempted {
+				t.Errorf("bucket %d starts at %s with %d operations, want %s with %d", i, b.Start, b.Operations.Overall.Attempted, want.start, want.attempted)
+			}
+		}
+		if len(during) != 1 {
+			t.Fatalf("got %d checkpoints during the 20ms Enter, want 1, at 10ms", len(during))
+		}
+		if r := during[0]; r.Operations.Overall.Attempted != 0 || len(r.Stages) != 0 {
+			t.Errorf("the checkpoint during the entry lists %d operations and %d stages, want none of either", r.Operations.Overall.Attempted, len(r.Stages))
+		}
+	})
+}
+
+// TestRunStageCheckpoints confirms a checkpoint taken during a staged run
+// lists the stages entered so far. Stage 2's Enter waits until a checkpoint
+// listed stage 1 alone, and the first checkpoint that lists both ends the
+// run, so the run holds checkpoints of both kinds, in that order.
+func TestRunStageCheckpoints(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var (
+			mu    sync.Mutex
+			snaps []*Result
+			once  sync.Once
+		)
+		sawFirst := make(chan struct{})
+		enter := func(ctx context.Context) error {
+			select {
+			case <-sawFirst:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		ops := []Operation{{Name: "validate", Weight: 1, Do: sleepFor(time.Millisecond)}}
+		cfg := validConfig()
+		cfg.Workers = 2
+		cfg.Duration = 30*time.Millisecond + time.Hour
+		cfg.Stages = []Stage{{Duration: 30 * time.Millisecond}, {Duration: time.Hour, Enter: enter}}
+		cfg.CheckpointInterval = 5 * time.Millisecond
+		cfg.OnCheckpoint = func(r *Result) {
+			mu.Lock()
+			snaps = append(snaps, r)
+			mu.Unlock()
+			switch len(r.Stages) {
+			case 1:
+				once.Do(func() { close(sawFirst) })
+			case 2:
+				cancel()
+			}
+		}
+		res, err := Run(ctx, ops, cfg)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if len(res.Stages) != 2 {
+			t.Fatalf("got %d stages, want 2", len(res.Stages))
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		seen := make(map[int]int) // checkpoints by the number of stages they list
+		prev := 0
+		for i, r := range snaps {
+			n := len(r.Stages)
+			if n < prev || n < 1 || n > 2 {
+				t.Errorf("checkpoint %d lists %d stages after one listed %d, want a non-decreasing count of 1 or 2", i, n, prev)
+				continue
+			}
+			prev = n
+			seen[n]++
+			if first := r.Stages[0]; first.Start != 0 || first.End < first.Start || first.End > 30*time.Millisecond {
+				t.Errorf("checkpoint %d: stage 1 runs from %s to %s, want from 0s to at most 30ms", i, first.Start, first.End)
+			}
+			if n == 2 {
+				if first := r.Stages[0]; first.End != 30*time.Millisecond {
+					t.Errorf("checkpoint %d: stage 1 ends at %s, want 30ms once stage 2 was entered", i, first.End)
+				}
+				if second := r.Stages[1]; second.Start != 30*time.Millisecond || second.End < second.Start {
+					t.Errorf("checkpoint %d: stage 2 runs from %s to %s, want from 30ms", i, second.Start, second.End)
+				}
+			}
+		}
+		if seen[1] == 0 || seen[2] == 0 {
+			t.Errorf("checkpoints by stage count = %v, want some listing 1 stage and some listing 2", seen)
+		}
+	})
 }
