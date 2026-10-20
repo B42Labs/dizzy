@@ -141,10 +141,11 @@ type ChaosBucket struct {
 // PressureStats holds the statistics of a closed-loop pressure run, persisted
 // next to the standard metrics: the worker count, the token pool size, the
 // users reserved for role churn, the operation mix, the per-operation
-// aggregate, the revocations the run made and per-time-bucket statistics. The
-// schema lives here, not in the pressure package, so the read-side commands
-// can render it without importing the engine. The percentiles in Operations
-// and in every bucket are the metrics collector's estimates within 1%.
+// aggregate, the revocations the run made, per-time-bucket statistics and,
+// for a staged run, per-stage statistics. The schema lives here, not in the
+// pressure package, so the read-side commands can render it without
+// importing the engine. The percentiles in Operations, in every bucket and in
+// every stage are the metrics collector's estimates within 1%.
 type PressureStats struct {
 	Workers int `json:"workers"`
 	Tokens  int `json:"tokens"`
@@ -160,6 +161,9 @@ type PressureStats struct {
 	// Revocations counts the revoke operations of the run that succeeded.
 	Revocations int              `json:"revocations"`
 	Buckets     []PressureBucket `json:"buckets,omitempty"`
+	// Stages holds one entry per stage of a staged run, in stage order. It is
+	// omitted for a run without stages, so such a record keeps its shape.
+	Stages []PressureStage `json:"stages,omitempty"`
 	// BucketWidth is the fixed width of every time bucket of an unbounded run.
 	// It is omitempty and 0 for a bounded run, whose ten buckets divide its
 	// duration equally.
@@ -182,6 +186,20 @@ type PressureBucket struct {
 	Start       time.Duration     `json:"start"`
 	Operations  metrics.Aggregate `json:"operations"`
 	Revocations int               `json:"revocations"`
+}
+
+// PressureStage is one stage of a staged pressure run. Index is 1-based.
+// FanAssignments is the stage's fan_assignments override, 0 and omitted
+// when the stage set none. Start is the offset at which the workers resumed
+// after the stage was entered, End the offset at which its window ended.
+// Operations are the draws that started in between, shaped like Metrics,
+// with one byType entry per operation; its wall is End minus Start.
+type PressureStage struct {
+	Index          int               `json:"index"`
+	FanAssignments int               `json:"fanAssignments,omitempty"`
+	Start          time.Duration     `json:"start"`
+	End            time.Duration     `json:"end"`
+	Operations     metrics.Aggregate `json:"operations"`
 }
 
 // Write marshals r as indented JSON and writes it to dir as run-<id>.json,

@@ -393,6 +393,69 @@ func TestWriteHTMLGoldenPressure(t *testing.T) {
 	}
 }
 
+// TestWriteHTMLGoldenPressureStages locks the rendered HTML for a staged
+// pressure record: the stage table under its own heading between the
+// per-operation table and the per-operation charts.
+func TestWriteHTMLGoldenPressureStages(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteHTML(&buf, pressureStagesRecord()); err != nil {
+		t.Fatalf("WriteHTML: %v", err)
+	}
+	checkGolden(t, "report-pressure-stages.html", buf.Bytes())
+}
+
+// TestWriteHTMLPressureStagesTable confirms a staged record's pressure
+// section carries one "Pressure stages" heading after the per-operation table
+// and before the first per-operation chart, over a sortable table with the
+// stage columns and one row per stage and operation, "all" first, with "-"
+// sorted as -1 for a stage without an override and the window sorted by
+// nanoseconds; and that a record without stages has no such heading.
+func TestWriteHTMLPressureStagesTable(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteHTML(&buf, pressureStagesRecord()); err != nil {
+		t.Fatalf("WriteHTML: %v", err)
+	}
+	section := pressureSection(buf.String())
+	const heading = "<h2>Pressure stages</h2>"
+	if got := strings.Count(section, heading); got != 1 {
+		t.Fatalf("pressure section has %d %q headings, want 1:\n%s", got, heading, section)
+	}
+	at := strings.Index(section, heading)
+	if ops := strings.Index(section, "<th>operation</th><th>ops</th>"); ops < 0 || ops > at {
+		t.Errorf("stage heading at %d does not follow the per-operation table at %d", at, ops)
+	}
+	if series := strings.Index(section, "<h2>Pressure: "); series < at {
+		t.Errorf("stage heading at %d does not precede the first per-operation heading at %d", at, series)
+	}
+	table := section[at+len(heading):]
+	table = table[:strings.Index(table, "</table>")]
+	if !strings.HasPrefix(table, "\n<table class=\"sortable\">\n  <thead><tr><th>stage</th><th>fan</th><th>start</th>") {
+		t.Errorf("stage heading is not followed by the sortable stage table:\n%s", table)
+	}
+	if !strings.Contains(table, "<th>end</th><th>operation</th><th>ops</th><th>ok</th><th>failed</th><th>ops/s</th><th>p50</th><th>p95</th><th>p99</th></tr></thead>") {
+		t.Errorf("stage table header lacks the remaining columns:\n%s", table)
+	}
+	if got := strings.Count(table, "<tr><td"); got != 6 {
+		t.Errorf("stage table has %d rows, want 6 (two stages, each all, effective and validate):\n%s", got, table)
+	}
+	for _, want := range []string{
+		`<tr><td data-sort="1">1</td><td data-sort="-1">-</td><td data-sort="0">0ms</td><td data-sort="60000000000">60.00s</td><td data-sort="all">all</td>`,
+		`<tr><td data-sort="2">2</td><td data-sort="1000">1000</td><td data-sort="61500400000">61.50s</td><td data-sort="120000000000">120.00s</td><td data-sort="validate">validate</td>`,
+	} {
+		if !strings.Contains(table, want) {
+			t.Errorf("stage table lacks the row %q:\n%s", want, table)
+		}
+	}
+
+	var plain bytes.Buffer
+	if err := WriteHTML(&plain, pressureRecord()); err != nil {
+		t.Fatalf("WriteHTML(without stages): %v", err)
+	}
+	if strings.Contains(plain.String(), "Pressure stages") {
+		t.Error("report of a run without stages has a stage heading")
+	}
+}
+
 // pressureSection returns the pressure section of a rendered report, from its
 // heading up to the script, or "" when the report has none.
 func pressureSection(out string) string {
