@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -42,6 +43,50 @@ pressure:
   duration: 1m
   workers: 4
   tokens: 10
+`
+
+// fanScenarioYAML is a Keystone scenario of five projects, three regular
+// users whose grants are all project-scoped, and one fan user, fan-0001, with
+// grants on two of the projects: the plan whose fan user the staged runs
+// against fakePressureKeystone grow.
+const fanScenarioYAML = `
+name: fan
+seed: 7
+resources:
+  domains:  1
+  roles:    2
+  projects: 5
+  users:    3
+distribution:
+  projects_per_domain:            { min: 5, max: 5 }
+  assignments_per_user:           { min: 1, max: 2 }
+  domain_scoped_assignment_ratio: 0
+  users_issuing_tokens_ratio:     0.5
+  fan_users:                      1
+  fan_assignments:                { min: 2, max: 2 }
+`
+
+// fanStagesScenarioYAML is a Keystone scenario whose fan user holds 500 of its
+// 1000 projects' grants, with a pressure block of two stages without a
+// duration that grow the fan user to 500 and then 1000 grants. It sets no
+// duration, so the command needs --duration.
+const fanStagesScenarioYAML = `
+name: fan-stages
+seed: 7
+resources:
+  domains:  1
+  roles:    2
+  projects: 1000
+  users:    3
+distribution:
+  projects_per_domain:  { min: 1000, max: 1000 }
+  assignments_per_user: { min: 1, max: 2 }
+  fan_users:            1
+  fan_assignments:      { min: 500, max: 500 }
+pressure:
+  stages:
+    - fan_assignments: 500
+    - fan_assignments: 1000
 `
 
 // adminTierMessage is the exact rejection of a caller below the admin tier.
@@ -130,12 +175,20 @@ func setPressureFlags(t *testing.T, cmd *cobra.Command, flags map[string]string,
 	return f
 }
 
-// mergePressure parses the sample scenario with block appended, sets flags
-// and mix on a fresh pressure command, and returns mergePressureConfig's
-// result with opts.timeout 42s.
+// mergePressure is mergePressureScenario over the sample scenario with block
+// appended, without the stage targets.
 func mergePressure(t *testing.T, block string, flags map[string]string, mix ...string) (pressure.Config, keystoneops.Options, error) {
 	t.Helper()
-	s, err := keystonescenario.Parse([]byte(sampleKeystoneScenarioYAML + "\n" + block))
+	cfg, o, _, err := mergePressureScenario(t, sampleKeystoneScenarioYAML+"\n"+block, flags, mix...)
+	return cfg, o, err
+}
+
+// mergePressureScenario parses the scenario body, sets flags and mix on a
+// fresh pressure command, and returns mergePressureConfig's result with
+// opts.timeout 42s.
+func mergePressureScenario(t *testing.T, body string, flags map[string]string, mix ...string) (pressure.Config, keystoneops.Options, []int, error) {
+	t.Helper()
+	s, err := keystonescenario.Parse([]byte(body))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -448,6 +501,109 @@ func TestMergePressureConfigDurationAndBucketWidth(t *testing.T) {
 	}
 }
 
+func TestStageWindows(t *testing.T) {
+	tests := []struct {
+		name     string
+		stages   []time.Duration // 0 for a stage without a duration
+		duration time.Duration
+		want     []time.Duration
+		wantErr  string
+	}{
+		{"stages without a duration share the run equally", []time.Duration{0, 0, 0}, 3 * time.Minute,
+			[]time.Duration{time.Minute, time.Minute, time.Minute}, ""},
+		{"stages without a duration share what the others leave", []time.Duration{2 * time.Minute, 0, 0}, 5 * time.Minute,
+			[]time.Duration{2 * time.Minute, 90 * time.Second, 90 * time.Second}, ""},
+		{"the last stage without a duration takes the remainder", []time.Duration{0, 0}, time.Second + 1,
+			[]time.Duration{500 * time.Millisecond, 500*time.Millisecond + 1}, ""},
+		{"the last stage runs to the end", []time.Duration{time.Minute, time.Minute}, 3 * time.Minute,
+			[]time.Duration{time.Minute, 2 * time.Minute}, ""},
+		{"durations past the run", []time.Duration{2 * time.Minute, 2 * time.Minute}, 3 * time.Minute, nil,
+			"pressure.stages: the stage durations add up to 4m0s, more than the run duration 3m0s"},
+		{"durations that fill the run", []time.Duration{3 * time.Minute, 0}, 3 * time.Minute, nil,
+			"pressure.stages: the stages with a duration fill the run duration 3m0s, leaving nothing for the 1 stage(s) without one"},
+		{"a rest too short to share", []time.Duration{time.Minute, 0, 0}, time.Minute + 1, nil,
+			"pressure.stages: the stages with a duration fill the run duration 1m0.000000001s, leaving nothing for the 2 stage(s) without one"},
+		{"durations whose sum overflows", []time.Duration{math.MaxInt64, 1}, 3 * time.Minute, nil,
+			"pressure.stages: the stage durations add up to 2562047h47m16.854775807s, more than the run duration 3m0s"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stages := make([]keystonescenario.Stage, len(tc.stages))
+			for i, d := range tc.stages {
+				stages[i].Duration = keystonescenario.Duration(d)
+			}
+			got, err := stageWindows(stages, tc.duration)
+			if tc.wantErr != "" {
+				wantExactError(t, err, tc.wantErr)
+				return
+			}
+			if err != nil {
+				t.Fatalf("stageWindows: %v", err)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("stageWindows(%v, %s) = %v, want %v", tc.stages, tc.duration, got, tc.want)
+			}
+			var sum time.Duration
+			for _, d := range got {
+				sum += d
+			}
+			if sum != tc.duration {
+				t.Errorf("the windows add up to %s, want the run duration %s", sum, tc.duration)
+			}
+		})
+	}
+}
+
+func TestMergePressureConfigStages(t *testing.T) {
+	t.Run("--duration 4m splits into the stages", func(t *testing.T) {
+		cfg, _, targets, err := mergePressureScenario(t, fanStagesScenarioYAML, map[string]string{"duration": "4m"})
+		if err != nil {
+			t.Fatalf("mergePressureConfig: %v", err)
+		}
+		if len(cfg.Stages) != 2 {
+			t.Fatalf("got %d stages, want 2: %+v", len(cfg.Stages), cfg.Stages)
+		}
+		for i, st := range cfg.Stages {
+			if st.Duration != 2*time.Minute {
+				t.Errorf("stage %d duration = %s, want 2m0s", i+1, st.Duration)
+			}
+			if st.Enter != nil {
+				t.Errorf("stage %d has an Enter; runKeystonePressure sets it", i+1)
+			}
+		}
+		if want := []int{500, 1000}; !slices.Equal(targets, want) {
+			t.Errorf("targets = %v, want %v", targets, want)
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("the merged staged config is invalid: %v", err)
+		}
+	})
+	t.Run("no duration anywhere leaves the stages to the duration check", func(t *testing.T) {
+		cfg, _, targets, err := mergePressureScenario(t, fanStagesScenarioYAML, nil)
+		if err != nil {
+			t.Fatalf("mergePressureConfig: %v", err)
+		}
+		if cfg.Stages != nil || targets != nil {
+			t.Errorf("Stages/targets = %+v/%v, want none without a duration", cfg.Stages, targets)
+		}
+		wantExactError(t, cfg.Validate(), "pressure duration must be set and positive, got 0s")
+	})
+}
+
+func TestKeystonePressureStageScenarioErrors(t *testing.T) {
+	t.Run("--duration 0 with stages", func(t *testing.T) {
+		err := execPressure(t, fanStagesScenarioYAML, "--duration", "0")
+		wantExactError(t, err, "pressure.stages need a bounded run; --duration 0 selects a run without an end")
+	})
+	t.Run("a stage below distribution.fan_assignments.max", func(t *testing.T) {
+		err := execPressure(t, fanStagesScenarioYAML, "--duration", "4m", "--set", "distribution.fan_assignments.max=600")
+		wantExactError(t, err, "invalid scenario: pressure.stages[0].fan_assignments (500) is below distribution.fan_assignments.max (600), which a fan user may already hold")
+	})
+	t.Run("a bounded staged run reaches the identity client", func(t *testing.T) {
+		wantIdentityClient(t, execPressure(t, fanStagesScenarioYAML, "--duration", "4m"))
+	})
+}
+
 func TestKeystonePressureWorkersCeiling(t *testing.T) {
 	err := execPressure(t, keystonePressureScenarioYAML, "--workers", "2000")
 	wantExactError(t, err, "pressure workers must be between 1 and 1024, got 2000")
@@ -682,7 +838,7 @@ func TestPressureStats(t *testing.T) {
 			ChurnUsers: 3,
 			Weights:    map[string]int{"validate": 60, "effective": 5, "revoke": 2, "grant_churn": 0, "issue": 1, "probe": 0, "bad_token": 0},
 		}
-		ps := pressureStats(r, o)
+		ps := pressureStats(r, o, nil)
 		if ps.Workers != 8 || ps.Tokens != 20 || ps.BucketWidth != time.Minute {
 			t.Errorf("Workers/Tokens/BucketWidth = %d/%d/%s, want 8/20/1m0s", ps.Workers, ps.Tokens, ps.BucketWidth)
 		}
@@ -716,7 +872,7 @@ func TestPressureStats(t *testing.T) {
 
 	t.Run("grant_churn on", func(t *testing.T) {
 		o := keystoneops.Options{Tokens: 20, ChurnUsers: 3, Weights: map[string]int{"validate": 60, "grant_churn": 2}}
-		ps := pressureStats(r, o)
+		ps := pressureStats(r, o, nil)
 		if ps.ChurnUsers != 3 {
 			t.Errorf("ChurnUsers = %d, want 3 while grant_churn is on", ps.ChurnUsers)
 		}
@@ -727,9 +883,35 @@ func TestPressureStats(t *testing.T) {
 	})
 
 	t.Run("no revocations and no buckets", func(t *testing.T) {
-		ps := pressureStats(&pressure.Result{Workers: 1, Operations: opStats(map[string]int{"validate": 4})}, keystoneops.Options{Tokens: 1, Weights: map[string]int{"validate": 1}})
+		ps := pressureStats(&pressure.Result{Workers: 1, Operations: opStats(map[string]int{"validate": 4})}, keystoneops.Options{Tokens: 1, Weights: map[string]int{"validate": 1}}, nil)
 		if ps.Revocations != 0 || ps.Buckets != nil {
 			t.Errorf("Revocations/Buckets = %d/%v, want 0/nil", ps.Revocations, ps.Buckets)
+		}
+	})
+
+	t.Run("stages", func(t *testing.T) {
+		o := keystoneops.Options{Tokens: 20, Weights: map[string]int{"validate": 60}}
+		if ps := pressureStats(r, o, nil); ps.Stages != nil {
+			t.Errorf("Stages = %+v for a run without stages, want nil", ps.Stages)
+		}
+
+		staged := *r
+		staged.Stages = []pressure.StageResult{
+			{Start: 0, End: time.Minute, Operations: opStats(map[string]int{"validate": 30})},
+			{Start: time.Minute + time.Second, End: 3 * time.Minute, Operations: opStats(map[string]int{"validate": 20, "effective": 2})},
+		}
+		ps := pressureStats(&staged, o, []int{0, 500})
+		want := []run.PressureStage{
+			{Index: 1, FanAssignments: 0, Start: 0, End: time.Minute, Operations: staged.Stages[0].Operations},
+			{Index: 2, FanAssignments: 500, Start: time.Minute + time.Second, End: 3 * time.Minute, Operations: staged.Stages[1].Operations},
+		}
+		if !reflect.DeepEqual(ps.Stages, want) {
+			t.Errorf("Stages = %+v, want %+v", ps.Stages, want)
+		}
+
+		// A stage past the end of the targets has none.
+		if ps := pressureStats(&staged, o, []int{0}); len(ps.Stages) != 2 || ps.Stages[1].FanAssignments != 0 {
+			t.Errorf("Stages = %+v with one target, want two stages, the second without a target", ps.Stages)
 		}
 	})
 }
@@ -773,6 +955,15 @@ func TestKeystonePressureHelpCarriesLabWarning(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("help output missing %q", want)
 		}
+	}
+	// The churn users come from the plan's regular users; a fan user, which
+	// sits at the end of the plan, is never one.
+	churn := newKeystonePressureCmd(&globalOptions{}).Flags().Lookup("churn-users")
+	if churn == nil {
+		t.Fatal("keystone pressure has no --churn-users flag")
+	}
+	if !strings.Contains(churn.Usage, "regular users") || !strings.Contains(churn.Usage, "never a fan user") {
+		t.Errorf("--churn-users usage = %q, want it to name the plan's regular users and exclude the fan users", churn.Usage)
 	}
 }
 
@@ -834,13 +1025,17 @@ const pressureTestRunID = "run1234"
 // derived from its logical name, answers every pressure operation with
 // success, lists nothing for the teardown's discovery, and records each
 // Delete. assignErr, issueErr and validateErr, when set, fail every role
-// assignment, every scoped token issue or every token validation. At its
-// first Delete it notes whether the run record exists in the working
-// directory, so a test can tell the record was written before the teardown
-// began. The provisioning stages and the workers call it concurrently, so mu
-// guards the fields below it.
+// assignment, every scoped token issue or every token validation; with
+// assignOK positive, assignErr spares the first assignOK role assignments,
+// so a test whose assignOK is the plan's assignment count fails only the
+// grants made after provisioning. It counts the role assignments per user
+// id. At its first Delete it notes whether the run record exists in the
+// working directory, so a test can tell the record was written before the
+// teardown began. The provisioning stages and the workers call it
+// concurrently, so mu guards the fields below it.
 type fakePressureKeystone struct {
 	assignErr   error
+	assignOK    int
 	issueErr    error
 	validateErr error
 
@@ -857,6 +1052,8 @@ type fakePressureKeystone struct {
 
 	mu                 sync.Mutex
 	issued             int
+	assigns            int            // every AssignRole call
+	assigned           map[string]int // AssignRole calls by user id
 	deleted            []resource.Resource
 	recordBeforeDelete bool
 	drawn              []string
@@ -909,12 +1106,27 @@ func (f *fakePressureKeystone) CreateUser(_ context.Context, u keystoneplan.User
 	return f.created(keystone.KindUser, u.Name), nil
 }
 
-// AssignRole grants a role as keystone.Client does, or fails with assignErr.
+// AssignRole counts the call for userID and grants a role as keystone.Client
+// does, or fails with assignErr once the first assignOK calls are made.
 func (f *fakePressureKeystone) AssignRole(_ context.Context, a keystoneplan.Assignment, userID, projectID, domainID, roleID string) (resource.Resource, error) {
-	if f.assignErr != nil {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.assigns++
+	if f.assigned == nil {
+		f.assigned = make(map[string]int)
+	}
+	f.assigned[userID]++
+	if f.assignErr != nil && f.assigns > f.assignOK {
 		return resource.Resource{}, f.assignErr
 	}
 	return keystone.AssignmentResource(a, userID, projectID, domainID, roleID), nil
+}
+
+// assignCalls returns how many AssignRole calls the fake saw for userID.
+func (f *fakePressureKeystone) assignCalls(userID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.assigned[userID]
 }
 
 // IssueToken completes the executor seam; Provision never calls it.
@@ -1017,7 +1229,13 @@ func (f *fakePressureKeystone) deletedIDs() map[string]int {
 // pressureTestPlan generates the plan of sampleKeystoneScenarioYAML.
 func pressureTestPlan(t *testing.T) *keystoneplan.Plan {
 	t.Helper()
-	s, err := keystonescenario.Parse([]byte(sampleKeystoneScenarioYAML))
+	return generateTestPlan(t, sampleKeystoneScenarioYAML)
+}
+
+// generateTestPlan generates the plan of the scenario body.
+func generateTestPlan(t *testing.T, body string) *keystoneplan.Plan {
+	t.Helper()
+	s, err := keystonescenario.Parse([]byte(body))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -1026,6 +1244,37 @@ func pressureTestPlan(t *testing.T) *keystoneplan.Plan {
 		t.Fatalf("Generate: %v", err)
 	}
 	return p
+}
+
+// fanTestUser is the fan user of fanScenarioYAML, and fanTestUserID the id
+// fakePressureKeystone creates it with.
+const (
+	fanTestUser   = "fan-0001"
+	fanTestUserID = "id-" + fanTestUser
+)
+
+// fanPressureTestPlan generates the plan of fanScenarioYAML and fails the test
+// unless it has the shape the staged runs rely on: five projects, three
+// regular users and fanTestUser holding two grants.
+func fanPressureTestPlan(t *testing.T) *keystoneplan.Plan {
+	t.Helper()
+	p := generateTestPlan(t, fanScenarioYAML)
+	if len(p.Projects) != 5 || len(p.Users) != 4 || p.FanUsers() != 1 || p.Users[3].Name != fanTestUser || fanTestGrants(p) != 2 {
+		t.Fatalf("the fan plan has %d projects, users %+v and %d grants of %s; want 5 projects, 3 regular users and %s with 2 grants",
+			len(p.Projects), p.Users, fanTestGrants(p), fanTestUser, fanTestUser)
+	}
+	return p
+}
+
+// fanTestGrants returns the number of plan assignments of fanTestUser.
+func fanTestGrants(p *keystoneplan.Plan) int {
+	n := 0
+	for _, a := range p.Assignments {
+		if a.User == fanTestUser {
+			n++
+		}
+	}
+	return n
 }
 
 // pressureTestRun is a pressureRun over p that passes every pre-cloud check: a
@@ -1055,6 +1304,21 @@ func pressureTestRun(t *testing.T, p *keystoneplan.Plan) pressureRun {
 	}
 	if err := checkPressureMix(r.o.Weights); err != nil {
 		t.Fatalf("the test run's mix is invalid: %v", err)
+	}
+	return r
+}
+
+// stagedPressureTestRun is pressureTestRun over p as a 60ms run of two 30ms
+// stages: the first without a fan_assignments target, the second growing the
+// fan user to four grants.
+func stagedPressureTestRun(t *testing.T, p *keystoneplan.Plan) pressureRun {
+	t.Helper()
+	r := pressureTestRun(t, p)
+	r.cfg.Duration = 60 * time.Millisecond
+	r.cfg.Stages = []pressure.Stage{{Duration: 30 * time.Millisecond}, {Duration: 30 * time.Millisecond}}
+	r.stages = []int{0, 4}
+	if err := r.cfg.Validate(); err != nil {
+		t.Fatalf("the staged test run's config is invalid: %v", err)
 	}
 	return r
 }
@@ -1247,6 +1511,190 @@ func TestRunKeystonePressureSetupFailures(t *testing.T) {
 				}
 			}
 			if want := fmt.Sprintf("deleted %d resource(s) for run %s", tc.wantCreated, pressureTestRunID); !strings.Contains(out.String(), want) {
+				t.Errorf("output %q missing %q", out.String(), want)
+			}
+		})
+	}
+}
+
+// TestRunKeystonePressureStages drives a staged run against the fake: the
+// second stage grows the fan user from its two plan grants to four, the
+// record lists both stages and the two stage grants among the created
+// resources, the output carries the Stages table, and the teardown removes
+// the stage grants with everything else. The caller's stages keep their nil
+// Enter.
+func TestRunKeystonePressureStages(t *testing.T) {
+	t.Chdir(t.TempDir())
+	p := fanPressureTestPlan(t)
+	f := &fakePressureKeystone{}
+	r := stagedPressureTestRun(t, p)
+	cmd := &cobra.Command{}
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+
+	if err := runKeystonePressure(context.Background(), cmd, f, r); err != nil {
+		t.Fatalf("runKeystonePressure: %v", err)
+	}
+	for i, st := range r.cfg.Stages {
+		if st.Enter != nil {
+			t.Errorf("the caller's stage %d got an Enter; runKeystonePressure must set it on a copy", i+1)
+		}
+	}
+
+	rec := loadPressureTestRecord(t)
+	if rec.Error != "" || rec.Incomplete {
+		t.Errorf("record Error/Incomplete = %q/%v, want empty/false for a completed run", rec.Error, rec.Incomplete)
+	}
+	if rec.Pressure == nil {
+		t.Fatal("record has no pressure statistics")
+	}
+	stages := rec.Pressure.Stages
+	if len(stages) != 2 {
+		t.Fatalf("record has %d stages, want 2: %+v", len(stages), stages)
+	}
+	for i, st := range stages {
+		if st.Index != i+1 {
+			t.Errorf("stage %d index = %d, want %d", i+1, st.Index, i+1)
+		}
+		if st.Start >= st.End {
+			t.Errorf("stage %d start %s is not before its end %s", i+1, st.Start, st.End)
+		}
+	}
+	if stages[0].FanAssignments != 0 || stages[1].FanAssignments != 4 {
+		t.Errorf("stage fanAssignments = %d, %d; want 0, 4", stages[0].FanAssignments, stages[1].FanAssignments)
+	}
+
+	// In the record file the stage without a target has no fanAssignments.
+	data, err := os.ReadFile("run-" + pressureTestRunID + ".json")
+	if err != nil {
+		t.Fatalf("reading the run record: %v", err)
+	}
+	var raw struct {
+		Pressure struct {
+			Stages []map[string]json.RawMessage `json:"stages"`
+		} `json:"pressure"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("decoding the run record: %v", err)
+	}
+	if len(raw.Pressure.Stages) != 2 {
+		t.Fatalf("the record file has %d stages, want 2", len(raw.Pressure.Stages))
+	}
+	if fan, ok := raw.Pressure.Stages[0]["fanAssignments"]; ok {
+		t.Errorf("stage 1 has fanAssignments %s in the record file, want it omitted", fan)
+	}
+	if fan := string(raw.Pressure.Stages[1]["fanAssignments"]); fan != "4" {
+		t.Errorf("stage 2 has fanAssignments %q in the record file, want 4", fan)
+	}
+
+	// The record lists the plan's resources and the two stage grants.
+	roots := len(p.Domains) + len(p.Roles) + len(p.Projects) + len(p.Users)
+	wantCreated := roots + len(p.Assignments) + 2
+	assignments := 0
+	for _, res := range rec.Created {
+		if res.Kind == keystone.KindAssignment {
+			assignments++
+		}
+	}
+	if len(rec.Created) != wantCreated || assignments != len(p.Assignments)+2 {
+		t.Errorf("record lists %d created resources, %d of them role assignments; want %d and %d",
+			len(rec.Created), assignments, wantCreated, len(p.Assignments)+2)
+	}
+	// Provisioning made one AssignRole call per plan grant of the fan user;
+	// every later call for it is a stage grant.
+	if got := f.assignCalls(fanTestUserID) - fanTestGrants(p); got != 2 {
+		t.Errorf("the fake saw %d AssignRole calls for %s after provisioning, want 2", got, fanTestUser)
+	}
+
+	// The teardown deleted every created resource; grant_churn may have
+	// deleted the churn user's assignments during the run as well.
+	deleted := f.deletedIDs()
+	for _, res := range rec.Created {
+		if deleted[res.ID] == 0 {
+			t.Errorf("created %s %q was not deleted", res.Kind, res.ID)
+		}
+	}
+	if want := fmt.Sprintf("deleted %d resource(s) for run %s", wantCreated, pressureTestRunID); !strings.Contains(out.String(), want) {
+		t.Errorf("output %q missing %q", out.String(), want)
+	}
+
+	// STAGE and FAN are right-aligned, so the second stage's rows are found
+	// by their fields.
+	if !strings.Contains(out.String(), "\nStages\n") {
+		t.Fatalf("output %q has no Stages table", out.String())
+	}
+	found := false
+	for _, line := range strings.Split(out.String(), "\n") {
+		if fields := strings.Fields(line); len(fields) >= 2 && fields[0] == "2" && fields[1] == "4" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("output %q has no row of stage 2 with fan assignments 4", out.String())
+	}
+}
+
+// TestRunKeystonePressureStageGrantFails proves that a failed stage entry
+// ends the run as a setup failure: the record's error names the stage, the
+// fan user and the grants made before the failure, the record has no
+// pressure statistics but lists those grants, the command returns "running
+// pressure (run <id>): " and the record's error, and the teardown removes
+// everything created, those grants included. grant_churn is off, so the
+// only role assignments after provisioning are the stage's and assignOK
+// counts them alone.
+func TestRunKeystonePressureStageGrantFails(t *testing.T) {
+	p := fanPressureTestPlan(t)
+	grantErr := errors.New("grant boom")
+	roots := len(p.Domains) + len(p.Roles) + len(p.Projects) + len(p.Users)
+
+	for _, granted := range []int{0, 1} {
+		t.Run(fmt.Sprintf("%d stage grant(s) before the failure", granted), func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			f := &fakePressureKeystone{assignErr: grantErr, assignOK: len(p.Assignments) + granted}
+			r := stagedPressureTestRun(t, p)
+			r.o.Weights[keystoneops.OpGrantChurn] = 0
+			cmd := &cobra.Command{}
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+
+			err := runKeystonePressure(context.Background(), cmd, f, r)
+			if err == nil {
+				t.Fatal("runKeystonePressure returned nil; a failed stage entry must exit non-zero")
+			}
+			if !errors.Is(err, grantErr) {
+				t.Errorf("error %v does not wrap the grant error", err)
+			}
+
+			rec := loadPressureTestRecord(t)
+			wantCause := fmt.Sprintf("entering stage 2: growing fan user %q to 4 assignments (%d granted): ", fanTestUser, granted)
+			if !strings.HasPrefix(rec.Error, wantCause) {
+				t.Errorf("record error = %q, want one starting with %q", rec.Error, wantCause)
+			}
+			if want := "running pressure (run " + pressureTestRunID + "): " + rec.Error; err.Error() != want {
+				t.Errorf("error = %q, want %q", err.Error(), want)
+			}
+			if rec.Pressure != nil {
+				t.Error("a failed stage entry recorded pressure statistics")
+			}
+			wantCreated := roots + len(p.Assignments) + granted
+			if len(rec.Created) != wantCreated {
+				t.Errorf("record lists %d created resources, want %d", len(rec.Created), wantCreated)
+			}
+
+			if !f.recordBeforeDelete {
+				t.Error("the run record was not written before teardown began")
+			}
+			deleted := f.deletedIDs()
+			if len(deleted) != len(rec.Created) {
+				t.Errorf("teardown deleted %d resources, want the %d the record lists", len(deleted), len(rec.Created))
+			}
+			for _, res := range rec.Created {
+				if deleted[res.ID] != 1 {
+					t.Errorf("created %s %q deleted %d times, want once", res.Kind, res.ID, deleted[res.ID])
+				}
+			}
+			if want := fmt.Sprintf("deleted %d resource(s) for run %s", wantCreated, pressureTestRunID); !strings.Contains(out.String(), want) {
 				t.Errorf("output %q missing %q", out.String(), want)
 			}
 		})
