@@ -13,7 +13,10 @@ evidence behind the changes is a one-process profile on SQLite, and
 C5C3/cobaltcore#1456 says its absolute numbers do not carry to MariaDB and
 memcached. `pressure` exists so that a run against a build with a change and a
 run against one without it can be read side by side on a real control plane.
-This page explains why the load is built the way it is.
+Three more changes, C5C3/cobaltcore#1463, C5C3/cobaltcore#1464 and
+C5C3/cobaltcore#1465, change keystonemiddleware itself, which runs inside Nova,
+Neutron, Cinder and Glance, so `pressure` can also send its users' tokens to
+those services. This page explains why the load is built the way it is.
 
 ## Why not the churn engine
 
@@ -91,6 +94,12 @@ then send different mixes, and the comparison would compare the mixes. With
 two generators, the sequence of operations a worker draws depends on nothing
 but the seed and the worker's index.
 
+The propagation probe, which runs beside the workers, has a generator of its
+own, seeded from the run seed. It seeds one generator per probe from it, in
+the order the probes start, and each probe draws the token it revokes from its
+own. Two probes that overlap therefore draw the same values whichever of them
+reaches the pool first.
+
 That is where determinism ends. How far a worker gets into its sequence in the
 duration depends on Keystone's latency, which is what the run measures. Which
 token a draw picks depends on the order in which other workers put tokens
@@ -99,8 +108,8 @@ See [Determinism and reproducibility](determinism.md).
 
 ## What each operation makes visible
 
-The table in #92 maps each CobaltCore change to the load that shows it. The
-rows this build can run:
+The table in #92 maps each CobaltCore change to the load that shows it, and
+this build runs every row:
 
 | CobaltCore change | Load | What to compare |
 |---|---|---|
@@ -108,20 +117,109 @@ rows this build can run:
 | C5C3/cobaltcore#1458, one validation and one role resolution per request | `validate` under `grant_churn`, which keeps Keystone's role caches cold | Validate p50 and p95 under churn |
 | C5C3/cobaltcore#1461, fewer cache round trips and an in-process cache tier | `validate` warm, with `revoke` and `grant_churn` at weight 0 and 128 workers | Validate p50, and the throughput at a fixed worker count |
 | C5C3/cobaltcore#1459, linear implied-role expansion and a bulk role lookup | `effective` for a fan user over the stages 500 to 4000 grants | The `effective` latency per stage: before the change it grows about fourfold per doubling of the grants, after it about twofold |
+| C5C3/cobaltcore#1463, event-driven token eviction in the middleware | The propagation probe, e.g. `--propagation-every 30s`, next to `probe` with many distinct pool tokens over more than 300 s | The propagation delay, from a revocation to the first 401 at a service: up to 300 s before the change, seconds after it, and fewer slow probes |
+| C5C3/cobaltcore#1464, an in-process cache tier in the middleware | `probe` with repeating tokens at a high rate | The probe p50 at each service: it drops by 0.3 to 1.2 ms, which shows over tens of thousands of samples |
+| C5C3/cobaltcore#1465, an offline signature and expiry check that rejects a bad token inside the service | `bad_token` next to `validate` | After the change, a bad-token latency of about 0.1 ms at each service and a validate p50 that does not move under the flood |
 
 The first row is why the report's bucket table carries the cumulative
 revocations next to each bucket's latency: the revocation lookup's cost grows
 with the events Keystone has to scan, so a latency that climbs with the
 revocation count is the signature of the unpatched lookup. The third row needs
 a warm cache, so a mix without the two operations that flush it, e.g.
-`--mix revoke=0 --mix grant_churn=0 --workers 128`.
+`--mix revoke=0 --mix grant_churn=0 --workers 128`. Whether the probes of the
+fifth and sixth rows send a service distinct or repeating tokens depends on
+the pool's size, `--tokens`, and on the rate of the probes that reach that
+service, since a draw picks a pool token at random.
 
-The remaining rows of #92 cover the middleware changes C5C3/cobaltcore#1463,
-C5C3/cobaltcore#1464 and C5C3/cobaltcore#1465, which only show when a pool
-token goes to Nova, Neutron, Cinder or Glance. #95 adds the `probe` and
-`bad_token` operations and the propagation probe for them. Their scenario keys
-parse today, and a positive value is rejected, so a scenario written for a
-later release fails loudly instead of running a different load.
+## Probes at the other services
+
+The last three rows measure keystonemiddleware, which runs inside Nova,
+Neutron, Cinder and Glance and sees a token only when a request brings it
+there. Three parts of a run send tokens to those services: the `probe`
+operation, the `bad_token` operation and the propagation probe. See
+[`pressure`](../reference/cli.md#pressure) for what each one sends.
+
+Each of them takes a service's endpoint from the catalog of the pool token it
+draws, not from the admin's. Cinder's catalog URL carries the project id,
+`/v3/<project_id>`, so a Cinder endpoint read from the admin's catalog names
+the admin's project, and Cinder refuses a member token of another project
+there. The token's catalog also decides which of the four services exist for
+that user: a service the catalog does not list is left out, and a `probe` or
+`bad_token` draw picks among the listed ones at random. The region and the
+interface are those of the `clouds.yaml` entry. A run that sends tokens to the
+services needs at least one of the four in the first pool token's catalog,
+and fails at priming without one.
+
+Every request is one read, the cheapest authenticated one the service offers:
+`GET /limits` at Nova, `GET /v2.0/networks?limit=1` at Neutron,
+`GET /v3/<project_id>/limits` at Cinder and `GET /v2/images?limit=1` at
+Glance. Each is a read that the `reader` role on the token's project allows,
+and its cost in the service does not grow with what the lab holds: the limits
+of one project, or the first item of a list. A probe's latency is the
+middleware's work on the token plus the read. With the read's cost fixed, the
+middleware's work is the part that differs between two builds, and
+C5C3/cobaltcore#1464 changes it by a fraction of a millisecond, which a read
+that grew with the lab's servers, networks, volumes or images would bury in
+its own spread.
+
+The pool users do not hold `reader` from the plan. The plan's roles are the
+run's own, created under its name prefix, and imply no other role, so no
+service's policy names them. Under their default policies, Cinder's
+`GET /v3/<project_id>/limits` and Glance's `GET /v2/images` ask for `reader`
+on the token's project, and without it both would answer every probe with a
+403: a policy refusal after the middleware's work, not the read the probe
+exists to time. So a run with `probe` or the propagation probe grants the
+cloud's `reader` role to every pool user on the project its tokens are scoped
+to, before it primes the pool, and tears the grants down with the rest of the
+run. Neither a churn user nor a fan user gets the grant, so the count an
+`effective` draw lists for a fan user stays the count its stage set. On a
+cloud without a `reader` role the run grants nothing, logs a warning and goes
+on, and the probes still reach every service whose read policy does not ask
+for the role. `bad_token` needs no role at all: keystonemiddleware refuses a
+bad token before the service checks any policy.
+
+The propagation probe measures C5C3/cobaltcore#1463 directly. Once per
+interval, `propagation.every` or `--propagation-every`, it takes a token out
+of the pool, revokes it, puts a fresh token for the same user and project back
+as `revoke` does, and sends the revoked token to one service once a second
+until the service answers 401. The delay is the time from the revocation to
+that 401. Before the change a service keeps accepting the revoked token for as
+long as keystonemiddleware caches it, up to 300 s; after it, for seconds. One
+poll a second resolves the delay to about a second, fine enough for a number
+that drops from minutes to seconds, and a probe against a build without the
+change costs a few hundred requests. A poll that ends without a 401 does not
+end the probe: a 2xx, a 5xx, a 403 and a poll that runs past `--timeout` each
+cost a second until the next poll. Each probe polls one service, and the next
+probe the next service in turn. A probe that outlasts the interval does not
+hold up the next one: at `every: 30s` and the default ceiling of 10 minutes,
+about 20 probes poll at once.
+
+The ceiling, `propagation.timeout` or `--propagation-timeout`, ends a probe
+whose service still accepts the token. That probe counts as timed out, and
+its delay enters the percentiles as the ceiling, so a percentile at the
+ceiling says the service accepted the revoked token at least that long, not
+how long. A probe still polling when the run ends is not recorded: the run
+ended it, not the service, so it is neither a delay nor a timeout.
+
+`bad_token` sends a service a token it has to refuse and counts the expected
+401 as a success, with its latency. The token is either a random string as
+long as a pool token, drawn from `A-Za-z0-9-_`, the alphabet of a Fernet
+token, or a pool token that `revoke` or the propagation probe revoked earlier
+in the run. A revoked token serves only once it is 5 minutes old, which is
+keystonemiddleware's default token cache time. A service may still hold a
+younger revoked token in its cache as valid, and a draw that sent it would
+measure that cache, the subject of the propagation probe, instead of the
+rejection path. A service that accepts a bad token shows as `accepted` in the
+error breakdown.
+
+The propagation probe's revocations are real revocation events, as those of
+`revoke` are. On Keystone 2026.2 each one flushes the token validation cache
+for every user of that Keystone, and each adds an event for the revocation
+lookup of the first row to scan. The record counts them as `token` calls
+under `metrics`, and the `--otel` export as `token`/`revoke`. They are not in
+`revocations` or the bucket table's cumulative revocations, which count
+`revoke` draws. With the propagation probe on, Keystone therefore holds more
+revocation events than the bucket table shows.
 
 ## Fan users and stages
 
@@ -173,19 +271,20 @@ runs needs.
 Every proof in #92 comes down to the same scenario and seed, run once against
 a build with a CobaltCore change and once against a build without it.
 `keystone report --run <without>.json --compare <with>.json` reads the two
-records and prints both runs' p50, p95, p99 and throughput per operation and
-per stage, with the difference; see
+records and prints both runs' p50, p95, p99 and throughput per operation, per
+stage and per service, and their propagation delays, with the difference; see
 [Comparing two runs](../reference/cli.md#comparing-two-runs).
 
 The comparison first checks that the two runs sent the same load: the
-scenario, the seed, the workers, the token pool, the mix and the stages, their
-number and each one's `fan_assignments`. Each of them changes what the
-workers send, and a delta between two runs that differ in one would mix the
-change under test with the change of the load. The command refuses such
-records and names every difference. `--allow-mismatch` compares them anyway,
-for a reader who changed one on purpose, and prints the differences above the
-tables. What the comparison cannot check is the build each run measured; the
-records do not carry it.
+scenario, the seed, the workers, the token pool, the mix, the propagation
+probe's interval and ceiling, and the stages, their number and each one's
+`fan_assignments`. Each of them changes what the run sends, and a delta
+between two runs that differ in one would mix the change under test with the
+change of the load. The command refuses such records and names every
+difference. `--allow-mismatch` compares them anyway, for a reader who changed
+one on purpose, and prints the differences above the tables. What the
+comparison cannot check is the build each run measured; the records do not
+carry it.
 
 Every delta is the other run minus the base. With the build without the
 change as the base, a negative latency delta and a positive `ops/s` delta are
@@ -213,11 +312,12 @@ quotes. See [Export metrics to OpenTelemetry](../how-to/export-to-otel.md).
 
 ## Distance to the cloud
 
-Some of these changes, C5C3/cobaltcore#1461 among them, move the validate
-latency by less than a millisecond. A client measures that latency plus its
-own network path to Keystone, and a path through a WAN, a VPN or a load
-balancer in another site can add more spread than the change is worth. Runs
-that look for sub-millisecond deltas belong on a client close to the cloud:
+Some of these changes move a latency by less than a millisecond:
+C5C3/cobaltcore#1461 the validate latency, C5C3/cobaltcore#1464 the probe
+latency. A client measures that latency plus its own network path to Keystone
+or to the service, and a path through a WAN, a VPN or a load balancer in
+another site can add more spread than the change is worth. Runs that look for
+sub-millisecond deltas belong on a client close to the cloud:
 the [container image](../how-to/install-and-verify.md#use-the-container-image)
 running in the cluster next to Keystone. The table report rounds the pressure
 latencies to the microsecond, and the collector's percentile estimates stay
@@ -228,10 +328,13 @@ within 1% of the exact value, 20 µs at a 2 ms median.
 Every `revoke` is a real revocation event. On Keystone 2026.2 each one flushes
 the token validation cache for every user of that Keystone, not only for the
 run's own users, so a pressure run with a positive `revoke` weight slows down
-every service's validations for as long as it runs. The verb also needs the
-admin tier, since validating and revoking other users' tokens and listing
-their role assignments are admin operations; see
-[Keystone's privilege model](privilege-model.md).
+every service's validations for as long as it runs. The revocations of the
+propagation probe do the same, one per interval. `bad_token` floods Nova,
+Neutron, Cinder or Glance with tokens they have to reject; it exists to load
+the services' rejection path. `probe`, `bad_token` and the propagation probe
+are all off by default. The verb also needs the admin tier, since validating
+and revoking other users' tokens and listing their role assignments are admin
+operations; see [Keystone's privilege model](privilege-model.md).
 
 `pressure` therefore belongs on a lab or on the
 [`devstack-c5c3`](../how-to/run-against-devstack-c5c3.md) stack, never on a

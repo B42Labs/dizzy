@@ -22,8 +22,10 @@ re-query, report on, and tear down by tag. `dizzy mix` offers `generate`,
 `chaos`, `status`, `report` and `cleanup`.
 
 `dizzy keystone` additionally offers `pressure`, a closed-loop load on
-Keystone's token validation, revocation and role-listing path for a lab cloud;
-see [Pressure mode](docs/explanation/pressure-mode.md).
+Keystone's token validation, revocation and role-listing path for a lab cloud.
+It can also send its pool of user tokens to Nova, Neutron, Cinder and Glance,
+to measure keystonemiddleware inside those services; see
+[Pressure mode](docs/explanation/pressure-mode.md).
 `dizzy keystone report --compare` prints the difference between two pressure
 runs.
 

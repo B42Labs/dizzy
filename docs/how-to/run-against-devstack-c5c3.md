@@ -37,6 +37,7 @@ $ make devstack-c5c3                                                        # ke
 $ make devstack-c5c3 DEVSTACK_C5C3_SCENARIO=scenarios/keystone/medium.yaml
 $ make devstack-c5c3 DEVSTACK_C5C3_CMD=chaos ARGS="--duration 10m"
 $ make devstack-c5c3 DEVSTACK_C5C3_CMD=pressure ARGS="--duration 5m"        # closed-loop token load, then clean up
+$ make devstack-c5c3 DEVSTACK_C5C3_CMD=pressure ARGS="--mix probe=30 --propagation-every 30s"  # also needs Nova, Neutron, Cinder or Glance
 $ make devstack-c5c3 KEEP=1                                                 # keep the resources and the run record
 ```
 
@@ -53,6 +54,21 @@ revocation event, and on Keystone 2026.2 each one flushes the token validation
 cache for every user of that Keystone, so the verb never belongs on a shared
 cloud. See [`pressure`](../reference/cli.md#pressure) and
 [Pressure mode](../explanation/pressure-mode.md).
+
+`--mix probe=30` also sends pool tokens to Nova, Neutron, Cinder and Glance,
+and `--propagation-every 30s` revokes a pool token every 30 s and polls one of
+those services with it until it answers 401, for at most the 10 minutes
+`--propagation-timeout` defaults to. The propagation probe's revocations are
+real revocation events too. Both flags need at least one of the four services
+in the pool users' catalog. The quick-start's control plane runs Keystone and
+Horizon, none of the four, so a run with either flag needs a control plane that
+also runs Nova, Neutron, Cinder or Glance. On a stack whose catalog lists none
+of them, the run stops at priming with
+`pressure probe needs at least one of nova, neutron, cinder, glance in the pool users' catalog; the first pool token's catalog lists none`
+and tears down what it created. Against a build without C5C3/cobaltcore#1463
+a probe may poll for up to 300 s, and a probe still polling when the run ends
+is not recorded, so give such a run a `--duration` well above the 5 minutes of
+the default `small` profile.
 
 The run tears its own resources down and runs its leak check before it exits.
 The target's cleanup step then runs `keystone cleanup --run` on the new run

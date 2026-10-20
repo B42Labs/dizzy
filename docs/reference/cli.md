@@ -201,19 +201,23 @@ warning and the run goes on.
 revocation and role-listing path: a fixed number of workers each send one
 request after another, with no pause in between, for the whole duration. The
 churn of `chaos` never reaches this path, because its only token operation is
-a password login. See [Pressure mode](../explanation/pressure-mode.md).
+a password login. With `probe` or the propagation probe, the run also sends
+the pool's tokens to Nova, Neutron, Cinder and Glance, and `bad_token` sends
+those services tokens they have to reject. See
+[Pressure mode](../explanation/pressure-mode.md).
 
-> **Run `pressure` on a lab, never on a shared cloud.** Every `revoke` is a
-> real revocation event, and on Keystone 2026.2 each one flushes the token
-> validation cache for every user of that Keystone, not only for the run's own
-> users. The verb belongs on a lab or on the
+> **Run `pressure` on a lab, never on a shared cloud.** Every `revoke` and
+> every revocation of the propagation probe is a real revocation event, and on
+> Keystone 2026.2 each one flushes the token validation cache for every user
+> of that Keystone, not only for the run's own users. The verb, with `probe`,
+> `bad_token` and the propagation probe, belongs on a lab or on the
 > [`devstack-c5c3`](../how-to/run-against-devstack-c5c3.md) stack.
 
 A `pressure:` block in the scenario YAML sets the duration, the bucket width,
-the workers, the token pool, the churn users, the mix and the stages; the flags
-override all of these but the stages, which have no flag. Every built-in
-Keystone profile ships such a block, so `pressure` runs them with no extra
-flags. See
+the workers, the token pool, the churn users, the mix, the propagation probe
+and the stages; the flags override all of these but the stages, which have no
+flag. Every built-in Keystone profile ships such a block, so `pressure` runs
+them with no extra flags. See
 [The `pressure:` block](scenario-schema.md#the-pressure-block).
 
 | Flag | Default | Description |
@@ -226,6 +230,8 @@ flags. See
 | `--tokens <n>` | `100` | Size of the token pool. `0` takes the block's value or the default |
 | `--churn-users <n>` | `1` | Users reserved for `grant_churn`, taken from the end of the plan's regular users, so a fan user is never one; they never enter the token pool. Reserved only when `grant_churn` has a positive weight; `0` reserves none and then needs a `grant_churn` weight of `0`. A negative value fails with `--churn-users must not be negative, got -1` |
 | `--mix <operation>=<weight>` | see below | Weight of one operation; repeatable |
+| `--propagation-every <duration>` | `0` | Revoke one pool token at this interval and poll a service with it until it answers 401; `0` switches the propagation probe off, also when given as a flag over a scenario block. A negative value fails with `--propagation-every must not be negative, got -1s`. See **The propagation probe** below |
+| `--propagation-timeout <duration>` | `10m` | Ceiling of one propagation probe; a probe still accepted after it counts as a timeout. A negative value fails whether or not the propagation probe is on, and `0` fails while the probe is on, both with `--propagation-timeout must be positive, got <value>`, e.g. `--propagation-timeout must be positive, got 0s` |
 | `--no-cleanup` | off | Leave resources in place at the end of the run, on interrupt *and* after a failed setup |
 | `--privilege auto\|admin\|domain-manager` | `auto` | Privilege tier. `auto` classifies the caller's token, `admin` asserts the admin tier without classifying it, and `domain-manager` fails before any API call. Only the admin tier runs |
 | `--domain <name>` | the token's domain | Without effect, since only the admin tier runs. Setting it logs `--domain and --roles are ignored: keystone pressure runs in the admin tier only` |
@@ -243,8 +249,8 @@ when two `--mix` values name the same operation, the later one wins.
 | `revoke` | `2` | Takes a token out of the pool and sends `DELETE /v3/auth/tokens` with it as `X-Subject-Token`, then a password login (`POST /v3/auth/tokens`) for the same user and project, whose token goes back into the pool. The login runs even when the revocation failed. The draw succeeds only when both calls do |
 | `grant_churn` | `2` | Unassigns one of the churn users' role assignments (`DELETE /v3/projects/<project>/users/<user>/roles/<role>`, or `/v3/domains/<domain>/...` for a domain-scoped one) and assigns it again with a `PUT` to the same path, so Keystone's assignment caches keep being invalidated. The `PUT` runs even when the `DELETE` failed, and the draw fails with the first error. One worker at a time churns a given assignment |
 | `issue` | `1` | A password login (`POST /v3/auth/tokens`) for the user and project of a pool token, whose new token replaces it. The old token is not revoked, so the draw measures the login alone. When the login fails, the old token goes back into the pool |
-| `probe` | `0` | Parsed; this build rejects a positive weight |
-| `bad_token` | `0` | Parsed; this build rejects a positive weight |
+| `probe` | `0` | Picks a pool token and, at random, one of the services its catalog lists, and sends that service's cheapest authenticated read with the token as `X-Auth-Token`: `GET <compute>/limits` to Nova, `GET <network>/v2.0/networks?limit=1` to Neutron, `GET <block-storage>/limits` to Cinder, whose catalog URL already carries `/v3/<project_id>`, or `GET <image>/v2/images?limit=1` to Glance. One request, whose body is discarded. See **Probes** below |
+| `bad_token` | `0` | Picks a pool token and, at random, one of the services its catalog lists, and sends the request of a `probe` with a token the service has to reject in place of the pool token: a revoked pool token or a random one. A 401 is the expected answer and counts as a success; a 2xx fails as `accepted`. See **Bad tokens** below |
 
 Every draw is one sample under its operation's name, whatever calls it made:
 a `revoke` sample covers the revocation and the reissue together. No operation
@@ -252,20 +258,15 @@ retries, so a failed call is a failed sample. When the reissue of a `revoke`
 fails, the pool shrinks by one and the run logs the warning
 `token pool shrank; a reissue failed`; a draw that finds the pool empty fails
 as `pool-empty`. The error breakdown labels a failure
-`canceled`, `timeout`, `forbidden`, `not-found`, `transient` (a 500, 502, 503,
-504 or 429), `other` (any other failure, a 400 or a 501 among them) or
-`pool-empty`.
+`canceled`, `timeout`, `forbidden`, `not-found`, `unauthorized` (a 401, e.g.
+a service refusing a live pool token), `transient` (a 500, 502, 503, 504 or
+429), `other` (any other failure, a 400 or a 501 among them), `pool-empty`,
+`no-service` (a `probe` or `bad_token` draw whose token's catalog lists none
+of Nova, Neutron, Cinder and Glance) or `accepted` (a service that answered a
+`bad_token` draw with a 2xx).
 
-The command rejects what this build does not run before it makes any API call:
-
-```console
-$ dizzy keystone pressure --scenario scenarios/keystone/small.yaml --mix probe=1
-error: pressure mix weight "probe" is not supported by this build; supported operations: validate, effective, revoke, grant_churn, issue
-```
-
-`bad_token` fails the same way, a block with a positive `propagation.every`
-fails with `pressure.propagation is not supported by this build`, and a mix
-whose weights are all `0` fails with
+Before it makes any API call, the command checks its input. A mix whose
+weights are all `0` fails with
 `pressure mix: every weight is 0; at least one operation needs a positive weight`.
 A `--mix` value that is not `<operation>=<weight>`, names an unknown operation
 or carries a weight that is not a non-negative integer fails with an error
@@ -291,7 +292,38 @@ A run goes through these steps:
 2. **Provisioning.** Creates the plan's domains, roles, projects, users and
    role assignments exactly as `apply` does, without `apply`'s token stage.
    The fan users and their grants are among them.
-3. **Priming the token pool.** Issues `--tokens` project-scoped tokens, round
+3. **Granting the reader role.** After the check of the plan against the
+   options below, a run with a positive `probe` weight or with the
+   propagation probe looks up the cloud's `reader` role by name and grants it
+   to the user of every pool pair, the distinct `(user, project)` pairs the
+   pool's tokens are scoped to, on that pair's project. Neither a churn user
+   nor a fan user gets it, and a run whose only request to the services is
+   `bad_token` looks up and grants nothing. The lookup and each grant retry
+   a transient failure as a fan user's grant of a stage does, `--timeout`
+   bounding each attempt; the lookup is no call in the metrics summary. At
+   most `--concurrency` grants are in flight. The grants count as
+   `role_assignment` calls in the metrics summary and as
+   `role_assignment`/`create` in the `--otel` export, as the provisioning's
+   grants do. They join the run's created resources and go with the teardown;
+   the `reader` role is the cloud's and stays. A pool user's `effective`
+   listing, which a run without fan users draws, counts the grant too. The
+   run then logs
+   `granted reader role to the pool users` with `grants`, the number of
+   grants, e.g. for the `small` profile with `--mix probe=30`:
+
+   ```text
+   level=INFO msg="granted reader role to the pool users" grants=14
+   ```
+
+   When the lookup fails, e.g. on a cloud without a role named `reader`, the
+   run makes no grant, logs the warning
+   `pool users get no reader role; a service whose read policy asks for it refuses the probes with 403`
+   with the `error`, `role "reader" not found` for a missing role, and goes
+   on. The first failed grant ends the setup with
+   `granting reader role (run <id>): granting role "reader" to the pool users (<n> of <m> granted): …`,
+   whose `<m>` counts the pool pairs. See **Probes** below for why the run
+   needs the role.
+4. **Priming the token pool.** Issues `--tokens` project-scoped tokens, round
    robin over the distinct `(user, project)` pairs of the plan's
    project-scoped role assignments in plan order, leaving out the churn users
    and the fan users. Then it issues one more token per fan user, scoped to
@@ -301,16 +333,20 @@ A run goes through these steps:
    issues in flight: 1000 tokens at the default `--concurrency 8` take about
    22 s before the first worker starts. The first failed issue stops the
    priming, e.g. `priming token pool (3 of 7 issued): …`, whose counts include
-   the fan users' tokens.
-4. **The workers** run for the duration, or with `--duration 0` until SIGINT
+   the fan users' tokens. A run with a positive `probe` or `bad_token` weight
+   or with the propagation probe needs at least one of Nova, Neutron, Cinder
+   and Glance in the first pool token's catalog. When that catalog lists none
+   of them, the priming fails before any token enters the pool with
+   `pressure probe needs at least one of nova, neutron, cinder, glance in the pool users' catalog; the first pool token's catalog lists none`.
+5. **The workers** run for the duration, or with `--duration 0` until SIGINT
    or SIGTERM. A draw in flight when the run ends finishes or times out on
    its own, and the run waits for it. A run with stages runs them one after
    the other; see **Stages** below.
-5. **Results.** Prints the metrics summary and the `Pressure` table to stdout,
+6. **Results.** Prints the metrics summary and the `Pressure` table to stdout,
    writes `run-<id>.json` with a `pressure` object and prints
    `run record written to run-<id>.json`. See
    [What `report` renders](metrics.md#what-report-renders).
-6. **Teardown and leak check**, as for `chaos`: prints
+7. **Teardown and leak check**, as for `chaos`: prints
    `deleted <n> resource(s) for run <id>`, then
    `leak check: no run-named resources remain` or
    `leak check: <n> run-named resource(s) still present after teardown`.
@@ -327,13 +363,15 @@ swaps a new token in only after its issue succeeded; a failed issue keeps the
 old token until the next look. When the first pool token reports no usable
 expiry, the refresher does not start and the run logs a warning. The issues
 of the priming and of the refresher count as `token` calls in the metrics
-summary and are no pressure operation. `validate`, `revoke` and `issue` draw
-from the pool only, so a fan user's token is never validated, revoked or
-replaced by a draw, and `grant_churn` never touches a fan user's grant.
+summary and are no pressure operation. `validate`, `revoke`, `issue`,
+`probe`, `bad_token` and the propagation probe take their tokens from the
+pool only, so a fan user's token is never validated, revoked, replaced or
+sent to Nova, Neutron, Cinder or Glance, and `grant_churn` never touches a fan
+user's grant.
 
-After provisioning and before the priming, the command checks the plan
-against the options, and each failure goes through the setup-failure path
-below:
+After provisioning and before the reader grants and the priming, the command
+checks the plan against the options, and each failure goes through the
+setup-failure path below:
 
 - `pressure needs at least one project-scoped assignment outside the churn and fan users to issue pool tokens from; the plan has none`
 - `pressure fan user "<name>" holds no project-scoped assignment to scope its token to`
@@ -343,6 +381,137 @@ below:
 - `pressure grant_churn needs the churn users to hold at least one assignment; the last <n> regular user(s) of the plan hold none`,
   while `grant_churn` has a positive weight, so a run with `--churn-users 0`
   needs a `grant_churn` weight of `0`
+
+**Probes.** `probe`, `bad_token` and the propagation probe send their requests
+to the endpoints in the pool token's own catalog, not in the admin's. Every
+token the command issues for the pool, in the priming, the refresher, a
+`revoke`, an `issue` or the propagation probe, keeps the URLs of Nova,
+Neutron, Cinder and Glance from the catalog that comes with it, picked with
+the region and the interface of the clouds.yaml entry, and with the public
+interface when the entry names none or one other than `internal`,
+`internalURL`, `admin` and `adminURL`. Cinder's catalog URL carries the project
+id, `/v3/<project_id>`, so every token goes to the Cinder endpoint of its own
+project; the admin's catalog would name the admin's project, and Cinder
+refuses a member token of another project there. A service the token's
+catalog does not list is left out for that token, and a draw picks among the
+services that remain. A catalog that cannot be read fails the issue with
+`reading the token's catalog: …`. A request to a service never
+re-authenticates, so a 401 is the answer to that one request, and a `probe`
+draw that gets one fails as `unauthorized`.
+
+A pool user holds only the plan's roles, which are the run's own and imply no
+other, so no service's policy names them. Under their default policies,
+Cinder's `GET /v3/<project_id>/limits` and Glance's `GET /v2/images` ask for
+`reader` on the token's project, and without it they refuse every probe with
+a 403, which fails as `forbidden`. A run with `probe` or the propagation probe
+therefore grants the pool users the cloud's `reader` role on their projects
+before the priming (step 3 above), and the teardown removes the grants with
+the rest of the run's resources. `bad_token` gets no grant: a service refuses
+its tokens before any policy check.
+
+Every `probe` draw is one sample of `probe` in the `Operations` table, as every
+draw is. A draw that sends its request is also one sample under its service in
+the record's [`pressure.probes`](run-record.md#probes), which the `Pressure`
+table prints as a `Probes` table with one row per service; a draw that fails
+as `pool-empty` or `no-service` sends none and is not in it. The `bad_token`
+draws go to `pressure.badTokens` and a `Bad tokens` table the same way. Both
+tables have the columns of the `Operations` table with `SERVICE` in place of
+`OPERATION`, and their `OPS/S` divides by the same time as the `Operations`
+table's. After the priming, a run with a positive `probe` or `bad_token`
+weight or with the propagation probe logs `probe services` with `services`,
+those the first pool token's catalog lists:
+
+```text
+level=INFO msg="probe services" services="[nova glance]"
+```
+
+**The propagation probe.** `--propagation-every`, or `propagation.every` in
+the block, starts a probe that measures how long a service keeps accepting a
+revoked token. It runs beside the workers, not as a weighted draw. At every
+interval it takes a token out of the pool, revokes it and reissues a token for
+the same user and project into the pool, as a `revoke` draw does: the reissue
+runs even when the revocation failed, and a failed reissue shrinks the pool
+and logs `token pool shrank; a reissue failed`. These revocations are real
+revocation events. `revocations` and the buckets' `REVOCATIONS` count the
+`revoke` draws only; the probe's revocations count as `token` calls under
+`metrics`, and as `token`/`revoke` in the `--otel` export. The probe then
+polls one service with the revoked token, sending the request of a `probe`
+once a second until the service answers 401. The delay is the time from the revocation to that 401.
+The probes take the services in turn, in the order `nova`, `neutron`,
+`cinder`, `glance`, among those the first pool token's catalog lists; when the
+revoked token's own catalog lacks the service in turn, the probe polls the
+first service that catalog lists. A poll that fails another way, e.g. with a
+5xx, a 403 or a timeout, does not end the probe; it costs a second until the
+next poll. `--timeout` bounds the revoke and the reissue each, and each poll
+ends at `--timeout` or at the probe's ceiling, whichever comes first.
+
+A probe whose service has not answered 401 when `--propagation-timeout`, or
+`propagation.timeout` in the block, has passed since the revocation counts as
+a timeout, with the ceiling as its delay, and logs a warning with `service`
+and `timeout`:
+
+```text
+level=WARN msg="propagation probe timed out; the service still accepted the revoked token" service=nova timeout=10m0s
+```
+
+A new probe starts at every interval while earlier ones still poll, so a slow
+probe never delays the next: with an interval of `30s` and the default ceiling
+of `10m`, about 20 are in flight at once. A probe skipped before its first
+poll records no delay and logs `propagation probe skipped; the token pool is empty`,
+`propagation probe skipped; the revoke failed` with the `error`, or
+`propagation probe skipped; the token's catalog lists no service`. A probe
+still running when the run ends is abandoned without a log line and recorded
+neither as a delay nor as a timeout. The end of the run does not cut a revoke
+or a reissue short: a probe it catches during either finishes both, each
+within `--timeout`, and still puts a new token for the user and project into
+the pool. The `starting pressure run` log line carries `propagation`, the
+interval or `off`.
+The record keeps the interval, the ceiling, the number of probes, the
+timeouts and the delays as `pressure.propagation`, and the delays also as the
+`revocation` entry of `metrics.readiness`; see
+[`propagation`](run-record.md#propagation). The `Pressure` table prints them
+as a `Propagation` block after the `Probes` and `Bad tokens` tables, every
+duration rounded to the millisecond, with `-` on the `delay:` line when no
+probe completed.
+
+**Bad tokens.** A `bad_token` draw picks a pool token for its length and its
+catalog's services, then sends a token the service has to reject in its
+place. When the run holds a pool token that `revoke` or the propagation probe
+revoked at least 5 minutes earlier, about half the draws send one of those.
+The others, and every draw before then, send a random string as long as the
+pool token, drawn from `A-Za-z0-9-_`, the alphabet of a Fernet token. Five
+minutes is keystonemiddleware's default token cache time, so a `bad_token`
+draw never measures the cache the propagation probe measures. The run keeps
+the last 256 revoked tokens in process memory only, as it keeps the pool. A
+401 is the expected answer and counts as a success with its latency; a 2xx
+fails as `accepted`, and every other failure keeps its label. The operation
+exists to load the services' rejection path and is off by default. It belongs
+on a lab, never on a shared cloud.
+
+For a run with `--mix probe=30 --mix bad_token=20 --propagation-every 30s`
+whose pool tokens list Nova and Glance, the `Pressure` table continues after
+the `Operations` table with:
+
+```text
+Probes
+SERVICE    OPS     OK  FAILED  OPS/S      MIN      MEAN       P50       P90       P95       P99        MAX
+glance   61204  61204       0  170.0  5.912ms  13.873ms  12.604ms  19.311ms  22.147ms   29.85ms  118.402ms
+nova     60877  60877       0  169.1  3.481ms   8.226ms   7.519ms  11.642ms  13.408ms  18.733ms   96.115ms
+
+Bad tokens
+SERVICE    OPS     OK  FAILED  OPS/S      MIN     MEAN      P50      P90      P95       P99       MAX
+glance   40981  40981       0  113.8  2.204ms  5.187ms  4.713ms  7.395ms  8.531ms  11.906ms  64.287ms
+nova     40640  40640       0  112.9  2.117ms  4.968ms  4.502ms  7.081ms  8.214ms  11.473ms   58.92ms
+
+Propagation
+  every:     30s
+  timeout:   10m0s
+  probes:    12
+  timed out: 0
+  delay:     p50 2.1s / p95 4.8s / p99 6.2s / max 6.2s
+```
+
+See [What `report` renders](metrics.md#what-report-renders).
 
 **Stages.** A `stages:` list in the `pressure:` block divides a bounded run
 into consecutive stages, each of which can grow the fan users' grants; see
@@ -382,8 +551,9 @@ level=INFO msg="entering stage" run=1a2b3c4d stage=2 fanAssignments=1000 granted
 ```
 
 The `starting pressure run` log line carries `stages`, the number of stages.
-A staged run prints a `Stages` table after the `Operations` table, with an
-`all` row and one row per operation for each stage, e.g. for stages of
+A staged run prints a `Stages` table after the `Operations` table and any
+`Probes`, `Bad tokens` or `Propagation` output, with an `all` row and one row
+per operation for each stage, e.g. for stages of
 `fan_assignments` 500 and 1000 over `--duration 4m`:
 
 ```text
@@ -409,19 +579,27 @@ API call:
 A stage that fails to enter ends the run like a failed setup; see the table
 below.
 
-**Global flags.** `--concurrency` bounds the provisioning, the priming of the
-pool, the refresher and the grants of a stage, not the workers; `--workers`
-sets their number. `--timeout` bounds each draw of a worker, all of its calls
-together, each issue of the priming and the refresher, each provisioning and
-teardown call, and each attempt of a stage grant. `--seed` overrides the
-scenario seed, which also seeds the workers' generators. `--otel` exports the
-client's calls, among them `token`/`validate` and `token`/`revoke`; see
-[Metrics](metrics.md).
+**Global flags.** `--concurrency` bounds the provisioning, the reader grants,
+the priming of the pool, the refresher and the grants of a stage, not the
+workers; `--workers` sets their number. `--timeout` bounds each draw of a
+worker, all of its calls together, each issue of the priming and the
+refresher, each provisioning and teardown call, the lookup of the `reader`
+role, each attempt of a reader grant or a stage grant, and the revoke, the
+reissue and each poll of a propagation probe. `--seed` overrides the scenario seed, which
+also seeds the workers' generators and the propagation probe's. `--otel`
+exports the client's calls, among them `token`/`validate` and `token`/`revoke`,
+the requests to the services under the kinds `probe`, `bad_token` and
+`propagation` with the service as the operation, and each propagation delay
+as a time-to-ready of kind `revocation`; see [Metrics](metrics.md).
 
 **Connections.** The identity client keeps up to `--workers` plus
 `--concurrency` idle connections to the Keystone endpoint, where other verbs
 keep 2. Over HTTP/1.1 a smaller pool would close most connections after each
 request, and the latency samples would then include a TCP and TLS handshake.
+The requests to Nova, Neutron, Cinder and Glance share the identity client's
+connection pool. The same limit holds for each service host, but all hosts,
+Keystone included, share one total: 100 idle connections, net/http's default,
+or the per-host limit when that is larger.
 
 **End of the run.** By default the run tears its resources down at the end or
 when interrupted, then runs the leak check, as `chaos` does. With
@@ -437,8 +615,9 @@ When the run record could not be written, the hint names `--run-id <id>`
 instead of `--run`.
 
 A failure before the workers start, while provisioning, checking the plan
-against the options or priming the pool, first writes a record with `error`
-set and the resources created so far and prints its path. It then tears
+against the options, granting the reader role or priming the pool, first
+writes a record with `error` set and the resources created so far, the reader
+grants made before the failure among them, and prints its path. It then tears
 those resources down and prints `deleted <n> resource(s) for run <id>`, with
 no leak check, or with `--no-cleanup` prints
 `pressure setup failed; resources left in place — reclaim with: keystone cleanup --run run-<id>.json`.
@@ -452,7 +631,8 @@ step and the run id:
 |---|---|
 | Provisioning | `provisioning plan (run <id>): …` |
 | Checking the plan against the options | `building pressure set (run <id>): …` |
-| Priming | `starting pressure run (run <id>): priming token pool (<n> of <m> issued): …` |
+| Granting the reader role | `granting reader role (run <id>): granting role "reader" to the pool users (<n> of <m> granted): …` |
+| Priming | `starting pressure run (run <id>): priming token pool (<n> of <m> issued): …`, or, for a run with `probe`, `bad_token` or the propagation probe, `starting pressure run (run <id>): pressure probe needs at least one of nova, neutron, cinder, glance in the pool users' catalog; the first pool token's catalog lists none` |
 | Entering a stage | `running pressure (run <id>): entering stage <n>: …`, e.g. `running pressure (run <id>): entering stage 2: growing fan user "fan-0001" to 1000 assignments (0 granted): …` |
 
 A teardown that fails partway appends
@@ -532,8 +712,8 @@ builder backs all six namespaces, so `dizzy cinder report` and
 |---|---|---|
 | `--run <path>` | — | Path to the run record to report on (**required**) |
 | `--format <fmt>` | `table` | `table`, `json`, `csv`, or `html` |
-| `--compare <path>` | — | Path to a second `keystone pressure` run record; the report then prints both records' percentiles and throughput per operation and per stage, and the second minus the first as the difference. See [Comparing two runs](#comparing-two-runs) |
-| `--allow-mismatch` | off | Compare two records whose scenario, seed, workers, token pool, mix or stages differ. Needs `--compare` |
+| `--compare <path>` | — | Path to a second `keystone pressure` run record; the report then prints both records' percentiles and throughput per operation, per service of the probes and bad tokens and per stage, their propagation delays, and the second minus the first as the difference. See [Comparing two runs](#comparing-two-runs) |
+| `--allow-mismatch` | off | Compare two records whose scenario, seed, workers, token pool, mix, propagation probe or stages differ. Needs `--compare` |
 
 - **table** — human-readable, one row per resource kind plus an overall row.
 - **json** — the aggregate metrics, machine-readable.
@@ -586,21 +766,50 @@ validate   ops/s   4120.0  5310.4  +1190.4  +28.9%
 
 The `Operations` table has four rows per operation, `p50`, `p95`, `p99` and
 `ops/s`: first for `all`, the run's draws together, then for every operation
-either record drew, sorted by name. When either record has stages, a `Stages`
-table follows with the same rows per stage and operation, the stages of the
-two records paired by their index. A record written as a checkpoint
+either record drew, sorted by name. When either record has probe draws, a
+`Probes` table follows with the columns `SERVICE`, `METRIC`, `BASE`, `OTHER`,
+`DELTA` and `CHANGE` and the same four rows for every service either record
+probed, sorted by name, and when either has `bad_token` draws, a `Bad tokens`
+table follows the same way. When either record ran the propagation probe, a
+`Propagation` table follows with the columns `METRIC`, `BASE`, `OTHER`,
+`DELTA` and `CHANGE` and the rows `p50`, `p95`, `p99`, `max`, `probes` and
+`timed out`. There, a record without the probe, or whose probe completed
+none, shows `-` in its cell, in `DELTA` and in `CHANGE`. The `base:` or
+`other:` line of a record with the probe ends with its settings, e.g.
+`, propagation every=30s,timeout=10m0s`. For a base whose services kept
+accepting a revoked token for minutes and an other whose services refused it
+within seconds:
+
+```text
+Propagation
+METRIC      BASE  OTHER     DELTA  CHANGE
+p50         3m0s     3s    -2m57s  -98.3%
+p95        4m50s   5.4s  -4m44.6s  -98.1%
+p99         5m0s     6s    -4m54s  -98.0%
+max         5m0s     6s    -4m54s  -98.0%
+probes        12     12        +0   +0.0%
+timed out      0      0        +0       -
+```
+
+When either record has stages, a `Stages` table follows last with the same
+rows as the `Operations` table per stage and operation, the stages of the two
+records paired by their index. A record written as a checkpoint
 (`"incomplete": true`) compares like a final one, and its line under
 `Comparison` carries ` (incomplete)` after the run id. See
 [Comparing two runs](metrics.md#comparing-two-runs) for every format.
 
 The two records have to come from the same load. When their scenario, seed,
-workers, token pool, mix, number of stages or a stage's `fan_assignments`
-differ, the command names every difference and fails:
+workers, token pool, mix, propagation probe, number of stages or a stage's
+`fan_assignments` differ, the command names every difference and fails:
 
 ```console
 $ dizzy keystone report --run run-1a2b3c4d.json --compare run-9c0d1e2f.json
 error: comparing run-1a2b3c4d.json with run-9c0d1e2f.json: the records come from different loads (seed 42 vs 43; workers 8 vs 16); pass --allow-mismatch to compare them anyway
 ```
+
+The propagation probe differs when its interval or its ceiling does, e.g.
+`propagation every=30s,timeout=10m0s vs off` for a base with the probe and an
+other without it.
 
 `--allow-mismatch` compares them anyway and prints the differences on a
 `loads differ:` line under the two runs. Only `keystone pressure` records
