@@ -25,6 +25,17 @@ var htmlTemplateSrc string
 // and the output is deterministic.
 var htmlTemplate = template.Must(template.New("report").Parse(htmlTemplateSrc))
 
+// compareTemplateSrc is the comparison page template, embedded like the
+// report's.
+//
+//go:embed compare.tmpl.html
+var compareTemplateSrc string
+
+// compareTemplate is the parsed comparison page. It is parsed into the
+// report's template set, so it renders the report's "styles" and
+// "sortScript" blocks, and like the report it takes a fully precomputed view.
+var compareTemplate = template.Must(htmlTemplate.New("compare").Parse(compareTemplateSrc))
+
 // Chart geometry, in user-space SVG pixels. Horizontal bar charts (latency,
 // volume, errors) share one row layout; the chaos time series uses its own
 // vertical layout. All charts share the template's 720px viewBox width.
@@ -116,6 +127,33 @@ type laneView struct {
 	Scenario string
 	KPIs     []kpi
 	Chaos    *chaosView
+}
+
+// comparisonView is the fully precomputed model of the comparison page: the
+// two runs, the mismatches joined by "; " (empty when the loads match), and
+// the rows of the operation table and of the stage table, which is empty
+// when neither record has stages.
+type comparisonView struct {
+	Base             comparisonRun
+	Other            comparisonRun
+	Mismatches       string
+	OperationColumns []string
+	Operations       []typeRow
+	StageColumns     []string
+	Stages           []typeRow
+}
+
+// comparisonRun is one run of the comparison page, shown as a line of chips.
+// Role is "base" or "other".
+type comparisonRun struct {
+	Role       string
+	RunID      string
+	Incomplete bool
+	Scenario   string
+	Seed       string
+	Workers    int
+	Tokens     int
+	Mix        string
 }
 
 type headerView struct {
@@ -606,6 +644,42 @@ func buildPressureStageRow(st PressureStage, label string, s metrics.Stats) type
 		latencyCell(s.Latency.P95),
 		latencyCell(s.Latency.P99),
 	}}
+}
+
+// comparisonOperationColumns and comparisonStageColumns name the columns of
+// the comparison page's tables: those of WriteComparisonTable, in lower case.
+var (
+	comparisonOperationColumns = []string{"operation", "metric", "base", "other", "delta", "change"}
+	comparisonStageColumns     = []string{"stage", "fan", "operation", "metric", "base", "other", "delta", "change"}
+)
+
+// buildComparisonView converts a comparison into the model of its page, with
+// the cells WriteComparisonTable shows and their sort keys.
+func buildComparisonView(c *Comparison) comparisonView {
+	return comparisonView{
+		Base:             buildComparisonRun("base", c.Base),
+		Other:            buildComparisonRun("other", c.Other),
+		Mismatches:       strings.Join(c.Mismatches, "; "),
+		OperationColumns: comparisonOperationColumns,
+		Operations:       comparisonRows(nil, c.Operations),
+		StageColumns:     comparisonStageColumns,
+		Stages:           stageComparisonRows(c.Stages),
+	}
+}
+
+// buildComparisonRun converts the summary of one compared run into its
+// chips line under the given role.
+func buildComparisonRun(role string, s RunSummary) comparisonRun {
+	return comparisonRun{
+		Role:       role,
+		RunID:      s.RunID,
+		Incomplete: s.Incomplete,
+		Scenario:   s.Scenario,
+		Seed:       strconv.FormatInt(s.Seed, 10),
+		Workers:    s.Workers,
+		Tokens:     s.Tokens,
+		Mix:        formatPressureMix(s.Mix),
+	}
 }
 
 // operationBuckets converts a pressure run's buckets into the series of one

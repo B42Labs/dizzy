@@ -4,63 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Run report: {{.Header.RunID}}</title>
-<style>
-:root {
-  --fg: #1b1f24; --muted: #5b6570; --line: #d7dde3; --bg: #ffffff;
-  --panel: #f6f8fa; --ok: #2da44e; --fail: #cf222e; --bar: #4493f8;
-  --p50: #8250df; --p99: #bc4c00;
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0; padding: 24px; background: var(--bg); color: var(--fg);
-  font: 14px/1.5 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
-}
-h1 { font-size: 20px; margin: 0 0 4px; }
-h2 { font-size: 16px; margin: 28px 0 10px; }
-.muted { color: var(--muted); }
-.banner { padding: 10px 14px; border-radius: 6px; margin: 12px 0; font-weight: 600; }
-.banner.ok { background: #dafbe1; color: #116329; }
-.banner.fail { background: #ffebe9; color: #82071e; }
-.banner.warn { background: #fff8c5; color: #7d4e00; }
-.banner .detail { font-weight: 400; margin-top: 4px; word-break: break-word; }
-.meta { color: var(--muted); }
-.meta b { color: var(--fg); font-weight: 600; }
-.kpis { display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0; }
-.kpi {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-  padding: 12px 16px; min-width: 130px;
-}
-.kpi .v { font-size: 22px; font-weight: 700; }
-.kpi .l { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
-table { border-collapse: collapse; width: 100%; }
-th, td { padding: 6px 10px; border-bottom: 1px solid var(--line); text-align: right; }
-th:first-child, td:first-child { text-align: left; }
-thead th { color: var(--muted); font-weight: 600; }
-.sortable thead th { cursor: pointer; user-select: none; white-space: nowrap; }
-.sortable thead th::after { content: ""; }
-.sortable thead th.asc::after { content: " \25B2"; }
-.sortable thead th.desc::after { content: " \25BC"; }
-svg { max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
-.lbl { fill: var(--fg); font-size: 12px; }
-.cap { fill: var(--muted); font-size: 12px; }
-.axis { fill: var(--muted); font-size: 11px; }
-.grid { stroke: var(--line); stroke-width: 1; }
-.lat-line { stroke: var(--muted); stroke-width: 2; }
-.lat-band { fill: var(--bar); }
-.seg-ok { fill: var(--ok); }
-.seg-fail { fill: var(--fail); }
-.bar { fill: var(--bar); }
-.bar-fail { fill: var(--fail); }
-.line-p50 { fill: none; stroke: var(--p50); stroke-width: 1.5; }
-.line-p99 { fill: none; stroke: var(--p99); stroke-width: 1.5; }
-.legend { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
-.legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin: 0 4px 0 12px; }
-.toggle { cursor: pointer; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; font: inherit; }
-.chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
-.chip { background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; font-size: 13px; }
-.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-[hidden] { display: none; }
-</style>
+<style>{{template "styles"}}</style>
 </head>
 <body>
 
@@ -275,26 +219,7 @@ document.querySelectorAll(".toggle").forEach(function (btn) {
     else { el.setAttribute("hidden", ""); btn.textContent = "Show inventory"; }
   });
 });
-document.querySelectorAll("table.sortable").forEach(function (table) {
-  var headers = table.tHead.rows[0].cells;
-  Array.prototype.forEach.call(headers, function (th, col) {
-    th.addEventListener("click", function () {
-      var asc = !th.classList.contains("asc");
-      Array.prototype.forEach.call(headers, function (h) { h.classList.remove("asc", "desc"); });
-      th.classList.add(asc ? "asc" : "desc");
-      var body = table.tBodies[0];
-      var rows = Array.prototype.slice.call(body.rows);
-      rows.sort(function (a, b) {
-        var x = a.cells[col].dataset.sort, y = b.cells[col].dataset.sort;
-        var nx = parseFloat(x), ny = parseFloat(y);
-        var cmp = (!isNaN(nx) && !isNaN(ny)) ? nx - ny : String(x).localeCompare(String(y));
-        return asc ? cmp : -cmp;
-      });
-      rows.forEach(function (r) { body.appendChild(r); });
-    });
-  });
-});
-</script>
+{{template "sortScript"}}</script>
 </body>
 </html>
 {{define "seriesCharts"}}
@@ -320,3 +245,83 @@ document.querySelectorAll("table.sortable").forEach(function (table) {
 </svg>
 <p class="legend"><span class="sw" style="background:var(--p50)"></span>p50<span class="sw" style="background:var(--p99)"></span>p99. axis max {{.Latency.AxisMax}}.</p>
 {{- end -}}
+{{- /* styles and sortScript are the stylesheet and the table sorter the
+report shares with the comparison page of compare.tmpl.html. */ -}}
+{{define "styles"}}
+:root {
+  --fg: #1b1f24; --muted: #5b6570; --line: #d7dde3; --bg: #ffffff;
+  --panel: #f6f8fa; --ok: #2da44e; --fail: #cf222e; --bar: #4493f8;
+  --p50: #8250df; --p99: #bc4c00;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 24px; background: var(--bg); color: var(--fg);
+  font: 14px/1.5 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+}
+h1 { font-size: 20px; margin: 0 0 4px; }
+h2 { font-size: 16px; margin: 28px 0 10px; }
+.muted { color: var(--muted); }
+.banner { padding: 10px 14px; border-radius: 6px; margin: 12px 0; font-weight: 600; }
+.banner.ok { background: #dafbe1; color: #116329; }
+.banner.fail { background: #ffebe9; color: #82071e; }
+.banner.warn { background: #fff8c5; color: #7d4e00; }
+.banner .detail { font-weight: 400; margin-top: 4px; word-break: break-word; }
+.meta { color: var(--muted); }
+.meta b { color: var(--fg); font-weight: 600; }
+.kpis { display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0; }
+.kpi {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px 16px; min-width: 130px;
+}
+.kpi .v { font-size: 22px; font-weight: 700; }
+.kpi .l { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+table { border-collapse: collapse; width: 100%; }
+th, td { padding: 6px 10px; border-bottom: 1px solid var(--line); text-align: right; }
+th:first-child, td:first-child { text-align: left; }
+thead th { color: var(--muted); font-weight: 600; }
+.sortable thead th { cursor: pointer; user-select: none; white-space: nowrap; }
+.sortable thead th::after { content: ""; }
+.sortable thead th.asc::after { content: " \25B2"; }
+.sortable thead th.desc::after { content: " \25BC"; }
+svg { max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.lbl { fill: var(--fg); font-size: 12px; }
+.cap { fill: var(--muted); font-size: 12px; }
+.axis { fill: var(--muted); font-size: 11px; }
+.grid { stroke: var(--line); stroke-width: 1; }
+.lat-line { stroke: var(--muted); stroke-width: 2; }
+.lat-band { fill: var(--bar); }
+.seg-ok { fill: var(--ok); }
+.seg-fail { fill: var(--fail); }
+.bar { fill: var(--bar); }
+.bar-fail { fill: var(--fail); }
+.line-p50 { fill: none; stroke: var(--p50); stroke-width: 1.5; }
+.line-p99 { fill: none; stroke: var(--p99); stroke-width: 1.5; }
+.legend { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+.legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin: 0 4px 0 12px; }
+.toggle { cursor: pointer; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; font: inherit; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.chip { background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; font-size: 13px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+[hidden] { display: none; }
+{{end -}}
+{{define "sortScript" -}}
+document.querySelectorAll("table.sortable").forEach(function (table) {
+  var headers = table.tHead.rows[0].cells;
+  Array.prototype.forEach.call(headers, function (th, col) {
+    th.addEventListener("click", function () {
+      var asc = !th.classList.contains("asc");
+      Array.prototype.forEach.call(headers, function (h) { h.classList.remove("asc", "desc"); });
+      th.classList.add(asc ? "asc" : "desc");
+      var body = table.tBodies[0];
+      var rows = Array.prototype.slice.call(body.rows);
+      rows.sort(function (a, b) {
+        var x = a.cells[col].dataset.sort, y = b.cells[col].dataset.sort;
+        var nx = parseFloat(x), ny = parseFloat(y);
+        var cmp = (!isNaN(nx) && !isNaN(ny)) ? nx - ny : String(x).localeCompare(String(y));
+        return asc ? cmp : -cmp;
+      });
+      rows.forEach(function (r) { body.appendChild(r); });
+    });
+  });
+});
+{{end -}}
