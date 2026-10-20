@@ -427,11 +427,11 @@ func TestChaosBucketWidth(t *testing.T) {
 }
 
 // TestParsePressureBlock confirms a full pressure block, including every mix
-// weight, the propagation block that later work delivers and two stages, one
-// without a duration, parses into the matching fields and validates; that a
-// scenario with no pressure block is valid; and that an unknown key at any
-// level of the block fails strict unmarshal loudly. Each weight carries a
-// distinct value so a swapped YAML tag shows up as a mismatch.
+// weight, both keys of the propagation block and two stages, one without a
+// duration, parses into the matching fields and validates; that a scenario
+// with no pressure block is valid; and that an unknown key at any level of the
+// block fails strict unmarshal loudly. Each weight and each propagation key
+// carries a distinct value so a swapped YAML tag shows up as a mismatch.
 func TestParsePressureBlock(t *testing.T) {
 	yaml := `name: p
 seed: 1
@@ -459,7 +459,7 @@ pressure:
     grant_churn: 4
     issue: 1
     bad_token: 7
-  propagation: { every: 30s }
+  propagation: { every: 30s, timeout: 10m }
   stages:
     - fan_assignments: 500
     - { fan_assignments: 1000, duration: 2m }
@@ -482,7 +482,7 @@ pressure:
 			Issue:      intPtr(1),
 			BadToken:   intPtr(7),
 		},
-		Propagation: &Propagation{Every: Duration(30 * time.Second)},
+		Propagation: &Propagation{Every: Duration(30 * time.Second), Timeout: Duration(10 * time.Minute)},
 		BucketWidth: Duration(2 * time.Minute),
 		Stages: []Stage{
 			{FanAssignments: intPtr(500)},
@@ -536,6 +536,7 @@ func TestValidatePressureBlock(t *testing.T) {
 		},
 		{name: "empty mix", block: "{ mix: {} }"},
 		{name: "zero propagation interval", block: "{ propagation: { every: 0s } }"},
+		{name: "zero propagation timeout", block: "{ propagation: { timeout: 0s } }"},
 		{name: "negative workers", block: "{ workers: -1 }", wantErr: "pressure.workers must not be negative, got -1"},
 		{name: "negative tokens", block: "{ tokens: -1 }", wantErr: "pressure.tokens must not be negative, got -1"},
 		{name: "negative churn_users", block: "{ churn_users: -1 }", wantErr: "pressure.churn_users must not be negative, got -1"},
@@ -552,6 +553,11 @@ func TestValidatePressureBlock(t *testing.T) {
 			name:    "negative propagation interval",
 			block:   "{ propagation: { every: -1s } }",
 			wantErr: "pressure.propagation.every must not be negative, got -1s",
+		},
+		{
+			name:    "negative propagation timeout",
+			block:   "{ propagation: { timeout: -1s } }",
+			wantErr: "pressure.propagation.timeout must not be negative, got -1s",
 		},
 		{name: "empty stages", block: "{ stages: [] }"},
 		{name: "stages without an override", block: "{ stages: [{ duration: 1m }, {}] }"},
@@ -716,7 +722,7 @@ func describePressure(p *Pressure) string {
 			ptr(m.Validate), ptr(m.Probe), ptr(m.Effective), ptr(m.Revoke), ptr(m.GrantChurn), ptr(m.Issue), ptr(m.BadToken))
 	}
 	if p.Propagation != nil {
-		s += fmt.Sprintf(", propagation: {every: %s}", time.Duration(p.Propagation.Every))
+		s += fmt.Sprintf(", propagation: {every: %s, timeout: %s}", time.Duration(p.Propagation.Every), time.Duration(p.Propagation.Timeout))
 	}
 	if len(p.Stages) > 0 {
 		stages := make([]string, len(p.Stages))
