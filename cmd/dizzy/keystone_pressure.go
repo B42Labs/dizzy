@@ -6,13 +6,16 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -133,7 +136,7 @@ every user of that Keystone, not only for the run's own users.`,
 				return err
 			}
 
-			cfg, o, err := mergePressureConfig(cmd, opts, s, f)
+			cfg, o, stages, err := mergePressureConfig(cmd, opts, s, f)
 			if err != nil {
 				return err
 			}
@@ -197,6 +200,7 @@ every user of that Keystone, not only for the run's own users.`,
 				runID:       runID,
 				plan:        p,
 				cfg:         cfg,
+				stages:      stages,
 				o:           o,
 				concurrency: opts.concurrency,
 				opTimeout:   opts.timeout,
@@ -214,7 +218,7 @@ every user of that Keystone, not only for the run's own users.`,
 	flags.DurationVar(&f.bucketWidth, "bucket-width", defaultChaosBucketWidth, "width of one time bucket in an unbounded run's time series, at least 1m")
 	flags.IntVar(&f.workers, "workers", 0, fmt.Sprintf("closed-loop workers, 1 to 1024; 0 takes the scenario pressure block's value or %d", defaultPressureWorkers))
 	flags.IntVar(&f.tokens, "tokens", 0, fmt.Sprintf("size of the token pool; 0 takes the scenario pressure block's value or %d", defaultPressureTokens))
-	flags.IntVar(&f.churnUsers, "churn-users", defaultPressureChurnUsers, "users reserved for grant_churn, taken from the end of the plan; they hold no pool token")
+	flags.IntVar(&f.churnUsers, "churn-users", defaultPressureChurnUsers, "users reserved for grant_churn, taken from the end of the plan's regular users, never a fan user; they hold no pool token")
 	flags.StringArrayVar(&f.mix, "mix", nil, "weight of one operation as <operation>=<weight>, e.g. --mix revoke=0; operations: "+strings.Join(supportedPressureOps, ", ")+" (repeatable)")
 	flags.BoolVar(&noCleanup, "no-cleanup", false, "leave the identity resources in place — at the end of the run, on interrupt or after a failed setup — instead of tearing them down by name prefix")
 	priv.register(flags)
@@ -239,16 +243,19 @@ type pressureKeystone interface {
 var _ pressureKeystone = (*keystone.Client)(nil)
 
 // pressureRun carries what runKeystonePressure needs besides Keystone: the run
-// id, the plan, the engine config and the operation options that passed every
-// pre-cloud check, the global concurrency and per-operation timeout,
-// --no-cleanup, and the collector and telemetry the Keystone client records
-// into. cfg comes as mergePressureConfig returns it, without the seed, the
-// classifier and the checkpoint, which runKeystonePressure sets. A nil tel is
-// the disabled export.
+// id, the plan, the engine config, the stages' fan_assignments targets and the
+// operation options that passed every pre-cloud check, the global concurrency
+// and per-operation timeout, --no-cleanup, and the collector and telemetry the
+// Keystone client records into. cfg and stages come as mergePressureConfig
+// returns them: cfg without the seed, the classifier, the checkpoint and the
+// stages' Enter, which runKeystonePressure sets, and stages with one target
+// per stage of cfg, 0 for a stage without one. A nil tel is the disabled
+// export.
 type pressureRun struct {
 	runID       string
 	plan        *keystoneplan.Plan
 	cfg         pressure.Config
+	stages      []int
 	o           keystoneops.Options
 	concurrency int
 	opTimeout   time.Duration
@@ -263,11 +270,14 @@ type pressureRun struct {
 // runs the workers from the plan's seed, with keystoneops.Classify labeling
 // their errors and a run-record checkpoint every chaosCheckpointInterval,
 // prints the metrics summary and the Pressure table, writes the run record,
-// and tears down through finishKeystoneTeardown. A failure before the workers
-// finish goes through failPressureSetup, which writes a record whose error
-// names the failure and tears down what was created so far. It is split from
-// the command so a test can drive it with a fake Keystone; it prints to cmd's
-// output.
+// and tears down through finishKeystoneTeardown. In a staged run, entering a
+// stage with a fan_assignments target grows every fan user to it through
+// keystoneops.Set.GrowFan while no operation is in flight, and the grants
+// join the run's created resources. A failure before the workers finish, a
+// failed stage entry included, goes through failPressureSetup, which writes a
+// record whose error names the failure and tears down what was created so
+// far. It is split from the command so a test can drive it with a fake
+// Keystone; it prints to cmd's output.
 func runKeystonePressure(ctx context.Context, cmd *cobra.Command, c pressureKeystone, r pressureRun) error {
 	p, cfg, o := r.plan, r.cfg, r.o
 	out := cmd.OutOrStdout()
@@ -315,6 +325,18 @@ func runKeystonePressure(ctx context.Context, cmd *cobra.Command, c pressureKeys
 		return setupFailed(prov.Created, "starting pressure run", err)
 	}
 
+	// created lists every resource the run has created: the provisioned ones
+	// and, from here on, the grants of the stage entries. A stage entry
+	// appends to it while a checkpoint may read it, so createdMu guards it,
+	// and createdSoFar returns a copy.
+	var createdMu sync.Mutex
+	created := prov.Created
+	createdSoFar := func() []resource.Resource {
+		createdMu.Lock()
+		defer createdMu.Unlock()
+		return slices.Clone(created)
+	}
+
 	// buildRecord builds the run record as of finished, for the checkpoints
 	// written while the workers run and for the final record.
 	buildRecord := func(res *pressure.Result, finished time.Time) *run.Record {
@@ -325,9 +347,9 @@ func runKeystonePressure(ctx context.Context, cmd *cobra.Command, c pressureKeys
 			Seed:       p.Seed,
 			StartedAt:  start,
 			FinishedAt: finished,
-			Created:    prov.Created,
+			Created:    createdSoFar(),
 			Metrics:    r.collector.Aggregate(finished.Sub(start)),
-			Pressure:   pressureStats(res, o),
+			Pressure:   pressureStats(res, o, r.stages),
 		}
 	}
 	// The engine settings that make the run this command's run are set here,
@@ -341,10 +363,34 @@ func runKeystonePressure(ctx context.Context, cmd *cobra.Command, c pressureKeys
 	cfg.CheckpointInterval = chaosCheckpointInterval
 	cfg.OnCheckpoint = chaosCheckpoint(".", buildRecord)
 
+	// The engine enters each stage while no operation is in flight. A stage
+	// with a fan_assignments target grows every fan user to it, and its
+	// grants join created, those of a failed entry included, so the record
+	// lists them and the teardown removes them. cfg.Stages is cloned first,
+	// so setting Enter leaves the caller's config as it was.
+	cfg.Stages = slices.Clone(cfg.Stages)
+	for i := range cfg.Stages {
+		target := stageTarget(r.stages, i)
+		cfg.Stages[i].Enter = func(ctx context.Context) error {
+			if target == 0 {
+				slog.Info("entering stage", "run", r.runID, "stage", i+1)
+				return nil
+			}
+			began := time.Now()
+			res, err := set.GrowFan(ctx, target, r.concurrency)
+			createdMu.Lock()
+			created = append(created, res...)
+			createdMu.Unlock()
+			slog.Info("entering stage", "run", r.runID, "stage", i+1, "fanAssignments", target,
+				"granted", len(res), "took", time.Since(began))
+			return err
+		}
+	}
+
 	duration := pressureDurationLabel(cfg)
 	slog.Info("starting pressure run", "run", r.runID, "scenario", p.Scenario, "duration", duration,
 		"workers", cfg.Workers, "tokens", o.Tokens, "churnUsers", pressureChurnUsers(o),
-		"mix", pressureMixLabel(o.Weights), "concurrency", r.concurrency)
+		"mix", pressureMixLabel(o.Weights), "stages", len(cfg.Stages), "concurrency", r.concurrency)
 
 	hb := startHeartbeat(ctx, "pressure in progress", collectorSnapshot(r.collector, start, "duration", duration))
 	result, runErr := pressure.Run(ctx, set.Operations(), cfg)
@@ -352,10 +398,10 @@ func runKeystonePressure(ctx context.Context, cmd *cobra.Command, c pressureKeys
 	set.Close()
 	finished := time.Now()
 	if runErr != nil {
-		// Run fails only on a config or operation list the checks before the
-		// first cloud call should have rejected; the provisioned resources
-		// still go.
-		return setupFailed(prov.Created, "running pressure", runErr)
+		// Run fails on a config or operation list the checks before the first
+		// cloud call should have rejected, and on a stage entry that failed;
+		// everything created so far still goes, that entry's grants included.
+		return setupFailed(createdSoFar(), "running pressure", runErr)
 	}
 	rec := buildRecord(result, finished)
 
@@ -417,7 +463,15 @@ func parseMixFlag(values []string) (map[string]int, error) {
 // or the checkpoint, which runKeystonePressure adds once the plan is
 // provisioned; pressure.Config.Validate does not read them while OnCheckpoint
 // is unset, so the command's pre-cloud check is the same without them.
-func mergePressureConfig(cmd *cobra.Command, opts *globalOptions, s keystonescenario.Scenario, f pressureFlags) (pressure.Config, keystoneops.Options, error) {
+//
+// The block's stages, which no flag overrides, divide the merged duration:
+// once every duration layer is applied, stageWindows resolves their windows
+// into cfg.Stages, each with a nil Enter for runKeystonePressure to set, and
+// the fourth value holds each stage's fan_assignments, 0 for a stage without
+// one. Stages need a bounded run, so --duration 0 with stages fails; with no
+// duration anywhere cfg.Stages stays empty, and cfg.Validate reports the
+// missing duration as it does for a run without stages.
+func mergePressureConfig(cmd *cobra.Command, opts *globalOptions, s keystonescenario.Scenario, f pressureFlags) (pressure.Config, keystoneops.Options, []int, error) {
 	cfg := pressure.Config{
 		Workers:     defaultPressureWorkers,
 		BucketWidth: defaultChaosBucketWidth,
@@ -483,7 +537,7 @@ func mergePressureConfig(cmd *cobra.Command, opts *globalOptions, s keystonescen
 	if flags.Changed("mix") {
 		weights, err := parseMixFlag(f.mix)
 		if err != nil {
-			return pressure.Config{}, keystoneops.Options{}, err
+			return pressure.Config{}, keystoneops.Options{}, nil, err
 		}
 		for name, w := range weights {
 			o.Weights[name] = w
@@ -491,12 +545,83 @@ func mergePressureConfig(cmd *cobra.Command, opts *globalOptions, s keystonescen
 	}
 
 	if o.ChurnUsers < 0 {
-		return pressure.Config{}, keystoneops.Options{}, fmt.Errorf("--churn-users must not be negative, got %d", o.ChurnUsers)
+		return pressure.Config{}, keystoneops.Options{}, nil, fmt.Errorf("--churn-users must not be negative, got %d", o.ChurnUsers)
 	}
 	if o.Tokens < 1 {
-		return pressure.Config{}, keystoneops.Options{}, fmt.Errorf("pressure tokens must be at least 1, got %d", o.Tokens)
+		return pressure.Config{}, keystoneops.Options{}, nil, fmt.Errorf("pressure tokens must be at least 1, got %d", o.Tokens)
 	}
-	return cfg, o, nil
+
+	var targets []int
+	if b := s.Pressure; b != nil && len(b.Stages) > 0 {
+		switch {
+		case cfg.Unbounded:
+			return pressure.Config{}, keystoneops.Options{}, nil, errors.New("pressure.stages need a bounded run; --duration 0 selects a run without an end")
+		case cfg.Duration > 0:
+			windows, err := stageWindows(b.Stages, cfg.Duration)
+			if err != nil {
+				return pressure.Config{}, keystoneops.Options{}, nil, err
+			}
+			for i, st := range b.Stages {
+				cfg.Stages = append(cfg.Stages, pressure.Stage{Duration: windows[i]})
+				target := 0
+				if st.FanAssignments != nil {
+					target = *st.FanAssignments
+				}
+				targets = append(targets, target)
+			}
+		}
+	}
+	return cfg, o, targets, nil
+}
+
+// stageWindows resolves the stage durations against the run duration. A
+// stage with a duration keeps it; the stages without one share the rest
+// equally, the last of them taking the remainder of the division; when every
+// stage has a duration and they add up to less than duration, the last stage
+// runs to the end. The result adds up to duration exactly.
+//
+// stages must not be empty. A rest too short to give each stage without a
+// duration a positive share counts as leaving nothing for them, so every
+// window is positive.
+func stageWindows(stages []keystonescenario.Stage, duration time.Duration) ([]time.Duration, error) {
+	windows := make([]time.Duration, len(stages))
+	var (
+		fixed time.Duration // the sum of the stages' own durations
+		open  []int         // the indexes of the stages without a duration
+	)
+	for i, st := range stages {
+		d := time.Duration(st.Duration)
+		if d == 0 {
+			open = append(open, i)
+			continue
+		}
+		windows[i] = d
+		// The sum saturates rather than wraps, so durations that overflow it
+		// are reported as more than the run duration.
+		if d > math.MaxInt64-fixed {
+			fixed = math.MaxInt64
+		} else {
+			fixed += d
+		}
+	}
+	if fixed > duration {
+		return nil, fmt.Errorf("pressure.stages: the stage durations add up to %s, more than the run duration %s", fixed, duration)
+	}
+	rest := duration - fixed
+	if len(open) == 0 {
+		windows[len(windows)-1] += rest
+		return windows, nil
+	}
+	n := time.Duration(len(open))
+	share := rest / n
+	if share == 0 {
+		return nil, fmt.Errorf("pressure.stages: the stages with a duration fill the run duration %s, leaving nothing for the %d stage(s) without one", duration, len(open))
+	}
+	for _, i := range open {
+		windows[i] = share
+	}
+	windows[open[len(open)-1]] += rest % n
+	return windows, nil
 }
 
 // checkPressureSupported rejects what the scenario and the flags may set but
@@ -561,13 +686,13 @@ func resolvePressureTier(ctx context.Context, gc *gophercloud.ServiceClient, pri
 
 // failPressureSetup handles a keystone pressure run that failed before or
 // while its workers ran: provisioning, building the operation set, priming the
-// pool, or the engine rejecting its input. It has the shape of
-// finishAbortedKeystoneApply: writeRecord runs first, so a teardown that fails
-// partway, or a second-signal hard abort during it, still leaves a record to
-// reclaim from. With noCleanup it prints the reclaim hint and leaves the
-// resources; otherwise it tears them down on a context.WithoutCancel of ctx,
-// each op bounded by opTimeout, in reverse dependency order. Every return is a
-// non-nil error that starts with what failed and names the run id, so the
+// pool, the engine rejecting its input, or a stage entry failing. It has the
+// shape of finishAbortedKeystoneApply: writeRecord runs first, so a teardown
+// that fails partway, or a second-signal hard abort during it, still leaves a
+// record to reclaim from. With noCleanup it prints the reclaim hint and leaves
+// the resources; otherwise it tears them down on a context.WithoutCancel of
+// ctx, each op bounded by opTimeout, in reverse dependency order. Every return
+// is a non-nil error that starts with what failed and names the run id, so the
 // command exits non-zero.
 func failPressureSetup(ctx context.Context, out io.Writer, c keystoneexec.Cleaner, runID string, created []resource.Resource, noCleanup bool, opTimeout time.Duration, what string, cause error, writeRecord func() (string, error)) error {
 	recordPath, _ := writeRecord()
@@ -598,8 +723,10 @@ func failPressureSetup(ctx context.Context, out io.Writer, c keystoneexec.Cleane
 // operations, and each bucket's Revocations those of that bucket and every
 // earlier one, so a latency change reads next to the revocations that had
 // piled up by then. ChurnUsers is 0 when grant_churn is off, since no user is
-// reserved then.
-func pressureStats(r *pressure.Result, o keystoneops.Options) *run.PressureStats {
+// reserved then. Stages holds the stages the run entered, in order, each with
+// its 1-based index and its fan_assignments target from stages, 0 for a stage
+// without one; it is nil for a run without stages.
+func pressureStats(r *pressure.Result, o keystoneops.Options, stages []int) *run.PressureStats {
 	ps := &run.PressureStats{
 		Workers:     r.Workers,
 		Tokens:      o.Tokens,
@@ -614,7 +741,26 @@ func pressureStats(r *pressure.Result, o keystoneops.Options) *run.PressureStats
 		cumulative += succeededRevocations(b.Operations)
 		ps.Buckets = append(ps.Buckets, run.PressureBucket{Start: b.Start, Operations: b.Operations, Revocations: cumulative})
 	}
+	for i, st := range r.Stages {
+		ps.Stages = append(ps.Stages, run.PressureStage{
+			Index:          i + 1,
+			FanAssignments: stageTarget(stages, i),
+			Start:          st.Start,
+			End:            st.End,
+			Operations:     st.Operations,
+		})
+	}
 	return ps
+}
+
+// stageTarget returns the fan_assignments target of stage i, the 0-based
+// index into stages, and 0 when the stage sets none or stages has no entry
+// for it.
+func stageTarget(stages []int, i int) int {
+	if i < len(stages) {
+		return stages[i]
+	}
+	return 0
 }
 
 // succeededRevocations returns the succeeded samples of the revoke operation
