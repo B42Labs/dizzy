@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -396,8 +397,10 @@ func drawnNames(t *testing.T, ops []Operation, seed int64, n, extraDraws int, st
 // TestWorkerDrawsArePureFunctionOfSeed confirms the operations worker 0 draws
 // depend only on the seed and its index: two runs with the same seed draw the
 // same 1000 names, also when Do draws from its generator in one run and not
-// in the other, the names equal those of a picker built from the derived pick
-// seed, and another seed draws a different sequence.
+// in the other, and also when two operations of weight 0 are appended to the
+// list, as keystoneops appends probe and bad_token; the names equal those of a
+// picker built from the derived pick seed, and another seed draws a different
+// sequence.
 func TestWorkerDrawsArePureFunctionOfSeed(t *testing.T) {
 	const n = 1000
 	ops := []Operation{
@@ -416,6 +419,15 @@ func TestWorkerDrawsArePureFunctionOfSeed(t *testing.T) {
 	busy := drawnNames(t, ops, 42, n, 3)
 	if !reflect.DeepEqual(first, busy) {
 		t.Error("a Do that draws from its generator changed the drawn sequence")
+	}
+	// Operations appended at weight 0 leave the cumulative weights of the
+	// first five, and with them every draw, as they were.
+	appended := slices.Concat(ops, []Operation{
+		{Name: "probe", Weight: 0, Do: noop},
+		{Name: "bad_token", Weight: 0, Do: noop},
+	})
+	if got := drawnNames(t, appended, 42, n, 0); !reflect.DeepEqual(first, got) {
+		t.Error("two operations of weight 0 appended to the list changed the drawn sequence")
 	}
 
 	p := newPicker(ops, workerSeeds(42, 1)[0].pick)
