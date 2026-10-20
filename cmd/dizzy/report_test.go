@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -128,6 +129,118 @@ func TestReportCompare(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestKeystoneReportCompareServices confirms "keystone report --compare"
+// renders the probes and the propagation probe of two pressure records of
+// the same load, the propagation settings equal so they compare without a
+// mismatch, in the table, JSON and HTML formats: each output names nova, the
+// probed service, and carries the propagation delays of both runs as the
+// format renders them. The CSV format stays refused.
+func TestKeystoneReportCompareServices(t *testing.T) {
+	dir := t.TempDir()
+	var paths []string
+	for _, r := range []struct {
+		runID              string
+		novaP50            time.Duration
+		delayP50, delayMax time.Duration
+	}{
+		{"press001", 1200 * time.Microsecond, 180 * time.Second, 300 * time.Second},
+		{"press002", 900 * time.Microsecond, 3 * time.Second, 6 * time.Second},
+	} {
+		// The pressure record of TestReportCompare, with probes at nova and
+		// the propagation probe added and written again under its run id.
+		rec, err := run.Load(writePressureRecord(t, dir, r.runID, 42, 350*time.Microsecond))
+		if err != nil {
+			t.Fatalf("loading the seeded record: %v", err)
+		}
+		rec.Pressure.Probes = []metrics.Stats{{Type: "nova", Attempted: 12, Succeeded: 12, Throughput: 0.1,
+			Latency: metrics.Latency{Median: r.novaP50, P95: 2 * r.novaP50, P99: 3 * r.novaP50}}}
+		rec.Pressure.Propagation = &run.PressurePropagation{Every: 30 * time.Second, Timeout: 10 * time.Minute, Probes: 12,
+			Delay: metrics.Latency{Median: r.delayP50, P95: r.delayMax, P99: r.delayMax, Max: r.delayMax}}
+		path, err := run.Write(dir, rec)
+		if err != nil {
+			t.Fatalf("writing run record: %v", err)
+		}
+		paths = append(paths, path)
+	}
+	a, b := paths[0], paths[1]
+
+	compare := func(t *testing.T, format string) string {
+		t.Helper()
+		out, err := execRoot(t, "keystone", "report", "--run", a, "--compare", b, "--format", format)
+		if err != nil {
+			t.Fatalf("report --compare --format %s: %v", format, err)
+		}
+		return out
+	}
+
+	t.Run("table", func(t *testing.T) {
+		out := compare(t, "table")
+		for _, want := range []string{
+			"  base:  run press001, scenario small, seed 42, workers 4, tokens 3, mix validate=9, propagation every=30s,timeout=10m0s\n",
+			"\nProbes\n", "\nPropagation\n",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("table comparison lacks %q:\n%s", want, out)
+			}
+		}
+		// The tables are aligned, so the rows are found by their fields.
+		rows := make(map[string]bool)
+		for _, line := range strings.Split(out, "\n") {
+			rows[strings.Join(strings.Fields(line), " ")] = true
+		}
+		for _, want := range []string{
+			"nova p50 1.2ms 900µs -300µs -25.0%",
+			"p50 3m0s 3s -2m57s -98.3%",
+			"max 5m0s 6s -4m54s -98.0%",
+			"probes 12 12 +0 +0.0%",
+		} {
+			if !rows[want] {
+				t.Errorf("table comparison has no row %q:\n%s", want, out)
+			}
+		}
+	})
+
+	t.Run("json", func(t *testing.T) {
+		var c run.Comparison
+		if err := json.Unmarshal([]byte(compare(t, "json")), &c); err != nil {
+			t.Fatalf("decoding the JSON comparison: %v", err)
+		}
+		if len(c.Probes) != 1 || c.Probes[0].Operation != "nova" || c.Probes[0].Delta == nil || c.Probes[0].Delta.P50 != -300*time.Microsecond {
+			t.Errorf("probes = %+v, want nova with a p50 delta of -300µs", c.Probes)
+		}
+		p := c.Propagation
+		if p == nil || p.Base == nil || p.Other == nil || p.Base.P50 != 180*time.Second || p.Other.P50 != 3*time.Second || p.Base.Max != 300*time.Second || p.Other.Max != 6*time.Second {
+			t.Errorf("propagation = %+v, want base p50 3m0s and max 5m0s, other p50 3s and max 6s", p)
+		}
+		if len(c.Mismatches) != 0 {
+			t.Errorf("mismatches = %v, want none for the same load", c.Mismatches)
+		}
+	})
+
+	t.Run("html", func(t *testing.T) {
+		out := compare(t, "html")
+		for _, want := range []string{
+			"<h2>Probes</h2>",
+			`<td data-sort="nova">nova</td>`,
+			"<h2>Propagation</h2>",
+			`<td data-sort="p50">p50</td><td data-sort="180000000000">3m0s</td><td data-sort="3000000000">3s</td>`,
+			`<td data-sort="max">max</td><td data-sort="300000000000">5m0s</td><td data-sort="6000000000">6s</td>`,
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("html comparison lacks %q", want)
+			}
+		}
+	})
+
+	t.Run("csv", func(t *testing.T) {
+		_, err := execRoot(t, "keystone", "report", "--run", a, "--compare", b, "--format", "csv")
+		const want = "--compare is not available for --format csv; use table, json or html"
+		if err == nil || err.Error() != want {
+			t.Errorf("report --compare --format csv error = %v, want %q", err, want)
+		}
+	})
 }
 
 // TestReportCompareRejectsCSV confirms --compare refuses the CSV format
