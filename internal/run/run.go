@@ -141,11 +141,13 @@ type ChaosBucket struct {
 // PressureStats holds the statistics of a closed-loop pressure run, persisted
 // next to the standard metrics: the worker count, the token pool size, the
 // users reserved for role churn, the operation mix, the per-operation
-// aggregate, the revocations the run made, per-time-bucket statistics and,
-// for a staged run, per-stage statistics. The schema lives here, not in the
-// pressure package, so the read-side commands can render it without
-// importing the engine. The percentiles in Operations, in every bucket and in
-// every stage are the metrics collector's estimates within 1%.
+// aggregate, the revocations the run made, per-time-bucket statistics, for a
+// staged run per-stage statistics, and for a run that sent pool tokens to the
+// other services the probe and bad-token draws per service and the
+// propagation probe. The schema lives here, not in the pressure package, so
+// the read-side commands can render it without importing the engine. The
+// percentiles in Operations, in every bucket, in every stage, per service and
+// of the propagation delays are the metrics collector's estimates within 1%.
 type PressureStats struct {
 	Workers int `json:"workers"`
 	Tokens  int `json:"tokens"`
@@ -164,10 +166,30 @@ type PressureStats struct {
 	// Stages holds one entry per stage of a staged run, in stage order. It is
 	// omitted for a run without stages, so such a record keeps its shape.
 	Stages []PressureStage `json:"stages,omitempty"`
+	// Probes holds the probe draws per service, Type being the service, sorted
+	// by service name. It is omitted when the run drew no probe.
+	Probes []metrics.Stats `json:"probes,omitempty"`
+	// BadTokens holds the bad_token draws per service the same way.
+	BadTokens []metrics.Stats `json:"badTokens,omitempty"`
+	// Propagation holds the propagation probe's settings and outcome. It is nil,
+	// and omitted, for a run without the probe.
+	Propagation *PressurePropagation `json:"propagation,omitempty"`
 	// BucketWidth is the fixed width of every time bucket of an unbounded run.
 	// It is omitempty and 0 for a bounded run, whose ten buckets divide its
 	// duration equally.
 	BucketWidth time.Duration `json:"bucketWidth,omitempty"`
+}
+
+// PressurePropagation is the propagation probe of a pressure run: its
+// interval and ceiling, the probes that completed, those that reached the
+// ceiling, and the delay from the revocation to the first 401 over all of
+// them, a timed-out probe counting as the ceiling.
+type PressurePropagation struct {
+	Every    time.Duration   `json:"every"`
+	Timeout  time.Duration   `json:"timeout"`
+	Probes   int             `json:"probes"`
+	TimedOut int             `json:"timedOut"`
+	Delay    metrics.Latency `json:"delay"`
 }
 
 // PressureWeight is one operation of a pressure run's mix: a worker draws the

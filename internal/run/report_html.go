@@ -84,20 +84,36 @@ type htmlView struct {
 }
 
 // pressureView is the pressure section of a report: the run's settings and
-// revocations as chips, the per-operation table, the stage table of a staged
+// revocations as chips, the per-operation table, the probe and bad-token
+// tables by service (each empty for a run without such draws), the
+// propagation probe (nil for a run without it), the stage table of a staged
 // run (Stages is empty for any other), and one pair of time-series charts per
 // operation.
 type pressureView struct {
-	Workers      int
-	Tokens       int
-	ChurnUsers   int
-	Revocations  int
-	Mix          string
-	Columns      []string
-	PerType      []typeRow
-	StageColumns []string
-	Stages       []typeRow
-	Series       []pressureSeries
+	Workers        int
+	Tokens         int
+	ChurnUsers     int
+	Revocations    int
+	Mix            string
+	Columns        []string
+	PerType        []typeRow
+	ServiceColumns []string
+	Probes         []typeRow
+	BadTokens      []typeRow
+	Propagation    *propagationView
+	StageColumns   []string
+	Stages         []typeRow
+	Series         []pressureSeries
+}
+
+// propagationView is the propagation probe of a pressure report, shown as
+// chips: its interval and ceiling in time.Duration notation, the probes that
+// completed and those among them that timed out, and the humanized p50, p95,
+// p99 and max of their delays, each "-" when no probe completed.
+type propagationView struct {
+	Every, Timeout     string
+	Probes, TimedOut   int
+	P50, P95, P99, Max string
 }
 
 // pressureSeries is the time series of one pressure operation. Chart carries
@@ -576,21 +592,26 @@ func buildChaosView(c *ChaosStats) *chaosView {
 
 // buildPressureView converts a pressure run's statistics into its section:
 // the chips, the per-operation table in the columns of the per-type table
-// with "operation" in place of "type", the stage table, and per operation,
-// in the order of Operations.ByType, the time-series charts of that
-// operation's buckets.
+// with "operation" in place of "type", the probe and bad-token tables in the
+// same columns with "service" in place of "type", the propagation chips, the
+// stage table, and per operation, in the order of Operations.ByType, the
+// time-series charts of that operation's buckets.
 func buildPressureView(p *PressureStats) *pressureView {
 	v := &pressureView{
-		Workers:      p.Workers,
-		Tokens:       p.Tokens,
-		ChurnUsers:   p.ChurnUsers,
-		Revocations:  p.Revocations,
-		Mix:          formatPressureMix(p.Mix),
-		Columns:      append([]string{"operation"}, perTypeColumns[1:]...),
-		PerType:      buildPerType(p.Operations.ByType),
-		StageColumns: pressureStageColumns,
-		Stages:       buildPressureStages(p.Stages),
-		Series:       make([]pressureSeries, 0, len(p.Operations.ByType)),
+		Workers:        p.Workers,
+		Tokens:         p.Tokens,
+		ChurnUsers:     p.ChurnUsers,
+		Revocations:    p.Revocations,
+		Mix:            formatPressureMix(p.Mix),
+		Columns:        append([]string{"operation"}, perTypeColumns[1:]...),
+		PerType:        buildPerType(p.Operations.ByType),
+		ServiceColumns: append([]string{"service"}, perTypeColumns[1:]...),
+		Probes:         buildPerType(p.Probes),
+		BadTokens:      buildPerType(p.BadTokens),
+		Propagation:    buildPropagationView(p.Propagation),
+		StageColumns:   pressureStageColumns,
+		Stages:         buildPressureStages(p.Stages),
+		Series:         make([]pressureSeries, 0, len(p.Operations.ByType)),
 	}
 	for _, s := range p.Operations.ByType {
 		buckets := operationBuckets(p.Buckets, s.Type)
@@ -600,6 +621,31 @@ func buildPressureView(p *PressureStats) *pressureView {
 			chart.Latency = buildBucketLatency(buckets)
 		}
 		v.Series = append(v.Series, pressureSeries{Name: s.Type, Chart: chart})
+	}
+	return v
+}
+
+// buildPropagationView converts a pressure run's propagation probe into its
+// chips, or returns nil for a run without the probe. A run in which no probe
+// completed, its first tick not reached or its probes abandoned when it
+// ended, has no delay to show, so its percentiles read "-" rather than "0ms".
+func buildPropagationView(p *PressurePropagation) *propagationView {
+	if p == nil {
+		return nil
+	}
+	v := &propagationView{
+		Every:    p.Every.String(),
+		Timeout:  p.Timeout.String(),
+		Probes:   p.Probes,
+		TimedOut: p.TimedOut,
+		P50:      "-",
+		P95:      "-",
+		P99:      "-",
+		Max:      "-",
+	}
+	if p.Probes > 0 {
+		v.P50, v.P95 = humanizeDuration(p.Delay.Median), humanizeDuration(p.Delay.P95)
+		v.P99, v.Max = humanizeDuration(p.Delay.P99), humanizeDuration(p.Delay.Max)
 	}
 	return v
 }

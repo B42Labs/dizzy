@@ -160,6 +160,44 @@
   {{end}}
   </tbody>
 </table>
+{{- if .Pressure.Probes}}
+
+<h2>Probes by service</h2>
+<table class="sortable">
+  <thead><tr>{{range .Pressure.ServiceColumns}}<th>{{.}}</th>{{end}}</tr></thead>
+  <tbody>
+  {{range .Pressure.Probes}}
+    <tr>{{range .Cells}}<td data-sort="{{.Sort}}">{{.Text}}</td>{{end}}</tr>
+  {{end}}
+  </tbody>
+</table>
+{{- end}}
+{{- if .Pressure.BadTokens}}
+
+<h2>Bad tokens by service</h2>
+<table class="sortable">
+  <thead><tr>{{range .Pressure.ServiceColumns}}<th>{{.}}</th>{{end}}</tr></thead>
+  <tbody>
+  {{range .Pressure.BadTokens}}
+    <tr>{{range .Cells}}<td data-sort="{{.Sort}}">{{.Text}}</td>{{end}}</tr>
+  {{end}}
+  </tbody>
+</table>
+{{- end}}
+{{- with .Pressure.Propagation}}
+
+<h2>Propagation</h2>
+<div class="chips">
+  <span class="chip">every {{.Every}}</span>
+  <span class="chip">timeout {{.Timeout}}</span>
+  <span class="chip">probes {{.Probes}}</span>
+  <span class="chip">timed out {{.TimedOut}}</span>
+  <span class="chip">p50 {{.P50}}</span>
+  <span class="chip">p95 {{.P95}}</span>
+  <span class="chip">p99 {{.P99}}</span>
+  <span class="chip">max {{.Max}}</span>
+</div>
+{{- end}}
 {{- if .Pressure.Stages}}
 
 <h2>Pressure stages</h2>

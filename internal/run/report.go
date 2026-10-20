@@ -229,16 +229,22 @@ func formatBucketErrors(errs []metrics.ErrorCount) string {
 // WritePressureTable renders the statistics of a pressure run: a block with
 // the workers, the token pool size, the churn users (only when the run
 // reserved any), the mix and the revocations; a table with one row per
-// operation; when the run has stages, a table with one row for each stage as
-// a whole, labelled "all", followed by one row per operation of that stage,
-// every row carrying the stage's index, its fan_assignments override ("-"
-// for none) and its window; and, when the run has time buckets, a table with
-// one row for each bucket as a whole, carrying its cumulative revocations and
-// its error breakdown, followed by one row per operation of that bucket. The
-// error breakdown is recorded per bucket, not per operation, so the operation
-// rows leave those two cells empty. Latencies are rounded to the
-// microsecond, because the token path moves in sub-millisecond steps, and
-// show as "-" for a row without operations. It writes nothing for nil.
+// operation; when the run drew probes, a table "Probes" with one row per
+// service, and when it drew bad tokens, a table "Bad tokens" the same way,
+// both in the columns of the operation table; when the run had the
+// propagation probe, a block with its interval, ceiling, probe counts and
+// delay percentiles, every duration rounded to the millisecond and the delay
+// shown as "-" when no probe completed; when the run has stages, a table with
+// one row for each stage as a whole, labelled "all", followed by one row per
+// operation of that stage, every row carrying the stage's index, its
+// fan_assignments override ("-" for none) and its window; and, when the run
+// has time buckets, a table with one row for each bucket as a whole, carrying
+// its cumulative revocations and its error breakdown, followed by one row per
+// operation of that bucket. The error breakdown is recorded per bucket, not
+// per operation, so the operation rows leave those two cells empty.
+// Latencies in the tables are rounded to the microsecond, because the token
+// path moves in sub-millisecond steps, and show as "-" for a row without
+// operations. It writes nothing for nil.
 func WritePressureTable(w io.Writer, p *PressureStats) error {
 	if p == nil {
 		return nil
@@ -253,16 +259,21 @@ func WritePressureTable(w io.Writer, p *PressureStats) error {
 	fmt.Fprintf(&b, "  mix:         %s\n", formatPressureMix(p.Mix))
 	fmt.Fprintf(&b, "  revocations: %d\n", p.Revocations)
 
-	rows := [][]string{{"OPERATION", "OPS", "OK", "FAILED", "OPS/S", "MIN", "MEAN", "P50", "P90", "P95", "P99", "MAX"}}
-	for _, s := range p.Operations.ByType {
-		row := []string{s.Type, strconv.Itoa(s.Attempted), strconv.Itoa(s.Succeeded), strconv.Itoa(s.Failed),
-			fmt.Sprintf("%.1f", s.Throughput)}
-		rows = append(rows, append(row, microCells(s,
-			s.Latency.Min, s.Latency.Mean, s.Latency.Median, s.Latency.P90, s.Latency.P95, s.Latency.P99, s.Latency.Max)...))
-	}
-	// Only OPERATION is a label; every other column is a number.
-	if err := writeStatsTable(&b, "Operations", rows, 1); err != nil {
+	if err := writePressureStatsTable(&b, "Operations", "OPERATION", p.Operations.ByType); err != nil {
 		return fmt.Errorf("writing pressure table: %w", err)
+	}
+	if len(p.Probes) > 0 {
+		if err := writePressureStatsTable(&b, "Probes", "SERVICE", p.Probes); err != nil {
+			return fmt.Errorf("writing pressure table: %w", err)
+		}
+	}
+	if len(p.BadTokens) > 0 {
+		if err := writePressureStatsTable(&b, "Bad tokens", "SERVICE", p.BadTokens); err != nil {
+			return fmt.Errorf("writing pressure table: %w", err)
+		}
+	}
+	if p.Propagation != nil {
+		writePropagationBlock(&b, p.Propagation)
 	}
 
 	if len(p.Stages) > 0 {
@@ -301,6 +312,56 @@ func WritePressureTable(w io.Writer, p *PressureStats) error {
 		return fmt.Errorf("writing pressure table: %w", err)
 	}
 	return nil
+}
+
+// pressureStatsColumns names the columns of the pressure operation, probe and
+// bad-token tables after their label column, in the order pressureStatsRow
+// fills them.
+var pressureStatsColumns = []string{"OPS", "OK", "FAILED", "OPS/S", "MIN", "MEAN", "P50", "P90", "P95", "P99", "MAX"}
+
+// writePressureStatsTable writes one of the pressure tables that carry a row
+// per group of samples, the operations or the services a probe or a bad
+// token went to: label heads the first column, each group's Type fills it,
+// and pressureStatsRow the rest. It returns the writer's error unwrapped.
+func writePressureStatsTable(w io.Writer, title, label string, stats []metrics.Stats) error {
+	rows := [][]string{append([]string{label}, pressureStatsColumns...)}
+	for _, s := range stats {
+		rows = append(rows, pressureStatsRow(s.Type, s))
+	}
+	// Only the label column is left-aligned; every other column is a number.
+	return writeStatsTable(w, title, rows, 1)
+}
+
+// pressureStatsRow renders one row of the pressure operation, probe and
+// bad-token tables: the label, the operation counts, the throughput with one
+// decimal, and the min, mean, p50, p90, p95, p99 and max latencies of s
+// rounded to the microsecond.
+func pressureStatsRow(label string, s metrics.Stats) []string {
+	row := []string{label, strconv.Itoa(s.Attempted), strconv.Itoa(s.Succeeded), strconv.Itoa(s.Failed),
+		fmt.Sprintf("%.1f", s.Throughput)}
+	return append(row, microCells(s,
+		s.Latency.Min, s.Latency.Mean, s.Latency.Median, s.Latency.P90, s.Latency.P95, s.Latency.P99, s.Latency.Max)...)
+}
+
+// writePropagationBlock writes the propagation probe's block of the pressure
+// table: its interval and ceiling, the probes that completed and those among
+// them that reached the ceiling, and the p50, p95, p99 and max of their
+// delays, or "-" when no probe completed, so such a run does not read as a
+// 0s delay. Every duration is rounded to the millisecond: a delay is seconds
+// to minutes long, unlike the token path.
+func writePropagationBlock(b *strings.Builder, p *PressurePropagation) {
+	b.WriteString("\nPropagation\n")
+	fmt.Fprintf(b, "  every:     %s\n", p.Every.Round(time.Millisecond))
+	fmt.Fprintf(b, "  timeout:   %s\n", p.Timeout.Round(time.Millisecond))
+	fmt.Fprintf(b, "  probes:    %d\n", p.Probes)
+	fmt.Fprintf(b, "  timed out: %d\n", p.TimedOut)
+	delay := "-"
+	if p.Probes > 0 {
+		round := func(d time.Duration) time.Duration { return d.Round(time.Millisecond) }
+		delay = fmt.Sprintf("p50 %s / p95 %s / p99 %s / max %s",
+			round(p.Delay.Median), round(p.Delay.P95), round(p.Delay.P99), round(p.Delay.Max))
+	}
+	fmt.Fprintf(b, "  delay:     %s\n", delay)
 }
 
 // pressureBucketRow renders one row of the pressure bucket table: the
@@ -418,14 +479,18 @@ func WriteJSON(w io.Writer, r *Record) error {
 
 // WriteCSV renders the run's per-type and overall metrics as CSV, one row per
 // resource type plus a leading overall row. A pressure run appends one row per
-// operation labelled pressure/<operation>, then, per stage, one row per
-// operation of that stage labelled pressure/stage-<index>/<operation>, and
-// then, per time bucket, one row per operation of that bucket labelled
-// pressure@<start>/<operation>; the cumulative revocations and a stage's
-// override and window have no column in the fixed header. A mix run
-// appends, per persona, an overall row labelled <persona>/overall and one row
-// per type labelled <persona>/<type>, and then the same rows per background
-// lane, labelled <lane>/overall and <lane>/<type>.
+// operation labelled pressure/<operation>, then one row per service of its
+// probes labelled pressure/probe/<service> and of its bad tokens labelled
+// pressure/bad_token/<service>, then, for the propagation probe, one row
+// labelled pressure/propagation, then, per stage, one row per operation of
+// that stage labelled pressure/stage-<index>/<operation>, and then, per time
+// bucket, one row per operation of that bucket labelled
+// pressure@<start>/<operation>; the cumulative revocations, a stage's
+// override and window and the propagation probe's interval and ceiling have
+// no column in the fixed header. A mix run appends, per persona, an overall
+// row labelled <persona>/overall and one row per type labelled
+// <persona>/<type>, and then the same rows per background lane, labelled
+// <lane>/overall and <lane>/<type>.
 func WriteCSV(w io.Writer, r *Record) error {
 	cw := csv.NewWriter(w)
 	if err := cw.Write(csvHeader); err != nil {
@@ -462,13 +527,34 @@ func WriteCSV(w io.Writer, r *Record) error {
 }
 
 // writePressureRows writes one row per operation of a pressure run, labelled
-// pressure/<operation>; then, per stage, one row per operation of that
-// stage, labelled pressure/stage-<index>/<operation>; and then, per time
-// bucket, one row per operation of that bucket, labelled
-// pressure@<start>/<operation> with start in time.Duration notation.
+// pressure/<operation>; then one row per service of its probes, labelled
+// pressure/probe/<service>, and of its bad tokens, labelled
+// pressure/bad_token/<service>; then, when the run had the propagation
+// probe, one row labelled pressure/propagation, which counts the completed
+// probes as attempted, the timed-out ones as failed and carries their
+// delays; then, per stage, one row per operation of that stage, labelled
+// pressure/stage-<index>/<operation>; and then, per time bucket, one row per
+// operation of that bucket, labelled pressure@<start>/<operation> with start
+// in time.Duration notation.
 func writePressureRows(cw *csv.Writer, p *PressureStats) error {
 	for _, s := range p.Operations.ByType {
 		if err := cw.Write(statsRow("pressure/"+s.Type, s)); err != nil {
+			return fmt.Errorf("writing csv row: %w", err)
+		}
+	}
+	for _, s := range p.Probes {
+		if err := cw.Write(statsRow("pressure/probe/"+s.Type, s)); err != nil {
+			return fmt.Errorf("writing csv row: %w", err)
+		}
+	}
+	for _, s := range p.BadTokens {
+		if err := cw.Write(statsRow("pressure/bad_token/"+s.Type, s)); err != nil {
+			return fmt.Errorf("writing csv row: %w", err)
+		}
+	}
+	if pp := p.Propagation; pp != nil {
+		s := metrics.Stats{Attempted: pp.Probes, Succeeded: pp.Probes - pp.TimedOut, Failed: pp.TimedOut, Latency: pp.Delay}
+		if err := cw.Write(statsRow("pressure/propagation", s)); err != nil {
 			return fmt.Errorf("writing csv row: %w", err)
 		}
 	}

@@ -359,11 +359,15 @@ func TestRecordOmitsPersonaKeys(t *testing.T) {
 }
 
 // TestRecordRoundTripWithPressure confirms a pressure record's statistics,
-// including the mix, the per-operation aggregate and the buckets with their
-// cumulative revocations, survive a write/load round trip intact, under a
-// top-level "pressure" key.
+// including the mix, the per-operation aggregate, the buckets with their
+// cumulative revocations, the probe and bad-token draws per service and the
+// propagation probe, survive a write/load round trip intact, under a
+// top-level "pressure" key with the probes, badTokens and propagation keys
+// inside it.
 func TestRecordRoundTripWithPressure(t *testing.T) {
 	rec := pressureRecord()
+	services := pressureServicesRecord().Pressure
+	rec.Pressure.Probes, rec.Pressure.BadTokens, rec.Pressure.Propagation = services.Probes, services.BadTokens, services.Propagation
 
 	path, err := Write(t.TempDir(), rec)
 	if err != nil {
@@ -373,8 +377,10 @@ func TestRecordRoundTripWithPressure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading record: %v", err)
 	}
-	if !bytes.Contains(data, []byte(`"pressure"`)) {
-		t.Errorf("pressure record carries no pressure key:\n%s", data)
+	for _, key := range []string{`"pressure"`, `"probes"`, `"badTokens"`, `"propagation"`} {
+		if !bytes.Contains(data, []byte(key)) {
+			t.Errorf("pressure record carries no %s key:\n%s", key, data)
+		}
 	}
 	loaded, err := Load(path)
 	if err != nil {
@@ -412,7 +418,10 @@ func TestRecordOmitsPressureKey(t *testing.T) {
 }
 
 // TestPressureRecordOmitsOptionalKeys confirms a bounded pressure run that
-// reserved no churn users writes neither churnUsers nor bucketWidth.
+// reserved no churn users writes neither churnUsers nor bucketWidth, and that
+// a run without probes, bad tokens and the propagation probe writes none of
+// the probes, badTokens and propagation keys, so its record keeps the shape
+// it had before the probes existed.
 func TestPressureRecordOmitsOptionalKeys(t *testing.T) {
 	rec := pressureRecord()
 	rec.Pressure.ChurnUsers = 0
@@ -426,7 +435,7 @@ func TestPressureRecordOmitsOptionalKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading record: %v", err)
 	}
-	for _, key := range []string{`"churnUsers"`, `"bucketWidth"`} {
+	for _, key := range []string{`"churnUsers"`, `"bucketWidth"`, `"probes"`, `"badTokens"`, `"propagation"`} {
 		if bytes.Contains(data, []byte(key)) {
 			t.Errorf("pressure record carries %s although it is unset:\n%s", key, data)
 		}
