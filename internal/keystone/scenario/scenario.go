@@ -66,18 +66,23 @@ type Chaos struct {
 
 // Pressure holds the closed-loop load knobs read from a scenario's pressure
 // block. It is read only by the keystone pressure subcommand. Every field
-// except Propagation has a pressure CLI flag that overrides it, and Set has no
-// key for the block, as for the chaos block. A zero Duration, Workers, Tokens
-// or BucketWidth means unset and falls back to the command's default; Duration
-// is not required here because a flag may supply it, and a zero duration in
-// the block never selects a run without an end, which only --duration 0 does.
-// ChurnUsers is a pointer so an omitted key (nil) falls back to the command's
-// default while an explicit churn_users: 0 reserves no user for grant_churn.
+// except Propagation and Stages has a pressure CLI flag that overrides it, and
+// Set has no key for the block, as for the chaos block. A zero Duration,
+// Workers, Tokens or BucketWidth means unset and falls back to the command's
+// default; Duration is not required here because a flag may supply it, and a
+// zero duration in the block never selects a run without an end, which only
+// --duration 0 does. ChurnUsers is a pointer so an omitted key (nil) falls
+// back to the command's default while an explicit churn_users: 0 reserves no
+// user for grant_churn.
 //
 // BucketWidth is the width of one time bucket of a run without an end, as for
 // the chaos block. The probe and bad_token weights of Mix and the Propagation
 // block are parsed and validated now and delivered by later work; until then
 // the command rejects a positive value for any of them.
+//
+// Stages split a bounded run into consecutive windows, each of which may grow
+// the fan users' grants when the run enters it; they come from the scenario
+// only. No stages means a run of one window, as before stages existed.
 type Pressure struct {
 	Duration    Duration     `yaml:"duration"`
 	Workers     int          `yaml:"workers"`
@@ -86,6 +91,16 @@ type Pressure struct {
 	Mix         *Mix         `yaml:"mix"`
 	Propagation *Propagation `yaml:"propagation"`
 	BucketWidth Duration     `yaml:"bucket_width"`
+	Stages      []Stage      `yaml:"stages"`
+}
+
+// Stage is one stage of a pressure run. FanAssignments, when set, is the
+// number of grants every fan user holds once the run has entered the stage.
+// Duration is the stage's share of the run; zero means an equal share of
+// what the stages with a duration leave.
+type Stage struct {
+	FanAssignments *int     `yaml:"fan_assignments"`
+	Duration       Duration `yaml:"duration"`
 }
 
 // Mix holds the pressure operation weights: a worker draws an operation with
@@ -299,6 +314,9 @@ func (s Scenario) Validate() error {
 	if err := s.Pressure.validate(); err != nil {
 		return err
 	}
+	if err := s.validateStages(); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -340,9 +358,12 @@ func (c *Chaos) validate() error {
 // validate checks the pressure block for semantic consistency. A nil receiver
 // (no pressure block) is valid. Nothing is required here because the
 // command's defaults and flags may supply every value; only the values that
-// are present must not be negative. The checks that need the merged values,
-// such as the workers ceiling, an all-zero mix or an operation this build does
-// not run, belong to the command.
+// are present must not be negative, and a stage's fan_assignments must be at
+// least 1. A stage is named by its 0-based index. The stage checks that need
+// the distribution belong to Scenario.validateStages; the checks that need the
+// merged values, such as the workers ceiling, an all-zero mix, an operation
+// this build does not run or stage durations that overrun the run, belong to
+// the command.
 func (p *Pressure) validate() error {
 	if p == nil {
 		return nil
@@ -367,6 +388,52 @@ func (p *Pressure) validate() error {
 	}
 	if p.Propagation != nil && p.Propagation.Every < 0 {
 		return fmt.Errorf("pressure.propagation.every must not be negative, got %s", time.Duration(p.Propagation.Every))
+	}
+	for i, st := range p.Stages {
+		if st.Duration < 0 {
+			return fmt.Errorf("pressure.stages[%d].duration must not be negative, got %s", i, time.Duration(st.Duration))
+		}
+		if st.FanAssignments != nil && *st.FanAssignments < 1 {
+			return fmt.Errorf("pressure.stages[%d].fan_assignments must be at least 1, got %d", i, *st.FanAssignments)
+		}
+	}
+	return nil
+}
+
+// validateStages checks the fan_assignments of the pressure stages against
+// the distribution, over the stages that set one, in order: a stage may set
+// one only when the scenario has fan users, never above resources.projects,
+// since each grant is on a distinct project, and never below what a fan user
+// may already hold, so a stage only adds grants and its fan_assignments is the
+// count every fan user holds in it. For the first such stage that is
+// distribution.fan_assignments.max, for a later one the previous such stage's
+// value. A stage without fan_assignments is a window with no override. A
+// scenario without a pressure block or without stages is valid.
+func (s Scenario) validateStages() error {
+	if s.Pressure == nil {
+		return nil
+	}
+	prev := -1 // the index of the last stage that set fan_assignments
+	for i, st := range s.Pressure.Stages {
+		if st.FanAssignments == nil {
+			continue
+		}
+		n := *st.FanAssignments
+		if s.Distribution.FanUsers == 0 {
+			return fmt.Errorf("pressure.stages[%d] sets fan_assignments but distribution.fan_users is 0", i)
+		}
+		if n > s.Resources.Projects {
+			return fmt.Errorf("pressure.stages[%d].fan_assignments (%d) exceeds resources.projects (%d)", i, n, s.Resources.Projects)
+		}
+		if prev < 0 {
+			if n < s.Distribution.FanAssignments.Max {
+				return fmt.Errorf("pressure.stages[%d].fan_assignments (%d) is below distribution.fan_assignments.max (%d), which a fan user may already hold",
+					i, n, s.Distribution.FanAssignments.Max)
+			}
+		} else if before := *s.Pressure.Stages[prev].FanAssignments; n < before {
+			return fmt.Errorf("pressure.stages[%d].fan_assignments (%d) is below stage %d's (%d); a stage never removes assignments", i, n, prev, before)
+		}
+		prev = i
 	}
 	return nil
 }

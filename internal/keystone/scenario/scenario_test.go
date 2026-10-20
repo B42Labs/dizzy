@@ -427,22 +427,24 @@ func TestChaosBucketWidth(t *testing.T) {
 }
 
 // TestParsePressureBlock confirms a full pressure block, including every mix
-// weight and the propagation block that later work delivers, parses into the
-// matching fields and validates; that a scenario with no pressure block is
-// valid; and that an unknown key at any level of the block fails strict
-// unmarshal loudly. Each weight carries a distinct value so a swapped YAML tag
-// shows up as a mismatch.
+// weight, the propagation block that later work delivers and two stages, one
+// without a duration, parses into the matching fields and validates; that a
+// scenario with no pressure block is valid; and that an unknown key at any
+// level of the block fails strict unmarshal loudly. Each weight carries a
+// distinct value so a swapped YAML tag shows up as a mismatch.
 func TestParsePressureBlock(t *testing.T) {
 	yaml := `name: p
 seed: 1
 resources:
   domains: 1
   roles: 1
-  projects: 1
+  projects: 1000
   users: 2
 distribution:
   projects_per_domain: { min: 1, max: 1 }
   assignments_per_user: { min: 1, max: 1 }
+  fan_users: 1
+  fan_assignments: { min: 500, max: 500 }
 pressure:
   duration: 10m
   workers: 4
@@ -458,6 +460,9 @@ pressure:
     issue: 1
     bad_token: 7
   propagation: { every: 30s }
+  stages:
+    - fan_assignments: 500
+    - { fan_assignments: 1000, duration: 2m }
 `
 	s, err := Parse([]byte(yaml))
 	if err != nil {
@@ -479,6 +484,10 @@ pressure:
 		},
 		Propagation: &Propagation{Every: Duration(30 * time.Second)},
 		BucketWidth: Duration(2 * time.Minute),
+		Stages: []Stage{
+			{FanAssignments: intPtr(500)},
+			{FanAssignments: intPtr(1000), Duration: Duration(2 * time.Minute)},
+		},
 	}
 	if !reflect.DeepEqual(s.Pressure, want) {
 		t.Errorf("pressure block = %s, want %s", describePressure(s.Pressure), describePressure(want))
@@ -500,6 +509,7 @@ pressure:
 		"{ nope: 1 }",
 		"{ mix: { nope: 1 } }",
 		"{ propagation: { nope: 1s } }",
+		"{ stages: [{ nope: 1 }] }",
 	} {
 		if _, err := Parse([]byte("name: p\npressure: " + block + "\n")); err == nil {
 			t.Errorf("Parse of pressure: %s: expected an error, got nil", block)
@@ -543,6 +553,28 @@ func TestValidatePressureBlock(t *testing.T) {
 			block:   "{ propagation: { every: -1s } }",
 			wantErr: "pressure.propagation.every must not be negative, got -1s",
 		},
+		{name: "empty stages", block: "{ stages: [] }"},
+		{name: "stages without an override", block: "{ stages: [{ duration: 1m }, {}] }"},
+		{
+			name:    "negative stage duration",
+			block:   "{ stages: [{ duration: -1m }] }",
+			wantErr: "pressure.stages[0].duration must not be negative, got -1m0s",
+		},
+		{
+			name:    "negative duration of a later stage",
+			block:   "{ stages: [{ duration: 1m }, { duration: -1s }] }",
+			wantErr: "pressure.stages[1].duration must not be negative, got -1s",
+		},
+		{
+			name:    "zero stage fan_assignments",
+			block:   "{ stages: [{ fan_assignments: 0 }] }",
+			wantErr: "pressure.stages[0].fan_assignments must be at least 1, got 0",
+		},
+		{
+			name:    "negative stage fan_assignments",
+			block:   "{ stages: [{ fan_assignments: -2 }] }",
+			wantErr: "pressure.stages[0].fan_assignments must be at least 1, got -2",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -555,6 +587,100 @@ func TestValidatePressureBlock(t *testing.T) {
 				t.Fatal("pressure block did not parse into a non-nil Pressure")
 			}
 			s := smallScenario()
+			s.Pressure = parsed.Pressure
+			err = s.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != tc.wantErr {
+				t.Fatalf("Validate() = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidateStages covers the checks of the stages' fan_assignments against
+// the distribution, one violated rule at a time with its exact message and
+// 0-based stage index, and the stage lists that validate. A stage without
+// fan_assignments is skipped by every check, so a later stage compares with
+// the last stage that set one.
+func TestValidateStages(t *testing.T) {
+	// fan gives smallScenario's five projects one fan user holding two or
+	// three grants.
+	fan := func(s *Scenario) {
+		s.Distribution.FanUsers = 1
+		s.Distribution.FanAssignments = Range{Min: 2, Max: 3}
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*Scenario)
+		stages  string
+		wantErr string
+	}{
+		{
+			name:    "fan_assignments without fan users",
+			stages:  "[{ fan_assignments: 5 }]",
+			wantErr: "pressure.stages[0] sets fan_assignments but distribution.fan_users is 0",
+		},
+		{
+			name:    "fan_users checked before the projects",
+			stages:  "[{ duration: 1m }, { fan_assignments: 6 }]",
+			wantErr: "pressure.stages[1] sets fan_assignments but distribution.fan_users is 0",
+		},
+		{name: "durations without fan users", stages: "[{ duration: 1m }, {}]"},
+		{
+			name:    "above the projects",
+			mutate:  fan,
+			stages:  "[{ fan_assignments: 6 }]",
+			wantErr: "pressure.stages[0].fan_assignments (6) exceeds resources.projects (5)",
+		},
+		{
+			name:    "a later stage above the projects",
+			mutate:  fan,
+			stages:  "[{ fan_assignments: 3 }, { fan_assignments: 6 }]",
+			wantErr: "pressure.stages[1].fan_assignments (6) exceeds resources.projects (5)",
+		},
+		{
+			name:    "first below the fan max",
+			mutate:  fan,
+			stages:  "[{ fan_assignments: 2 }]",
+			wantErr: "pressure.stages[0].fan_assignments (2) is below distribution.fan_assignments.max (3), which a fan user may already hold",
+		},
+		{
+			name:    "first override after a window below the fan max",
+			mutate:  fan,
+			stages:  "[{ duration: 1m }, { fan_assignments: 2 }]",
+			wantErr: "pressure.stages[1].fan_assignments (2) is below distribution.fan_assignments.max (3), which a fan user may already hold",
+		},
+		{
+			name:    "a later stage below the one before",
+			mutate:  fan,
+			stages:  "[{ fan_assignments: 4 }, { fan_assignments: 3 }]",
+			wantErr: "pressure.stages[1].fan_assignments (3) is below stage 0's (4); a stage never removes assignments",
+		},
+		{
+			name:    "a later stage below the last override across a window",
+			mutate:  fan,
+			stages:  "[{ fan_assignments: 4 }, { duration: 1m }, { fan_assignments: 3 }]",
+			wantErr: "pressure.stages[2].fan_assignments (3) is below stage 0's (4); a stage never removes assignments",
+		},
+		{name: "a window and then the fan max", mutate: fan, stages: "[{ duration: 1m }, { fan_assignments: 3 }]"},
+		{name: "non-decreasing overrides", mutate: fan, stages: "[{ fan_assignments: 3 }, { fan_assignments: 3 }, {}, { fan_assignments: 5 }]"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			parsed, err := Parse([]byte("name: x\npressure: { stages: " + tc.stages + " }\n"))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			s := smallScenario()
+			if tc.mutate != nil {
+				tc.mutate(&s)
+			}
 			s.Pressure = parsed.Pressure
 			err = s.Validate()
 			if tc.wantErr == "" {
@@ -591,6 +717,13 @@ func describePressure(p *Pressure) string {
 	}
 	if p.Propagation != nil {
 		s += fmt.Sprintf(", propagation: {every: %s}", time.Duration(p.Propagation.Every))
+	}
+	if len(p.Stages) > 0 {
+		stages := make([]string, len(p.Stages))
+		for i, st := range p.Stages {
+			stages[i] = fmt.Sprintf("{fan_assignments: %s, duration: %s}", ptr(st.FanAssignments), time.Duration(st.Duration))
+		}
+		s += ", stages: [" + strings.Join(stages, ", ") + "]"
 	}
 	return s + "}"
 }

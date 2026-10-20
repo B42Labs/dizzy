@@ -84,7 +84,8 @@ func TestProfilesShipChaosBlock(t *testing.T) {
 // scenario schema's profile table, so `keystone pressure --scenario
 // scenarios/keystone/<profile>.yaml` runs without extra flags, and that no
 // profile sets churn_users, mix, propagation or bucket_width, which stay at the
-// command's defaults.
+// command's defaults, or stages, which a staged run takes from the example in
+// the scenario schema instead.
 func TestProfilesShipPressureBlock(t *testing.T) {
 	want := map[string]struct {
 		duration time.Duration
@@ -114,7 +115,7 @@ func TestProfilesShipPressureBlock(t *testing.T) {
 			if p.Tokens != w.tokens {
 				t.Errorf("profile keystone/%s.yaml pressure.tokens = %d, want %d", name, p.Tokens, w.tokens)
 			}
-			if p.ChurnUsers != nil || p.Mix != nil || p.Propagation != nil || p.BucketWidth != 0 {
+			if p.ChurnUsers != nil || p.Mix != nil || p.Propagation != nil || p.BucketWidth != 0 || p.Stages != nil {
 				t.Errorf("profile keystone/%s.yaml pressure block = %s, want only duration, workers and tokens set", name, describePressure(p))
 			}
 		})
