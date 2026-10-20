@@ -66,19 +66,20 @@ type Chaos struct {
 
 // Pressure holds the closed-loop load knobs read from a scenario's pressure
 // block. It is read only by the keystone pressure subcommand. Every field
-// except Propagation and Stages has a pressure CLI flag that overrides it, and
-// Set has no key for the block, as for the chaos block. A zero Duration,
-// Workers, Tokens or BucketWidth means unset and falls back to the command's
-// default; Duration is not required here because a flag may supply it, and a
-// zero duration in the block never selects a run without an end, which only
-// --duration 0 does. ChurnUsers is a pointer so an omitted key (nil) falls
-// back to the command's default while an explicit churn_users: 0 reserves no
-// user for grant_churn.
+// except Stages has a pressure CLI flag that overrides it, and so does each
+// key of Propagation. Set has no key for the pressure block, as for the chaos
+// block. A zero Duration, Workers, Tokens or BucketWidth means unset and falls
+// back to the command's default; Duration is not required here because a flag
+// may supply it, and a zero duration in the block never selects a run without
+// an end, which only --duration 0 does. ChurnUsers is a pointer so an omitted
+// key (nil) falls back to the command's default while an explicit
+// churn_users: 0 reserves no user for grant_churn.
 //
 // BucketWidth is the width of one time bucket of a run without an end, as for
 // the chaos block. The probe and bad_token weights of Mix and the Propagation
-// block are parsed and validated now and delivered by later work; until then
-// the command rejects a positive value for any of them.
+// block are the parts of a run that leave Keystone: they send requests to
+// Nova, Neutron, Cinder and Glance, as far as the pool users' catalog lists
+// them.
 //
 // Stages split a bounded run into consecutive windows, each of which may grow
 // the fan users' grants when the run enters it; they come from the scenario
@@ -106,8 +107,10 @@ type Stage struct {
 // Mix holds the pressure operation weights: a worker draws an operation with
 // probability weight divided by the sum of the weights. Each weight is a
 // pointer so an omitted key (nil) falls back to the command's default while
-// an explicit 0 switches the operation off. Probe and BadToken are parsed now
-// and delivered by later work.
+// an explicit 0 switches the operation off. Probe and BadToken weigh the two
+// operations that go to a service other than Keystone: probe sends a pool
+// token there for the cheapest read the service offers, and bad_token floods
+// it with tokens it has to reject. Both are off by default.
 type Mix struct {
 	Validate   *int `yaml:"validate"`
 	Probe      *int `yaml:"probe"`
@@ -119,10 +122,13 @@ type Mix struct {
 }
 
 // Propagation configures the propagation probe, which revokes one pool token
-// every Every and measures how long a service takes to reject it. It is parsed
-// now and delivered by later work.
+// every Every and measures how long a service takes to reject it.
 type Propagation struct {
 	Every Duration `yaml:"every"`
+	// Timeout is the ceiling of one probe: a probe whose service still accepts
+	// the revoked token after it counts as a timeout. Zero means the command's
+	// default.
+	Timeout Duration `yaml:"timeout"`
 }
 
 // Interval is the random delay range between scheduled churn actions.
@@ -361,9 +367,9 @@ func (c *Chaos) validate() error {
 // are present must not be negative, and a stage's fan_assignments must be at
 // least 1. A stage is named by its 0-based index. The stage checks that need
 // the distribution belong to Scenario.validateStages; the checks that need the
-// merged values, such as the workers ceiling, an all-zero mix, an operation
-// this build does not run or stage durations that overrun the run, belong to
-// the command.
+// merged values, such as the workers ceiling, an all-zero mix, a propagation
+// timeout that must be positive while the probe runs or stage durations that
+// overrun the run, belong to the command.
 func (p *Pressure) validate() error {
 	if p == nil {
 		return nil
@@ -388,6 +394,9 @@ func (p *Pressure) validate() error {
 	}
 	if p.Propagation != nil && p.Propagation.Every < 0 {
 		return fmt.Errorf("pressure.propagation.every must not be negative, got %s", time.Duration(p.Propagation.Every))
+	}
+	if p.Propagation != nil && p.Propagation.Timeout < 0 {
+		return fmt.Errorf("pressure.propagation.timeout must not be negative, got %s", time.Duration(p.Propagation.Timeout))
 	}
 	for i, st := range p.Stages {
 		if st.Duration < 0 {
