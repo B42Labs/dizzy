@@ -15,19 +15,23 @@ import (
 
 // Plan is the fully-expanded expected state for one Keystone run. Scenario and
 // Seed record the provenance that produced it; the slices enumerate every
-// domain, role, project, user, role assignment, and token issue. Domains and
-// roles are created in admin mode and bound to the in-scope domain / reused
-// roles in domain-manager mode. User passwords are never in the plan: each is
-// derived deterministically from (seed, logical name) at apply time.
+// domain, role, implied-role rule, project, user, role assignment, and token
+// issue. Domains, roles and implied-role rules are created in admin mode; in
+// domain-manager mode the domains and roles bind to the in-scope domain and
+// reused roles, and the rules are not created. User passwords are never in the
+// plan: each is derived deterministically from (seed, logical name) at apply
+// time. ImpliedRoles is omitted when empty, so a plan without rules encodes as
+// it did before they existed.
 type Plan struct {
-	Scenario    string       `json:"scenario"`
-	Seed        int64        `json:"seed"`
-	Domains     []Domain     `json:"domains"`
-	Roles       []Role       `json:"roles"`
-	Projects    []Project    `json:"projects"`
-	Users       []User       `json:"users"`
-	Assignments []Assignment `json:"assignments"`
-	Tokens      []TokenIssue `json:"tokens"`
+	Scenario     string        `json:"scenario"`
+	Seed         int64         `json:"seed"`
+	Domains      []Domain      `json:"domains"`
+	Roles        []Role        `json:"roles"`
+	ImpliedRoles []ImpliedRole `json:"implied_roles,omitempty"`
+	Projects     []Project     `json:"projects"`
+	Users        []User        `json:"users"`
+	Assignments  []Assignment  `json:"assignments"`
+	Tokens       []TokenIssue  `json:"tokens"`
 }
 
 // Domain is an identity domain, referenced elsewhere by its logical name.
@@ -38,6 +42,14 @@ type Domain struct {
 // Role is a role, referenced by assignments by its logical name.
 type Role struct {
 	Name string `json:"name"`
+}
+
+// ImpliedRole is one implied-role rule: a grant of the role Prior also gives
+// its holder the role Implied on the same target. Both reference roles by
+// their logical names.
+type ImpliedRole struct {
+	Prior   string `json:"prior"`
+	Implied string `json:"implied"`
 }
 
 // Project is a project in a domain, both referenced by logical name.
@@ -76,8 +88,9 @@ type TokenIssue struct {
 }
 
 // Validate checks the plan graph for well-formedness: unique logical names per
-// kind, every domain/role/project/user reference resolving, no duplicate
-// (user, target, role) grant, and every token issue naming an existing user and
+// kind, every domain/role/project/user reference resolving, every implied-role
+// rule linking two distinct known roles at most once, no duplicate (user,
+// target, role) grant, and every token issue naming an existing user and
 // project backed by a matching project-scoped assignment. It returns an error
 // naming the first offending resource.
 func (p *Plan) Validate() error {
@@ -88,6 +101,23 @@ func (p *Plan) Validate() error {
 	roles, err := uniqueNames("role", names(p.Roles, func(r Role) string { return r.Name }))
 	if err != nil {
 		return err
+	}
+
+	rules := make(map[[2]string]bool, len(p.ImpliedRoles))
+	for _, ir := range p.ImpliedRoles {
+		for _, name := range []string{ir.Prior, ir.Implied} {
+			if !roles[name] {
+				return fmt.Errorf("implied role rule references unknown role %q", name)
+			}
+		}
+		if ir.Prior == ir.Implied {
+			return fmt.Errorf("implied role rule lets role %q imply itself", ir.Prior)
+		}
+		key := [2]string{ir.Prior, ir.Implied}
+		if rules[key] {
+			return fmt.Errorf("duplicate implied role rule (%q implies %q)", ir.Prior, ir.Implied)
+		}
+		rules[key] = true
 	}
 
 	projects := make(map[string]bool, len(p.Projects))
@@ -185,12 +215,16 @@ func (p *Plan) FanUsers() int {
 // "keystone apply --dry-run" to preview a scenario without touching a cloud.
 // The users count includes the fan users, which a line of their own counts
 // again only when the plan has any, so the summary of a plan without fan users
-// is unchanged.
+// is unchanged. The implied-role rules get a line only when the plan has any,
+// for the same reason.
 func (p *Plan) Summary() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Plan for scenario %q (seed %d)\n", p.Scenario, p.Seed)
 	fmt.Fprintf(&b, "  domains:         %d\n", len(p.Domains))
 	fmt.Fprintf(&b, "  roles:           %d\n", len(p.Roles))
+	if n := len(p.ImpliedRoles); n > 0 {
+		fmt.Fprintf(&b, "  implied roles:   %d\n", n)
+	}
 	fmt.Fprintf(&b, "  projects:        %d\n", len(p.Projects))
 	fmt.Fprintf(&b, "  users:           %d\n", len(p.Users))
 	if n := p.FanUsers(); n > 0 {

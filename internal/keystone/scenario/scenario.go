@@ -162,14 +162,25 @@ func (d *Duration) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
-// Resources holds the fixed counts of top-level resources to create. Domains and
-// roles are admin-only knobs: in domain-manager mode domains are forced to the
-// single in-scope domain and roles are ignored (existing roles reused).
+// Resources holds the fixed counts of top-level resources to create and the
+// implied-role rules between the created roles. Domains, roles and the rules
+// are admin-only knobs: in domain-manager mode domains are forced to the single
+// in-scope domain, roles are ignored (existing roles reused) and no rule is
+// created.
 type Resources struct {
-	Domains  int `yaml:"domains"`
-	Roles    int `yaml:"roles"`
-	Projects int `yaml:"projects"`
-	Users    int `yaml:"users"`
+	Domains      int           `yaml:"domains"`
+	Roles        int           `yaml:"roles"`
+	Projects     int           `yaml:"projects"`
+	Users        int           `yaml:"users"`
+	ImpliedRoles []ImpliedRole `yaml:"implied_roles"`
+}
+
+// ImpliedRole declares that a grant of the role Prior also gives its holder
+// every role in Implies on the same target. Both name roles of the plan by
+// their logical names, role-0001 to role-<resources.roles>.
+type ImpliedRole struct {
+	Prior   string   `yaml:"prior"`
+	Implies []string `yaml:"implies"`
 }
 
 // Distribution holds the ranges and ratios that shape how projects are dealt
@@ -314,6 +325,9 @@ func (s Scenario) Validate() error {
 			s.Resources.Users, s.Distribution.AssignmentsPerUser.Max, total, maxCount)
 	}
 
+	if err := s.validateImpliedRoles(); err != nil {
+		return err
+	}
 	if err := s.Chaos.validate(); err != nil {
 		return err
 	}
@@ -325,6 +339,68 @@ func (s Scenario) Validate() error {
 	}
 
 	return nil
+}
+
+// validateImpliedRoles checks the implied-role rules against the plan's roles.
+// A rule needs two distinct roles, so a scenario with rules needs at least two.
+// Each rule must imply at least one role, name only plan roles, never let a
+// role imply itself and never repeat a (prior, implied) pair of an earlier rule
+// or entry. A rule is named by its 0-based index, an implied role by its
+// 0-based index within the rule. A cycle is valid: Keystone accepts it and its
+// expansion stops at a cycle. A scenario without rules is valid.
+func (s Scenario) validateImpliedRoles() error {
+	rules := s.Resources.ImpliedRoles
+	if len(rules) == 0 {
+		return nil
+	}
+	roles := s.Resources.Roles
+	if roles < 2 {
+		return fmt.Errorf("resources.roles must be at least 2 when implied_roles are declared, got %d", roles)
+	}
+	seen := make(map[[2]string]bool)
+	for i, r := range rules {
+		if len(r.Implies) == 0 {
+			return fmt.Errorf("resources.implied_roles[%d].implies must name at least one role", i)
+		}
+		if !planRole(r.Prior, roles) {
+			return fmt.Errorf("resources.implied_roles[%d].prior %q is not a role of the plan, whose roles are role-0001 to %s", i, r.Prior, roleName(roles))
+		}
+		for j, implied := range r.Implies {
+			if !planRole(implied, roles) {
+				return fmt.Errorf("resources.implied_roles[%d].implies[%d] %q is not a role of the plan, whose roles are role-0001 to %s", i, j, implied, roleName(roles))
+			}
+			if implied == r.Prior {
+				return fmt.Errorf("resources.implied_roles[%d].implies[%d] lets %q imply itself", i, j, implied)
+			}
+			key := [2]string{r.Prior, implied}
+			if seen[key] {
+				return fmt.Errorf("resources.implied_roles[%d].implies[%d] repeats the rule %q implies %q", i, j, r.Prior, implied)
+			}
+			seen[key] = true
+		}
+	}
+	return nil
+}
+
+// roleName returns the logical name Generate gives the k-th role (1-based).
+func roleName(k int) string {
+	return fmt.Sprintf("role-%04d", k)
+}
+
+// planRole reports whether name is the logical name of one of the roles roles
+// a plan creates, role-0001 to roleName(roles). It parses the number rather
+// than building the set of names, since roles may be up to maxCount, and
+// compares the name back to roleName so that role-1 or role-00001 fail.
+func planRole(name string, roles int) bool {
+	digits, ok := strings.CutPrefix(name, "role-")
+	if !ok {
+		return false
+	}
+	k, err := strconv.Atoi(digits)
+	if err != nil || k < 1 || k > roles {
+		return false
+	}
+	return roleName(k) == name
 }
 
 // validate checks the chaos block for semantic consistency. A nil receiver (no

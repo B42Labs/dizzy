@@ -105,6 +105,28 @@ func TestValidateRejects(t *testing.T) {
 			},
 			wantMsg: "no matching project-scoped assignment",
 		},
+		{
+			name:    "implied role rule references unknown prior role",
+			mutate:  func(p *Plan) { p.ImpliedRoles = []ImpliedRole{{Prior: "ghost", Implied: "role-0002"}} },
+			wantMsg: `implied role rule references unknown role "ghost"`,
+		},
+		{
+			name:    "implied role rule references unknown implied role",
+			mutate:  func(p *Plan) { p.ImpliedRoles = []ImpliedRole{{Prior: "role-0001", Implied: "ghost"}} },
+			wantMsg: `implied role rule references unknown role "ghost"`,
+		},
+		{
+			name:    "implied role rule implies its own prior",
+			mutate:  func(p *Plan) { p.ImpliedRoles = []ImpliedRole{{Prior: "role-0001", Implied: "role-0001"}} },
+			wantMsg: `implied role rule lets role "role-0001" imply itself`,
+		},
+		{
+			name: "duplicate implied role rule",
+			mutate: func(p *Plan) {
+				p.ImpliedRoles = []ImpliedRole{{Prior: "role-0001", Implied: "role-0002"}, {Prior: "role-0001", Implied: "role-0002"}}
+			},
+			wantMsg: `duplicate implied role rule ("role-0001" implies "role-0002")`,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -170,5 +192,27 @@ func TestSummaryFanUsers(t *testing.T) {
 func TestDomainScopedAssignments(t *testing.T) {
 	if got := validPlan().DomainScopedAssignments(); got != 1 {
 		t.Errorf("DomainScopedAssignments() = %d, want 1", got)
+	}
+}
+
+// TestSummaryImpliedRoles checks the implied roles line: a plan with rules
+// that validates prints their count right after the roles line, and a plan
+// without rules prints no such line.
+func TestSummaryImpliedRoles(t *testing.T) {
+	p := validPlan()
+	p.ImpliedRoles = []ImpliedRole{
+		{Prior: "role-0001", Implied: "role-0002"},
+		{Prior: "role-0002", Implied: "role-0001"},
+	}
+	if err := p.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil for a plan with implied-role rules", err)
+	}
+	got := p.Summary()
+	if want := "  roles:           2\n  implied roles:   2\n  projects:"; !strings.Contains(got, want) {
+		t.Errorf("Summary() missing %q:\n%s", want, got)
+	}
+
+	if got := validPlan().Summary(); strings.Contains(got, "implied roles") {
+		t.Errorf("Summary() of a plan without implied-role rules has an implied roles line:\n%s", got)
 	}
 }

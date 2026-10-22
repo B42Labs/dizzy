@@ -733,3 +733,191 @@ func describePressure(p *Pressure) string {
 	}
 	return s + "}"
 }
+
+// TestParseImpliedRoles confirms the implied_roles key of the resources block
+// parses into its rules, each with its prior and implied roles in order, and
+// validates, and that an unknown key inside a rule fails strict unmarshal
+// loudly.
+func TestParseImpliedRoles(t *testing.T) {
+	yaml := `name: ir
+seed: 1
+resources:
+  domains: 1
+  roles: 3
+  projects: 2
+  users: 2
+  implied_roles:
+    - { prior: role-0001, implies: [role-0002, role-0003] }
+distribution:
+  projects_per_domain: { min: 1, max: 2 }
+  assignments_per_user: { min: 1, max: 1 }
+`
+	s, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	want := []ImpliedRole{{Prior: "role-0001", Implies: []string{"role-0002", "role-0003"}}}
+	if !reflect.DeepEqual(s.Resources.ImpliedRoles, want) {
+		t.Errorf("implied_roles = %+v, want %+v", s.Resources.ImpliedRoles, want)
+	}
+	if err := s.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil", err)
+	}
+
+	if _, err := Parse([]byte("name: ir\nresources:\n  implied_roles:\n    - { prior: role-0001, implied: [role-0002] }\n")); err == nil {
+		t.Error("Parse of an implied-role rule with an unknown key: expected an error, got nil")
+	}
+}
+
+// TestValidateImpliedRoles checks the implied-role rules against the roles of
+// the small scenario, raised to three where a rule needs them: no rules and an
+// empty list are valid even with a single role, a cycle is valid, and every
+// other failure reports its exact message, naming the failing rule and entry
+// by index, in the order Validate checks them.
+func TestValidateImpliedRoles(t *testing.T) {
+	rule := func(prior string, implies ...string) ImpliedRole {
+		return ImpliedRole{Prior: prior, Implies: implies}
+	}
+	chain := rule("role-0001", "role-0002")
+	tests := []struct {
+		name    string
+		roles   int
+		rules   []ImpliedRole
+		mutate  func(*Scenario) // an extra change, when set
+		wantMsg string          // empty means valid
+	}{
+		{name: "no rules", roles: 1},
+		{name: "empty list", roles: 1, rules: []ImpliedRole{}},
+		{name: "chain", roles: 3, rules: []ImpliedRole{rule("role-0001", "role-0002"), rule("role-0002", "role-0003")}},
+		{name: "cycle", roles: 3, rules: []ImpliedRole{rule("role-0001", "role-0002"), rule("role-0002", "role-0001")}},
+		{
+			name:    "too few roles",
+			roles:   1,
+			rules:   []ImpliedRole{rule("role-0001", "role-0002")},
+			wantMsg: "resources.roles must be at least 2 when implied_roles are declared, got 1",
+		},
+		{
+			name:    "no implied role",
+			roles:   3,
+			rules:   []ImpliedRole{rule("role-0001")},
+			wantMsg: "resources.implied_roles[0].implies must name at least one role",
+		},
+		{
+			name:    "an empty implies list, as YAML's implies: [] parses",
+			roles:   3,
+			rules:   []ImpliedRole{{Prior: "role-0001", Implies: []string{}}},
+			wantMsg: "resources.implied_roles[0].implies must name at least one role",
+		},
+		{
+			name:    "no implied role is reported before an unknown prior",
+			roles:   3,
+			rules:   []ImpliedRole{{Prior: "role-0009", Implies: []string{}}},
+			wantMsg: "resources.implied_roles[0].implies must name at least one role",
+		},
+		{
+			name:    "no implied role in the second rule",
+			roles:   3,
+			rules:   []ImpliedRole{chain, rule("role-0002")},
+			wantMsg: "resources.implied_roles[1].implies must name at least one role",
+		},
+		{
+			name:    "unknown prior in the second rule",
+			roles:   3,
+			rules:   []ImpliedRole{chain, rule("role-0009", "role-0001")},
+			wantMsg: `resources.implied_roles[1].prior "role-0009" is not a role of the plan, whose roles are role-0001 to role-0003`,
+		},
+		{
+			name:    "self implication in the second entry of the second rule",
+			roles:   3,
+			rules:   []ImpliedRole{chain, rule("role-0002", "role-0003", "role-0002")},
+			wantMsg: `resources.implied_roles[1].implies[1] lets "role-0002" imply itself`,
+		},
+		{
+			name:    "a negative role count is reported before the rules",
+			roles:   -1,
+			rules:   []ImpliedRole{chain},
+			wantMsg: "resources.roles must not be negative, got -1",
+		},
+		{
+			name:    "the rules are checked before the chaos block",
+			roles:   1,
+			rules:   []ImpliedRole{chain},
+			mutate:  func(s *Scenario) { s.Chaos.Duration = -1 },
+			wantMsg: "resources.roles must be at least 2 when implied_roles are declared, got 1",
+		},
+		{
+			name:    "prior beyond the roles",
+			roles:   3,
+			rules:   []ImpliedRole{rule("role-0004", "role-0001")},
+			wantMsg: `resources.implied_roles[0].prior "role-0004" is not a role of the plan, whose roles are role-0001 to role-0003`,
+		},
+		{
+			name:    "prior not in the plan's form",
+			roles:   3,
+			rules:   []ImpliedRole{rule("role-1", "role-0002")},
+			wantMsg: `resources.implied_roles[0].prior "role-1" is not a role of the plan, whose roles are role-0001 to role-0003`,
+		},
+		{
+			name:    "prior is a cloud role",
+			roles:   3,
+			rules:   []ImpliedRole{rule("reader", "role-0002")},
+			wantMsg: `resources.implied_roles[0].prior "reader" is not a role of the plan, whose roles are role-0001 to role-0003`,
+		},
+		{
+			name:    "prior role-0000",
+			roles:   3,
+			rules:   []ImpliedRole{rule("role-0000", "role-0002")},
+			wantMsg: `resources.implied_roles[0].prior "role-0000" is not a role of the plan, whose roles are role-0001 to role-0003`,
+		},
+		{
+			name:    "implied beyond the roles",
+			roles:   3,
+			rules:   []ImpliedRole{rule("role-0001", "role-0004")},
+			wantMsg: `resources.implied_roles[0].implies[0] "role-0004" is not a role of the plan, whose roles are role-0001 to role-0003`,
+		},
+		{
+			name:    "implied with an extra digit",
+			roles:   3,
+			rules:   []ImpliedRole{rule("role-0001", "role-0002", "role-00003")},
+			wantMsg: `resources.implied_roles[0].implies[1] "role-00003" is not a role of the plan, whose roles are role-0001 to role-0003`,
+		},
+		{
+			name:    "self implication",
+			roles:   3,
+			rules:   []ImpliedRole{rule("role-0001", "role-0001")},
+			wantMsg: `resources.implied_roles[0].implies[0] lets "role-0001" imply itself`,
+		},
+		{
+			name:    "repeated rule across rules",
+			roles:   3,
+			rules:   []ImpliedRole{rule("role-0001", "role-0002"), rule("role-0001", "role-0002")},
+			wantMsg: `resources.implied_roles[1].implies[0] repeats the rule "role-0001" implies "role-0002"`,
+		},
+		{
+			name:    "repeated rule within a rule",
+			roles:   3,
+			rules:   []ImpliedRole{rule("role-0001", "role-0002", "role-0003", "role-0002")},
+			wantMsg: `resources.implied_roles[0].implies[2] repeats the rule "role-0001" implies "role-0002"`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := smallScenario()
+			s.Resources.Roles = tc.roles
+			s.Resources.ImpliedRoles = tc.rules
+			if tc.mutate != nil {
+				tc.mutate(&s)
+			}
+			err := s.Validate()
+			if tc.wantMsg == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != tc.wantMsg {
+				t.Fatalf("Validate() = %v, want %q", err, tc.wantMsg)
+			}
+		})
+	}
+}
