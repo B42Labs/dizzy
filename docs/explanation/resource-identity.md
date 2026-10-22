@@ -66,14 +66,18 @@ start with `dizzy-a1b2c3d4-keystone-`. See [Combined runs](combined-runs.md).
 
 ## Where the stamp doesn't reach
 
-Two resource types cannot be discovered by their own identity, and both are
-reclaimed from the **run record's created list**, by id:
+Three resource types cannot be discovered by their own identity, and all three
+are reclaimed from the **run record's created list**, by id:
 
 - **Neutron address scopes.** Some Neutron releases return 404 when you try to
   tag one. Tagging them is therefore best-effort: a failure is logged, tolerated,
   and left out of the metrics.
 - **Keystone role assignments.** A grant is a relation, not an object with a
   name. It has nothing to stamp.
+- **Keystone implied-role rules.** A rule is a relation like a grant, with no
+  name to stamp. `cleanup --run` deletes it by id from the record. Without a
+  record it goes with its roles, since Keystone deletes a role's implied-role
+  rules when it deletes the role.
 
 The practical consequence is a real asymmetry in the `cleanup` command:
 

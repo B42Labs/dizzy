@@ -116,7 +116,7 @@ this build runs every row:
 | C5C3/cobaltcore#1457, a narrow revocation lookup and no cache flush per logout | `validate` while `revoke` accumulates revocation events | Validate latency per bucket against the cumulative revocations: before the change a slope and a jump after every revocation, after it a flat line |
 | C5C3/cobaltcore#1458, one validation and one role resolution per request | `validate` under `grant_churn`, which keeps Keystone's role caches cold | Validate p50 and p95 under churn |
 | C5C3/cobaltcore#1461, fewer cache round trips and an in-process cache tier | `validate` warm, with `revoke` and `grant_churn` at weight 0 and 128 workers | Validate p50, and the throughput at a fixed worker count |
-| C5C3/cobaltcore#1459, linear implied-role expansion and a bulk role lookup | `effective` for a fan user over the stages 500 to 4000 grants | The `effective` latency per stage: before the change it grows about fourfold per doubling of the grants, after it about twofold |
+| C5C3/cobaltcore#1459, linear implied-role expansion and a bulk role lookup | `effective` for a fan user whose grants carry implied roles, over the stages 500 to 4000 grants, beside `grant_churn`, which keeps Keystone's computed-assignment cache cold | The `effective` latency per stage: before the change it grows about fourfold per doubling of the grants, after it about twofold |
 | C5C3/cobaltcore#1463, event-driven token eviction in the middleware | The propagation probe, e.g. `--propagation-every 30s`, next to `probe` with many distinct pool tokens over more than 300 s | The propagation delay, from a revocation to the first 401 at a service: up to 300 s before the change, seconds after it, and fewer slow probes |
 | C5C3/cobaltcore#1464, an in-process cache tier in the middleware | `probe` with repeating tokens at a high rate | The probe p50 at each service: it drops by 0.3 to 1.2 ms, which shows over tens of thousands of samples |
 | C5C3/cobaltcore#1465, an offline signature and expiry check that rejects a bad token inside the service | `bad_token` next to `validate` | After the change, a bad-token latency of about 0.1 ms at each service and a validate p50 that does not move under the flood |
@@ -163,19 +163,19 @@ that grew with the lab's servers, networks, volumes or images would bury in
 its own spread.
 
 The pool users do not hold `reader` from the plan. The plan's roles are the
-run's own, created under its name prefix, and imply no other role, so no
-service's policy names them. Under their default policies, Cinder's
-`GET /v3/<project_id>/limits` and Glance's `GET /v2/images` ask for `reader`
-on the token's project, and without it both would answer every probe with a
-403: a policy refusal after the middleware's work, not the read the probe
-exists to time. So a run with `probe` or the propagation probe grants the
+run's own, created under its name prefix, and a scenario's implied-role rules
+link them only to each other, so no service's policy names them. Under their
+default policies, Cinder's `GET /v3/<project_id>/limits` and Glance's
+`GET /v2/images` ask for `reader` on the token's project, and without it both
+would answer every probe with a 403: a policy refusal after the middleware's
+work, not the read the probe exists to time. So a run with `probe` or the propagation probe grants the
 cloud's `reader` role to every pool user on the project its tokens are scoped
 to, before it primes the pool, and tears the grants down with the rest of the
-run. Neither a churn user nor a fan user gets the grant, so the count an
-`effective` draw lists for a fan user stays the count its stage set. On a
-cloud without a `reader` role the run grants nothing, logs a warning and goes
-on, and the probes still reach every service whose read policy does not ask
-for the role. `bad_token` needs no role at all: keystonemiddleware refuses a
+run. Neither a churn user nor a fan user gets the grant, so an `effective`
+draw for a fan user lists the grants its stage set, each with the implied
+roles its role brings, and nothing more. On a cloud without a `reader` role
+the run grants nothing, logs a warning and goes on, and the probes still
+reach every service whose read policy does not ask for the role. `bad_token` needs no role at all: keystonemiddleware refuses a
 bad token before the service checks any policy.
 
 The propagation probe measures C5C3/cobaltcore#1463 directly. Once per
@@ -229,25 +229,29 @@ for them. A scenario's `distribution.fan_users` adds users with that many
 grants, and the stages of its `pressure:` block grow their grants while the
 run goes on, so one run measures the listing at several sizes. Without
 stages, the 500, 1000, 2000 and 4000 grants of the table would be four runs,
-four records and four provisionings of 4000 projects. See
-[Fan users](../reference/scenario-schema.md#fan-users) for the keys and a
-scenario for C5C3/cobaltcore#1459.
+four records and four provisionings of 4000 projects. A scenario's
+`resources.implied_roles` lets the roles of the fan users' grants imply other
+roles of the plan; without such rules, Keystone expands nothing for the
+listing. See
+[Fan users](../reference/scenario-schema.md#fan-users) and
+[Implied roles](../reference/scenario-schema.md#implied-roles) for the keys
+and a scenario for C5C3/cobaltcore#1459.
 
 The fan users are extra users, not pool users given more grants. They are
 drawn after everything else in the plan, so a scenario with fan users keeps
 the regular users, their grants and with them the token pool it had without
 them, and the other operations go to the same users either way. A fan user
 holds a token of its own outside the pool, which no `revoke` or `issue` takes
-away, and `grant_churn` never touches its grants. The count an `effective`
-draw lists is therefore the count its stage set, and not one a worker changed
-a moment before.
+away, and `grant_churn` never touches its grants. An `effective` draw
+therefore lists the grants its stage set, each with the implied roles its
+role brings, and not grants a worker changed a moment before.
 
 A stage's grants are hundreds to thousands of writes to Keystone. A draw that
 ran beside them would measure Keystone under that write load, and a listing in
 their middle would see a count between two stages. So at the end of a window
 the workers finish the draws they have in flight and wait, the run makes the
 grants with no draw in flight, and the workers resume in the next stage: every
-draw of a stage lists the count the stage names. The pause costs time, not
+draw of a stage lists the grants the stage names. The pause costs time, not
 accuracy: the grants' time comes out of the stage's window, and the stage's
 throughput divides by the time after them.
 

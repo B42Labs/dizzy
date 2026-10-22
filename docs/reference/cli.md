@@ -289,8 +289,9 @@ A run goes through these steps:
    error: keystone pressure needs the admin tier: validating and revoking other users' tokens and listing their role assignments are admin operations; the caller resolved to tier "domain-manager"
    ```
 
-2. **Provisioning.** Creates the plan's domains, roles, projects, users and
-   role assignments exactly as `apply` does, without `apply`'s token stage.
+2. **Provisioning.** Creates the plan's domains, roles, implied-role rules,
+   projects, users and role assignments exactly as `apply` does, without
+   `apply`'s token stage.
    The fan users and their grants are among them.
 3. **Granting the reader role.** After the check of the plan against the
    options below, a run with a positive `probe` weight or with the
@@ -399,11 +400,12 @@ services that remain. A catalog that cannot be read fails the issue with
 re-authenticates, so a 401 is the answer to that one request, and a `probe`
 draw that gets one fails as `unauthorized`.
 
-A pool user holds only the plan's roles, which are the run's own and imply no
-other, so no service's policy names them. Under their default policies,
-Cinder's `GET /v3/<project_id>/limits` and Glance's `GET /v2/images` ask for
-`reader` on the token's project, and without it they refuse every probe with
-a 403, which fails as `forbidden`. A run with `probe` or the propagation probe
+A pool user holds only the plan's roles, which are the run's own, and a
+scenario's implied-role rules link them only to each other, so no service's
+policy names them. Under their default policies, Cinder's
+`GET /v3/<project_id>/limits` and Glance's `GET /v2/images` ask for `reader`
+on the token's project, and without it they refuse every probe with a 403,
+which fails as `forbidden`. A run with `probe` or the propagation probe
 therefore grants the pool users the cloud's `reader` role on their projects
 before the priming (step 3 above), and the teardown removes the grants with
 the rest of the run's resources. `bad_token` gets no grant: a service refuses
@@ -844,7 +846,10 @@ Discovery differs per service, and so does what `--run-id` alone can reach:
 - **keystone** — projects are found by tag (falling back to the name prefix);
   domains, users, and roles by the `dizzy-<runid>-` name prefix. Role
   assignments are best reclaimed *with* a record, which is their authoritative
-  handle.
+  handle. Implied-role rules have no name; they are deleted by id from the
+  run record, after the projects and before the roles. Without a record they
+  go with their roles, because Keystone deletes a role's implied-role rules
+  when it deletes the role.
 - **nova** — servers and data volumes are found by their `dizzy:run=<id>`
   metadata; the companion networks, subnets, and ports by the `dizzy:run=<id>`
   tag. Servers are deleted first (so their attachments release), then ports,

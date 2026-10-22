@@ -189,6 +189,7 @@ pressure:          # read only by `keystone pressure`; see "The pressure: block"
 | `resources.roles` | int | Roles. Admin-only; ignored in domain-manager mode, which reuses existing roles |
 | `resources.projects` | int | Projects |
 | `resources.users` | int | Users |
+| `resources.implied_roles` | list | Implied-role rules, each a `prior` role and the roles it `implies`, by logical name. Admin-only; see [Implied roles](#implied-roles) |
 | `distribution.projects_per_domain` | range | Clustering granularity of the round-robin deal of projects across domains — **not** a per-domain cap |
 | `distribution.assignments_per_user` | range | `(user, target, role)` grants drawn per user |
 | `distribution.domain_scoped_assignment_ratio` | ratio | Fraction of grants targeting the domain rather than a project |
@@ -251,13 +252,77 @@ terms, e.g.
 `resources.users (20) × distribution.assignments_per_user.max (3) + distribution.fan_users (1000) × distribution.fan_assignments.max (1000) = 1000060 exceeds the total assignment limit of 1000000`;
 without them it names the first alone.
 
+### Implied roles
+
+`resources.implied_roles` declares implied-role rules between the plan's own
+roles. Each rule names a `prior` role and, under `implies`, the roles it
+implies, all by logical name, from `role-0001` to the last role of
+`resources.roles`:
+
+```yaml
+resources:
+  roles: 3
+  implied_roles:
+    - { prior: role-0001, implies: [role-0002] }
+    - { prior: role-0002, implies: [role-0003] }
+```
+
+A rule gives every holder of a grant of `prior` the implied roles on the same
+target, and Keystone lists each implied role as an extra effective
+assignment. With the rules above, an effective role-assignment listing shows
+a grant of `role-0001` on a project together with `role-0002` and `role-0003`
+on that project. Since a rule names only the plan's roles, it can never name
+a cloud role such as `admin` or `reader`.
+
+In admin mode the run creates the rules right after the roles, before the
+projects and users. The run record lists each (prior, implied) pair in its
+created list as kind `implied_role`, with a logical name such as
+`role-0001->role-0002` and the id `<prior role id>:<implied role id>`; a rule
+has no cloud name. `keystone status` shows a rule as `present` or `gone`, and
+the metrics record its create and its delete under the kind `implied_role`.
+`apply --dry-run` prints an `implied roles:` line directly
+after the `roles:` line when the plan has rules. The line counts the (prior,
+implied) pairs, so a rule that implies two roles counts twice.
+
+Domain-manager mode creates no roles, so it ignores the key and logs the
+warning
+`implied-role rules are ignored in domain-manager mode, which reuses existing roles`
+with `rules=<n>`, the number of pairs.
+
+The teardown deletes the recorded rules after the projects and before the
+roles, and a 404 counts as success. Without a record, in
+`keystone cleanup --run-id` or the orphan sweep of
+`keystone monitor --reclaim-orphans`, the cleanup has no rule to delete, but
+the rules go with their roles: Keystone deletes a role's implied-role rules
+when it deletes the role. The leak check is unchanged, since a rule cannot
+outlive its roles.
+
+A cycle, such as `role-0001` implying `role-0002` and `role-0002` implying
+`role-0001`, is allowed: Keystone accepts it, and its expansion stops at a
+cycle. The key has no `--set` form; declare the rules in the scenario file.
+See [A fan for C5C3/cobaltcore#1459](#a-fan-for-c5c3cobaltcore1459) for a
+scenario whose fan user's grants carry implied roles.
+
+With rules declared, validation checks the role count first, then each rule
+in turn: its `implies` list, its `prior`, and then each entry of its
+`implies` in turn. It reports the first failure, in this order:
+
+- `resources.roles must be at least 2 when implied_roles are declared, got 1`
+- `resources.implied_roles[0].implies must name at least one role`
+- `resources.implied_roles[0].prior "role-0004" is not a role of the plan, whose roles are role-0001 to role-0003`
+- `resources.implied_roles[0].implies[0] "role-0004" is not a role of the plan, whose roles are role-0001 to role-0003`
+- `resources.implied_roles[0].implies[0] lets "role-0001" imply itself`
+- `resources.implied_roles[1].implies[0] repeats the rule "role-0001" implies "role-0002"`,
+  for a pair that an earlier rule or entry already declared
+
 ### A fan for C5C3/cobaltcore#1459
 
 C5C3/cobaltcore#1459 makes the effective-assignment listing linear in the
 number of grants. Showing that takes one user with thousands of grants and a
-measurement at several sizes. This scenario gives one fan user 500 grants and
-grows them to 1000, 2000 and 4000 in four stages of 5 minutes each, while the
-workers draw `validate` and `effective` only:
+measurement at several sizes. This scenario gives one fan user 500 grants of
+roles that carry implied roles and grows them to 1000, 2000 and 4000 in four
+stages of 5 minutes each, while the workers draw `validate`, `effective` and
+`grant_churn` only:
 
 ```yaml
 name: fan-1459
@@ -265,9 +330,12 @@ seed: 42
 
 resources:
   domains:  1
-  roles:    2
+  roles:    3
   projects: 4000
   users:    20
+  implied_roles:
+    - { prior: role-0001, implies: [role-0002] }
+    - { prior: role-0002, implies: [role-0003] }
 
 distribution:
   projects_per_domain:            { min: 1, max: 3 }
@@ -283,7 +351,7 @@ pressure:
     validate:    10
     effective:   20
     revoke:       0
-    grant_churn:  0
+    grant_churn: 20
     issue:        0
   stages:          # four windows of 5m each
     - fan_assignments: 500
@@ -296,13 +364,30 @@ pressure:
 $ dizzy keystone apply --scenario fan-1459.yaml --dry-run
 Plan for scenario "fan-1459" (seed 42)
   domains:         1
-  roles:           2
+  roles:           3
+  implied roles:   2
   projects:        4000
   users:           21
   fan users:       1
   assignments:     542 (1 domain-scoped)
   token issues:    11
 ```
+
+The two rules have the shape of the chain of Keystone's default roles, in
+which `admin` implies `member` and `member` implies `reader`, between the
+plan's own roles. A fan grant of `role-0001`
+brings two implied assignments, a grant of `role-0002` one and a grant of
+`role-0003` none. The fan user's grants draw their roles from all three, and
+the grants of a stage take them in turn, so on average each grant brings one
+implied assignment, and the listing at 4000 grants returns about 8000
+entries.
+
+`grant_churn` at the weight of `effective` keeps Keystone's cache of computed
+assignments cold. Keystone answers a repeated listing of the same user from
+that cache until the next assignment write, and a cached listing expands
+nothing. Each `grant_churn` draw makes two such writes: it unassigns a churn
+user's grant and assigns it again. The churn user is `user-0020`, the last
+regular user, since `churn_users` falls back to 1.
 
 `keystone pressure --scenario fan-1459.yaml` then prints a `Stages` table with
 an `effective` row per stage: the listing latency at 500, 1000, 2000 and 4000
@@ -825,10 +910,11 @@ in the block fails parsing, as everywhere in a scenario.
 All three Keystone profiles carry a `pressure:` block with `duration`,
 `workers` and `tokens` (see [Keystone](#keystone)), so `keystone pressure`
 runs any of them with no flags. None sets `churn_users`, `mix`, `propagation`,
-`bucket_width` or `stages`, and none sets `distribution.fan_users`; the
-scenario of [A fan for C5C3/cobaltcore#1459](#a-fan-for-c5c3cobaltcore1459)
-is the starting point for a run with fan users and stages. The block has no
-`--set` keys. See
+`bucket_width` or `stages`, none sets `distribution.fan_users`, and none
+declares `resources.implied_roles`; the scenario of
+[A fan for C5C3/cobaltcore#1459](#a-fan-for-c5c3cobaltcore1459) is the
+starting point for a run with fan users, implied roles and stages. The block
+has no `--set` keys. See
 [`pressure`](cli.md#pressure) for what each operation sends and
 [Pressure mode](../explanation/pressure-mode.md) for why the load is built
 this way.

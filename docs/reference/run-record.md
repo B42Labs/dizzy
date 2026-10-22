@@ -57,8 +57,8 @@ is the same whichever service produced it.
 
 On a `mix` record the list holds every persona's resources, persona by persona,
 and then every lane's, lane by lane, each lane with the resources it created
-before its engine started (the Keystone lane's domains and roles) first. An
-empty run writes `"created": []`.
+before its engine started (the Keystone lane's domains, roles and implied-role
+rules) first. An empty run writes `"created": []`.
 
 On a `keystone pressure` record the list also holds, after the provisioned
 resources, the grants of the cloud's `reader` role to the pool users that a

@@ -19,15 +19,16 @@ tokens and listing their role assignments are admin operations in Keystone's
 default policy, and a tier that cannot run three of its seven operations would
 measure something else. For `probe` and the propagation probe, the admin tier
 also grants the cloud's `reader` role to the pool users on their projects
-before it primes the pool. The plan's roles are the run's own and imply no
-other, while Cinder's `GET /v3/<project_id>/limits` and Glance's
-`GET /v2/images` ask for `reader` on the token's project under their default
-policies. The requests to the services themselves need no admin right:
-`probe` and the polls of the propagation probe go out to Nova, Neutron, Cinder
-and Glance with the pool users' own tokens, each a read that `reader` on the
-token's project allows, and `bad_token` sends tokens the service has to
-refuse, for which a pool user needs no role. The propagation probe's
-revocations, like those of `revoke`, go to Keystone with the admin token.
+before it primes the pool. The plan's roles are the run's own, and a
+scenario's implied-role rules link them only to each other, while Cinder's
+`GET /v3/<project_id>/limits` and Glance's `GET /v2/images` ask for `reader`
+on the token's project under their default policies. The requests to the
+services themselves need no admin right: `probe` and the polls of the
+propagation probe go out to Nova, Neutron, Cinder and Glance with the pool
+users' own tokens, each a read that `reader` on the token's project allows,
+and `bad_token` sends tokens the service has to refuse, for which a pool user
+needs no role. The propagation probe's revocations, like those of `revoke`, go
+to Keystone with the admin token.
 `pressure` classifies the caller only with `--privilege auto`;
 `--privilege admin` asserts the tier without the classification call. A
 caller classified as a domain manager fails before any write, and
@@ -61,7 +62,9 @@ it at apply time. Here the cloud-specific fact is *who you are*.
 
 **In admin mode** the binder creates the plan's domains and roles, and everything
 else hangs off them. The run is fully self-contained: it brings its own domains,
-its own roles, and removes both at teardown.
+its own roles, and removes both at teardown. Right after the roles it also
+creates the scenario's implied-role rules, which link only the run's own
+roles, and the teardown removes them too.
 
 **In domain-manager mode** the binder creates no domains and no roles. It *binds*
 every logical domain in the plan onto the single in-scope domain — the caller's,
@@ -76,11 +79,16 @@ It follows that some scenarios are admin-only. A plan asking for
 rejects it in domain-manager mode. `resources.roles` is simply ignored there —
 roles are reused, not created. This is why the shipped `small` Keystone profile
 declares exactly one domain, and `medium` and `large` do not.
+`resources.implied_roles` is ignored in domain-manager mode as well, since the
+rules link roles the run creates and this mode creates none, and the run logs
+the warning
+`implied-role rules are ignored in domain-manager mode, which reuses existing roles`
+with `rules=<n>`.
 
 ## Why token issue is an operation
 
-The six Keystone operations are: create domain, create user, create project,
-create role, assign role, and **issue token**.
+The seven Keystone operations are: create domain, create user, create project,
+create role, create implied-role rule, assign role, and **issue token**.
 
 The last is different in kind. It authenticates *as a created user* and obtains a
 project-scoped token — the tool's first operation that acts as a principal it
@@ -154,8 +162,13 @@ pre-existing domain and uses pre-existing roles, neither of which it may delete.
 
 Teardown therefore runs in reverse dependency order and touches only resources
 carrying the run's name prefix: tokens need no teardown (they expire); role
-assignments are unassigned; users deleted; projects deleted; roles deleted **only
-in admin mode**; domains disabled and then deleted, again **only in admin mode**.
+assignments are unassigned; users deleted; projects deleted; implied-role rules
+and then roles deleted **only in admin mode**; domains disabled and then
+deleted, again **only in admin mode**.
+
+An implied-role rule carries no name prefix, since it has no name. The teardown
+deletes the rules the run record lists, and without a record they go with their
+roles: Keystone deletes a role's implied-role rules when it deletes the role.
 
 The disable-before-delete is a Keystone requirement — it refuses to delete an
 enabled domain — which is why an `update` operation appears in a Keystone run's
