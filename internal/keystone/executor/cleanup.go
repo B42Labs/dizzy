@@ -29,18 +29,22 @@ type Cleaner interface {
 var _ Cleaner = (*keystone.Client)(nil)
 
 // Cleanup deletes every resource a run created in reverse dependency order —
-// unassign role assignments, delete users, delete projects, delete roles
-// (admin-created only), then disable-then-delete domains (admin-created only) —
-// returning the number deleted. Each kind is discovered by the run's name prefix
-// (projects additionally by tag) and unioned (deduplicated by id) with the run
-// record's created list as a belt-and-suspenders handle, so it never touches
-// resources the tool did not create and still reclaims a resource whose listing
-// missed it. Assignments are additionally discovered from each surviving user's
-// live grants. Keystone refuses to delete an enabled domain, so each domain is
-// disabled before it is deleted (a cascade removes its remaining contents). An
-// already-gone resource (a 404) counts as success, so running Cleanup twice is a
-// no-op; each mutating op is bounded by opTimeout. The first non-404 error stops
-// the run and is returned with the count deleted so far.
+// unassign role assignments, delete users, delete projects, delete implied-role
+// rules, delete roles (admin-created only), then disable-then-delete domains
+// (admin-created only) — returning the number deleted. Each kind is discovered
+// by the run's name prefix (projects additionally by tag) and unioned
+// (deduplicated by id) with the run record's created list as a
+// belt-and-suspenders handle, so it never touches resources the tool did not
+// create and still reclaims a resource whose listing missed it. Assignments are
+// additionally discovered from each surviving user's live grants. Implied-role
+// rules have no name or tag and are deleted from the record only: a sweep
+// without a record reaches them through their roles, since Keystone deletes a
+// role's rules when it deletes the role. Keystone refuses to delete an enabled
+// domain, so each domain is disabled before it is deleted (a cascade removes
+// its remaining contents). An already-gone resource (a 404) counts as success,
+// so running Cleanup twice is a no-op; each mutating op is bounded by
+// opTimeout. The first non-404 error stops the run and is returned with the
+// count deleted so far.
 //
 // Roles and domains are additionally guarded by the dizzy- name prefix
 // (HasNamePrefix): in domain-manager mode the run shares a pre-existing domain
@@ -95,6 +99,15 @@ func Cleanup(ctx context.Context, c Cleaner, runID string, recorded []resource.R
 		return deleted, err
 	}
 	n, err = deleteResources(ctx, c, union(discoveredProjects, recordedOfKind(recorded, keystone.KindProject)), opTimeout)
+	deleted += n
+	if err != nil {
+		return deleted, err
+	}
+
+	// Delete the implied-role rules before their roles — admin-created only, as
+	// no domain-manager run records one. They are discovered from the record
+	// alone; deleting a role removes any rule the record missed.
+	n, err = deleteResources(ctx, c, union(recordedOfKind(recorded, keystone.KindImpliedRole)), opTimeout)
 	deleted += n
 	if err != nil {
 		return deleted, err

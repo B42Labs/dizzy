@@ -1,11 +1,14 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -26,8 +29,9 @@ type fakeKeystone struct {
 	mu     sync.Mutex
 	nextID int
 
-	opOrder  []string       // "domain"/"role"/"project"/"user"/"assign"/"token" in call-start order
-	attempts map[string]int // create attempts per logical name
+	opOrder     []string       // "domain"/"role"/"implied_role"/"project"/"user"/"assign"/"token" in call-start order
+	attempts    map[string]int // create attempts per logical name
+	ruleRoleIDs [][2]string    // the (prior, implied) role ids of every created implied-role rule
 
 	forbid   map[string]bool // logical -> return a 403 (wrapped ErrForbidden)
 	conflict map[string]bool // logical -> return a 409 (terminal)
@@ -112,6 +116,21 @@ func (f *fakeKeystone) CreateRole(ctx context.Context, r plan.Role) (resource.Re
 		return resource.Resource{}, err
 	}
 	return f.record(keystone.KindRole, r.Name), nil
+}
+
+// CreateImpliedRole records the rule r between the role ids it is handed and
+// returns a resource with the client's synthetic id <prior>:<implied>. A
+// failure is injected by the rule's label, prior->implied.
+func (f *fakeKeystone) CreateImpliedRole(ctx context.Context, r plan.ImpliedRole, priorRoleID, impliedRoleID string) (resource.Resource, error) {
+	f.note("implied_role")
+	logical := r.Prior + "->" + r.Implied
+	if err := f.injectedErr(logical); err != nil {
+		return resource.Resource{}, err
+	}
+	f.mu.Lock()
+	f.ruleRoleIDs = append(f.ruleRoleIDs, [2]string{priorRoleID, impliedRoleID})
+	f.mu.Unlock()
+	return resource.Resource{Kind: keystone.KindImpliedRole, Logical: logical, ID: priorRoleID + ":" + impliedRoleID}, nil
 }
 
 func (f *fakeKeystone) CreateProject(ctx context.Context, p plan.Project, domainID string) (resource.Resource, error) {
@@ -586,5 +605,177 @@ func TestProvisionRootFailureReturnsResult(t *testing.T) {
 	}
 	if len(prov.Created) != 0 || len(prov.IDs) != 0 || prov.IDs == nil || prov.Passwords == nil {
 		t.Errorf("result = %+v, want nothing created and non-nil empty maps", prov)
+	}
+}
+
+// impliedRolePlan is fullPlan with a third role and the chain role-0001 ->
+// role-0002 -> role-0003 as its implied-role rules.
+func impliedRolePlan() *plan.Plan {
+	p := fullPlan()
+	p.Roles = append(p.Roles, plan.Role{Name: "role-0003"})
+	p.ImpliedRoles = []plan.ImpliedRole{
+		{Prior: "role-0001", Implied: "role-0002"},
+		{Prior: "role-0002", Implied: "role-0003"},
+	}
+	return p
+}
+
+// countOps returns how often op appears in the fake's call order.
+func (f *fakeKeystone) countOps(op string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, o := range f.opOrder {
+		if o == op {
+			n++
+		}
+	}
+	return n
+}
+
+// TestApplyCreatesImpliedRolesAfterRoles confirms admin mode creates the
+// implied-role rules as a stage of their own, after every role and before any
+// project or user, with the cloud ids the roles stage returned, and records
+// them in Created right after the roles.
+func TestApplyCreatesImpliedRolesAfterRoles(t *testing.T) {
+	f := newFake()
+	res, err := Apply(context.Background(), f, impliedRolePlan(), keystone.TierAdmin, adminRes(), 4, time.Minute)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	rank := map[string]int{"domain": 0, "role": 1, "implied_role": 2, "project": 3, "user": 3, "assign": 4, "token": 5}
+	phase := 0
+	for i, op := range f.opOrder {
+		if rank[op] < phase {
+			t.Fatalf("op %q at index %d violates stage order %v", op, i, f.opOrder)
+		}
+		phase = rank[op]
+	}
+	if n := f.countOps("implied_role"); n != 2 {
+		t.Errorf("CreateImpliedRole called %d times, want 2", n)
+	}
+
+	// 1 domain + 3 roles + 2 rules + 2 projects + 2 users + 2 assignments.
+	if len(res.Created) != 12 {
+		t.Fatalf("created %d resources, want 12: %+v", len(res.Created), res.Created)
+	}
+	roleIDs := make(map[string]string)
+	for _, r := range res.Created[1:4] {
+		if r.Kind != keystone.KindRole {
+			t.Fatalf("Created[1:4] = %+v, want the three roles", res.Created[1:4])
+		}
+		roleIDs[r.Logical] = r.ID
+	}
+	wantRules := []resource.Resource{
+		{Kind: keystone.KindImpliedRole, Logical: "role-0001->role-0002", ID: roleIDs["role-0001"] + ":" + roleIDs["role-0002"]},
+		{Kind: keystone.KindImpliedRole, Logical: "role-0002->role-0003", ID: roleIDs["role-0002"] + ":" + roleIDs["role-0003"]},
+	}
+	if got := res.Created[4:6]; !slices.Equal(got, wantRules) {
+		t.Errorf("Created[4:6] = %+v, want the rules %+v right after the roles", got, wantRules)
+	}
+	f.mu.Lock()
+	gotIDs := slices.Clone(f.ruleRoleIDs)
+	f.mu.Unlock()
+	slices.SortFunc(gotIDs, func(a, b [2]string) int { return strings.Compare(a[0]+a[1], b[0]+b[1]) })
+	wantIDs := [][2]string{{roleIDs["role-0001"], roleIDs["role-0002"]}, {roleIDs["role-0002"], roleIDs["role-0003"]}}
+	slices.SortFunc(wantIDs, func(a, b [2]string) int { return strings.Compare(a[0]+a[1], b[0]+b[1]) })
+	if !slices.Equal(gotIDs, wantIDs) {
+		t.Errorf("rules created between role ids %v, want %v", gotIDs, wantIDs)
+	}
+}
+
+// TestApplyWithoutImpliedRolesCreatesNone confirms a plan without rules makes
+// no CreateImpliedRole call.
+func TestApplyWithoutImpliedRolesCreatesNone(t *testing.T) {
+	f := newFake()
+	if _, err := Apply(context.Background(), f, fullPlan(), keystone.TierAdmin, adminRes(), 4, time.Minute); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if n := f.countOps("implied_role"); n != 0 {
+		t.Errorf("CreateImpliedRole called %d times for a plan without rules, want 0", n)
+	}
+}
+
+// TestApplyImpliedRoleConflictStopsBeforeChildren confirms a 409 on the second
+// rule is not retried, fails the run before any project or user is created,
+// and leaves the roots made before it, the first rule among them, in Created
+// for the teardown.
+func TestApplyImpliedRoleConflictStopsBeforeChildren(t *testing.T) {
+	f := newFake()
+	f.conflict["role-0002->role-0003"] = true
+
+	res, err := Apply(context.Background(), f, impliedRolePlan(), keystone.TierAdmin, adminRes(), 1, time.Minute)
+	if !gophercloud.ResponseCodeIs(err, 409) {
+		t.Fatalf("Apply error = %v, want the 409 of the second rule", err)
+	}
+	if n := f.attempts["role-0002->role-0003"]; n != 1 {
+		t.Errorf("conflicting rule attempted %d times, want 1 (409 is terminal)", n)
+	}
+	if n := f.countOps("project") + f.countOps("user"); n != 0 {
+		t.Errorf("%d project/user create(s) after a failed rule, want 0", n)
+	}
+	var kinds []resource.Kind
+	for _, r := range res.Created {
+		kinds = append(kinds, r.Kind)
+	}
+	want := []resource.Kind{keystone.KindDomain, keystone.KindRole, keystone.KindRole, keystone.KindRole, keystone.KindImpliedRole}
+	if !slices.Equal(kinds, want) {
+		t.Errorf("Created kinds = %v, want %v", kinds, want)
+	}
+	if last := res.Created[len(res.Created)-1]; last.Logical != "role-0001->role-0002" {
+		t.Errorf("recorded rule = %q, want role-0001->role-0002", last.Logical)
+	}
+}
+
+// TestApplyImpliedRoleRetriesTransient confirms a transient 503 on a rule is
+// retried and the rule is created on the third attempt.
+func TestApplyImpliedRoleRetriesTransient(t *testing.T) {
+	f := newFake()
+	f.failures["role-0001->role-0002"] = 2
+
+	if _, err := Apply(context.Background(), f, impliedRolePlan(), keystone.TierAdmin, adminRes(), 1, time.Minute); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if n := f.attempts["role-0001->role-0002"]; n != 3 {
+		t.Errorf("role-0001->role-0002 attempted %d times, want 3", n)
+	}
+}
+
+// TestApplyDomainManagerIgnoresImpliedRoles confirms domain-manager mode
+// creates no implied-role rule, since it reuses roles a manager may not
+// change, and logs one warning that the plan's rules are ignored, and none
+// for a plan without rules.
+func TestApplyDomainManagerIgnoresImpliedRoles(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	f := newFake()
+	res := keystone.Resolution{DomainID: "dm-real", RoleIDs: []string{"role-a", "role-b"}}
+	result, err := Apply(context.Background(), f, impliedRolePlan(), keystone.TierDomainManager, res, 4, time.Minute)
+	if err != nil {
+		t.Fatalf("Apply (domain-manager): %v", err)
+	}
+	if n := f.countOps("implied_role"); n != 0 {
+		t.Errorf("domain-manager mode called CreateImpliedRole %d times, want 0", n)
+	}
+	for _, r := range result.Created {
+		if r.Kind == keystone.KindImpliedRole {
+			t.Errorf("domain-manager mode recorded the rule %+v", r)
+		}
+	}
+	const msg = `level=WARN msg="implied-role rules are ignored in domain-manager mode, which reuses existing roles" rules=2`
+	if n := strings.Count(logs.String(), msg); n != 1 {
+		t.Errorf("log has %d line(s) %q, want 1:\n%s", n, msg, logs.String())
+	}
+
+	logs.Reset()
+	if _, err := Apply(context.Background(), newFake(), fullPlan(), keystone.TierDomainManager, res, 4, time.Minute); err != nil {
+		t.Fatalf("Apply (domain-manager, no rules): %v", err)
+	}
+	if strings.Contains(logs.String(), "implied-role rules are ignored") {
+		t.Errorf("a plan without rules logged the implied-role warning:\n%s", logs.String())
 	}
 }

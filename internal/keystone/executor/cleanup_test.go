@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -266,5 +267,85 @@ func strCount(events []string, s string) int {
 func TestForbiddenSentinelWired(t *testing.T) {
 	if !errors.Is(wrapForbidden(), keystone.ErrForbidden) {
 		t.Error("the test forbidden wrapper does not match keystone.ErrForbidden")
+	}
+}
+
+// recordedRule is an implied-role rule between the seeded role r1 and a second
+// role r2, as a run record lists it.
+var recordedRule = resource.Resource{Kind: keystone.KindImpliedRole, Logical: "role-0001->role-0002", ID: "r1:r2"}
+
+// TestCleanupDeletesImpliedRolesBeforeRoles confirms a recorded implied-role
+// rule is deleted after every project and before every role, and counts. The
+// record lists the role, the rule and the project in the order a run creates
+// them, so a rule step that took more than the record's rules would delete
+// the role before the rule.
+func TestCleanupDeletesImpliedRolesBeforeRoles(t *testing.T) {
+	f := seedRun()
+	recorded := []resource.Resource{f.roles[0], recordedRule, f.projects[0]}
+	deleted, err := Cleanup(context.Background(), f, "run0", recorded, time.Minute)
+	if err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	// assignment + user + project + rule + role + domain.
+	if deleted != 6 {
+		t.Errorf("deleted %d resources, want 6", deleted)
+	}
+	order := []string{"del:p1", "del:r1:r2", "del:r1"}
+	prev := -1
+	for _, e := range order {
+		at := idx(f.events, e)
+		if at < 0 {
+			t.Fatalf("event %q never happened; log=%v", e, f.events)
+		}
+		if at < prev {
+			t.Fatalf("event %q out of order; log=%v", e, f.events)
+		}
+		prev = at
+	}
+}
+
+// TestCleanupImpliedRoleAlreadyGone confirms a rule Keystone answers 404 for,
+// gone with its role or deleted before, counts as success but not as a
+// deletion, so the sweep goes on to the roles.
+func TestCleanupImpliedRoleAlreadyGone(t *testing.T) {
+	f := seedRun()
+	f.gone[recordedRule.ID] = true
+	deleted, err := Cleanup(context.Background(), f, "run0", []resource.Resource{recordedRule}, time.Minute)
+	if err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	if deleted != 5 {
+		t.Errorf("deleted %d resources, want 5 (the gone rule is not counted)", deleted)
+	}
+	if idx(f.events, "del:r1") < 0 {
+		t.Errorf("the role was not deleted after the gone rule; log=%v", f.events)
+	}
+}
+
+// TestCleanupImpliedRoleDeleteFails confirms a non-404 failure deleting a rule
+// stops the sweep before any role and names the rule.
+func TestCleanupImpliedRoleDeleteFails(t *testing.T) {
+	f := seedRun()
+	f.failDel[recordedRule.ID] = gophercloud.ErrUnexpectedResponseCode{Actual: 500}
+	_, err := Cleanup(context.Background(), f, "run0", []resource.Resource{recordedRule}, time.Minute)
+	if err == nil || !strings.HasPrefix(err.Error(), "deleting implied_role r1:r2: ") {
+		t.Fatalf("Cleanup error = %v, want one starting with %q", err, "deleting implied_role r1:r2: ")
+	}
+	if idx(f.events, "del:r1") >= 0 {
+		t.Errorf("a role was deleted after the rule failed; log=%v", f.events)
+	}
+}
+
+// TestCleanupWithoutRecordedImpliedRoles confirms a sweep without a record,
+// as keystone cleanup --run-id makes, attempts no rule delete: it lists no
+// rules, and Keystone removes them with their roles.
+func TestCleanupWithoutRecordedImpliedRoles(t *testing.T) {
+	f := seedRun()
+	if _, err := Cleanup(context.Background(), f, "run0", nil, time.Minute); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	want := []string{"del:u1:project:p1:r1", "del:u1", "del:p1", "del:r1", "disable:d1", "del:d1"}
+	if !slices.Equal(f.events, want) {
+		t.Errorf("events = %v, want %v", f.events, want)
 	}
 }

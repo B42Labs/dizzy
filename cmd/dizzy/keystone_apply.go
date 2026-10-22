@@ -25,11 +25,11 @@ import (
 // scenario into a plan and prints a summary without making any API calls.
 // Without --dry-run it authenticates, runs the read-only privilege pre-check
 // (which replaces the quota pre-check Neutron/Cinder run), creates domains,
-// roles, projects, users, assigns roles, and issues tokens, then prints the
-// collected timing metrics. On Ctrl-C / SIGTERM the run record is written and
-// the partial topology is torn down (assignments, users, projects, then roles
-// and domains); --keep-on-abort leaves it in place with the cleanup hint; a
-// second signal aborts hard.
+// roles, implied-role rules, projects, users, assigns roles, and issues
+// tokens, then prints the collected timing metrics. On Ctrl-C / SIGTERM the run
+// record is written and the partial topology is torn down (assignments, users,
+// projects, then implied-role rules, roles and domains); --keep-on-abort leaves
+// it in place with the cleanup hint; a second signal aborts hard.
 func newKeystoneApplyCmd(opts *globalOptions) *cobra.Command {
 	var (
 		scenarioPath string

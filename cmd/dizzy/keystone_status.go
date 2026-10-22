@@ -16,9 +16,9 @@ import (
 
 // newKeystoneStatusCmd builds "keystone status", which loads a keystone run
 // record, authenticates against the cloud, and re-queries the live state of
-// every domain, role, project, user, and role assignment the run created,
-// printing a table of logical name, kind, id, and current state. A resource that
-// no longer exists shows as "gone".
+// every domain, role, implied-role rule, project, user, and role assignment the
+// run created, printing a table of logical name, kind, id, and current state. A
+// resource that no longer exists shows as "gone".
 func newKeystoneStatusCmd(opts *globalOptions) *cobra.Command {
 	var runPath string
 

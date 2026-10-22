@@ -18,9 +18,11 @@ import (
 )
 
 // newKeystoneCleanupCmd builds "keystone cleanup", which deletes every domain,
-// role, project, user, and role assignment a run created, identified strictly by
-// the run's dizzy-<id>- name prefix (projects also by tag), in reverse
-// dependency order. It is idempotent: a second run deletes nothing. The run is
+// role, implied-role rule, project, user, and role assignment a run created,
+// identified strictly by the run's dizzy-<id>- name prefix (projects also by
+// tag; implied-role rules, which have no name, by the run record, and without
+// one with their roles), in reverse dependency order. It is idempotent: a
+// second run deletes nothing. The run is
 // identified either by its record (--run) or directly by id (--run-id); exactly
 // one is required.
 func newKeystoneCleanupCmd(opts *globalOptions) *cobra.Command {
