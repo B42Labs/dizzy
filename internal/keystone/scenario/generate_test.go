@@ -359,3 +359,50 @@ func TestGenerateFanZeroLeavesPlanUnchanged(t *testing.T) {
 		t.Error("a fan_assignments range without fan users changed the generated plan")
 	}
 }
+
+// TestGenerateImpliedRoles confirms every implied role of a rule becomes one
+// (prior, implied) pair of the plan, rule by rule and entry by entry in
+// declaration order.
+func TestGenerateImpliedRoles(t *testing.T) {
+	s := smallScenario()
+	s.Resources.Roles = 3
+	s.Resources.ImpliedRoles = []ImpliedRole{
+		{Prior: "role-0001", Implies: []string{"role-0002", "role-0003"}},
+		{Prior: "role-0002", Implies: []string{"role-0003"}},
+	}
+	p, err := s.Generate()
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	want := []plan.ImpliedRole{
+		{Prior: "role-0001", Implied: "role-0002"},
+		{Prior: "role-0001", Implied: "role-0003"},
+		{Prior: "role-0002", Implied: "role-0003"},
+	}
+	if !reflect.DeepEqual(p.ImpliedRoles, want) {
+		t.Errorf("ImpliedRoles = %+v, want %+v", p.ImpliedRoles, want)
+	}
+}
+
+// TestGenerateImpliedRolesDrawNothing confirms the rules take no draw: the
+// small scenario with a rule generates the golden plan byte for byte once its
+// rules are set aside, so a scenario's rules change nothing else of its plan.
+func TestGenerateImpliedRolesDrawNothing(t *testing.T) {
+	s := smallScenario()
+	s.Resources.ImpliedRoles = []ImpliedRole{{Prior: "role-0001", Implies: []string{"role-0002"}}}
+	p, err := s.Generate()
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	if len(p.ImpliedRoles) != 1 {
+		t.Fatalf("ImpliedRoles = %+v, want one rule", p.ImpliedRoles)
+	}
+	p.ImpliedRoles = nil
+	want, err := os.ReadFile(filepath.Join("testdata", "golden", "small.plan.json"))
+	if err != nil {
+		t.Fatalf("reading golden file: %v", err)
+	}
+	if !bytes.Equal(marshal(t, p), want) {
+		t.Error("an implied-role rule changed the rest of the generated plan")
+	}
+}

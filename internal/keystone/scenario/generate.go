@@ -15,8 +15,10 @@ import (
 //
 // The draw order is fixed and pinned by the golden test:
 //
-//  1. domains (dom-%04d) and 2. roles (role-%04d) — no draws; they are named
-//     scaffolding the binder maps onto created-or-reused reality per tier.
+//  1. domains (dom-%04d) and 2. roles (role-%04d) and their implied-role rules,
+//     one (prior, implied) pair per implied role in declaration order — no
+//     draws; they are named scaffolding the binder maps onto created-or-reused
+//     reality per tier, so a plan without rules draws exactly as before.
 //  3. projects (proj-%04d) — the fixed projects count is dealt across domains in
 //     round-robin batches: cycling the domain list, each turn draws a run length
 //     from projects_per_domain and assigns that many next projects to the
@@ -56,7 +58,15 @@ func (s Scenario) Generate() (*plan.Plan, error) {
 
 	p.Roles = make([]plan.Role, 0, s.Resources.Roles)
 	for i := 0; i < s.Resources.Roles; i++ {
-		p.Roles = append(p.Roles, plan.Role{Name: fmt.Sprintf("role-%04d", i+1)})
+		p.Roles = append(p.Roles, plan.Role{Name: roleName(i + 1)})
+	}
+
+	// The implied-role rules are declared, not drawn, so they leave the RNG
+	// sequence undisturbed; without rules p.ImpliedRoles stays nil.
+	for _, r := range s.Resources.ImpliedRoles {
+		for _, implied := range r.Implies {
+			p.ImpliedRoles = append(p.ImpliedRoles, plan.ImpliedRole{Prior: r.Prior, Implied: implied})
+		}
 	}
 
 	// Deal the fixed project count across the domains in round-robin batches, so
