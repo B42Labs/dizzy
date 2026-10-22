@@ -248,8 +248,8 @@ comes after the Keystone lane's, and domains created before it fails would
 have to be torn down again. The Keystone lane therefore creates its scaffold in
 a step of its own, once every persona and every lane has passed its
 pre-checks. When that step fails, the run deletes what the step created and
-stops. The domains and roles it created join the record as the lane's first
-resources, so the teardown and `mix cleanup` reclaim them.
+stops. The domains, roles and implied-role rules it created join the record
+as the lane's first resources, so the teardown and `mix cleanup` reclaim them.
 
 A lane that names no `clouds.yaml` entry authenticates with `--os-cloud`, the
 project of every persona that names none either. It then shares that
