@@ -1329,6 +1329,12 @@ func (f *fakePressureKeystone) CreateRole(_ context.Context, r keystoneplan.Role
 	return f.created(keystone.KindRole, r.Name), nil
 }
 
+// CreateImpliedRole creates the implied-role rule r between the two role ids
+// with the client's synthetic id <prior>:<implied>.
+func (f *fakePressureKeystone) CreateImpliedRole(_ context.Context, r keystoneplan.ImpliedRole, priorRoleID, impliedRoleID string) (resource.Resource, error) {
+	return resource.Resource{Kind: keystone.KindImpliedRole, Logical: r.Prior + "->" + r.Implied, ID: priorRoleID + ":" + impliedRoleID}, nil
+}
+
 // CreateProject creates the project p with an id derived from its name.
 func (f *fakePressureKeystone) CreateProject(_ context.Context, p keystoneplan.Project, _ string) (resource.Resource, error) {
 	return f.created(keystone.KindProject, p.Name), nil
@@ -1794,6 +1800,56 @@ func TestRunKeystonePressureCompletes(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("output %q missing %q", out.String(), want)
 		}
+	}
+}
+
+// TestRunKeystonePressureImpliedRoles drives a run over a plan with an
+// implied-role rule: provisioning creates the rule after the roles, the record
+// lists it there, and the teardown deletes it before the roles.
+func TestRunKeystonePressureImpliedRoles(t *testing.T) {
+	t.Chdir(t.TempDir())
+	body := strings.Replace(sampleKeystoneScenarioYAML, "  users:    4\n",
+		"  users:    4\n  implied_roles:\n    - { prior: role-0001, implies: [role-0002] }\n", 1)
+	p := generateTestPlan(t, body)
+	if len(p.ImpliedRoles) != 1 {
+		t.Fatalf("the test plan has the implied-role rules %+v, want one", p.ImpliedRoles)
+	}
+	f := &fakePressureKeystone{}
+	cmd := &cobra.Command{}
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+
+	if err := runKeystonePressure(context.Background(), cmd, f, pressureTestRun(t, p)); err != nil {
+		t.Fatalf("runKeystonePressure: %v", err)
+	}
+
+	rec := loadPressureTestRecord(t)
+	rule := resource.Resource{Kind: keystone.KindImpliedRole, Logical: "role-0001->role-0002", ID: "id-role-0001:id-role-0002"}
+	at := slices.Index(rec.Created, rule)
+	if at < 0 {
+		t.Fatalf("record does not list the rule %+v: %+v", rule, rec.Created)
+	}
+	for i, r := range rec.Created {
+		if (r.Kind == keystone.KindRole && i > at) || ((r.Kind == keystone.KindProject || r.Kind == keystone.KindUser) && i < at) {
+			t.Errorf("created %s %q at %d, rule at %d; want the rule after every role and before every project and user", r.Kind, r.Logical, i, at)
+		}
+	}
+
+	f.mu.Lock()
+	deleted := slices.Clone(f.deleted)
+	f.mu.Unlock()
+	ruleAt := slices.Index(deleted, rule)
+	if ruleAt < 0 {
+		t.Fatalf("the teardown did not delete the rule; deleted %+v", deleted)
+	}
+	for i, r := range deleted {
+		if r.Kind == keystone.KindRole && i < ruleAt {
+			t.Errorf("the teardown deleted role %q at %d before the rule at %d", r.Logical, i, ruleAt)
+		}
+	}
+	wantCreated := len(p.Domains) + len(p.Roles) + len(p.ImpliedRoles) + len(p.Projects) + len(p.Users) + len(p.Assignments)
+	if want := fmt.Sprintf("deleted %d resource(s) for run %s", wantCreated, pressureTestRunID); !strings.Contains(out.String(), want) {
+		t.Errorf("output %q missing %q", out.String(), want)
 	}
 }
 

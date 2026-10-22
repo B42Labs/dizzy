@@ -1,7 +1,8 @@
-// Package executor turns a Keystone plan into real domains, roles, projects,
-// users, role assignments, and issued tokens. It runs strictly ordered stages —
-// bind the roots (create domains and roles in admin mode; map onto the in-scope
-// domain and reused roles in domain-manager mode), create projects and users
+// Package executor turns a Keystone plan into real domains, roles, implied-role
+// rules, projects, users, role assignments, and issued tokens. It runs strictly
+// ordered stages — bind the roots (create domains, roles and the rules between
+// the roles in admin mode; map onto the in-scope domain and reused roles in
+// domain-manager mode), create projects and users
 // concurrently, grant role assignments, then issue tokens — with independent
 // work within a stage run concurrently up to a configurable limit, transient
 // failures retried with exponential backoff, a 403 policy denial failing fast
@@ -41,6 +42,7 @@ const (
 type Keystone interface {
 	CreateDomain(ctx context.Context, d plan.Domain) (resource.Resource, error)
 	CreateRole(ctx context.Context, r plan.Role) (resource.Resource, error)
+	CreateImpliedRole(ctx context.Context, r plan.ImpliedRole, priorRoleID, impliedRoleID string) (resource.Resource, error)
 	CreateProject(ctx context.Context, p plan.Project, domainID string) (resource.Resource, error)
 	CreateUser(ctx context.Context, u plan.User, domainID, password string) (resource.Resource, error)
 	AssignRole(ctx context.Context, a plan.Assignment, userID, projectID, domainID, roleID string) (resource.Resource, error)
@@ -59,18 +61,22 @@ type Bindings struct {
 }
 
 // Result is the outcome of an apply: every resource that was created, in
-// dependency order (roots, then projects and users, then assignments). Tokens
-// create no resource and never appear here.
+// dependency order (roots, which are the domains, roles and implied-role
+// rules, then projects and users, then assignments). Tokens create no resource
+// and never appear here.
 type Result struct {
 	Created []resource.Resource
 }
 
 // BindRoots resolves the plan's domains and roles to cloud ids. In admin mode it
-// creates the domains then the roles (two ordered stages) and returns them as
-// created resources. In domain-manager mode it writes nothing: every logical
-// domain binds onto the single in-scope domain and logical role i binds onto the
-// reused role i mod len(reused), so nothing reused enters the created list. The
-// created roots are returned so the caller can record and later tear them down.
+// creates the domains, then the roles, then the implied-role rules between the
+// roles (three ordered stages) and returns them as created resources. In
+// domain-manager mode it writes nothing: every logical domain binds onto the
+// single in-scope domain and logical role i binds onto the reused role i mod
+// len(reused), so nothing reused enters the created list, and no rule is
+// created, since a manager may not change the reused roles; a plan with rules
+// logs that they are ignored. The created roots are returned so the caller can
+// record and later tear them down.
 func BindRoots(ctx context.Context, c Keystone, p *plan.Plan, tier keystone.Tier, res keystone.Resolution, concurrency int, opTimeout time.Duration) (Bindings, []resource.Resource, error) {
 	b := Bindings{
 		Domains: make(map[string]string, len(p.Domains)),
@@ -80,6 +86,9 @@ func BindRoots(ctx context.Context, c Keystone, p *plan.Plan, tier keystone.Tier
 	if tier != keystone.TierAdmin {
 		// Domain-manager mode: pure mapping, no writes. Reused roots never enter
 		// the created list, so cleanup can never delete them.
+		if n := len(p.ImpliedRoles); n > 0 {
+			slog.Warn("implied-role rules are ignored in domain-manager mode, which reuses existing roles", "rules", n)
+		}
 		for _, d := range p.Domains {
 			b.Domains[d.Name] = res.DomainID
 		}
@@ -121,6 +130,16 @@ func BindRoots(ctx context.Context, c Keystone, p *plan.Plan, tier keystone.Tier
 		return b, created, err
 	}
 
+	ruleRes, err := runStage(ctx, p.ImpliedRoles, concurrency, func(ctx context.Context, r plan.ImpliedRole) (resource.Resource, error) {
+		return e.create(ctx, func(ctx context.Context) (resource.Resource, error) {
+			return c.CreateImpliedRole(ctx, r, b.Roles[r.Prior], b.Roles[r.Implied])
+		})
+	})
+	created = appendCreated(created, ruleRes)
+	if err != nil {
+		return b, created, err
+	}
+
 	return b, created, nil
 }
 
@@ -129,7 +148,8 @@ func BindRoots(ctx context.Context, c Keystone, p *plan.Plan, tier keystone.Tier
 // user's password, held in memory for the caller's token operations.
 type Provisioned struct {
 	// Created lists every resource that was created, in dependency order (roots,
-	// then projects and users, then assignments), exactly as Apply records it.
+	// which are the domains, roles and implied-role rules, then projects and
+	// users, then assignments), exactly as Apply records it.
 	Created []resource.Resource
 	// Bindings maps the plan's logical domains and roles to their cloud ids.
 	Bindings Bindings

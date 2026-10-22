@@ -107,14 +107,14 @@ func newKeystonePressureCmd(opts *globalOptions) *cobra.Command {
 		Short: "Run closed-loop token validation, revocation and role-listing load against Keystone",
 		Long: `Run a closed-loop load against Keystone's token validation, revocation and
 role-listing path. The command provisions the scenario's domains, roles,
-projects, users and role assignments, primes a pool of project-scoped tokens,
-and runs a fixed number of workers that each send one request after another,
-drawn by weight from validate, effective, revoke, grant_churn, issue, probe
-and bad_token, for the configured duration or, with --duration 0, until it is
-interrupted. It prints the metrics summary and the Pressure table, writes
-run-<id>.json, and tears its resources down unless --no-cleanup is given.
-Only the admin tier runs: validating and revoking other users' tokens and
-listing their role assignments are admin operations.
+implied-role rules, projects, users and role assignments, primes a pool of
+project-scoped tokens, and runs a fixed number of workers that each send one
+request after another, drawn by weight from validate, effective, revoke,
+grant_churn, issue, probe and bad_token, for the configured duration or, with
+--duration 0, until it is interrupted. It prints the metrics summary and the
+Pressure table, writes run-<id>.json, and tears its resources down unless
+--no-cleanup is given. Only the admin tier runs: validating and revoking other
+users' tokens and listing their role assignments are admin operations.
 
 probe sends a pool token to Nova, Neutron, Cinder or Glance, as far as the
 token's catalog lists them, for the cheapest read the service offers.
@@ -244,9 +244,10 @@ type pressureKeystone interface {
 
 // pressureReaderRole is the role a run that sends live pool tokens to the
 // other services grants the pool users on their projects. The plan's roles
-// are the run's own and imply no other, while a service's read policy may
-// ask for reader on the token's project, as Glance's get_images does under
-// its default policy, and would refuse every probe with a 403 without it.
+// are the run's own and imply at most each other, never a role a service's
+// policy names, while a service's read policy may ask for reader on the
+// token's project, as Glance's get_images does under its default policy, and
+// would refuse every probe with a 403 without it.
 const pressureReaderRole = "reader"
 
 // The production *keystone.Client must satisfy the seam.
