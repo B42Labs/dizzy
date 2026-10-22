@@ -35,6 +35,45 @@ func (c *Client) CreateRole(ctx context.Context, r keystoneplan.Role) (resource.
 	return resource.Resource{Kind: KindRole, Logical: r.Name, Name: name, ID: id}, nil
 }
 
+// CreateImpliedRole creates the implied-role rule r: a grant of the role
+// priorID also gives its holder the role impliedID on the same target
+// (PUT /v3/roles/<prior>/implies/<implied>). It returns a synthetic-id
+// resource, since a rule has no cloud id or name, that status re-queries and
+// cleanup deletes by parsing. A 403 is wrapped with ErrForbidden; a 409, which
+// Keystone answers for a rule that already exists, stays terminal.
+func (c *Client) CreateImpliedRole(ctx context.Context, r keystoneplan.ImpliedRole, priorID, impliedID string) (resource.Resource, error) {
+	err := c.timed(ctx, string(KindImpliedRole), "create", func(ctx context.Context) error {
+		return roles.CreateRoleInferenceRule(ctx, c.gc, priorID, impliedID).Err
+	})
+	if err != nil {
+		return resource.Resource{}, wrapCreate(KindImpliedRole, impliedRoleLogical(r), err)
+	}
+	return resource.Resource{Kind: KindImpliedRole, Logical: impliedRoleLogical(r), ID: impliedRoleID(priorID, impliedID)}, nil
+}
+
+// impliedRoleID builds the synthetic implied-role rule id
+// "<priorID>:<impliedID>" that parseImpliedRoleID inverts. It is the one place
+// the format is written.
+func impliedRoleID(priorID, impliedID string) string {
+	return priorID + ":" + impliedID
+}
+
+// parseImpliedRoleID inverts impliedRoleID. Keystone ids are hex, so ":" is an
+// unambiguous separator.
+func parseImpliedRoleID(id string) (priorID, impliedID string, err error) {
+	parts := strings.Split(id, ":")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("malformed implied role id %q", id)
+	}
+	return parts[0], parts[1], nil
+}
+
+// impliedRoleLogical renders a human-readable label for an implied-role rule,
+// for the status table's LOGICAL column (a rule has no cloud name).
+func impliedRoleLogical(r keystoneplan.ImpliedRole) string {
+	return r.Prior + "->" + r.Implied
+}
+
 // ErrRoleNotFound is what FindRoleByName's error wraps when no role has the
 // name, so a caller can tell a missing role from a failed listing. Its text is
 // the "not found" of that error's message.
