@@ -1382,3 +1382,172 @@ func TestRedactToken(t *testing.T) {
 		t.Error("redactToken with an empty token wrapped the error, want it returned as is")
 	}
 }
+
+// TestCreateImpliedRole confirms creating an implied-role rule issues one PUT
+// to /roles/<prior>/implies/<implied>, records one implied_role sample, and
+// returns a rule resource with the logical label and the synthetic id.
+func TestCreateImpliedRole(t *testing.T) {
+	var gotPath, gotMethod string
+	var calls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		gotPath, gotMethod = r.URL.Path, r.Method
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"role_inference":{"prior_role":{"id":"rid1"},"implies":{"id":"rid2"}}}`)
+	}))
+	defer ts.Close()
+
+	c, m := testClient(ts)
+	got, err := c.CreateImpliedRole(context.Background(), keystoneplan.ImpliedRole{Prior: "role-0001", Implied: "role-0002"}, "rid1", "rid2")
+	if err != nil {
+		t.Fatalf("CreateImpliedRole: %v", err)
+	}
+	if calls != 1 || gotMethod != http.MethodPut {
+		t.Errorf("%d call(s), method %s; want 1 PUT", calls, gotMethod)
+	}
+	if want := "/roles/rid1/implies/rid2"; !strings.HasSuffix(gotPath, want) {
+		t.Errorf("path = %q, want it to end with %q", gotPath, want)
+	}
+	if want := (resource.Resource{Kind: KindImpliedRole, Logical: "role-0001->role-0002", ID: "rid1:rid2"}); got != want {
+		t.Errorf("CreateImpliedRole = %+v, want %+v", got, want)
+	}
+
+	var samples int
+	for _, s := range m.Aggregate(time.Second).ByType {
+		if s.Type == string(KindImpliedRole) {
+			samples += s.Attempted
+		}
+	}
+	if samples != 1 {
+		t.Errorf("implied_role operation samples = %d, want 1 (the create)", samples)
+	}
+}
+
+// TestCreateImpliedRoleErrors confirms a 403 carries ErrForbidden, so the
+// executor fails fast, and a 409 (Keystone's answer to an existing rule) names
+// the rule and is not retryable.
+func TestCreateImpliedRoleErrors(t *testing.T) {
+	for _, tc := range []struct {
+		status    int
+		forbidden bool
+	}{
+		{http.StatusForbidden, true},
+		{http.StatusConflict, false},
+	} {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+			}))
+			defer ts.Close()
+
+			c, _ := testClient(ts)
+			_, err := c.CreateImpliedRole(context.Background(), keystoneplan.ImpliedRole{Prior: "role-0001", Implied: "role-0002"}, "rid1", "rid2")
+			if err == nil {
+				t.Fatalf("CreateImpliedRole against a %d: expected an error, got nil", tc.status)
+			}
+			if got := errors.Is(err, ErrForbidden); got != tc.forbidden {
+				t.Errorf("errors.Is(err, ErrForbidden) = %v, want %v; err = %v", got, tc.forbidden, err)
+			}
+			if want := `creating implied_role "role-0001->role-0002"`; !strings.HasPrefix(err.Error(), want) {
+				t.Errorf("error %q does not start with %q", err, want)
+			}
+			if IsRetryable(err) {
+				t.Errorf("IsRetryable(%v) = true, want false", err)
+			}
+		})
+	}
+}
+
+// TestDeleteImpliedRole confirms deleting an implied-role rule resource issues
+// a DELETE to /roles/<prior>/implies/<implied> parsed from its id, and that a
+// malformed id fails before any request.
+func TestDeleteImpliedRole(t *testing.T) {
+	var gotPath, gotMethod string
+	var calls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		gotPath, gotMethod = r.URL.Path, r.Method
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	c, _ := testClient(ts)
+	if err := c.Delete(context.Background(), resource.Resource{Kind: KindImpliedRole, ID: "rid1:rid2"}); err != nil {
+		t.Fatalf("Delete(implied role): %v", err)
+	}
+	if gotMethod != http.MethodDelete {
+		t.Errorf("method = %s, want DELETE", gotMethod)
+	}
+	if want := "/roles/rid1/implies/rid2"; !strings.HasSuffix(gotPath, want) {
+		t.Errorf("path = %q, want it to end with %q", gotPath, want)
+	}
+
+	err := c.Delete(context.Background(), resource.Resource{Kind: KindImpliedRole, ID: "not-an-id"})
+	if err == nil || err.Error() != `malformed implied role id "not-an-id"` {
+		t.Errorf("Delete with a malformed id = %v, want %q", err, `malformed implied role id "not-an-id"`)
+	}
+	if calls != 1 {
+		t.Errorf("%d request(s), want 1: a malformed id must fail before any request", calls)
+	}
+}
+
+// TestObserveImpliedRole confirms status reads an implied-role rule as
+// present while Keystone has it and as gone once Keystone answers 404, and
+// that a malformed id is an error, which status shows as such, not as gone.
+func TestObserveImpliedRole(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		exists bool
+	}{
+		{http.StatusOK, true},
+		{http.StatusNotFound, false},
+	} {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			var gotPath string
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				if tc.status == http.StatusOK {
+					_, _ = io.WriteString(w, `{"role_inference":{"prior_role":{"id":"rid1"},"implies":{"id":"rid2"}}}`)
+				}
+			}))
+			defer ts.Close()
+
+			c, _ := testClient(ts)
+			status, exists, err := c.Observe(context.Background(), resource.Resource{Kind: KindImpliedRole, ID: "rid1:rid2"})
+			if err != nil || status != "" || exists != tc.exists {
+				t.Errorf("Observe = (%q, %v, %v), want (\"\", %v, nil)", status, exists, err, tc.exists)
+			}
+			if want := "/roles/rid1/implies/rid2"; !strings.HasSuffix(gotPath, want) {
+				t.Errorf("path = %q, want it to end with %q", gotPath, want)
+			}
+		})
+	}
+
+	ts := httptest.NewServer(http.NotFoundHandler())
+	defer ts.Close()
+	c, _ := testClient(ts)
+	_, exists, err := c.Observe(context.Background(), resource.Resource{Kind: KindImpliedRole, ID: "not-an-id"})
+	if err == nil || err.Error() != `malformed implied role id "not-an-id"` || exists {
+		t.Errorf("Observe with a malformed id = (exists %v, %v), want an error %q", exists, err, `malformed implied role id "not-an-id"`)
+	}
+}
+
+// TestImpliedRoleIDRoundTrip confirms parseImpliedRoleID inverts impliedRoleID
+// and rejects an id that is not two non-empty parts.
+func TestImpliedRoleIDRoundTrip(t *testing.T) {
+	prior, implied, err := parseImpliedRoleID(impliedRoleID("rid1", "rid2"))
+	if err != nil || prior != "rid1" || implied != "rid2" {
+		t.Errorf("parseImpliedRoleID(impliedRoleID(rid1, rid2)) = (%q, %q, %v), want (rid1, rid2, nil)", prior, implied, err)
+	}
+	for _, id := range []string{"", "rid1", "rid1:", ":rid2", "rid1:rid2:rid3", "u:project:p:r"} {
+		if _, _, err := parseImpliedRoleID(id); err == nil {
+			t.Errorf("parseImpliedRoleID(%q): expected an error, got nil", id)
+		}
+	}
+	if got := impliedRoleLogical(keystoneplan.ImpliedRole{Prior: "role-0001", Implied: "role-0002"}); got != "role-0001->role-0002" {
+		t.Errorf("impliedRoleLogical = %q, want role-0001->role-0002", got)
+	}
+}

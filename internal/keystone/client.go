@@ -28,15 +28,17 @@ import (
 )
 
 // Keystone resource kinds. They double as the metrics "type" label; KindToken is
-// also recorded as a time-to-ready kind (the token-issue latency). Assignments
-// and tokens carry no cloud name or tag — they live only in the run record.
+// also recorded as a time-to-ready kind (the token-issue latency). Assignments,
+// implied-role rules and tokens carry no cloud name or tag — they live only in
+// the run record.
 const (
-	KindDomain     resource.Kind = "domain"
-	KindProject    resource.Kind = "project"
-	KindUser       resource.Kind = "user"
-	KindRole       resource.Kind = "role"
-	KindAssignment resource.Kind = "role_assignment"
-	KindToken      resource.Kind = "token"
+	KindDomain      resource.Kind = "domain"
+	KindProject     resource.Kind = "project"
+	KindUser        resource.Kind = "user"
+	KindRole        resource.Kind = "role"
+	KindImpliedRole resource.Kind = "implied_role"
+	KindAssignment  resource.Kind = "role_assignment"
+	KindToken       resource.Kind = "token"
 )
 
 // namePrefix is the common prefix of every resource this tool creates. A run's

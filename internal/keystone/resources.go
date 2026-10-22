@@ -15,12 +15,12 @@ import (
 
 // Observe re-queries the live state of a created resource, recording the call.
 // It returns the resource's status, whether the resource still exists, and any
-// error other than a 404. Domains and projects render enabled/disabled; users
-// and roles have no status and render "" (shown as "present" by the status
-// table); an assignment exists when the grant is still present. A 404 (or an
-// absent assignment) is reported as ("", false, nil) so a resource deleted out
-// of band reads as gone rather than as a failure. The status command drives this
-// over a run's resources.
+// error other than a 404. Domains and projects render enabled/disabled; users,
+// roles and implied-role rules have no status and render "" (shown as
+// "present" by the status table); an assignment exists when the grant is still
+// present. A 404 (or an absent assignment) is reported as ("", false, nil) so a
+// resource deleted out of band reads as gone rather than as a failure. The
+// status command drives this over a run's resources.
 func (c *Client) Observe(ctx context.Context, r resource.Resource) (status string, exists bool, err error) {
 	var (
 		st string
@@ -63,6 +63,15 @@ func (c *Client) observeOne(ctx context.Context, r resource.Resource) (string, b
 		return "", true, nil
 	case KindRole:
 		if _, err := roles.Get(ctx, c.gc, r.ID).Extract(); err != nil {
+			return "", false, err
+		}
+		return "", true, nil
+	case KindImpliedRole:
+		prior, implied, err := parseImpliedRoleID(r.ID)
+		if err != nil {
+			return "", false, err
+		}
+		if err := roles.GetRoleInferenceRule(ctx, c.gc, prior, implied).Err; err != nil {
 			return "", false, err
 		}
 		return "", true, nil
@@ -116,10 +125,12 @@ func (c *Client) assignmentExists(ctx context.Context, r resource.Resource) (boo
 }
 
 // Delete removes a resource, recording the call. Domains, projects, users, and
-// roles are deleted by id; an assignment is revoked by parsing its synthetic id
-// back into an unassign. A 404 surfaces to the caller, which treats an
-// already-gone resource as success to keep cleanup idempotent. Deleting a domain
-// requires it be disabled first (DisableDomain), which the cleanup path does.
+// roles are deleted by id; an implied-role rule is deleted by parsing its
+// synthetic id back into its prior and implied role; an assignment is revoked
+// by parsing its synthetic id back into an unassign. A 404 surfaces to the
+// caller, which treats an already-gone resource as success to keep cleanup
+// idempotent. Deleting a domain requires it be disabled first (DisableDomain),
+// which the cleanup path does.
 func (c *Client) Delete(ctx context.Context, r resource.Resource) error {
 	return c.timed(ctx, string(r.Kind), "delete", func(ctx context.Context) error {
 		switch r.Kind {
@@ -131,6 +142,12 @@ func (c *Client) Delete(ctx context.Context, r resource.Resource) error {
 			return users.Delete(ctx, c.gc, r.ID).ExtractErr()
 		case KindRole:
 			return roles.Delete(ctx, c.gc, r.ID).ExtractErr()
+		case KindImpliedRole:
+			prior, implied, err := parseImpliedRoleID(r.ID)
+			if err != nil {
+				return err
+			}
+			return roles.DeleteRoleInferenceRule(ctx, c.gc, prior, implied).ExtractErr()
 		case KindAssignment:
 			t, err := parseAssignmentID(r.ID)
 			if err != nil {
