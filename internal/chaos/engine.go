@@ -268,12 +268,14 @@ func Run(ctx context.Context, nodes []Node, seed int64, cfg Config, clk Clock) (
 // the cloud delete confirms the resource was removed, so a delete that failed
 // or was cancelled before it ran leaves a resource that may still exist;
 // liveResources reads it once the op is finished to keep the run record
-// authoritative.
+// authoritative. ids holds the parent cloud ids a delete op passed to the
+// node's Delete, so a retry of a failed delete passes the same ones.
 type op struct {
 	done         chan struct{}
 	res          resource.Resource
 	failed       bool
 	deleteFailed bool
+	ids          map[string]string
 }
 
 // nodeState is the scheduler's per-node bookkeeping, mutated only by the single
@@ -308,6 +310,74 @@ func (st *nodeState) retire(create, del *op) {
 		}
 	}
 	st.retired = append(kept, retired{create: create, del: del})
+}
+
+// deleteRetry is a second delete of a retired instance, run by the node's next
+// create: prev is the delete it follows, and op takes prev's place in the
+// node's retired list, so the run record follows the retry's outcome.
+type deleteRetry struct {
+	create, prev, op *op
+	settled          bool
+}
+
+// retryDeletes puts a retry op in place of the delete of every retired
+// instance whose removal is not confirmed yet, and returns the retries for
+// the create the scheduler is dispatching. A delete still in flight gets one
+// too: the create waits for it, and the retry runs only when it failed.
+func (st *nodeState) retryDeletes() []deleteRetry {
+	var retries []deleteRetry
+	for i := range st.retired {
+		r := &st.retired[i]
+		if finished(r.del) && !r.del.deleteFailed {
+			continue
+		}
+		retry := &op{done: make(chan struct{}), deleteFailed: true}
+		retries = append(retries, deleteRetry{create: r.create, prev: r.del, op: retry})
+		r.del = retry
+	}
+	return retries
+}
+
+// runRetries deletes again, before the create, each retired instance whose
+// delete failed, with the parent ids that delete used, and records each
+// attempt as a delete outcome. The create's deps hold the node's last
+// operation, so every prev has finished by now. A retry that fails leaves the
+// instance to the node's next create, and to the teardown.
+func (e *engine) runRetries(ctx context.Context, nd Node, offset time.Duration, retries []deleteRetry) {
+	for i := range retries {
+		rt := &retries[i]
+		res := rt.create.res
+		if rt.prev.deleteFailed && res.ID != "" {
+			t0 := time.Now()
+			err := nd.Delete(e.opContext(ctx), rt.prev.ids, res)
+			e.res.add(outcome{offset: offset, latency: time.Since(t0), success: err == nil, errKind: e.classify(err)})
+			if err == nil {
+				e.res.cycle()
+			}
+			rt.op.deleteFailed = err != nil
+		} else {
+			rt.op.deleteFailed = rt.prev.deleteFailed
+		}
+		rt.op.ids = rt.prev.ids
+		rt.settled = true
+		close(rt.op.done)
+	}
+}
+
+// settleRetries finishes every retry the create did not run, because it was
+// cancelled before it was admitted, with the outcome of the delete it follows.
+// It waits for that delete, which never waits for the create.
+func settleRetries(retries []deleteRetry) {
+	for i := range retries {
+		rt := &retries[i]
+		if rt.settled {
+			continue
+		}
+		<-rt.prev.done
+		rt.op.deleteFailed = rt.prev.deleteFailed
+		rt.op.ids = rt.prev.ids
+		close(rt.op.done)
+	}
 }
 
 // outcome records one completed operation for the time-bucketed report.
@@ -917,7 +987,9 @@ func (e *engine) samplePopulation() {
 
 // dispatchCreate marks node idx present and launches its create. The create
 // waits for the node's previous operation (serialization) and its parents'
-// creates (so parent cloud ids are resolved) before acquiring a slot.
+// creates (so parent cloud ids are resolved) before acquiring a slot. It first
+// deletes again each earlier instance of the node whose delete failed, since
+// that instance still holds its share of the project's quota.
 func (e *engine) dispatchCreate(ctx context.Context, idx int, offset time.Duration) {
 	nd := e.nodes[idx]
 	st := &e.states[idx]
@@ -928,6 +1000,7 @@ func (e *engine) dispatchCreate(ctx context.Context, idx int, offset time.Durati
 		deps = append(deps, st.last)
 	}
 	parentKeys, parentOps := e.parentOps(idx, &deps)
+	retries := st.retryDeletes()
 
 	st.present = true
 	st.mutated = false // a fresh instance re-arms its at-most-once mutation
@@ -936,10 +1009,12 @@ func (e *engine) dispatchCreate(ctx context.Context, idx int, offset time.Durati
 	e.present++
 
 	e.launch(ctx, newOp, offset, func() {
+		defer settleRetries(retries)
 		if !e.await(ctx, deps, nd.Gate) {
 			return
 		}
 		defer e.release(nd.Gate)
+		e.runRetries(ctx, nd, offset, retries)
 		if parentOpFailed(parentOps) {
 			return // a parent's create failed (or produced no cloud id); skip the
 			// doomed child create instead of recording a bookkeeping-artifact failure
@@ -996,6 +1071,7 @@ func (e *engine) dispatchDelete(ctx context.Context, idx int, offset time.Durati
 		}
 		defer e.release(nd.Gate)
 		ids := resolveIDs(parentKeys, parentOps)
+		newOp.ids = ids
 		res := createOp.res
 		if res.ID == "" {
 			newOp.deleteFailed = false
