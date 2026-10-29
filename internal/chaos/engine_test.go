@@ -963,7 +963,7 @@ func liveIDs(e *engine) []string {
 // lists an instance while its delete is in flight, also when the node's
 // re-create already waits behind that delete, drops it once the delete
 // confirms removal, and keeps it next to its re-created successor when the
-// delete fails.
+// delete and the re-create's retry of it fail.
 func TestLiveResourcesKeepsInstanceUntilDeleteConfirms(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -973,12 +973,12 @@ func TestLiveResourcesKeepsInstanceUntilDeleteConfirms(t *testing.T) {
 	}{
 		{name: "delete confirms", want: nil},
 		{name: "delete confirms, node created again", recreate: true, want: []string{"id-1"}},
-		{name: "delete fails, node created again", recreate: true, deleteErr: errors.New("conflict"), want: []string{"id-0", "id-1"}},
+		{name: "delete and its retry fail, node created again", recreate: true, deleteErr: errors.New("conflict"), want: []string{"id-0", "id-1"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			started, release := make(chan struct{}), make(chan struct{})
-			creates := 0 // the node's ops run one after another
+			creates, deletes := 0, 0 // the node's ops run one after another
 			node := Node{
 				Key: "vol-0", Kind: resource.Kind("volume"),
 				Create: func(context.Context, map[string]string) (resource.Resource, error) {
@@ -987,8 +987,11 @@ func TestLiveResourcesKeepsInstanceUntilDeleteConfirms(t *testing.T) {
 					return resource.Resource{Kind: "volume", Logical: "vol-0", ID: id}, nil
 				},
 				Delete: func(context.Context, map[string]string, resource.Resource) error {
-					started <- struct{}{}
-					<-release
+					deletes++
+					if deletes == 1 { // the first delete is held in flight; a retry is not
+						started <- struct{}{}
+						<-release
+					}
 					return tc.deleteErr
 				},
 			}
@@ -1012,6 +1015,119 @@ func TestLiveResourcesKeepsInstanceUntilDeleteConfirms(t *testing.T) {
 				t.Errorf("liveResources after the drain = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestCreateRetriesFailedDeleteFirst confirms the create of a node deletes
+// again, before it creates the node, the earlier instance whose delete failed,
+// passes that delete's parent ids, records the retry as a delete outcome and
+// a cycle, and drops the instance from the run record once the retry
+// confirms its removal. A retry that fails too leaves the instance to the
+// next create, which tries again.
+func TestCreateRetriesFailedDeleteFirst(t *testing.T) {
+	var calls []string
+	creates, deletes, failDeletes := 0, 0, 2
+	parent := Node{
+		Key: "net-0", Kind: resource.Kind("network"),
+		Create: func(context.Context, map[string]string) (resource.Resource, error) {
+			return resource.Resource{Kind: "network", Logical: "net-0", ID: "net-id"}, nil
+		},
+		Delete: func(context.Context, map[string]string, resource.Resource) error { return nil },
+	}
+	child := Node{
+		Key: "srv-0", Kind: resource.Kind("server"), Parents: []string{"net-0"},
+		Create: func(context.Context, map[string]string) (resource.Resource, error) {
+			id := fmt.Sprintf("id-%d", creates)
+			creates++
+			calls = append(calls, "create "+id)
+			return resource.Resource{Kind: "server", Logical: "srv-0", ID: id}, nil
+		},
+		Delete: func(_ context.Context, ids map[string]string, res resource.Resource) error {
+			deletes++
+			calls = append(calls, fmt.Sprintf("delete %s net=%s", res.ID, ids["net-0"]))
+			if deletes <= failDeletes {
+				return errors.New("503 service unavailable")
+			}
+			return nil
+		},
+	}
+	e := newEngine([]Node{parent, child}, 7, validConfig(), newFakeClock())
+	ctx := context.Background()
+	e.res.advance(0)
+	e.dispatchCreate(ctx, 0, 0)
+	e.dispatchCreate(ctx, 1, 0)
+	e.dispatchDelete(ctx, 1, 0, nil) // fails
+	e.dispatchCreate(ctx, 1, 0)      // its retry fails too
+	<-e.states[1].create.done
+	if got := liveIDs(e); !reflect.DeepEqual(got, []string{"net-id", "id-0", "id-1"}) {
+		t.Errorf("liveResources after a failed retry = %v, want [net-id id-0 id-1]", got)
+	}
+	e.dispatchDelete(ctx, 1, 0, nil) // removes id-1, and id-0 is retried below
+	e.dispatchCreate(ctx, 1, 0)
+	e.wg.Wait()
+
+	want := []string{
+		"create id-0",
+		"delete id-0 net=net-id",
+		"delete id-0 net=net-id", "create id-1",
+		"delete id-1 net=net-id",
+		"delete id-0 net=net-id", "create id-2",
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Errorf("cloud calls = %q, want %q", calls, want)
+	}
+	if got := liveIDs(e); !reflect.DeepEqual(got, []string{"net-id", "id-2"}) {
+		t.Errorf("liveResources after the drain = %v, want [net-id id-2]", got)
+	}
+	if got := len(e.states[1].retired); got > 2 {
+		t.Errorf("retired instances = %d, want the confirmed ones pruned on the next delete", got)
+	}
+	r := e.assemble(nil)
+	var attempted, failed int
+	for _, b := range r.Buckets {
+		attempted += b.Stats.Attempted
+		failed += b.Stats.Failed
+	}
+	if attempted != 8 || failed != 2 || r.Cycles != 2 {
+		t.Errorf("attempted=%d failed=%d cycles=%d, want 8 operations (4 creates, 4 deletes), 2 failed, 2 cycles",
+			attempted, failed, r.Cycles)
+	}
+}
+
+// TestCancelledCreateSettlesItsRetry confirms a create cancelled before it is
+// admitted runs no retry, and that the instance whose delete failed stays in
+// the run record.
+func TestCancelledCreateSettlesItsRetry(t *testing.T) {
+	deletes := 0
+	gate := make(chan struct{}, 1)
+	node := Node{
+		Key: "vol-0", Kind: resource.Kind("volume"), Gate: gate,
+		Create: func(context.Context, map[string]string) (resource.Resource, error) {
+			return resource.Resource{Kind: "volume", Logical: "vol-0", ID: "id-0"}, nil
+		},
+		Delete: func(context.Context, map[string]string, resource.Resource) error {
+			deletes++
+			return errors.New("conflict")
+		},
+	}
+	e := newEngine([]Node{node}, 7, validConfig(), newFakeClock())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.res.advance(0)
+	e.dispatchCreate(ctx, 0, 0)
+	e.dispatchDelete(ctx, 0, 0, nil)
+	<-e.states[0].last.done
+
+	gate <- struct{}{} // another op of the family holds the gate
+	e.dispatchCreate(ctx, 0, 0)
+	cancel()
+	e.wg.Wait()
+
+	if deletes != 1 {
+		t.Errorf("the delete closure ran %d times, want 1: a cancelled create retries nothing", deletes)
+	}
+	if got := liveIDs(e); !reflect.DeepEqual(got, []string{"id-0"}) {
+		t.Errorf("liveResources = %v, want [id-0]", got)
 	}
 }
 
