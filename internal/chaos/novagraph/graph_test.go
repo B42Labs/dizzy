@@ -405,10 +405,12 @@ func TestLongLivedResizeAlternatesFlavors(t *testing.T) {
 }
 
 // TestLongLivedVolumeToggle confirms a kept volume is detached and attached in
-// turn, starting with a detach, without being created again; that a failed
-// detach or attach is tried again; that a detach answered with 404 counts as
-// done; and that an attach whose in-use wait gave up attaches again, which the
-// client accepts for a volume that is already attached.
+// turn, starting with a detach, without being created again; that every detach
+// waits until the server no longer has the attachment, unless its available
+// wait failed; that a failed detach, attachment wait or attach is tried again;
+// that a detach answered with 404 counts as done; and that an attach whose
+// in-use wait gave up attaches again, which the client accepts for a volume
+// that is already attached.
 func TestLongLivedVolumeToggle(t *testing.T) {
 	boom := errors.New("detach failed")
 	refused := errors.New("attach failed")
@@ -419,11 +421,13 @@ func TestLongLivedVolumeToggle(t *testing.T) {
 		wantErrs  []error            // what the three mutations return
 		wantCalls []string
 	}{
-		{"alternates", nil, []error{nil, nil, nil}, []string{"attach", "detach", "attach", "detach"}},
-		{"a failed detach is tried again", map[string][]error{"DetachVolume": {boom}}, []error{boom, nil, nil}, []string{"attach", "detach", "detach", "attach"}},
-		{"a 404 counts as detached", map[string][]error{"DetachVolume": {notFound}}, []error{nil, nil, nil}, []string{"attach", "detach", "attach", "detach"}},
-		{"a failed attach is tried again", map[string][]error{"AttachVolume": {refused}}, []error{nil, refused, nil}, []string{"attach", "detach", "attach", "attach"}},
-		{"a timed-out in-use wait attaches again", map[string][]error{"WaitForVolumeStatus:in-use": {context.DeadlineExceeded}}, []error{nil, context.DeadlineExceeded, nil}, []string{"attach", "detach", "attach", "attach"}},
+		{"alternates", nil, []error{nil, nil, nil}, []string{"attach", "detach", "wait-detached", "attach", "detach", "wait-detached"}},
+		{"a failed detach is tried again", map[string][]error{"DetachVolume": {boom}}, []error{boom, nil, nil}, []string{"attach", "detach", "detach", "wait-detached", "attach"}},
+		{"a 404 counts as detached", map[string][]error{"DetachVolume": {notFound}}, []error{nil, nil, nil}, []string{"attach", "detach", "wait-detached", "attach", "detach", "wait-detached"}},
+		{"a failed attach is tried again", map[string][]error{"AttachVolume": {refused}}, []error{nil, refused, nil}, []string{"attach", "detach", "wait-detached", "attach", "attach"}},
+		{"a timed-out in-use wait attaches again", map[string][]error{"WaitForVolumeStatus:in-use": {context.DeadlineExceeded}}, []error{nil, context.DeadlineExceeded, nil}, []string{"attach", "detach", "wait-detached", "attach", "attach"}},
+		{"a timed-out available wait skips the attachment wait", map[string][]error{"WaitForVolumeStatus:available": {context.DeadlineExceeded}}, []error{context.DeadlineExceeded, nil, nil}, []string{"attach", "detach", "detach", "wait-detached", "attach"}},
+		{"a timed-out attachment wait detaches again", map[string][]error{"WaitForVolumeDetached": {context.DeadlineExceeded}}, []error{context.DeadlineExceeded, nil, nil}, []string{"attach", "detach", "wait-detached", "detach", "wait-detached", "attach"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
