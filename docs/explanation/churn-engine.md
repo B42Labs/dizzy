@@ -106,17 +106,19 @@ This is why the churn engine can safely pick any live node as a delete candidate
 A delete can fail while the cloud is degraded: the API refuses the call, or the
 resource is not gone within the operation timeout. The node is absent from that
 decision on, since the inventory is logical, so the engine creates it again
-later. The instance whose delete failed is still in the cloud and still counts
-against the project's quota, and it stays in the run record.
+later. The instance whose delete failed can still be in the cloud and count
+against the project's quota, so it stays in the run record.
 
 So the next create of the node first deletes that instance again, with the
-parent ids the failed delete used, and only then creates the new one. A retry
-that confirms the removal drops the instance from the run record; one that
-fails leaves it to the node's next create and, at the latest, to the teardown.
-Without the retry, every failed delete would hold its share of the quota until
-the teardown, and a run sized to the quota would fail every create once enough
-deletes had failed. The retry draws nothing from the seed, so the decision
-schedule stays the same, and it counts as one more delete in the statistics.
+parent ids the failed delete used, and only then creates the new one. A delete
+that gave up can still finish in the cloud, so a retry that finds the resource
+already gone has confirmed its removal. A retry that confirms the removal drops
+the instance from the run record; one that fails leaves it to the node's next
+create and, at the latest, to the teardown. Without the retry, every instance a
+failed delete left behind would hold its share of the quota until the teardown,
+and a run sized to the quota would fail every create once enough deletes had
+failed. The retry draws nothing from the seed, so the decision schedule stays
+the same, and it counts as one more delete in the statistics.
 
 ## Mutations
 
