@@ -340,7 +340,13 @@ func (f *fakeNova) Delete(_ context.Context, r resource.Resource) error {
 	return nil
 }
 func (f *fakeNova) WaitForReady(context.Context, resource.Resource) error { return nil }
-func (f *fakeNova) WaitForGone(context.Context, resource.Resource) error  { return nil }
+
+// WaitForGone returns the errors queued under its name.
+func (f *fakeNova) WaitForGone(context.Context, resource.Resource) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.injected("WaitForGone")
+}
 
 // WaitForServerStatus and WaitForVolumeStatus return the errors queued under
 // their name and the wanted status, e.g. "WaitForVolumeStatus:in-use".
