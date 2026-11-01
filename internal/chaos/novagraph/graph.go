@@ -592,12 +592,17 @@ func createVolume(ctx context.Context, opTimeout time.Duration, c Nova, v novapl
 // deleteVolume detaches a volume from its server, waits it to available and
 // until the server no longer has the attachment, and deletes it, waiting it to
 // be gone. A failed wait returns before the delete, so the volume stays and the
-// failure surfaces as a failed volume delete.
+// failure surfaces as a failed volume delete. A 404 in the available wait counts
+// as deleted, because a failed delete can still finish in the cloud.
 func deleteVolume(ctx context.Context, opTimeout time.Duration, c Nova, res, server resource.Resource) error {
 	if err := detach(ctx, opTimeout, func(ctx context.Context) error { return c.DetachVolume(ctx, server, res) }); err != nil {
 		return err
 	}
 	if err := waitVolumeStatus(ctx, opTimeout, c, res, statusVolumeAvailable); err != nil {
+		if nova.IsNotFound(err) {
+			slog.Info("volume already gone; nothing left to delete", "logical", res.Logical, "id", res.ID)
+			return nil
+		}
 		return err
 	}
 	if err := waitVolumeDetached(ctx, opTimeout, c, server, res); err != nil {

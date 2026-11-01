@@ -1,8 +1,11 @@
 package novagraph
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"reflect"
 	"sort"
@@ -292,11 +295,13 @@ func TestDeletePortWaitsForDetach(t *testing.T) {
 // TestDeleteVolumeWaitsForDetach confirms the churn graph's volume delete waits
 // until the server no longer has the attachment before it deletes the volume,
 // that a volume already detached still deletes, that a failed wait returns
-// before the delete, that a failed available wait skips the attachment wait, and
+// before the delete, that a failed available wait skips the attachment wait,
 // that a delete run again after a failed wait finishes, as the engine's retry
-// runs it.
+// runs it, and that a volume already gone in the available wait counts as
+// deleted, with or without a server id, including one a failed delete removed.
 func TestDeleteVolumeWaitsForDetach(t *testing.T) {
 	notFound := gophercloud.ErrUnexpectedResponseCode{Actual: http.StatusNotFound}
+	gone := fmt.Errorf("volume vol-1 is gone while waiting for readiness: %w", notFound)
 
 	// setup creates net-0001, srv-0001 and vol-0001 with their parents' ids
 	// and returns a function that deletes the volume the way the engine would.
@@ -383,6 +388,91 @@ func TestDeleteVolumeWaitsForDetach(t *testing.T) {
 			t.Fatalf("Delete after the failure: %v", err)
 		}
 		check(t, f, []string{"attach", "detach", "wait-detached", "detach", "wait-detached"}, 1)
+	})
+
+	t.Run("a volume gone in the available wait counts as deleted", func(t *testing.T) {
+		f := newFakeNova()
+		del := setup(t, f)
+		f.failNext["DetachVolume"] = []error{notFound}
+		f.failNext["WaitForVolumeStatus:available"] = []error{gone}
+		var logs bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+		t.Cleanup(func() { slog.SetDefault(prev) })
+		if err := del(); err != nil {
+			t.Fatalf("Delete of a gone volume: %v", err)
+		}
+		check(t, f, []string{"attach", "detach"}, 0)
+		for _, want := range []string{"level=INFO", "volume already gone; nothing left to delete", "logical=vol-0001", "id=vol-4"} {
+			if !strings.Contains(logs.String(), want) {
+				t.Errorf("logs = %q, want %q", logs.String(), want)
+			}
+		}
+	})
+
+	t.Run("a retry finds the volume its failed delete removed", func(t *testing.T) {
+		f := newFakeNova()
+		del := setup(t, f)
+		f.failNext["WaitForGone"] = []error{context.DeadlineExceeded}
+		f.failNext["DetachVolume"] = []error{nil, notFound}
+		f.failNext["WaitForVolumeStatus:available"] = []error{nil, gone}
+		if err := del(); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Delete with a failing gone wait = %v, want %v", err, context.DeadlineExceeded)
+		}
+		if err := del(); err != nil {
+			t.Fatalf("retry of the delete: %v", err)
+		}
+		check(t, f, []string{"attach", "detach", "wait-detached", "detach"}, 1)
+	})
+
+	t.Run("a terminal status stays a failed delete", func(t *testing.T) {
+		f := newFakeNova()
+		del := setup(t, f)
+		boom := errors.New("volume vol-1 reached terminal status \"error_deleting\"")
+		f.failNext["WaitForVolumeStatus:available"] = []error{boom}
+		if err := del(); !errors.Is(err, boom) {
+			t.Fatalf("Delete with a terminal status = %v, want %v", err, boom)
+		}
+		check(t, f, []string{"attach", "detach"}, 0)
+	})
+
+	t.Run("a gone volume with no server id counts as deleted", func(t *testing.T) {
+		f := newFakeNova()
+		f.failNext["WaitForVolumeStatus:available"] = []error{gone}
+		vol := resource.Resource{Kind: nova.KindVolume, Logical: "vol-0001", ID: "vol-1"}
+		if err := deleteVolume(context.Background(), time.Minute, f, vol, resource.Resource{}); err != nil {
+			t.Fatalf("deleteVolume: %v", err)
+		}
+	})
+}
+
+// TestGoneVolumeFailsOutsideDelete confirms only the volume delete reads a gone
+// volume as done: the detach of a kept volume and a volume create still fail
+// with the 404, which Classify labels not-found.
+func TestGoneVolumeFailsOutsideDelete(t *testing.T) {
+	gone := fmt.Errorf("volume vol-1 is gone while waiting for readiness: %w",
+		gophercloud.ErrUnexpectedResponseCode{Actual: http.StatusNotFound})
+
+	t.Run("a kept volume detach", func(t *testing.T) {
+		f := newFakeNova()
+		mutate := keptGraph(t, keptServer(novaplan.Server{}), f, resolvedAll())
+		f.failNext["WaitForVolumeStatus:available"] = []error{gone}
+		if err := mutate("vol-0001"); !nova.IsNotFound(err) {
+			t.Fatalf("mutation = %v, want a not-found error", err)
+		}
+		if got, want := logOf(f, f.attachLog, "vol-0001"), []string{"attach", "detach"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("calls = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a volume create", func(t *testing.T) {
+		f := newFakeNova()
+		f.failNext["WaitForVolumeStatus:available"] = []error{gone}
+		v := novaplan.Volume{Name: "vol-0001", SizeGiB: 1, Server: "srv-0001"}
+		server := resource.Resource{Kind: nova.KindServer, Logical: "srv-0001"}
+		if _, err := createVolume(context.Background(), time.Minute, f, v, server); !nova.IsNotFound(err) {
+			t.Fatalf("create = %v, want a not-found error", err)
+		}
 	})
 }
 
