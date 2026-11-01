@@ -252,6 +252,13 @@ func (f *fakeNova) WaitForPortDetached(_ context.Context, server, port resource.
 	f.attachLog[port.Logical] = append(f.attachLog[port.Logical], "wait-detached")
 	return f.injected("WaitForPortDetached")
 }
+func (f *fakeNova) WaitForVolumeDetached(_ context.Context, server, volume resource.Resource) error {
+	f.enterFamily(server.Logical)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.attachLog[volume.Logical] = append(f.attachLog[volume.Logical], "wait-detached")
+	return f.injected("WaitForVolumeDetached")
+}
 
 func (f *fakeNova) StopServer(_ context.Context, r resource.Resource) error {
 	f.enterFamily(r.Logical)

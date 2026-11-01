@@ -42,7 +42,8 @@ import (
 // and a fake satisfies it in tests. It mirrors the apply executor's Nova seam
 // plus the DeleteNetworkPorts the network churn deletes need, the
 // ColdMigrateServer the long-lived graph needs, the WaitForPortDetached every
-// port detach needs, and the CreateServerGroup the server group nodes need.
+// port detach needs, the WaitForVolumeDetached every volume detach needs, and
+// the CreateServerGroup the server group nodes need.
 type Nova interface {
 	CreateServerGroup(ctx context.Context, g novaplan.ServerGroup) (resource.Resource, error)
 	CreateNetwork(ctx context.Context, n novaplan.Network) (resource.Resource, error)
@@ -63,6 +64,7 @@ type Nova interface {
 	AttachPort(ctx context.Context, server, port resource.Resource) error
 	DetachPort(ctx context.Context, server, port resource.Resource) error
 	WaitForPortDetached(ctx context.Context, server, port resource.Resource) error
+	WaitForVolumeDetached(ctx context.Context, server, volume resource.Resource) error
 	Delete(ctx context.Context, r resource.Resource) error
 	WaitForReady(ctx context.Context, r resource.Resource) error
 	WaitForServerStatus(ctx context.Context, r resource.Resource, want string) error
@@ -344,15 +346,20 @@ func opSeed(seed int64, name string) int64 {
 }
 
 // volumeToggle returns the repeatable mutation of a kept data volume marked for
-// detach: it detaches the volume and waits for available, or attaches it and
-// waits for in-use.
+// detach: it detaches the volume and waits for available and until the server
+// no longer has the attachment, or attaches it and waits for in-use. Cinder
+// reports available before Nova drops the attachment, and Nova rejects an attach
+// started in between with a 400 that AttachVolume reads as a repeated attach.
 func volumeToggle(v novaplan.Volume, c Nova, opTimeout time.Duration) mutation {
 	return toggle(v.Server,
 		func(ctx context.Context, server, res resource.Resource) error {
 			if err := detach(ctx, opTimeout, func(ctx context.Context) error { return c.DetachVolume(ctx, server, res) }); err != nil {
 				return err
 			}
-			return waitVolumeStatus(ctx, opTimeout, c, res, statusVolumeAvailable)
+			if err := waitVolumeStatus(ctx, opTimeout, c, res, statusVolumeAvailable); err != nil {
+				return err
+			}
+			return waitVolumeDetached(ctx, opTimeout, c, server, res)
 		},
 		func(ctx context.Context, server, res resource.Resource) error {
 			if err := novaexec.WithRetry(ctx, opTimeout, func(ctx context.Context) error { return c.AttachVolume(ctx, server, res) }); err != nil {
@@ -648,6 +655,14 @@ func waitPortDetached(ctx context.Context, opTimeout time.Duration, c Nova, serv
 	detachCtx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 	return c.WaitForPortDetached(detachCtx, server, port)
+}
+
+// waitVolumeDetached polls until server no longer has volume's attachment,
+// bounded by opTimeout.
+func waitVolumeDetached(ctx context.Context, opTimeout time.Duration, c Nova, server, volume resource.Resource) error {
+	detachCtx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+	return c.WaitForVolumeDetached(detachCtx, server, volume)
 }
 
 // waitServerStatus polls a server to want, bounded by opTimeout.
