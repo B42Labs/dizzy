@@ -289,6 +289,103 @@ func TestDeletePortWaitsForDetach(t *testing.T) {
 	})
 }
 
+// TestDeleteVolumeWaitsForDetach confirms the churn graph's volume delete waits
+// until the server no longer has the attachment before it deletes the volume,
+// that a volume already detached still deletes, that a failed wait returns
+// before the delete, that a failed available wait skips the attachment wait, and
+// that a delete run again after a failed wait finishes, as the engine's retry
+// runs it.
+func TestDeleteVolumeWaitsForDetach(t *testing.T) {
+	notFound := gophercloud.ErrUnexpectedResponseCode{Actual: http.StatusNotFound}
+
+	// setup creates net-0001, srv-0001 and vol-0001 with their parents' ids
+	// and returns a function that deletes the volume the way the engine would.
+	setup := func(t *testing.T, f *fakeNova) func() error {
+		t.Helper()
+		nodes, err := Build(churnPlan(), f, novaexec.Resolved{}, time.Minute)
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		ctx := context.Background()
+		net, err := nodeByKey(t, nodes, "net-0001").Create(ctx, nil)
+		if err != nil {
+			t.Fatalf("creating net-0001: %v", err)
+		}
+		srv, err := nodeByKey(t, nodes, "srv-0001").Create(ctx, map[string]string{"net-0001": net.ID})
+		if err != nil {
+			t.Fatalf("creating srv-0001: %v", err)
+		}
+		ids := map[string]string{"srv-0001": srv.ID}
+		volNode := nodeByKey(t, nodes, "vol-0001")
+		vol, err := volNode.Create(ctx, ids)
+		if err != nil {
+			t.Fatalf("creating vol-0001: %v", err)
+		}
+		return func() error { return volNode.Delete(ctx, ids, vol) }
+	}
+	check := func(t *testing.T, f *fakeNova, wantLog []string, wantDeletes int) {
+		t.Helper()
+		if got := logOf(f, f.attachLog, "vol-0001"); !reflect.DeepEqual(got, wantLog) {
+			t.Errorf("calls = %v, want %v", got, wantLog)
+		}
+		if got := f.deletesBy[nova.KindVolume]; got != wantDeletes {
+			t.Errorf("volume deletes = %d, want %d", got, wantDeletes)
+		}
+	}
+
+	t.Run("waits for the attachment before the delete", func(t *testing.T) {
+		f := newFakeNova()
+		if err := setup(t, f)(); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		check(t, f, []string{"attach", "detach", "wait-detached"}, 1)
+	})
+
+	t.Run("a volume already detached still deletes", func(t *testing.T) {
+		f := newFakeNova()
+		del := setup(t, f)
+		f.failNext["DetachVolume"] = []error{notFound}
+		if err := del(); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		check(t, f, []string{"attach", "detach", "wait-detached"}, 1)
+	})
+
+	t.Run("a failed attachment wait leaves the volume undeleted", func(t *testing.T) {
+		f := newFakeNova()
+		del := setup(t, f)
+		f.failNext["WaitForVolumeDetached"] = []error{context.DeadlineExceeded}
+		if err := del(); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Delete with a failing wait = %v, want %v", err, context.DeadlineExceeded)
+		}
+		check(t, f, []string{"attach", "detach", "wait-detached"}, 0)
+	})
+
+	t.Run("a failed available wait skips the attachment wait", func(t *testing.T) {
+		f := newFakeNova()
+		del := setup(t, f)
+		f.failNext["WaitForVolumeStatus:available"] = []error{context.DeadlineExceeded}
+		if err := del(); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Delete with a failing wait = %v, want %v", err, context.DeadlineExceeded)
+		}
+		check(t, f, []string{"attach", "detach"}, 0)
+	})
+
+	t.Run("a delete after a failed wait finishes", func(t *testing.T) {
+		f := newFakeNova()
+		del := setup(t, f)
+		f.failNext["WaitForVolumeDetached"] = []error{context.DeadlineExceeded}
+		f.failNext["DetachVolume"] = []error{nil, notFound}
+		if err := del(); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Delete with a failing wait = %v, want %v", err, context.DeadlineExceeded)
+		}
+		if err := del(); err != nil {
+			t.Fatalf("Delete after the failure: %v", err)
+		}
+		check(t, f, []string{"attach", "detach", "wait-detached", "detach", "wait-detached"}, 1)
+	})
+}
+
 // keptServer is a plan of the one server srv-0001 with the operations of s,
 // a detachable volume vol-0001 and a detachable port port-0001.
 func keptServer(s novaplan.Server) *novaplan.Plan {
