@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
 	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/volumeattach"
@@ -82,6 +83,34 @@ func (c *Client) DetachVolume(ctx context.Context, server, volume resource.Resou
 		return fmt.Errorf("detaching volume %q from server %q: %w", volume.Logical, server.Logical, err)
 	}
 	return nil
+}
+
+// WaitForVolumeDetached waits until the server no longer has the volume's
+// attachment. DetachVolume returns once Nova accepted the detach, not once it is
+// done, and Cinder reports the volume available before Nova drops its block
+// device mapping. While that mapping exists, Nova rejects an attach with a 400,
+// so a re-attach must wait here first. It polls the attachment until Nova
+// answers 404, which it also answers for a deleted server. Every other answer,
+// an error other than a 404 included, is polled again with the backoff
+// WaitForGone uses: the caller's context is the only bound, and it returns
+// ctx.Err() when that ends first. It records no metrics sample.
+func (c *Client) WaitForVolumeDetached(ctx context.Context, server, volume resource.Resource) error {
+	backoff := 200 * time.Millisecond
+	for {
+		if _, err := volumeattach.Get(ctx, c.compute, server.ID, volume.ID).Extract(); IsNotFound(err) {
+			return nil
+		}
+
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
+		if backoff = time.Duration(float64(backoff) * 1.5); backoff > 2*time.Second {
+			backoff = 2 * time.Second
+		}
+	}
 }
 
 // ListVolumesByMetadata returns the data volumes carrying this run's
