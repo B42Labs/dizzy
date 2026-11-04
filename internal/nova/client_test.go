@@ -3,6 +3,10 @@ package nova
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"syscall"
 	"testing"
 
 	"github.com/gophercloud/gophercloud/v2"
@@ -91,6 +95,49 @@ func TestIsRetryable(t *testing.T) {
 	}
 }
 
+// TestMayHaveLanded verifies that a create error may have landed when it is a
+// 5xx or carries no HTTP status, and not when it is nil, a gophercloud input
+// error raised before the request was sent, or a status below 500, and that
+// wrapping the error changes nothing.
+func TestMayHaveLanded(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"invalid input", gophercloud.ErrInvalidInput{}, false},
+		{"missing input", gophercloud.ErrMissingInput{}, false},
+		{"400", respErr(400, ""), false},
+		{"403 quota", respErr(403, "quota exceeded"), false},
+		{"404", respErr(404, ""), false},
+		{"409", respErr(409, ""), false},
+		{"413", respErr(413, ""), false},
+		{"500", respErr(500, ""), true},
+		{"503", respErr(503, ""), true},
+		{"lost answer", &url.Error{Op: "Post", URL: "http://x", Err: io.EOF}, true},
+		{"unexpected EOF", io.ErrUnexpectedEOF, true},
+		{"connection reset", &url.Error{Op: "Post", URL: "http://x", Err: syscall.ECONNRESET}, true},
+		{"deadline", context.DeadlineExceeded, true},
+		{"canceled", context.Canceled, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mayHaveLanded(tc.err); got != tc.want {
+				t.Errorf("mayHaveLanded(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+			// A wrapped nil is a non-nil error without a status, so only a
+			// non-nil error is wrapped.
+			if tc.err == nil {
+				return
+			}
+			wrapped := fmt.Errorf("x: %w", tc.err)
+			if got := mayHaveLanded(wrapped); got != tc.want {
+				t.Errorf("mayHaveLanded(%v) = %v, want %v", wrapped, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIsNotFound(t *testing.T) {
 	if !IsNotFound(respErr(404, "gone")) {
 		t.Error("IsNotFound(404) = false, want true")
@@ -125,8 +172,8 @@ func TestResourceNameAndIdentity(t *testing.T) {
 		t.Errorf("resourceName = %q, want %q", got, want)
 	}
 	md := runMetadata("abc123", KindServer)
-	if md[metaRun] != "abc123" || md[metaType] != string(KindServer) {
-		t.Errorf("runMetadata = %v, want run=abc123 type=server", md)
+	if len(md) != 2 || md[metaRun] != "abc123" || md[metaType] != string(KindServer) {
+		t.Errorf("runMetadata = %v, want exactly run=abc123 type=server", md)
 	}
 	tags := runTags("abc123", KindNetwork)
 	if len(tags) != 2 || tags[0] != "dizzy:run=abc123" || tags[1] != "dizzy:type=network" {
