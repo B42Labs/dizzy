@@ -170,12 +170,15 @@ func userData(logical string) []byte {
 // StopServer requests an os-stop of the server. A retried stop can hit a 409
 // because the instance is already stopped; that 409 confirms the earlier request
 // committed, so it is treated as success rather than failing an otherwise-correct
-// run, mirroring the cinder extend-already-applied idiom.
+// run, mirroring the cinder extend-already-applied idiom. The confirmed case
+// records as a successful call.
 func (c *Client) StopServer(ctx context.Context, r resource.Resource) error {
-	err := c.timed(ctx, string(KindServer), "stop", func(ctx context.Context) error {
+	folded, err := c.timedFold(ctx, string(KindServer), "stop", func(ctx context.Context) error {
 		return servers.Stop(ctx, c.compute, r.ID).ExtractErr()
+	}, func(_ context.Context, err error) bool {
+		return conflictMentions(err, "stopped")
 	})
-	if err != nil && conflictMentions(err, "stopped") {
+	if folded {
 		slog.Info("server already stopped; treating a retried stop as success", "logical", r.Logical, "id", r.ID)
 		return nil
 	}
@@ -187,12 +190,14 @@ func (c *Client) StopServer(ctx context.Context, r resource.Resource) error {
 
 // StartServer requests an os-start of the server, with the symmetric 409
 // tolerance StopServer applies: an already-active instance confirms an earlier
-// start committed.
+// start committed. The confirmed case records as a successful call.
 func (c *Client) StartServer(ctx context.Context, r resource.Resource) error {
-	err := c.timed(ctx, string(KindServer), "start", func(ctx context.Context) error {
+	folded, err := c.timedFold(ctx, string(KindServer), "start", func(ctx context.Context) error {
 		return servers.Start(ctx, c.compute, r.ID).ExtractErr()
+	}, func(_ context.Context, err error) bool {
+		return conflictMentions(err, "active")
 	})
-	if err != nil && conflictMentions(err, "active") {
+	if folded {
 		slog.Info("server already active; treating a retried start as success", "logical", r.Logical, "id", r.ID)
 		return nil
 	}
@@ -220,12 +225,15 @@ func (c *Client) RebootServerHard(ctx context.Context, r resource.Resource) erro
 // hit a 409 because the instance is already in VERIFY_RESIZE (vm_state resized)
 // from the first request; that 409 confirms the earlier resize committed, so it
 // is treated as success and the waitServerStatus(VERIFY_RESIZE) that follows
-// stays the source of truth, mirroring the stop/start tolerance.
+// stays the source of truth, mirroring the stop/start tolerance. The confirmed
+// case records as a successful call.
 func (c *Client) ResizeServer(ctx context.Context, r resource.Resource, flavorID string) error {
-	err := c.timed(ctx, string(KindServer), "resize", func(ctx context.Context) error {
+	folded, err := c.timedFold(ctx, string(KindServer), "resize", func(ctx context.Context) error {
 		return servers.Resize(ctx, c.compute, r.ID, servers.ResizeOpts{FlavorRef: flavorID}).ExtractErr()
+	}, func(_ context.Context, err error) bool {
+		return conflictMentions(err, "resized")
 	})
-	if err != nil && conflictMentions(err, "resized") {
+	if folded {
 		slog.Info("server already in verify-resize; treating a retried resize as success", "logical", r.Logical, "id", r.ID)
 		return nil
 	}
@@ -247,12 +255,15 @@ func IsSameFlavor(err error) bool {
 // to ACTIVE on the new flavor. A retried confirm can hit a 409 because the
 // instance is already ACTIVE (vm_state active) from the first request; that 409
 // confirms the earlier confirm committed, so it is treated as success, the
-// symmetric tolerance StartServer applies.
+// symmetric tolerance StartServer applies. The confirmed case records as a
+// successful call.
 func (c *Client) ConfirmResizeServer(ctx context.Context, r resource.Resource) error {
-	err := c.timed(ctx, string(KindServer), "confirm-resize", func(ctx context.Context) error {
+	folded, err := c.timedFold(ctx, string(KindServer), "confirm-resize", func(ctx context.Context) error {
 		return servers.ConfirmResize(ctx, c.compute, r.ID).ExtractErr()
+	}, func(_ context.Context, err error) bool {
+		return conflictMentions(err, "active")
 	})
-	if err != nil && conflictMentions(err, "active") {
+	if folded {
 		slog.Info("server already active; treating a retried confirm-resize as success", "logical", r.Logical, "id", r.ID)
 		return nil
 	}
@@ -285,12 +296,15 @@ func (liveMigrateOpts) ToLiveMigrateMap() (map[string]any, error) {
 // migration for the run. A retried migrate can hit a 409 because the instance is
 // already migrating (task_state migrating) from the first request; that 409
 // confirms the earlier migrate committed, so it is treated as success and the
-// waitServerStatus(ACTIVE) that follows waits for the migration to finish.
+// waitServerStatus(ACTIVE) that follows waits for the migration to finish. The
+// confirmed case records as a successful call.
 func (c *Client) LiveMigrateServer(ctx context.Context, r resource.Resource) error {
-	err := c.timed(ctx, string(KindServer), "live-migrate", func(ctx context.Context) error {
+	folded, err := c.timedFold(ctx, string(KindServer), "live-migrate", func(ctx context.Context) error {
 		return servers.LiveMigrate(ctx, c.compute, r.ID, liveMigrateOpts{}).ExtractErr()
+	}, func(_ context.Context, err error) bool {
+		return conflictMentions(err, "migrating")
 	})
-	if err != nil && conflictMentions(err, "migrating") {
+	if folded {
 		slog.Info("server already migrating; treating a retried live-migrate as success", "logical", r.Logical, "id", r.ID)
 		return nil
 	}
@@ -308,12 +322,14 @@ func (c *Client) LiveMigrateServer(ctx context.Context, r resource.Resource) err
 // resize_migrating, resize_migrated, resize_finish) or in vm_state resized from
 // the first request; that 409 confirms the earlier migrate committed, so it is
 // treated as success and the waitServerStatus(VERIFY_RESIZE) that follows stays
-// the source of truth.
+// the source of truth. The confirmed case records as a successful call.
 func (c *Client) ColdMigrateServer(ctx context.Context, r resource.Resource) error {
-	err := c.timed(ctx, string(KindServer), "cold-migrate", func(ctx context.Context) error {
+	folded, err := c.timedFold(ctx, string(KindServer), "cold-migrate", func(ctx context.Context) error {
 		return servers.Migrate(ctx, c.compute, r.ID).ExtractErr()
+	}, func(_ context.Context, err error) bool {
+		return conflictMentions(err, "resiz")
 	})
-	if err != nil && conflictMentions(err, "resiz") {
+	if folded {
 		slog.Info("server already migrating; treating a retried cold-migrate as success", "logical", r.Logical, "id", r.ID)
 		return nil
 	}
