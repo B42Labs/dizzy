@@ -48,22 +48,26 @@ func (c *Client) CreateVolume(ctx context.Context, v cinderplan.Volume, volumeTy
 // ExtendVolume grows an already-available volume to newSizeGiB. The extend is an
 // offline resize on an unattached volume, so it needs no microversion. It
 // records under the new "extend" operation label and wraps a quota rejection
-// (the extra gigabytes count against the shared quota) with ErrQuota.
+// (the extra gigabytes count against the shared quota) with ErrQuota. A
+// retried extend that Cinder refuses because the volume already has the size
+// returns nil, and that confirmed case records as a successful call.
 func (c *Client) ExtendVolume(ctx context.Context, r resource.Resource, newSizeGiB int) error {
-	err := c.timed(ctx, string(KindVolume), "extend", func(ctx context.Context) error {
+	// Extend is not idempotent: if the first request commits on the backend but
+	// its response is lost (or returns a 5xx), the executor retries and Cinder
+	// rejects the re-issue with a 400 because the volume is already at the
+	// target. That 400 is itself confirmation the volume reached newSizeGiB, so
+	// treat it as success rather than failing an otherwise-correct run.
+	folded, err := c.timedFold(ctx, string(KindVolume), "extend", func(ctx context.Context) error {
 		return volumes.ExtendSize(ctx, c.gc, r.ID, volumes.ExtendSizeOpts{NewSize: newSizeGiB}).ExtractErr()
+	}, func(_ context.Context, err error) bool {
+		return isExtendAlreadyApplied(err)
 	})
+	if folded {
+		slog.Info("extend already applied; treating a retried extend as success",
+			"logical", r.Logical, "id", r.ID, "newSizeGiB", newSizeGiB)
+		return nil
+	}
 	if err != nil {
-		// Extend is not idempotent: if the first request commits on the backend but
-		// its response is lost (or returns a 5xx), the executor retries and Cinder
-		// rejects the re-issue with a 400 because the volume is already at the
-		// target. That 400 is itself confirmation the volume reached newSizeGiB, so
-		// treat it as success rather than failing an otherwise-correct run.
-		if isExtendAlreadyApplied(err) {
-			slog.Info("extend already applied; treating a retried extend as success",
-				"logical", r.Logical, "id", r.ID, "newSizeGiB", newSizeGiB)
-			return nil
-		}
 		return wrapCreate(KindVolume, r.Logical, err)
 	}
 	return nil

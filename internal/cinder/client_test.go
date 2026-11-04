@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 
 	"github.com/gophercloud/gophercloud/v2"
@@ -22,33 +23,87 @@ func respErr(status int, body string) error {
 
 // testServiceClient builds a Client whose gophercloud block-storage calls hit ts.
 func testServiceClient(ts *httptest.Server) *Client {
+	return testServiceClientWith(ts, metrics.NewCollector())
+}
+
+// testServiceClientWith builds a Client whose gophercloud block-storage calls
+// hit ts and whose samples go to m, so a test can read back what a call
+// recorded.
+func testServiceClientWith(ts *httptest.Server, m *metrics.Collector) *Client {
 	gc := &gophercloud.ServiceClient{
 		ProviderClient: &gophercloud.ProviderClient{},
 		Endpoint:       ts.URL + "/",
 	}
-	return New(gc, "run0", metrics.NewCollector())
+	return New(gc, "run0", m)
+}
+
+// wantOneSample fails the test unless m holds exactly one sample, of type typ,
+// that succeeded when errKind is empty and otherwise failed and classified to
+// errKind, so the error tally is empty or holds errKind once.
+func wantOneSample(t *testing.T, m *metrics.Collector, typ, errKind string) {
+	t.Helper()
+	succeeded := 1
+	var errs []metrics.ErrorCount
+	if errKind != "" {
+		succeeded = 0
+		errs = []metrics.ErrorCount{{Kind: errKind, Count: 1}}
+	}
+	agg := m.Aggregate(0)
+	if o := agg.Overall; o.Attempted != 1 || o.Succeeded != succeeded || o.Failed != 1-succeeded {
+		t.Errorf("overall attempted/succeeded/failed = %d/%d/%d, want 1/%d/%d",
+			o.Attempted, o.Succeeded, o.Failed, succeeded, 1-succeeded)
+	}
+	if len(agg.ByType) != 1 || agg.ByType[0].Type != typ ||
+		agg.ByType[0].Attempted != 1 || agg.ByType[0].Succeeded != succeeded {
+		t.Errorf("byType = %+v, want one %s sample with %d succeeded", agg.ByType, typ, succeeded)
+	}
+	if !slices.Equal(agg.Errors, errs) {
+		t.Errorf("errors = %v, want %v", agg.Errors, errs)
+	}
 }
 
 // TestExtendVolumeAlreadyApplied confirms a retried extend whose first request
 // already committed — Cinder then rejects the re-issue with a 400 "new size ...
 // must be greater than current size" — is treated as success, so an idempotent
 // retry does not fail an otherwise-correct run. A 400 for any other reason still
-// fails.
+// fails. Each case also checks the one sample the call records: the confirmed
+// 400 and an accepted extend record a succeeded volume sample with no error
+// kind, another 400 keeps its http_400, and a 413 records as a quota rejection
+// and wraps ErrQuota.
 func TestExtendVolumeAlreadyApplied(t *testing.T) {
 	cases := []struct {
-		name    string
-		body    string
-		wantErr bool
+		name      string
+		status    int
+		body      string
+		wantErr   bool
+		wantQuota bool   // whether errors.Is(err, ErrQuota) must hold
+		wantKind  string // the recorded error kind, "" for a success
 	}{
 		{
 			name:    "size not greater than current is success",
+			status:  http.StatusBadRequest,
 			body:    `{"badRequest":{"code":400,"message":"New size for extend must be greater than current size."}}`,
 			wantErr: false,
 		},
 		{
-			name:    "other 400 still fails",
-			body:    `{"badRequest":{"code":400,"message":"Invalid volume: some other reason"}}`,
-			wantErr: true,
+			name:     "other 400 still fails",
+			status:   http.StatusBadRequest,
+			body:     `{"badRequest":{"code":400,"message":"Invalid volume: some other reason"}}`,
+			wantErr:  true,
+			wantKind: "http_400",
+		},
+		{
+			name:    "accepted extend is success",
+			status:  http.StatusAccepted,
+			wantErr: false,
+		},
+		{
+			name:      "over quota fails with ErrQuota",
+			status:    http.StatusRequestEntityTooLarge,
+			body:      `{"overLimit":{"code":413,"message":"VolumeSizeExceedsAvailableQuota: Requested volume or snapshot exceeds allowed gigabytes quota."}}`,
+			wantErr:   true,
+			wantQuota: true,
+			wantKind:  "quota",
 		},
 	}
 	for _, tc := range cases {
@@ -58,12 +113,13 @@ func TestExtendVolumeAlreadyApplied(t *testing.T) {
 					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 				}
 				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusBadRequest)
+				w.WriteHeader(tc.status)
 				_, _ = io.WriteString(w, tc.body)
 			}))
 			defer ts.Close()
 
-			c := testServiceClient(ts)
+			m := metrics.NewCollector()
+			c := testServiceClientWith(ts, m)
 			err := c.ExtendVolume(context.Background(),
 				resource.Resource{Kind: KindVolume, Logical: "vol-0001", ID: "vol-1"}, 5)
 			if tc.wantErr && err == nil {
@@ -72,6 +128,10 @@ func TestExtendVolumeAlreadyApplied(t *testing.T) {
 			if !tc.wantErr && err != nil {
 				t.Fatalf("ExtendVolume: expected success for an already-applied extend, got %v", err)
 			}
+			if got := errors.Is(err, ErrQuota); got != tc.wantQuota {
+				t.Errorf("errors.Is(err, ErrQuota) = %v, want %v (err %v)", got, tc.wantQuota, err)
+			}
+			wantOneSample(t, m, string(KindVolume), tc.wantKind)
 		})
 	}
 }
