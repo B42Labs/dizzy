@@ -33,7 +33,16 @@ volumes dizzy attaches carry the same two keys as **metadata** — the Cinder
 mechanism — while the companion networks, subnets, and ports carry them as
 Neutron **tags**. Nova's server-list API cannot filter on metadata server-side,
 so server discovery lists the project's servers and filters client-side on the
-metadata dizzy itself wrote. A **boot-from-volume root volume** is Nova-created
+metadata dizzy itself wrote. Servers and data volumes carry a third metadata
+key, `dizzy:create`: a create token that tells one create request apart from
+an earlier one of the same name, so dizzy can find and adopt a resource whose
+create answer was lost (see
+[The churn engine](churn-engine.md#a-lost-create-answer-is-adopted)). Discovery
+and cleanup still filter on `dizzy:run` only. The churn network delete also
+removes an untracked server whose Nova-created port holds the network, and it
+checks the server's `dizzy:run` before it deletes the server, so it keeps the
+guarantee of [What cleanup will never do](#what-cleanup-will-never-do).
+A **boot-from-volume root volume** is Nova-created
 with delete-on-termination and carries no dizzy identity of its own; it dies with
 its server, so cleanup reaches it through the server delete. **Server groups**
 carry neither metadata nor tags, so identity lives in the name prefix

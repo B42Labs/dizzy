@@ -120,6 +120,45 @@ and a run sized to the quota would fail every create once enough deletes had
 failed. The retry draws nothing from the seed, so the decision schedule stays
 the same, and it counts as one more delete in the statistics.
 
+## A lost create answer is adopted
+
+A create can fail after it reached the cloud: the connection closes before the
+answer arrives, or the API answers 5xx after it committed. The server or volume
+can then exist although the engine never learned its id. Left alone, it holds
+its quota until the teardown, and the node's next create boots a second one
+under the same name.
+
+So dizzy stamps every server and data volume create with a create token, a
+sequence number under the metadata key `dizzy:create`. The token tells the
+instance of this request apart from an earlier instance of the same name, such
+as one whose delete failed. After a failure that may have reached the cloud,
+dizzy looks the resource up by name, run and token, and adopts a match as the
+node's resource. A server Nova is already deleting is not adopted. An answer
+below 500, such as a quota refusal, means the cloud created nothing, so it gets
+no lookup, and a create that succeeds with no earlier token waiting issues no
+extra request.
+
+The lookup runs right after the failure, while the operation's time has not run
+out, and again before the node's next create, or before a retry within the same
+operation. A create that timed out or was cancelled keeps its token waiting for
+that later lookup. The second lookup exists because an answer can arrive late,
+after the first lookup found nothing, and because a lookup during the same
+fault can fail as well, since the list request depends on the same services as
+the create. The next create posts only when that lookup finds nothing. When it
+fails, the create fails without posting, so a fault never boots a duplicate.
+
+Adoption can still come too late. A failed create leaves its node without a
+cloud id, so the node's delete has nothing to call, and the network under the
+server can become a delete candidate before the server node is created again.
+The orphan's boot port, which Nova created and which carries no dizzy tag,
+keeps the network in use, and every delete of the network answers 409. So the
+churn network delete first deletes this run's servers whose Nova-created port
+sits on the network, and waits until they are gone. It deletes only a server
+that carries the run's `dizzy:run` stamp; see
+[Resource identity and cleanup](resource-identity.md#what-cleanup-will-never-do).
+The lookups and these deletes draw nothing from the seed, so the decision
+schedule stays the same.
+
 ## Mutations
 
 Create and delete change the population. Some interesting operations don't.
