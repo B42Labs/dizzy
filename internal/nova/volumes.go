@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
@@ -17,14 +19,61 @@ import (
 // CreateVolume creates a blank data volume with the deterministic name and run
 // metadata. The metadata rides in the create request itself, the Cinder pattern.
 // A quota rejection is wrapped with ErrQuota so the executor fails fast.
+//
+// Each request carries a fresh create token under dizzy:create, and a lost
+// answer is handled as CreateServer handles it: the volume is looked up by name,
+// run and token right after a failure that may have landed and again before the
+// next create of the name, and a match is adopted instead of creating a second
+// volume. A pending lookup that fails returns its error without posting.
 func (c *Client) CreateVolume(ctx context.Context, v novaplan.Volume) (resource.Resource, error) {
 	name := resourceName(c.runID, v.Name)
+
+	// adopt returns the newest of the volumes a lookup found, which are this
+	// name's creates whose answer was lost. Any others stay in the cloud, where
+	// their metadata still makes them discoverable.
+	adopt := func(found []volumes.Volume) resource.Resource {
+		id := found[0].ID
+		slog.Info("adopted a volume whose create answer was lost", "name", name, "id", id)
+		if len(found) > 1 {
+			rest := make([]string, 0, len(found)-1)
+			for _, vol := range found[1:] {
+				rest = append(rest, vol.ID)
+			}
+			slog.Warn("more volumes of an earlier create whose answer was lost; the teardown deletes them",
+				"name", name, "ids", rest)
+		}
+		return resource.Resource{Kind: KindVolume, Logical: v.Name, Name: name, ID: id}
+	}
+
+	if tokens := c.takePending(KindVolume, name); len(tokens) > 0 {
+		found, err := c.lostVolumes(ctx, name, tokens)
+		if err != nil {
+			// Posting now could create a second volume beside one Cinder committed,
+			// so keep the tokens for the next attempt and fail instead; a 5xx from
+			// the list stays retryable.
+			for _, token := range tokens {
+				c.addPending(KindVolume, name, token)
+			}
+			return resource.Resource{}, wrapCreate(KindVolume, v.Name,
+				fmt.Errorf("looking up an earlier create whose answer was lost: %w", err))
+		}
+		if len(found) > 0 {
+			return adopt(found), nil
+		}
+	}
+
+	// The token rides on a copy of the run metadata, so runMetadata keeps the
+	// two keys discovery and the Neutron tags share.
+	token := c.createToken()
+	metadata := maps.Clone(runMetadata(c.runID, KindVolume))
+	metadata[metaCreate] = token
+
 	var id string
 	err := c.timed(ctx, string(KindVolume), "create", func(ctx context.Context) error {
 		created, err := volumes.Create(ctx, c.blockstorage, volumes.CreateOpts{
 			Name:     name,
 			Size:     v.SizeGiB,
-			Metadata: runMetadata(c.runID, KindVolume),
+			Metadata: metadata,
 		}, nil).Extract()
 		if err != nil {
 			return err
@@ -33,11 +82,60 @@ func (c *Client) CreateVolume(ctx context.Context, v novaplan.Volume) (resource.
 		return nil
 	})
 	if err != nil {
-		slog.Warn("create failed; a volume with this name may be orphaned in the cloud",
-			"name", name, "error", err)
+		// A create that may have reached Cinder is looked up by this request's
+		// token while the context allows and adopted when Cinder has it; otherwise
+		// the token stays pending for the next create of the name.
+		var lookupErr error
+		if mayHaveLanded(err) {
+			if ctx.Err() == nil {
+				var found []volumes.Volume
+				found, lookupErr = c.lostVolumes(ctx, name, []string{token})
+				if lookupErr == nil && len(found) > 0 {
+					return adopt(found), nil
+				}
+			}
+			c.addPending(KindVolume, name, token)
+		}
+		attrs := []any{"name", name, "error", err}
+		if lookupErr != nil {
+			attrs = append(attrs, "lookup", lookupErr)
+		}
+		slog.Warn("create failed; a volume with this name may be orphaned in the cloud", attrs...)
+		// The POST's error, not the lookup's, so errKind, IsRetryable and the
+		// executor see the failure they always saw.
 		return resource.Resource{}, wrapCreate(KindVolume, v.Name, err)
 	}
 	return resource.Resource{Kind: KindVolume, Logical: v.Name, Name: name, ID: id}, nil
+}
+
+// lostVolumes returns this run's data volumes named name whose dizzy:create
+// value is one of tokens, newest first: the volumes creates whose answer was lost
+// made. The name and run filters are requested server-side, but the metadata
+// filter is not universally honored, so the name, run and token are checked
+// again client-side; a volume without metadata matches nothing.
+func (c *Client) lostVolumes(ctx context.Context, name string, tokens []string) ([]volumes.Volume, error) {
+	var found []volumes.Volume
+	err := c.timed(ctx, string(KindVolume), "list", func(ctx context.Context) error {
+		found = nil
+		opts := volumes.ListOpts{Name: name, Metadata: map[string]string{metaRun: c.runID}}
+		return volumes.List(c.blockstorage, opts).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
+			items, err := volumes.ExtractVolumes(page)
+			if err != nil {
+				return false, err
+			}
+			for _, vol := range items {
+				if vol.Name == name && vol.Metadata[metaRun] == c.runID && slices.Contains(tokens, vol.Metadata[metaCreate]) {
+					found = append(found, vol)
+				}
+			}
+			return true, nil
+		})
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing volumes named %s: %w", name, err)
+	}
+	slices.SortStableFunc(found, func(a, b volumes.Volume) int { return b.CreatedAt.Compare(a.CreatedAt) })
+	return found, nil
 }
 
 // AttachVolume attaches a data volume to a server through the compute

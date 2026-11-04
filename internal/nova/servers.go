@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/gophercloud/gophercloud/v2"
@@ -35,8 +38,56 @@ type BootSpec struct {
 // the server into that server group; gophercloud rejects a group id that is
 // not a UUID before it sends the request. A quota rejection is wrapped with
 // ErrQuota so the executor fails fast.
+//
+// Each request carries a fresh create token under dizzy:create. When the POST
+// fails in a way that may have landed (see mayHaveLanded), the server is looked
+// up by name, run and token right away, and a match is adopted instead of
+// failing. When that lookup cannot run or finds nothing, the token stays
+// pending, and the next create of the name looks it up again before it posts,
+// so a create that Nova committed late is adopted instead of booting a second
+// server. A pending lookup that fails returns its error without posting.
 func (c *Client) CreateServer(ctx context.Context, s novaplan.Server, boot BootSpec) (resource.Resource, error) {
 	name := resourceName(c.runID, s.Name)
+
+	// adopt returns the newest of the servers a lookup found, which are this
+	// name's creates whose answer was lost. Any others stay in the cloud, where
+	// their metadata still makes them discoverable.
+	adopt := func(found []servers.Server) resource.Resource {
+		id := found[0].ID
+		slog.Info("adopted a server whose create answer was lost", "name", name, "id", id)
+		if len(found) > 1 {
+			rest := make([]string, 0, len(found)-1)
+			for _, srv := range found[1:] {
+				rest = append(rest, srv.ID)
+			}
+			slog.Warn("more servers of an earlier create whose answer was lost; the network sweep or the teardown deletes them",
+				"name", name, "ids", rest)
+		}
+		return resource.Resource{Kind: KindServer, Logical: s.Name, Name: name, ID: id}
+	}
+
+	if tokens := c.takePending(KindServer, name); len(tokens) > 0 {
+		found, err := c.lostServers(ctx, name, tokens)
+		if err != nil {
+			// Posting now could boot a second server beside one Nova committed, so
+			// keep the tokens for the next attempt and fail instead; a 5xx from the
+			// list stays retryable.
+			for _, token := range tokens {
+				c.addPending(KindServer, name, token)
+			}
+			return resource.Resource{}, wrapCreate(KindServer, s.Name,
+				fmt.Errorf("looking up an earlier create whose answer was lost: %w", err))
+		}
+		if len(found) > 0 {
+			return adopt(found), nil
+		}
+	}
+
+	// The token rides on a copy of the run metadata, so runMetadata keeps the
+	// two keys discovery and the Neutron tags share.
+	token := c.createToken()
+	metadata := maps.Clone(runMetadata(c.runID, KindServer))
+	metadata[metaCreate] = token
 
 	networks := make([]servers.Network, 0, len(boot.NetworkIDs))
 	for _, id := range boot.NetworkIDs {
@@ -47,7 +98,7 @@ func (c *Client) CreateServer(ctx context.Context, s novaplan.Server, boot BootS
 		Name:      name,
 		FlavorRef: boot.FlavorID,
 		Networks:  networks,
-		Metadata:  runMetadata(c.runID, KindServer),
+		Metadata:  metadata,
 	}
 	if s.BootFromVolume {
 		opts.BlockDevice = []servers.BlockDevice{{
@@ -82,11 +133,29 @@ func (c *Client) CreateServer(ctx context.Context, s novaplan.Server, boot BootS
 	})
 	if err != nil {
 		// A create that fails after the request reached Nova (a lost response or a
-		// 5xx past commit) can leave a server behind. Log the deterministic name so
-		// an operator can locate any such orphan; its metadata still makes it
-		// discoverable at cleanup.
-		slog.Warn("create failed; a server with this name may be orphaned in the cloud",
-			"name", name, "error", err)
+		// 5xx past commit) can leave a server behind. Look it up by this request's
+		// token while the context allows, and adopt it when Nova has it. Otherwise
+		// keep the token pending for the next create of the name, and log the
+		// deterministic name so an operator can locate any such orphan; its
+		// metadata still makes it discoverable at cleanup.
+		var lookupErr error
+		if mayHaveLanded(err) {
+			if ctx.Err() == nil {
+				var found []servers.Server
+				found, lookupErr = c.lostServers(ctx, name, []string{token})
+				if lookupErr == nil && len(found) > 0 {
+					return adopt(found), nil
+				}
+			}
+			c.addPending(KindServer, name, token)
+		}
+		attrs := []any{"name", name, "error", err}
+		if lookupErr != nil {
+			attrs = append(attrs, "lookup", lookupErr)
+		}
+		slog.Warn("create failed; a server with this name may be orphaned in the cloud", attrs...)
+		// The POST's error, not the lookup's, so errKind, IsRetryable and the
+		// executor see the failure they always saw.
 		return resource.Resource{}, wrapCreate(KindServer, s.Name, err)
 	}
 	return resource.Resource{Kind: KindServer, Logical: s.Name, Name: name, ID: id}, nil
@@ -290,6 +359,43 @@ func (c *Client) listServersByMetadata(ctx context.Context, filter map[string]st
 	if err != nil {
 		return nil, fmt.Errorf("listing servers by metadata: %w", err)
 	}
+	return found, nil
+}
+
+// lostServers returns this run's servers named name whose dizzy:create value is
+// one of tokens, newest first: the servers creates whose answer was lost made.
+// Nova applies the name filter as a regular expression on the server side, so
+// the name is anchored and quoted, and the name, run and token are checked again
+// client-side; a server without metadata matches nothing. A server Nova is
+// deleting or has deleted is no match either: a network sweep whose wait gave up
+// leaves such a server listed, and adopting it would hand the node's children a
+// server that is about to go.
+func (c *Client) lostServers(ctx context.Context, name string, tokens []string) ([]servers.Server, error) {
+	var found []servers.Server
+	err := c.timed(ctx, string(KindServer), "list", func(ctx context.Context) error {
+		found = nil
+		opts := servers.ListOpts{Name: "^" + regexp.QuoteMeta(name) + "$"}
+		return servers.List(c.compute, opts).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
+			items, err := servers.ExtractServers(page)
+			if err != nil {
+				return false, err
+			}
+			for _, srv := range items {
+				if srv.Name != name || srv.Metadata[metaRun] != c.runID || !slices.Contains(tokens, srv.Metadata[metaCreate]) {
+					continue
+				}
+				if srv.TaskState == "deleting" || srv.Status == "DELETED" || srv.Status == "SOFT_DELETED" {
+					continue
+				}
+				found = append(found, srv)
+			}
+			return true, nil
+		})
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing servers named %s: %w", name, err)
+	}
+	slices.SortStableFunc(found, func(a, b servers.Server) int { return b.Created.Compare(a.Created) })
 	return found, nil
 }
 

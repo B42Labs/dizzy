@@ -3,16 +3,148 @@ package nova
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gophercloud/gophercloud/v2"
+
 	"github.com/B42Labs/dizzy/internal/metrics"
+	novaplan "github.com/B42Labs/dizzy/internal/nova/plan"
 	"github.com/B42Labs/dizzy/internal/resource"
 )
+
+// testBlockStorageClient builds a Client whose Cinder (block-storage) service
+// calls hit ts. Only the data volume calls are exercised with it, so the compute
+// and network clients are left nil.
+func testBlockStorageClient(ts *httptest.Server) *Client {
+	gc := &gophercloud.ServiceClient{
+		ProviderClient: &gophercloud.ProviderClient{},
+		Endpoint:       ts.URL + "/",
+	}
+	return New(nil, nil, gc, "run0", metrics.NewCollector())
+}
+
+// cinderVolumes is the createAPI of Cinder volumes. Cinder writes its times
+// without a zone, the form gophercloud parses.
+var cinderVolumes = createAPI{
+	create: "/volumes", list: "/volumes/detail", one: "volume", many: "volumes",
+	prefix: "vol", status: "creating", createdKey: "created_at", createdAt: "2026-01-01T00:00:00.000000",
+}
+
+// TestCreateVolumeAdoptsLostAnswer verifies that a data volume create whose
+// answer may have been lost looks the volume up by name, run and create token,
+// right after the failure and before the next create of the name, and adopts a
+// match without posting again; that otherwise the POST's error is returned; and
+// that a quota refusal looks nothing up. The fake names each create by the
+// token it carries.
+func TestCreateVolumeAdoptsLostAnswer(t *testing.T) {
+	const name = "dizzy-run0-vol-0001"
+	vol := novaplan.Volume{Name: "vol-0001", SizeGiB: 1}
+	adopted := func(id string) resource.Resource {
+		return resource.Resource{Kind: "volume", Logical: "vol-0001", Name: name, ID: id}
+	}
+	create := func(c *Client) (resource.Resource, error) {
+		return c.CreateVolume(context.Background(), vol)
+	}
+
+	t.Run("answer lost after commit", func(t *testing.T) {
+		f := newLostAnswerFake(t, cinderVolumes, map[string]createAnswer{"1": answerLostAfterCommit})
+		got, err := create(testBlockStorageClient(f.ts))
+		if err != nil || got != adopted("vol-1") {
+			t.Fatalf("CreateVolume = %+v, %v, want %+v, nil", got, err, adopted("vol-1"))
+		}
+		f.wantCalls(t, "create 1", "list")
+		if names := f.listNames(); !slices.Equal(names, []string{name}) {
+			t.Errorf("list name queries = %q, want [%s]", names, name)
+		}
+	})
+
+	t.Run("answer lost, nothing created", func(t *testing.T) {
+		f := newLostAnswerFake(t, cinderVolumes, map[string]createAnswer{"1": answerLost})
+		c := testBlockStorageClient(f.ts)
+		_, err := create(c)
+		if want := `creating volume "vol-0001":`; err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Fatalf("CreateVolume = %v, want an error starting with %q", err, want)
+		}
+		if !errors.Is(err, io.EOF) {
+			t.Errorf("CreateVolume = %v, want it to wrap io.EOF", err)
+		}
+		f.wantCalls(t, "create 1", "list")
+
+		if _, err := create(c); err != nil {
+			t.Fatalf("second CreateVolume = %v, want nil", err)
+		}
+		f.wantCalls(t, "list", "create 2")
+	})
+
+	t.Run("late commit", func(t *testing.T) {
+		f := newLostAnswerFake(t, cinderVolumes, map[string]createAnswer{"1": answerLost})
+		c := testBlockStorageClient(f.ts)
+		if _, err := create(c); err == nil {
+			t.Fatal("CreateVolume = nil, want the lost answer's error")
+		}
+		f.wantCalls(t, "create 1", "list")
+
+		f.add(cinderVolumes.rec("vol-late", name, f.sent(0)))
+		got, err := create(c)
+		if err != nil || got != adopted("vol-late") {
+			t.Fatalf("second CreateVolume = %+v, %v, want %+v, nil", got, err, adopted("vol-late"))
+		}
+		f.wantCalls(t, "list")
+	})
+
+	t.Run("pending lookup fails", func(t *testing.T) {
+		f := newLostAnswerFake(t, cinderVolumes, map[string]createAnswer{"1": answerLost},
+			http.StatusOK, http.StatusServiceUnavailable)
+		c := testBlockStorageClient(f.ts)
+		if _, err := create(c); err == nil {
+			t.Fatal("CreateVolume = nil, want the lost answer's error")
+		}
+		f.wantCalls(t, "create 1", "list")
+
+		_, err := create(c)
+		if want := "looking up an earlier create whose answer was lost"; err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("second CreateVolume = %v, want an error containing %q", err, want)
+		}
+		f.wantCalls(t, "list")
+	})
+
+	t.Run("the token tells instances apart", func(t *testing.T) {
+		f := newLostAnswerFake(t, cinderVolumes, map[string]createAnswer{"1": answerLost})
+		f.add(
+			cinderVolumes.rec("vol-other-token", name, map[string]string{"dizzy:run": "run0", "dizzy:type": "volume", "dizzy:create": "7"}),
+			cinderVolumes.rec("vol-no-metadata", name, nil),
+		)
+		got, err := create(testBlockStorageClient(f.ts))
+		if !errors.Is(err, io.EOF) || got != (resource.Resource{}) {
+			t.Fatalf("CreateVolume = %+v, %v, want no adoption and the POST's io.EOF", got, err)
+		}
+		f.wantCalls(t, "create 1", "list")
+	})
+
+	t.Run("a 413 over-limit answer", func(t *testing.T) {
+		f := newLostAnswerFake(t, cinderVolumes, map[string]createAnswer{"1": {
+			status: http.StatusRequestEntityTooLarge,
+			body:   `{"overLimit":{"code":413,"message":"VolumeLimitExceeded: Maximum number of volumes allowed (10) exceeded"}}`,
+		}})
+		c := testBlockStorageClient(f.ts)
+		if _, err := create(c); !errors.Is(err, ErrQuota) {
+			t.Fatalf("CreateVolume = %v, want it to wrap ErrQuota", err)
+		}
+		f.wantCalls(t, "create 1")
+
+		if _, err := create(c); err != nil {
+			t.Fatalf("second CreateVolume = %v, want nil", err)
+		}
+		f.wantCalls(t, "create 2")
+	})
+}
 
 // TestAttachVolume verifies an accepted attach succeeds, a repeated attach that
 // Nova rejects because the volume is already attached is success only when the

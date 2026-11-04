@@ -16,7 +16,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
@@ -57,10 +60,15 @@ const (
 )
 
 // Metadata/tag keys binding a created resource to a tester run and its kind.
-// They mirror the Neutron and Cinder conventions already in use.
+// They mirror the Neutron and Cinder conventions already in use. Servers and
+// data volumes also carry metaCreate, the create token of the request that made
+// them, so a lookup after a lost answer can tell the instance that request
+// created from an earlier instance of the same name and run that is still in the
+// cloud.
 const (
-	metaRun  = "dizzy:run"
-	metaType = "dizzy:type"
+	metaRun    = "dizzy:run"
+	metaType   = "dizzy:type"
+	metaCreate = "dizzy:create"
 )
 
 // ErrQuota is the sentinel a create wrapper wraps when Nova rejects the request
@@ -78,6 +86,21 @@ type Client struct {
 	runID        string
 	metrics      *metrics.Collector
 	tel          *telemetry.Telemetry
+
+	// seq numbers the create tokens this Client stamps under metaCreate. A token
+	// is unique within one Client, and every Client has its own run id, so run,
+	// name and token together name one create request.
+	seq atomic.Uint64
+
+	// mu guards pending, because the churn engine creates from several
+	// goroutines at once.
+	mu sync.Mutex
+	// pending holds, under string(kind) + "/" + the cloud name, the tokens of
+	// earlier creates of that name whose answer was lost and whose instance a
+	// lookup did not find yet. The next create of the name takes the entry, so
+	// the record holds at most one entry per logical name and stays bounded in an
+	// unbounded run.
+	pending map[string][]string
 }
 
 // New returns a Client that names and stamps resources for runID and records
@@ -90,6 +113,7 @@ func New(compute, network, blockstorage *gophercloud.ServiceClient, runID string
 		blockstorage: blockstorage,
 		runID:        runID,
 		metrics:      m,
+		pending:      map[string][]string{},
 	}
 }
 
@@ -108,13 +132,43 @@ func resourceName(runID, logical string) string {
 
 // runMetadata returns the metadata stamped on every created resource of the
 // given kind: the run identifier and the resource type. Discovery for cleanup
-// filters on the run key. Servers and volumes use it directly; networks,
-// subnets, and ports carry the same pair as Neutron tags.
+// filters on the run key. Servers and volumes stamp a copy of it with their
+// create token added; networks, subnets, and ports carry the same pair as
+// Neutron tags.
 func runMetadata(runID string, kind resource.Kind) map[string]string {
 	return map[string]string{
 		metaRun:  runID,
 		metaType: string(kind),
 	}
+}
+
+// createToken returns a fresh create token for one create request. The request
+// carries it under metaCreate, so a lookup after a lost answer finds the
+// instance this request created and not an earlier one of the same name.
+func (c *Client) createToken() string {
+	return strconv.FormatUint(c.seq.Add(1), 10)
+}
+
+// addPending records token as the token of a create of kind named name whose
+// answer was lost and whose instance was not found, so the next create of that
+// name looks for it before it posts again.
+func (c *Client) addPending(kind resource.Kind, name, token string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := string(kind) + "/" + name
+	c.pending[key] = append(c.pending[key], token)
+}
+
+// takePending returns the tokens recorded for kind and name and deletes the
+// entry, so a token is looked up at most once more unless the caller puts it
+// back with addPending.
+func (c *Client) takePending(kind resource.Kind, name string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := string(kind) + "/" + name
+	tokens := c.pending[key]
+	delete(c.pending, key)
+	return tokens
 }
 
 // runTags returns the Neutron tags applied to every created network, subnet, or
@@ -176,6 +230,29 @@ func httpStatus(err error) int {
 		return code.GetStatusCode()
 	}
 	return 0
+}
+
+// mayHaveLanded reports whether a create that failed with err may still have
+// created its resource. gophercloud's input errors fail before the request is
+// sent, and a status below 500 is the service refusing the request, a quota
+// rejection included, so none of these created anything. A 5xx can come after
+// the service committed, and an error without a status (a lost connection, a
+// deadline, a cancel) leaves unknown whether the request arrived, so both may
+// have landed. IsRetryable stays apart from this: retrying a create without a
+// lookup is what boots a duplicate.
+func mayHaveLanded(err error) bool {
+	if err == nil {
+		return false
+	}
+	var missing gophercloud.ErrMissingInput
+	var invalid gophercloud.ErrInvalidInput
+	if errors.As(err, &missing) || errors.As(err, &invalid) {
+		return false
+	}
+	if s := httpStatus(err); s != 0 {
+		return s >= 500
+	}
+	return true
 }
 
 // errKind classifies an error into a stable, low-cardinality label for the
