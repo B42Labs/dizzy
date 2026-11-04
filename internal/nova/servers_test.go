@@ -25,15 +25,22 @@ import (
 	"github.com/B42Labs/dizzy/internal/resource"
 )
 
-// testComputeClient builds a Client whose Nova (compute) service calls hit ts.
-// Only the compute-backed lifecycle ops are exercised here, so the network and
-// block-storage clients are left nil.
+// testComputeClient builds a Client whose Nova (compute) service calls hit ts
+// and record into a fresh Collector the test does not read.
 func testComputeClient(ts *httptest.Server) *Client {
+	return testComputeClientWith(ts, metrics.NewCollector())
+}
+
+// testComputeClientWith builds a Client whose Nova (compute) service calls hit
+// ts and record into m, so a test can assert the samples a call records. Only
+// the compute-backed lifecycle ops are exercised here, so the network and
+// block-storage clients are left nil.
+func testComputeClientWith(ts *httptest.Server, m *metrics.Collector) *Client {
 	gc := &gophercloud.ServiceClient{
 		ProviderClient: &gophercloud.ProviderClient{},
 		Endpoint:       ts.URL + "/",
 	}
-	return New(gc, nil, nil, "run0", metrics.NewCollector())
+	return New(gc, nil, nil, "run0", m)
 }
 
 // conflictActionServer answers every server-action POST with a 409 carrying
@@ -56,7 +63,9 @@ func conflictActionServer(t *testing.T, body string) *httptest.Server {
 // treat a retried 409 that names their settled target state as success — a
 // committed-then-lost first attempt must not fail the run once the retry sees
 // the instance already transitioned — while a genuine non-target 409 (an ERROR
-// state) still surfaces as an error.
+// state, or one whose body names no state) still surfaces as an error. A
+// tolerated 409 records as one successful server call, and a surfaced one
+// records its http_409.
 func TestLifecycleOpsTolerateCommittedConflict(t *testing.T) {
 	srv := resource.Resource{Kind: KindServer, ID: "srv-1", Logical: "srv-0001"}
 
@@ -65,6 +74,16 @@ func TestLifecycleOpsTolerateCommittedConflict(t *testing.T) {
 		body string
 		call func(*Client) error
 	}{
+		{
+			name: "stop already stopped",
+			body: `{"conflictingRequest":{"message":"Cannot 'stop' instance srv-1 while it is in vm_state stopped"}}`,
+			call: func(c *Client) error { return c.StopServer(context.Background(), srv) },
+		},
+		{
+			name: "start already active",
+			body: `{"conflictingRequest":{"message":"Cannot 'start' instance srv-1 while it is in vm_state active"}}`,
+			call: func(c *Client) error { return c.StartServer(context.Background(), srv) },
+		},
 		{
 			name: "resize already in verify-resize",
 			body: `{"conflictingRequest":{"message":"Cannot 'resize' instance srv-1 while it is in vm_state resized"}}`,
@@ -85,9 +104,11 @@ func TestLifecycleOpsTolerateCommittedConflict(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ts := conflictActionServer(t, tc.body)
 			defer ts.Close()
-			if err := tc.call(testComputeClient(ts)); err != nil {
+			m := metrics.NewCollector()
+			if err := tc.call(testComputeClientWith(ts, m)); err != nil {
 				t.Errorf("op = %v, want nil (a committed-then-retried 409 is success)", err)
 			}
+			wantOneSample(t, m, string(KindServer), "")
 		})
 	}
 
@@ -97,15 +118,32 @@ func TestLifecycleOpsTolerateCommittedConflict(t *testing.T) {
 	t.Run("resize error state is not tolerated", func(t *testing.T) {
 		ts := conflictActionServer(t, `{"conflictingRequest":{"message":"Cannot 'resize' instance srv-1 while it is in vm_state error"}}`)
 		defer ts.Close()
-		if err := testComputeClient(ts).ResizeServer(context.Background(), srv, "flavor-2"); err == nil {
+		m := metrics.NewCollector()
+		if err := testComputeClientWith(ts, m).ResizeServer(context.Background(), srv, "flavor-2"); err == nil {
 			t.Error("ResizeServer on an ERROR-state 409 = nil, want an error")
 		}
+		wantOneSample(t, m, string(KindServer), "http_409")
+	})
+
+	// A stop 409 without a body names no state, so nothing confirms the stop
+	// committed and the conflict surfaces.
+	t.Run("stop with an empty body is not tolerated", func(t *testing.T) {
+		ts := conflictActionServer(t, "")
+		defer ts.Close()
+		m := metrics.NewCollector()
+		err := testComputeClientWith(ts, m).StopServer(context.Background(), srv)
+		if want := `stopping server "srv-0001":`; err == nil || !strings.HasPrefix(err.Error(), want) {
+			t.Errorf("StopServer = %v, want an error starting with %q", err, want)
+		}
+		wantOneSample(t, m, string(KindServer), "http_409")
 	})
 }
 
 // TestColdMigrateServer verifies the cold-migrate action body, that a retried
 // 409 naming a resize task state is success, and that every other failure
-// surfaces wrapped with the logical name.
+// surfaces wrapped with the logical name. A success, the tolerated 409
+// included, records as one successful server call, and a failure records the
+// error kind of its status.
 func TestColdMigrateServer(t *testing.T) {
 	srv := resource.Resource{Kind: KindServer, ID: "srv-1", Logical: "srv-0001"}
 
@@ -120,29 +158,35 @@ func TestColdMigrateServer(t *testing.T) {
 			w.WriteHeader(http.StatusAccepted)
 		}))
 		defer ts.Close()
-		if err := testComputeClient(ts).ColdMigrateServer(context.Background(), srv); err != nil {
+		m := metrics.NewCollector()
+		if err := testComputeClientWith(ts, m).ColdMigrateServer(context.Background(), srv); err != nil {
 			t.Fatalf("ColdMigrateServer = %v, want nil", err)
 		}
 		if body != `{"migrate":null}` {
 			t.Errorf("posted body = %s, want {\"migrate\":null}", body)
 		}
+		wantOneSample(t, m, string(KindServer), "")
 	})
 
 	t.Run("already migrating", func(t *testing.T) {
 		ts := conflictActionServer(t, `{"conflictingRequest":{"message":"Cannot 'migrate' instance srv-1 while it is in task_state resize_migrating"}}`)
 		defer ts.Close()
-		if err := testComputeClient(ts).ColdMigrateServer(context.Background(), srv); err != nil {
+		m := metrics.NewCollector()
+		if err := testComputeClientWith(ts, m).ColdMigrateServer(context.Background(), srv); err != nil {
 			t.Errorf("ColdMigrateServer = %v, want nil (a committed-then-retried 409 is success)", err)
 		}
+		wantOneSample(t, m, string(KindServer), "")
 	})
 
 	t.Run("error state is not tolerated", func(t *testing.T) {
 		ts := conflictActionServer(t, `{"conflictingRequest":{"message":"Cannot 'migrate' instance srv-1 while it is in vm_state error"}}`)
 		defer ts.Close()
-		err := testComputeClient(ts).ColdMigrateServer(context.Background(), srv)
+		m := metrics.NewCollector()
+		err := testComputeClientWith(ts, m).ColdMigrateServer(context.Background(), srv)
 		if want := `cold-migrating server "srv-0001":`; err == nil || !strings.HasPrefix(err.Error(), want) {
 			t.Errorf("ColdMigrateServer = %v, want an error starting with %q", err, want)
 		}
+		wantOneSample(t, m, string(KindServer), "http_409")
 	})
 
 	t.Run("forbidden", func(t *testing.T) {
@@ -150,7 +194,8 @@ func TestColdMigrateServer(t *testing.T) {
 			w.WriteHeader(http.StatusForbidden)
 		}))
 		defer ts.Close()
-		err := testComputeClient(ts).ColdMigrateServer(context.Background(), srv)
+		m := metrics.NewCollector()
+		err := testComputeClientWith(ts, m).ColdMigrateServer(context.Background(), srv)
 		if want := `cold-migrating server "srv-0001":`; err == nil || !strings.HasPrefix(err.Error(), want) {
 			t.Fatalf("ColdMigrateServer = %v, want an error starting with %q", err, want)
 		}
@@ -158,6 +203,7 @@ func TestColdMigrateServer(t *testing.T) {
 		if !errors.As(err, &code) || code.Actual != http.StatusForbidden {
 			t.Errorf("ColdMigrateServer = %v, want it to wrap the gophercloud 403", err)
 		}
+		wantOneSample(t, m, string(KindServer), "http_403")
 	})
 }
 
