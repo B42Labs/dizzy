@@ -200,7 +200,32 @@ func metadataMatches(md, filter map[string]string) bool {
 func (c *Client) timed(ctx context.Context, typ, op string, fn func(context.Context) error) error {
 	start := time.Now()
 	err := fn(ctx)
+	c.record(ctx, typ, op, time.Since(start), err)
+	return err
+}
+
+// timedFold runs fn like timed, for a call whose error can show that the
+// change it requested is already in place. When fn fails, it calls applied
+// with fn's error; applied reports whether that error confirms the change,
+// and may send a follow-up read to find out, which records no sample. A
+// confirmed call records as a success and returns (true, nil). Any other
+// outcome records fn's error as timed does and returns (false, fn's error).
+// The recorded duration covers fn alone, not applied.
+func (c *Client) timedFold(ctx context.Context, typ, op string, fn func(context.Context) error, applied func(context.Context, error) bool) (bool, error) {
+	start := time.Now()
+	err := fn(ctx)
 	d := time.Since(start)
+	if err != nil && applied(ctx, err) {
+		c.record(ctx, typ, op, d, nil)
+		return true, nil
+	}
+	c.record(ctx, typ, op, d, err)
+	return false, err
+}
+
+// record adds one sample for a call of typ and op that took d and ended
+// with err to the collector, and mirrors it into telemetry under op.
+func (c *Client) record(ctx context.Context, typ, op string, d time.Duration, err error) {
 	ek := errKind(err)
 	c.metrics.Record(metrics.Sample{
 		Type:     typ,
@@ -209,7 +234,6 @@ func (c *Client) timed(ctx context.Context, typ, op string, fn func(context.Cont
 		ErrKind:  ek,
 	})
 	c.tel.RecordOperation(ctx, typ, op, d, ek)
-	return err
 }
 
 // wrapCreate adds operation context to a create error and, when the error is a
