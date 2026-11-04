@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
 	"github.com/B42Labs/dizzy/internal/metrics"
 	"github.com/B42Labs/dizzy/internal/resource"
@@ -150,37 +153,87 @@ func TestWaitForPortDetached(t *testing.T) {
 	}
 }
 
+// wantOperationPoints fails the test unless reader holds exactly one
+// dizzy.operation.duration point for kind and op, with the outcome errKind
+// maps to, and one dizzy.operation.errors point under errKind when errKind is
+// not empty and none when it is.
+func wantOperationPoints(t *testing.T, reader *sdkmetric.ManualReader, kind, op, errKind string) {
+	t.Helper()
+	outcome := "error"
+	switch errKind {
+	case "":
+		outcome = "success"
+	case "timeout":
+		outcome = "timeout"
+	}
+	wantDuration := []map[string]string{{"kind": kind, "operation": op, "outcome": outcome}}
+	var wantErrors []map[string]string
+	if errKind != "" {
+		wantErrors = []map[string]string{{"kind": kind, "operation": op, "error.kind": errKind}}
+	}
+	if got := metricPoints(t, reader, "dizzy.operation.duration"); !slices.EqualFunc(got, wantDuration, maps.Equal) {
+		t.Errorf("dizzy.operation.duration points = %v, want %v", got, wantDuration)
+	}
+	if got := metricPoints(t, reader, "dizzy.operation.errors"); !slices.EqualFunc(got, wantErrors, maps.Equal) {
+		t.Errorf("dizzy.operation.errors points = %v, want %v", got, wantErrors)
+	}
+}
+
 // TestAttachPort verifies an accepted attach succeeds, a repeated attach that
 // Nova rejects with a 409 is success when the server has the port's interface
 // attachment, and that the 409 surfaces wrapped, still retryable, when it does
-// not.
+// not or the lookup fails. It checks that only a 409 sends the lookup, that a
+// confirmed 409 records as a successful port attach in the Collector and in
+// telemetry and logs the fold, and that every other outcome records the
+// attach's own error kind. The cases run serially because each one reads the
+// process-wide default logger.
 func TestAttachPort(t *testing.T) {
 	srv := resource.Resource{Kind: KindServer, ID: "srv-1", Logical: "srv-0001"}
 	port := resource.Resource{Kind: KindPort, ID: "port-1", Logical: "port-0001"}
+	const foldLog = `level=INFO msg="port already attached; treating a repeated attach as success" port=port-0001 server=srv-0001 id=port-1`
 
 	tests := []struct {
-		name       string
-		postStatus int
-		getStatus  int // the answer to the interface lookup after a 409
-		wantErr    bool
+		name        string
+		postStatus  int
+		emptyBody   bool // answer the 409 without a body
+		getStatus   int  // the answer to the interface lookup after a 409; 0 for none expected
+		wantErr     bool
+		wantStatus  int    // the status the returned error carries
+		wantKind    string // the recorded error kind, "" for a success
+		wantLookups int32
+		wantLog     bool // whether the fold is logged
 	}{
 		{name: "accepted", postStatus: http.StatusOK},
-		{name: "already attached to the server", postStatus: http.StatusConflict, getStatus: http.StatusOK},
-		{name: "in use without the server having it", postStatus: http.StatusConflict, getStatus: http.StatusNotFound, wantErr: true},
+		{name: "already attached to the server", postStatus: http.StatusConflict, getStatus: http.StatusOK,
+			wantLookups: 1, wantLog: true},
+		{name: "in use without the server having it", postStatus: http.StatusConflict, getStatus: http.StatusNotFound,
+			wantErr: true, wantStatus: http.StatusConflict, wantKind: "http_409", wantLookups: 1},
+		{name: "in use, lookup unavailable", postStatus: http.StatusConflict, getStatus: http.StatusServiceUnavailable,
+			wantErr: true, wantStatus: http.StatusConflict, wantKind: "http_409", wantLookups: 1},
+		{name: "a 409 without a body, attached to the server", postStatus: http.StatusConflict, emptyBody: true, getStatus: http.StatusOK,
+			wantLookups: 1, wantLog: true},
+		{name: "the attach fails", postStatus: http.StatusInternalServerError,
+			wantErr: true, wantStatus: http.StatusInternalServerError, wantKind: "http_500"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLog(t)
+			var lookups atomic.Int32
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				switch {
 				case r.Method == http.MethodPost && r.URL.Path == "/servers/srv-1/os-interface":
 					w.WriteHeader(tc.postStatus)
-					if tc.postStatus == http.StatusConflict {
+					switch {
+					case tc.postStatus == http.StatusConflict && !tc.emptyBody:
 						_, _ = w.Write([]byte(`{"conflictingRequest":{"code":409,"message":"Port port-1 is still in use."}}`))
-						return
+					case tc.postStatus == http.StatusOK:
+						_, _ = w.Write([]byte(`{"interfaceAttachment":{"port_id":"port-1","port_state":"ACTIVE"}}`))
+					case tc.postStatus == http.StatusInternalServerError:
+						_, _ = w.Write([]byte(`{"computeFault":{"code":500,"message":"Unexpected API Error."}}`))
 					}
-					_, _ = w.Write([]byte(`{"interfaceAttachment":{"port_id":"port-1","port_state":"ACTIVE"}}`))
-				case r.Method == http.MethodGet && r.URL.Path == "/servers/srv-1/os-interface/port-1":
+				case r.Method == http.MethodGet && r.URL.Path == "/servers/srv-1/os-interface/port-1" && tc.getStatus != 0:
+					lookups.Add(1)
 					w.WriteHeader(tc.getStatus)
 					if tc.getStatus == http.StatusOK {
 						_, _ = w.Write([]byte(`{"interfaceAttachment":{"port_id":"port-1","port_state":"ACTIVE"}}`))
@@ -191,7 +244,18 @@ func TestAttachPort(t *testing.T) {
 				}
 			}))
 			defer ts.Close()
-			err := testComputeClient(ts).AttachPort(context.Background(), srv, port)
+			c, m, reader := telemetryComputeClient(t, ts)
+			err := c.AttachPort(context.Background(), srv, port)
+
+			if got := lookups.Load(); got != tc.wantLookups {
+				t.Errorf("sent %d interface lookups, want %d", got, tc.wantLookups)
+			}
+			wantOneSample(t, m, string(KindPort), tc.wantKind)
+			wantOperationPoints(t, reader, string(KindPort), "attach", tc.wantKind)
+			if got := strings.Contains(logs.String(), foldLog); got != tc.wantLog {
+				t.Errorf("logged the fold = %v, want %v:\n%s", got, tc.wantLog, logs.String())
+			}
+
 			if !tc.wantErr {
 				if err != nil {
 					t.Errorf("AttachPort = %v, want nil", err)
@@ -202,7 +266,10 @@ func TestAttachPort(t *testing.T) {
 				t.Fatalf("AttachPort = %v, want an error starting with %q", err, want)
 			}
 			if !IsRetryable(err) {
-				t.Errorf("AttachPort = %v, want the retryable 409", err)
+				t.Errorf("AttachPort = %v, want it retryable", err)
+			}
+			if got := httpStatus(err); got != tc.wantStatus {
+				t.Errorf("AttachPort = %v carrying status %d, want %d", err, got, tc.wantStatus)
 			}
 		})
 	}
