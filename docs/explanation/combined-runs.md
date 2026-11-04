@@ -79,9 +79,9 @@ attach started in between fails with `is already attached to instances`. A
 toggle changes its state only when its step succeeded, so a failed resize,
 detach or attach is tried again in the same direction. A step whose wait gave
 up may still finish in the cloud, so the retry can find the change already
-made: an attach of a volume or port that is already attached counts as done,
-and a resize to the flavor the server already has turns around to the other
-flavor.
+made: an attach of a volume or port that is already attached counts as done
+and records as a successful call, and a resize to the flavor the server
+already has turns around to the other flavor.
 
 A kept server whose boot failed is not replaced. The engine marks a node present
 when it decides to create it, so it never schedules that create again, and it
