@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -73,6 +76,162 @@ func TestDeleteNetworkPorts(t *testing.T) {
 	if strings.Join(deletedPorts, ",") != "orphan-1,orphan-2" {
 		t.Errorf("deleted ports = %v, want only the empty-device-owner ports attempted", deletedPorts)
 	}
+}
+
+// TestListNetworkServers verifies the discovery behind the churn network
+// sweep: it returns the server that holds the network through an untagged
+// compute port and carries this run's dizzy:run, read once however many such
+// ports it has; it reads no server behind a port dizzy tagged, a service port
+// or a plain port; it skips another run's server, a server without metadata
+// and a server already gone; an empty network reads no server; and an
+// upstream error is wrapped with the network and, for a server read, with the
+// server id.
+func TestListNetworkServers(t *testing.T) {
+	// reply is the status and body a fake answers one request with.
+	type reply struct {
+		status int
+		body   string
+	}
+	// serve answers the port list of net-1 with ports and the GET of each
+	// server in servers with its reply, and counts the GETs per server id. A
+	// server without a reply must not be read.
+	serve := func(t *testing.T, ports reply, servers map[string]reply) (*Client, func() map[string]int) {
+		t.Helper()
+		var mu sync.Mutex
+		gets := map[string]int{}
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/ports":
+				if got := r.URL.Query().Get("network_id"); got != "net-1" {
+					t.Errorf("network_id query = %q, want net-1", got)
+				}
+				w.WriteHeader(ports.status)
+				_, _ = io.WriteString(w, ports.body)
+			case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/servers/"):
+				id := strings.TrimPrefix(r.URL.Path, "/servers/")
+				mu.Lock()
+				gets[id]++
+				mu.Unlock()
+				rep, ok := servers[id]
+				if !ok {
+					t.Errorf("unexpected GET of server %s", id)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				w.WriteHeader(rep.status)
+				_, _ = io.WriteString(w, rep.body)
+			default:
+				t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+		}))
+		t.Cleanup(ts.Close)
+		return testComputeNetworkClient(ts, metrics.NewCollector()), func() map[string]int {
+			mu.Lock()
+			defer mu.Unlock()
+			return maps.Clone(gets)
+		}
+	}
+	server := func(id, name, metadata string) reply {
+		return reply{http.StatusOK, `{"server":{"id":"` + id + `","name":"` + name + `"` + metadata + `}}`}
+	}
+	notFound := reply{http.StatusNotFound, `{"itemNotFound":{"code":404,"message":"Instance could not be found."}}`}
+	unavailable := reply{http.StatusServiceUnavailable, `{"message":"service unavailable"}`}
+
+	tests := []struct {
+		name     string
+		ports    reply
+		servers  map[string]reply
+		want     []resource.Resource
+		wantGets map[string]int
+	}{
+		{
+			name: "orphan",
+			ports: reply{http.StatusOK, `{"ports":[
+				{"id":"nic-1","device_owner":"compute:nova","device_id":"srv-a","tags":[]},
+				{"id":"nic-2","device_owner":"compute:nova","device_id":"srv-a"},
+				{"id":"port-1","device_owner":"compute:nova","device_id":"srv-b","tags":["dizzy:run=run0","dizzy:type=port"]},
+				{"id":"dhcp-1","device_owner":"network:dhcp","device_id":"dhcp-net-1"},
+				{"id":"plain-1","device_owner":"","device_id":""}
+			]}`},
+			servers:  map[string]reply{"srv-a": server("srv-a", "dizzy-run0-srv-0001", `,"metadata":{"dizzy:run":"run0","dizzy:type":"server"}`)},
+			want:     []resource.Resource{{Kind: "server", Logical: "srv-0001", Name: "dizzy-run0-srv-0001", ID: "srv-a"}},
+			wantGets: map[string]int{"srv-a": 1},
+		},
+		{
+			name: "another run's server",
+			ports: reply{http.StatusOK, `{"ports":[
+				{"id":"nic-1","device_owner":"compute:nova","device_id":"srv-c"},
+				{"id":"nic-2","device_owner":"compute:nova","device_id":"srv-d"}
+			]}`},
+			servers: map[string]reply{
+				"srv-c": server("srv-c", "dizzy-other-srv-0001", `,"metadata":{"dizzy:run":"other","dizzy:type":"server"}`),
+				"srv-d": server("srv-d", "someone-elses", ""),
+			},
+			wantGets: map[string]int{"srv-c": 1, "srv-d": 1},
+		},
+		{
+			// The live server listed after the gone one shows the 404 is skipped,
+			// not taken as the end of the listing.
+			name: "server already gone",
+			ports: reply{http.StatusOK, `{"ports":[
+				{"id":"nic-1","device_owner":"compute:nova","device_id":"srv-a"},
+				{"id":"nic-2","device_owner":"compute:nova","device_id":"srv-e"}
+			]}`},
+			servers: map[string]reply{
+				"srv-a": notFound,
+				"srv-e": server("srv-e", "dizzy-run0-srv-0002", `,"metadata":{"dizzy:run":"run0","dizzy:type":"server"}`),
+			},
+			want:     []resource.Resource{{Kind: "server", Logical: "srv-0002", Name: "dizzy-run0-srv-0002", ID: "srv-e"}},
+			wantGets: map[string]int{"srv-a": 1, "srv-e": 1},
+		},
+		{
+			name:     "empty network",
+			ports:    reply{http.StatusOK, `{"ports":[]}`},
+			wantGets: map[string]int{},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c, gets := serve(t, tc.ports, tc.servers)
+			got, err := c.ListNetworkServers(context.Background(), "net-1")
+			if err != nil {
+				t.Fatalf("ListNetworkServers: %v", err)
+			}
+			if len(tc.want) == 0 {
+				if len(got) != 0 {
+					t.Errorf("ListNetworkServers = %v, want no server", got)
+				}
+			} else if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("ListNetworkServers = %v, want %v", got, tc.want)
+			}
+			if g := gets(); !reflect.DeepEqual(g, tc.wantGets) {
+				t.Errorf("server GETs = %v, want %v", g, tc.wantGets)
+			}
+		})
+	}
+
+	t.Run("upstream errors", func(t *testing.T) {
+		c, gets := serve(t, unavailable, nil)
+		_, err := c.ListNetworkServers(context.Background(), "net-1")
+		if err == nil || !strings.HasPrefix(err.Error(), "listing servers on network net-1:") {
+			t.Errorf("ListNetworkServers with a failing port list = %v, want an error starting with %q", err, "listing servers on network net-1:")
+		}
+		if !IsRetryable(err) {
+			t.Errorf("IsRetryable(%v) = false, want true for a 503", err)
+		}
+		if g := gets(); len(g) != 0 {
+			t.Errorf("server GETs = %v, want none after a failed port list", g)
+		}
+
+		c, _ = serve(t, reply{http.StatusOK, `{"ports":[{"id":"nic-1","device_owner":"compute:nova","device_id":"srv-a"}]}`},
+			map[string]reply{"srv-a": unavailable})
+		_, err = c.ListNetworkServers(context.Background(), "net-1")
+		if err == nil || !strings.Contains(err.Error(), "getting server srv-a") {
+			t.Errorf("ListNetworkServers with a failing server GET = %v, want an error containing %q", err, "getting server srv-a")
+		}
+	})
 }
 
 // TestCreateTaggedRollsBackOnTagFailure verifies that when tagging a freshly

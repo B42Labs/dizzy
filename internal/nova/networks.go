@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"time"
 
+	"github.com/gophercloud/gophercloud/v2/openstack/compute/v2/servers"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/attributestags"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/networks"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/ports"
@@ -243,4 +246,66 @@ func (c *Client) DeleteNetworkPorts(ctx context.Context, networkID string) (int,
 		return deleted, fmt.Errorf("deleting ports on network %s: %w", networkID, err)
 	}
 	return deleted, nil
+}
+
+// ListNetworkServers returns this run's servers that hold networkID through a
+// port Nova created for them: a boot NIC, whose device_owner is compute:<zone>
+// and which, unlike a port dizzy created and tracks, carries no dizzy:run tag
+// of this run. A server whose create answer was lost keeps such a port on the
+// network although the churn does not track the server, and
+// DeleteNetworkPorts leaves the port alone, so every delete of the network
+// answers 409 until the server is gone. Each distinct server is read once, in
+// port-list order. A server already gone (404) is skipped, and so is a server
+// without this run's dizzy:run metadata, because dizzy never deletes a server
+// it did not stamp. No such port returns no server and issues no server read.
+func (c *Client) ListNetworkServers(ctx context.Context, networkID string) ([]resource.Resource, error) {
+	var items []ports.Port
+	err := c.timed(ctx, string(KindPort), "list", func(ctx context.Context) error {
+		pages, err := ports.List(c.network, ports.ListOpts{NetworkID: networkID}).AllPages(ctx)
+		if err != nil {
+			return err
+		}
+		items, err = ports.ExtractPorts(pages)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing servers on network %s: %w", networkID, err)
+	}
+
+	runTag := metaRun + "=" + c.runID
+	var ids []string
+	for _, p := range items {
+		if !strings.HasPrefix(p.DeviceOwner, "compute:") || p.DeviceID == "" || slices.Contains(p.Tags, runTag) {
+			continue
+		}
+		if !slices.Contains(ids, p.DeviceID) {
+			ids = append(ids, p.DeviceID)
+		}
+	}
+
+	var found []resource.Resource
+	for _, id := range ids {
+		var s *servers.Server
+		err := c.timed(ctx, string(KindServer), "get", func(ctx context.Context) error {
+			var getErr error
+			s, getErr = servers.Get(ctx, c.compute, id).Extract()
+			return getErr
+		})
+		if IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("listing servers on network %s: getting server %s: %w", networkID, id, err)
+		}
+		if s.Metadata[metaRun] != c.runID {
+			continue
+		}
+		found = append(found, resource.Resource{
+			Kind:    KindServer,
+			Logical: strings.TrimPrefix(s.Name, "dizzy-"+c.runID+"-"),
+			Name:    s.Name,
+			ID:      s.ID,
+		})
+	}
+	return found, nil
 }

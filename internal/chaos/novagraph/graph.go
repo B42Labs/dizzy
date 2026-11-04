@@ -41,14 +41,16 @@ import (
 // ports-and-adapters seam to the cloud — *nova.Client satisfies it in production
 // and a fake satisfies it in tests. It mirrors the apply executor's Nova seam
 // plus the DeleteNetworkPorts the network churn deletes need, the
-// ColdMigrateServer the long-lived graph needs, the WaitForPortDetached every
-// port detach needs, the WaitForVolumeDetached every volume detach needs, and
-// the CreateServerGroup the server group nodes need.
+// ListNetworkServers that finds the run's untracked servers those deletes
+// remove first, the ColdMigrateServer the long-lived graph needs, the
+// WaitForPortDetached every port detach needs, the WaitForVolumeDetached every
+// volume detach needs, and the CreateServerGroup the server group nodes need.
 type Nova interface {
 	CreateServerGroup(ctx context.Context, g novaplan.ServerGroup) (resource.Resource, error)
 	CreateNetwork(ctx context.Context, n novaplan.Network) (resource.Resource, error)
 	CreateSubnet(ctx context.Context, n novaplan.Network, networkID string) (resource.Resource, error)
 	DeleteNetworkPorts(ctx context.Context, networkID string) (int, error)
+	ListNetworkServers(ctx context.Context, networkID string) ([]resource.Resource, error)
 	CreateServer(ctx context.Context, s novaplan.Server, boot nova.BootSpec) (resource.Resource, error)
 	CreateVolume(ctx context.Context, v novaplan.Volume) (resource.Resource, error)
 	CreatePort(ctx context.Context, pt novaplan.Port, networkID string) (resource.Resource, error)
@@ -134,6 +136,9 @@ func Build(p *novaplan.Plan, c Nova, r novaexec.Resolved, opTimeout time.Duratio
 				return createNetwork(ctx, opTimeout, c, n)
 			},
 			Delete: func(ctx context.Context, _ map[string]string, res resource.Resource) error {
+				if err := deleteNetworkServers(ctx, opTimeout, c, res); err != nil {
+					return err
+				}
 				if _, err := c.DeleteNetworkPorts(ctx, res.ID); err != nil {
 					return err
 				}
@@ -706,6 +711,35 @@ func deleteGone(ctx context.Context, opTimeout time.Duration, c Nova, res resour
 	goneCtx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 	return c.WaitForGone(goneCtx, res)
+}
+
+// deleteNetworkServers deletes this run's servers that hold network through a
+// port Nova created for them, before the network delete. The engine deletes a
+// network only after the deletes of the servers on it have finished, so such a
+// server is either one whose create answer was lost, which the churn never
+// learned of, or a retired instance whose delete failed. While one of them
+// lives, Neutron refuses the network delete with a 409. Each server is deleted
+// and waited for until it is gone, so Nova has removed its port before the
+// port sweep and the network delete that follow. The first error returns
+// before the network delete; the engine then retries the whole delete, and
+// with it this sweep, at the network's next create.
+func deleteNetworkServers(ctx context.Context, opTimeout time.Duration, c Nova, network resource.Resource) error {
+	var held []resource.Resource
+	if err := novaexec.WithRetry(ctx, opTimeout, func(ctx context.Context) error {
+		var err error
+		held, err = c.ListNetworkServers(ctx, network.ID)
+		return err
+	}); err != nil {
+		return err
+	}
+	for _, srv := range held {
+		slog.Warn("deleting a server the churn does not track; it holds the network",
+			"network", network.Logical, "name", srv.Name, "id", srv.ID)
+		if err := deleteGone(ctx, opTimeout, c, srv); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Classify labels an operation error for the churn engine's per-bucket error
