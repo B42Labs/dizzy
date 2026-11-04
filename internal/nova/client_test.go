@@ -6,10 +6,15 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"reflect"
+	"slices"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
+
+	"github.com/B42Labs/dizzy/internal/metrics"
 )
 
 // respErr builds a gophercloud unexpected-response error for the given status
@@ -212,5 +217,100 @@ func TestMetadataMatches(t *testing.T) {
 	}
 	if metadataMatches(md, map[string]string{"dizzy:run": "r2"}) {
 		t.Error("metadataMatches should reject a mismatched value")
+	}
+}
+
+// wantOneSample fails the test unless m holds exactly one sample, of type typ,
+// that succeeded when errKind is empty and otherwise failed and classified to
+// errKind, so the error tally is empty or holds errKind once.
+func wantOneSample(t *testing.T, m *metrics.Collector, typ, errKind string) {
+	t.Helper()
+	succeeded := 1
+	var errs []metrics.ErrorCount
+	if errKind != "" {
+		succeeded = 0
+		errs = []metrics.ErrorCount{{Kind: errKind, Count: 1}}
+	}
+	agg := m.Aggregate(0)
+	if o := agg.Overall; o.Attempted != 1 || o.Succeeded != succeeded || o.Failed != 1-succeeded {
+		t.Errorf("overall attempted/succeeded/failed = %d/%d/%d, want 1/%d/%d",
+			o.Attempted, o.Succeeded, o.Failed, succeeded, 1-succeeded)
+	}
+	if len(agg.ByType) != 1 || agg.ByType[0].Type != typ ||
+		agg.ByType[0].Attempted != 1 || agg.ByType[0].Succeeded != succeeded {
+		t.Errorf("byType = %+v, want one %s sample with %d succeeded", agg.ByType, typ, succeeded)
+	}
+	if !slices.Equal(agg.Errors, errs) {
+		t.Errorf("errors = %v, want %v", agg.Errors, errs)
+	}
+}
+
+// TestTimedFold verifies that timedFold records one sample per call after
+// applied decides: a call that succeeds never asks applied and returns
+// (false, nil); a failure applied confirms records as a success and returns
+// (true, nil); any other failure records fn's error with its usual
+// classification and returns it; applied gets the call's context and fn's
+// error; and the recorded duration covers fn alone. The Client carries no
+// telemetry, so every case also shows that a nil telemetry is safe.
+func TestTimedFold(t *testing.T) {
+	type ctxKey struct{}
+	conflict := gophercloud.ErrUnexpectedResponseCode{Actual: 409}
+	canceled := fmt.Errorf("posting: %w", context.Canceled)
+
+	tests := []struct {
+		name        string
+		fnErr       error         // what fn returns
+		confirm     bool          // what applied returns
+		appliedWait time.Duration // how long applied sleeps before it returns
+		wantFolded  bool
+		wantErr     error  // the error timedFold returns, compared with reflect.DeepEqual
+		wantKind    string // the recorded error kind, "" for a success
+		maxLatency  time.Duration
+	}{
+		{name: "fn succeeds"},
+		{name: "an unconfirmed 409", fnErr: conflict, wantErr: conflict, wantKind: "http_409"},
+		{name: "a confirmed 409", fnErr: conflict, confirm: true, wantFolded: true},
+		{name: "an unconfirmed cancel", fnErr: canceled, wantErr: canceled, wantKind: "canceled"},
+		{name: "a slow confirmation is not timed", fnErr: conflict, confirm: true, appliedWait: 200 * time.Millisecond,
+			wantFolded: true, maxLatency: 100 * time.Millisecond},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := metrics.NewCollector()
+			c := New(nil, nil, nil, "run0", m)
+			ctx := context.WithValue(context.Background(), ctxKey{}, tc.name)
+
+			var calls int
+			var gotErr error
+			folded, err := c.timedFold(ctx, "port", "attach",
+				func(context.Context) error { return tc.fnErr },
+				func(actx context.Context, err error) bool {
+					calls++
+					gotErr = err
+					if got := actx.Value(ctxKey{}); got != tc.name {
+						t.Errorf("applied got a context carrying %v, want the call's context", got)
+					}
+					time.Sleep(tc.appliedWait)
+					return tc.confirm
+				})
+
+			if folded != tc.wantFolded || !reflect.DeepEqual(err, tc.wantErr) {
+				t.Errorf("timedFold = (%v, %v), want (%v, %v)", folded, err, tc.wantFolded, tc.wantErr)
+			}
+			switch {
+			case tc.fnErr == nil && calls != 0:
+				t.Errorf("applied called %d times after fn succeeded, want never", calls)
+			case tc.fnErr != nil && calls != 1:
+				t.Errorf("applied called %d times after fn failed, want once", calls)
+			case tc.fnErr != nil && !reflect.DeepEqual(gotErr, tc.fnErr):
+				t.Errorf("applied got %v, want fn's error %v", gotErr, tc.fnErr)
+			}
+			wantOneSample(t, m, "port", tc.wantKind)
+			if tc.maxLatency != 0 {
+				if got := m.Aggregate(0).Overall.Latency.Max; got >= tc.maxLatency {
+					t.Errorf("recorded latency max = %v, want below %v", got, tc.maxLatency)
+				}
+			}
+		})
 	}
 }
