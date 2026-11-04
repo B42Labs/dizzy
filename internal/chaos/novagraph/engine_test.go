@@ -4,12 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/url"
 	"reflect"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gophercloud/gophercloud/v2"
 
 	"github.com/B42Labs/dizzy/internal/chaos"
 	"github.com/B42Labs/dizzy/internal/nova"
@@ -52,9 +56,19 @@ type fakeNova struct {
 	deletesBy    map[resource.Kind]int // kind -> Delete calls
 	bootLog      []string              // "<server logical> ok|failed" per CreateServer call, in call order
 
+	// the network sweep
+	nicsBySrv    map[string][]string // server id -> the boot.NetworkIDs it was created with
+	netConflicts int                 // network Delete calls refused because a live server had a NIC on the network
+	netCalls     []string            // "ListNetworkServers", "DeleteNetworkPorts", "Delete <kind> <id>" and "WaitForGone <kind> <id>", in call order
+
 	// failNext queues, per method name, the errors its next calls return, one
 	// per call; a method with an empty queue succeeds.
 	failNext map[string][]error
+
+	// lostAnswers queues the errors CreateServer returns, one per call, after
+	// it has created the server, the way a create whose answer was lost leaves
+	// a server the caller never learns of.
+	lostAnswers []error
 
 	// invariants
 	doubleLive        bool // a resource created while a live instance of its logical exists
@@ -91,6 +105,7 @@ func newFakeNova() *fakeNova {
 		groupOf:           map[string]string{},
 		down:              map[string]bool{},
 		volServer:         map[string]string{},
+		nicsBySrv:         map[string][]string{},
 	}
 }
 
@@ -109,6 +124,19 @@ func (f *fakeNova) injected(method string) error {
 	}
 	f.failNext[method] = errs[1:]
 	return errs[0]
+}
+
+// heldBy returns the ids of the live servers with a NIC on networkID, sorted.
+// The caller must hold f.mu.
+func (f *fakeNova) heldBy(networkID string) []string {
+	var ids []string
+	for id, nets := range f.nicsBySrv {
+		if f.live[id] && slices.Contains(nets, networkID) {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
 }
 
 // enterFamily opens a per-server serial window, flagging an overlap if another
@@ -157,11 +185,38 @@ func (f *fakeNova) CreateSubnet(_ context.Context, n novaplan.Network, _ string)
 	defer f.mu.Unlock()
 	return resource.Resource{Kind: nova.KindSubnet, Logical: n.Subnet, ID: f.id("sub")}, nil
 }
-func (f *fakeNova) DeleteNetworkPorts(context.Context, string) (int, error) { return 0, nil }
+
+// DeleteNetworkPorts logs its call in netCalls and deletes nothing, since the
+// fake creates no port outside a port node.
+func (f *fakeNova) DeleteNetworkPorts(context.Context, string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.netCalls = append(f.netCalls, "DeleteNetworkPorts")
+	return 0, nil
+}
+
+// ListNetworkServers logs its call in netCalls and returns the error queued
+// under its name, or else every live server with a NIC on networkID, with its
+// kind and id only.
+func (f *fakeNova) ListNetworkServers(_ context.Context, networkID string) ([]resource.Resource, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.netCalls = append(f.netCalls, "ListNetworkServers")
+	if err := f.injected("ListNetworkServers"); err != nil {
+		return nil, err
+	}
+	var held []resource.Resource
+	for _, id := range f.heldBy(networkID) {
+		held = append(held, resource.Resource{Kind: nova.KindServer, ID: id})
+	}
+	return held, nil
+}
 
 // CreateServer checks that a server with a group boots into its group's live
 // instance, and returns the error queued under "CreateServer" without
-// creating anything. A boot takes opDelay.
+// creating anything. A server it creates gets a NIC on each of the boot
+// networks, and when an error is queued in lostAnswers it returns that error
+// after creating the server. A boot takes opDelay.
 func (f *fakeNova) CreateServer(_ context.Context, s novaplan.Server, boot nova.BootSpec) (resource.Resource, error) {
 	f.mu.Lock()
 	f.createSrv++
@@ -179,6 +234,13 @@ func (f *fakeNova) CreateServer(_ context.Context, s novaplan.Server, boot nova.
 	res := f.create(nova.KindServer, s.Name, "srv")
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.nicsBySrv[res.ID] = append([]string(nil), boot.NetworkIDs...)
+	if len(f.lostAnswers) > 0 {
+		err := f.lostAnswers[0]
+		f.lostAnswers = f.lostAnswers[1:]
+		f.bootLog = append(f.bootLog, s.Name+" failed")
+		return resource.Resource{}, err
+	}
 	f.bootLog = append(f.bootLog, s.Name+" ok")
 	f.down[s.Name] = false
 	return res, nil
@@ -311,11 +373,20 @@ func (f *fakeNova) ColdMigrateServer(_ context.Context, r resource.Resource) err
 }
 
 // Delete flags a server delete while another server of its group is down or
-// while a volume is still attached to it. A server delete takes opDelay.
+// while a volume is still attached to it. A server delete takes opDelay. It
+// logs its call in netCalls, and it refuses a network delete with a 409 and
+// counts it in netConflicts while a live server has a NIC on the network, as
+// Neutron refuses a network that is in use.
 func (f *fakeNova) Delete(_ context.Context, r resource.Resource) error {
 	f.mu.Lock()
 	f.deletes++
 	f.deletesBy[r.Kind]++
+	f.netCalls = append(f.netCalls, fmt.Sprintf("Delete %s %s", r.Kind, r.ID))
+	if r.Kind == nova.KindNetwork && len(f.heldBy(r.ID)) > 0 {
+		f.netConflicts++
+		f.mu.Unlock()
+		return gophercloud.ErrUnexpectedResponseCode{Actual: 409}
+	}
 	if r.Kind == nova.KindServer {
 		if g := f.groupOf[r.Logical]; g != "" {
 			for other, down := range f.down {
@@ -341,10 +412,12 @@ func (f *fakeNova) Delete(_ context.Context, r resource.Resource) error {
 }
 func (f *fakeNova) WaitForReady(context.Context, resource.Resource) error { return nil }
 
-// WaitForGone returns the errors queued under its name.
-func (f *fakeNova) WaitForGone(context.Context, resource.Resource) error {
+// WaitForGone logs its call in netCalls and returns the errors queued under
+// its name.
+func (f *fakeNova) WaitForGone(_ context.Context, r resource.Resource) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.netCalls = append(f.netCalls, fmt.Sprintf("WaitForGone %s %s", r.Kind, r.ID))
 	return f.injected("WaitForGone")
 }
 
@@ -729,5 +802,49 @@ func TestRunRollingRebootsFailedWorker(t *testing.T) {
 	worker := strings.TrimSuffix(f.bootLog[0], " failed")
 	if !slices.Contains(f.bootLog[1:], worker+" ok") {
 		t.Errorf("boot log = %v, want %s booted again", f.bootLog, worker)
+	}
+}
+
+// TestRunSweepsLostServer confirms a churn whose first server boot lost its
+// answer deletes the server that boot left on the network before the network
+// delete, so no network delete is refused and the server is gone at the end.
+// The plan seed is one whose schedule deletes the network.
+func TestRunSweepsLostServer(t *testing.T) {
+	f := newFakeNova()
+	f.lostAnswers = []error{&url.Error{Op: "Post", URL: "http://nova/servers", Err: io.EOF}}
+	p := &novaplan.Plan{
+		Scenario: "churn", Seed: 7, Image: "cirros", Flavor: "m1.tiny",
+		Networks: []novaplan.Network{{Name: "net-0001", Subnet: "sub-0001", CIDR: "10.0.1.0/24"}},
+		Servers:  []novaplan.Server{{Name: "srv-0001", Networks: []string{"net-0001"}}},
+	}
+	if _, err := chaos.Run(context.Background(), mustBuild(t, p, f), p.Seed, novaCfg(), newFakeClock()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.lostAnswers) != 0 || len(f.bootLog) == 0 || f.bootLog[0] != "srv-0001 failed" {
+		t.Fatalf("boot log = %v, want the first boot to lose its answer", f.bootLog)
+	}
+	if f.deletesBy[nova.KindNetwork] < 1 {
+		t.Fatalf("network deletes = %d, want at least one for seed %d", f.deletesBy[nova.KindNetwork], p.Seed)
+	}
+	if f.netConflicts != 0 {
+		t.Errorf("network deletes refused = %d, want 0", f.netConflicts)
+	}
+	// The fake numbers its ids in call order and runs one node's creates one
+	// after another, so the server of the first boot has the lowest number.
+	orphan, lowest := "", 0
+	for id := range f.nicsBySrv {
+		var n int
+		if _, err := fmt.Sscanf(id, "srv-%d", &n); err != nil {
+			t.Fatalf("server id %q: %v", id, err)
+		}
+		if orphan == "" || n < lowest {
+			orphan, lowest = id, n
+		}
+	}
+	if f.live[orphan] {
+		t.Errorf("server %s of the lost answer is live at the end, want it deleted", orphan)
 	}
 }

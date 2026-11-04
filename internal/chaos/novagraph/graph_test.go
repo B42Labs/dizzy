@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"reflect"
 	"sort"
 	"strings"
@@ -288,6 +290,138 @@ func TestDeletePortWaitsForDetach(t *testing.T) {
 		}
 		if got := f.deletesBy[nova.KindPort]; got != 0 {
 			t.Errorf("port deletes = %d, want 0", got)
+		}
+	})
+}
+
+// TestDeleteNetworkSweepsUntrackedServers confirms the churn graph's network
+// delete first deletes the servers on the network the churn does not track,
+// waiting for each to be gone, and only then sweeps the ports and deletes the
+// network; that a failed list or server delete returns before the network
+// delete; and that the delete run again, as the engine's retry runs it,
+// deletes the network.
+func TestDeleteNetworkSweepsUntrackedServers(t *testing.T) {
+	// setup creates net-0001 and, when lost is set, boots srv-0001 on it with
+	// a lost answer, which leaves a live server the churn does not track. It
+	// returns a function that deletes the network the way the engine would,
+	// the network's id, and the left server's id, "" without one.
+	setup := func(t *testing.T, f *fakeNova, lost bool) (func() error, string, string) {
+		t.Helper()
+		nodes, err := Build(churnPlan(), f, novaexec.Resolved{}, time.Minute)
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		ctx := context.Background()
+		netNode := nodeByKey(t, nodes, "net-0001")
+		net, err := netNode.Create(ctx, nil)
+		if err != nil {
+			t.Fatalf("creating net-0001: %v", err)
+		}
+		var orphan string
+		if lost {
+			f.lostAnswers = []error{&url.Error{Op: "Post", URL: "http://nova/servers", Err: io.EOF}}
+			if _, err := nodeByKey(t, nodes, "srv-0001").Create(ctx, map[string]string{"net-0001": net.ID}); err == nil {
+				t.Fatal("creating srv-0001 with a lost answer = nil, want an error")
+			}
+			f.mu.Lock()
+			for id := range f.nicsBySrv {
+				orphan = id
+			}
+			booted, live := len(f.nicsBySrv), f.live[orphan]
+			f.mu.Unlock()
+			if booted != 1 || !live {
+				t.Fatalf("servers booted = %d, left server live = %v, want one live server", booted, live)
+			}
+		}
+		return func() error { return netNode.Delete(ctx, nil, net) }, net.ID, orphan
+	}
+	calls := func(f *fakeNova) []string {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return append([]string(nil), f.netCalls...)
+	}
+
+	t.Run("orphan", func(t *testing.T) {
+		f := newFakeNova()
+		del, netID, orphan := setup(t, f, true)
+		var logs bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+		t.Cleanup(func() { slog.SetDefault(prev) })
+		if err := del(); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		want := []string{
+			"ListNetworkServers", "Delete server " + orphan, "WaitForGone server " + orphan,
+			"DeleteNetworkPorts", "Delete network " + netID, "WaitForGone network " + netID,
+		}
+		if got := calls(f); !reflect.DeepEqual(got, want) {
+			t.Errorf("calls = %v, want %v", got, want)
+		}
+		if f.netConflicts != 0 {
+			t.Errorf("network deletes refused = %d, want 0", f.netConflicts)
+		}
+		if f.live[orphan] {
+			t.Errorf("server %s is live after the network delete, want it deleted", orphan)
+		}
+		for _, w := range []string{"level=WARN", "deleting a server the churn does not track; it holds the network", "network=net-0001", "id=" + orphan} {
+			if !strings.Contains(logs.String(), w) {
+				t.Errorf("logs = %q, want %q", logs.String(), w)
+			}
+		}
+	})
+
+	t.Run("no server", func(t *testing.T) {
+		f := newFakeNova()
+		del, netID, _ := setup(t, f, false)
+		if err := del(); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		want := []string{"ListNetworkServers", "DeleteNetworkPorts", "Delete network " + netID, "WaitForGone network " + netID}
+		if got := calls(f); !reflect.DeepEqual(got, want) {
+			t.Errorf("calls = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("list fails", func(t *testing.T) {
+		f := newFakeNova()
+		del, _, _ := setup(t, f, false)
+		boom := errors.New("boom")
+		f.failNext["ListNetworkServers"] = []error{boom}
+		if err := del(); err != boom {
+			t.Fatalf("Delete with a failing list = %v, want %v unchanged", err, boom)
+		}
+		if got, want := calls(f), []string{"ListNetworkServers"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("calls = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("server delete fails", func(t *testing.T) {
+		f := newFakeNova()
+		del, netID, orphan := setup(t, f, true)
+		f.failNext["WaitForGone"] = []error{context.DeadlineExceeded}
+		if err := del(); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Delete with a failing server delete = %v, want %v", err, context.DeadlineExceeded)
+		}
+		got := calls(f)
+		for _, c := range got {
+			if c == "DeleteNetworkPorts" || strings.HasPrefix(c, "Delete network ") {
+				t.Errorf("calls = %v, want no port sweep and no network delete after the failed server delete", got)
+				break
+			}
+		}
+		if err := del(); err != nil {
+			t.Fatalf("retry of the delete: %v", err)
+		}
+		want := []string{
+			"ListNetworkServers", "Delete server " + orphan, "WaitForGone server " + orphan,
+			"ListNetworkServers", "DeleteNetworkPorts", "Delete network " + netID, "WaitForGone network " + netID,
+		}
+		if got := calls(f); !reflect.DeepEqual(got, want) {
+			t.Errorf("calls = %v, want %v", got, want)
+		}
+		if got := f.deletesBy[nova.KindNetwork]; got != 1 {
+			t.Errorf("network deletes = %d, want 1", got)
 		}
 	})
 }
