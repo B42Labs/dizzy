@@ -150,27 +150,44 @@ func TestCreateVolumeAdoptsLostAnswer(t *testing.T) {
 // Nova rejects because the volume is already attached is success only when the
 // server has the volume's attachment, a failed lookup surfaces its own error so
 // a transient one stays retryable, and every other rejection surfaces wrapped
-// with the logical names.
+// with the logical names. It checks that only an "already attached" 400 sends
+// the lookup, that a confirmed one records as a successful volume attach in the
+// Collector and in telemetry and logs the fold, and that every other outcome,
+// a failed lookup included, records the attach's own http_400. The cases run
+// serially because each one reads the process-wide default logger.
 func TestAttachVolume(t *testing.T) {
 	srv := resource.Resource{Kind: KindServer, ID: "srv-1", Logical: "srv-0001"}
 	vol := resource.Resource{Kind: KindVolume, ID: "vol-1", Logical: "vol-0001"}
+	const foldLog = `level=INFO msg="volume already attached; treating a repeated attach as success" volume=vol-0001 server=srv-0001 id=vol-1`
 
 	tests := []struct {
-		name       string
-		postStatus int
-		postBody   string
-		getStatus  int // the answer to the attachment lookup after an "already attached" 400
-		wantErr    bool
-		retryable  bool
+		name         string
+		postStatus   int
+		postBody     string
+		getStatus    int // the answer to the attachment lookup after an "already attached" 400
+		wantErr      bool
+		retryable    bool
+		wantContains string // a part the returned error carries, "" to skip the check
+		wantKind     string // the recorded error kind, "" for a success
+		wantLookups  int32
+		wantLog      bool // whether the fold is logged
 	}{
 		{name: "accepted", postStatus: http.StatusOK, postBody: `{"volumeAttachment":{"id":"vol-1","volumeId":"vol-1","serverId":"srv-1","device":"/dev/vdb"}}`},
-		{name: "already attached to the server", postStatus: http.StatusBadRequest, postBody: `{"badRequest":{"code":400,"message":"Invalid volume: volume vol-1 already attached"}}`, getStatus: http.StatusOK},
-		{name: "already attached to another server", postStatus: http.StatusBadRequest, postBody: `{"badRequest":{"code":400,"message":"Invalid volume: volume vol-1 is already attached to instances: srv-2"}}`, getStatus: http.StatusNotFound, wantErr: true},
-		{name: "already attached, lookup unavailable", postStatus: http.StatusBadRequest, postBody: `{"badRequest":{"code":400,"message":"Invalid volume: volume vol-1 already attached"}}`, getStatus: http.StatusServiceUnavailable, wantErr: true, retryable: true},
-		{name: "another bad request", postStatus: http.StatusBadRequest, postBody: `{"badRequest":{"code":400,"message":"Invalid volume: volume vol-1 status must be available"}}`, wantErr: true},
+		{name: "already attached to the server", postStatus: http.StatusBadRequest, postBody: `{"badRequest":{"code":400,"message":"Invalid volume: volume vol-1 already attached"}}`, getStatus: http.StatusOK,
+			wantLookups: 1, wantLog: true},
+		{name: "already attached to another server", postStatus: http.StatusBadRequest, postBody: `{"badRequest":{"code":400,"message":"Invalid volume: volume vol-1 is already attached to instances: srv-2"}}`, getStatus: http.StatusNotFound, wantErr: true,
+			wantKind: "http_400", wantLookups: 1},
+		{name: "already attached, lookup unavailable", postStatus: http.StatusBadRequest, postBody: `{"badRequest":{"code":400,"message":"Invalid volume: volume vol-1 already attached"}}`, getStatus: http.StatusServiceUnavailable, wantErr: true, retryable: true,
+			wantContains: "checking the attachment after", wantKind: "http_400", wantLookups: 1},
+		{name: "another bad request", postStatus: http.StatusBadRequest, postBody: `{"badRequest":{"code":400,"message":"Invalid volume: volume vol-1 status must be available"}}`, wantErr: true,
+			wantKind: "http_400"},
+		{name: "a bad request without a body", postStatus: http.StatusBadRequest, wantErr: true,
+			wantKind: "http_400"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLog(t)
+			var lookups atomic.Int32
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				switch {
@@ -178,6 +195,7 @@ func TestAttachVolume(t *testing.T) {
 					w.WriteHeader(tc.postStatus)
 					_, _ = w.Write([]byte(tc.postBody))
 				case r.Method == http.MethodGet && r.URL.Path == "/servers/srv-1/os-volume_attachments/vol-1" && tc.getStatus != 0:
+					lookups.Add(1)
 					w.WriteHeader(tc.getStatus)
 					if tc.getStatus == http.StatusOK {
 						_, _ = w.Write([]byte(`{"volumeAttachment":{"id":"vol-1","volumeId":"vol-1","serverId":"srv-1","device":"/dev/vdb"}}`))
@@ -188,7 +206,18 @@ func TestAttachVolume(t *testing.T) {
 				}
 			}))
 			defer ts.Close()
-			err := testComputeClient(ts).AttachVolume(context.Background(), srv, vol)
+			c, m, reader := telemetryComputeClient(t, ts)
+			err := c.AttachVolume(context.Background(), srv, vol)
+
+			if got := lookups.Load(); got != tc.wantLookups {
+				t.Errorf("sent %d attachment lookups, want %d", got, tc.wantLookups)
+			}
+			wantOneSample(t, m, string(KindVolume), tc.wantKind)
+			wantOperationPoints(t, reader, string(KindVolume), "attach", tc.wantKind)
+			if got := strings.Contains(logs.String(), foldLog); got != tc.wantLog {
+				t.Errorf("logged the fold = %v, want %v:\n%s", got, tc.wantLog, logs.String())
+			}
+
 			if !tc.wantErr {
 				if err != nil {
 					t.Errorf("AttachVolume = %v, want nil", err)
@@ -200,6 +229,9 @@ func TestAttachVolume(t *testing.T) {
 			}
 			if got := IsRetryable(err); got != tc.retryable {
 				t.Errorf("IsRetryable(%v) = %v, want %v", err, got, tc.retryable)
+			}
+			if tc.wantContains != "" && (err == nil || !strings.Contains(err.Error(), tc.wantContains)) {
+				t.Errorf("AttachVolume = %v, want an error containing %q", err, tc.wantContains)
 			}
 		})
 	}

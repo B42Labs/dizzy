@@ -35,18 +35,23 @@ func (c *Client) CreatePort(ctx context.Context, pt novaplan.Port, networkID str
 // A repeated attach can hit a 409 (the port is in use) because an earlier
 // request whose answer was lost already attached it. When the server then has
 // the port's interface attachment, that 409 confirms the earlier attach
-// committed, so it is treated as success; otherwise the 409 surfaces.
+// committed, so it is treated as success; otherwise the 409 surfaces. The
+// confirmed case records as a successful call.
 func (c *Client) AttachPort(ctx context.Context, server, port resource.Resource) error {
-	err := c.timed(ctx, string(KindPort), "attach", func(ctx context.Context) error {
+	folded, err := c.timedFold(ctx, string(KindPort), "attach", func(ctx context.Context) error {
 		_, err := attachinterfaces.Create(ctx, c.compute, server.ID, attachinterfaces.CreateOpts{PortID: port.ID}).Extract()
 		return err
-	})
-	if err != nil && gophercloud.ResponseCodeIs(err, 409) {
-		if _, gerr := attachinterfaces.Get(ctx, c.compute, server.ID, port.ID).Extract(); gerr == nil {
-			slog.Info("port already attached; treating a repeated attach as success",
-				"port", port.Logical, "server", server.Logical, "id", port.ID)
-			return nil
+	}, func(ctx context.Context, err error) bool {
+		if !gophercloud.ResponseCodeIs(err, 409) {
+			return false
 		}
+		_, gerr := attachinterfaces.Get(ctx, c.compute, server.ID, port.ID).Extract()
+		return gerr == nil
+	})
+	if folded {
+		slog.Info("port already attached; treating a repeated attach as success",
+			"port", port.Logical, "server", server.Logical, "id", port.ID)
+		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("attaching port %q to server %q: %w", port.Logical, server.Logical, err)
