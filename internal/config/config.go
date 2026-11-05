@@ -146,6 +146,27 @@ func NewImageClient(ctx context.Context, cloudName string) (*gophercloud.Service
 	return client, nil
 }
 
+// NewKeyManagerClient authenticates against the cloud described in clouds.yaml
+// and returns a KeyManagerV1 (Barbican) service client. Barbican's catalog URL
+// carries no version, so the client confirms v1 from the endpoint's version
+// document and appends v1/ to the endpoint for its requests. A cloud whose
+// catalog has no key-manager endpoint fails here, before any resource is
+// written. When cloudName is empty the cloud is selected from the OS_CLOUD
+// environment variable, following the standard clouds.yaml search paths.
+func NewKeyManagerClient(ctx context.Context, cloudName string) (*gophercloud.ServiceClient, error) {
+	provider, endpointOptions, err := newProvider(ctx, cloudName)
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := openstack.NewKeyManagerV1(provider, endpointOptions)
+	if err != nil {
+		return nil, fmt.Errorf("creating key manager v1 client: %w", err)
+	}
+
+	return client, nil
+}
+
 // ComputeStack bundles the four service clients a Nova run needs, all built from
 // one authentication: Compute (Nova) for servers and their attachments, Network
 // (Neutron) for the companion networks/subnets/ports, BlockStorage (Cinder) for

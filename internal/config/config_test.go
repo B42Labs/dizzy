@@ -267,7 +267,9 @@ func credentialAuth(authURL string) string {
 // fakeCloud is a Keystone whose catalog points every service at the server
 // itself, with a Neutron network list the test answers through networks. The
 // endpoints carry their major version, so the client skips discovery, and
-// Neutron's client appends v2.0 once more.
+// Neutron's client appends v2.0 once more. The key-manager endpoint carries no
+// version, as Barbican's catalog URL does not, so the fake also answers its
+// version document, and the key-manager client appends v1 to it.
 type fakeCloud struct {
 	srv *httptest.Server
 
@@ -298,6 +300,8 @@ func newFakeCloud(t *testing.T) *fakeCloud {
 		catalog = append(catalog, fmt.Sprintf(`{"type":%q,"endpoints":[{"interface":"public","region":"RegionOne","url":%q}]}`,
 			svc[0], fc.srv.URL+"/"+svc[0]+"/"+svc[1]+"/"))
 	}
+	catalog = append(catalog, fmt.Sprintf(`{"type":"key-manager","endpoints":[{"interface":"public","region":"RegionOne","url":%q}]}`,
+		fc.srv.URL+"/key-manager/"))
 	token := `{"token":{"expires_at":"2030-01-01T00:00:00Z","project":{"id":"pid"},"catalog":[` + strings.Join(catalog, ",") + `]}}`
 
 	mux.HandleFunc("POST /v3/auth/tokens", func(w http.ResponseWriter, _ *http.Request) {
@@ -319,6 +323,13 @@ func newFakeCloud(t *testing.T) *fakeCloud {
 		w.Header().Set("X-Subject-Token", r.Header.Get("X-Subject-Token"))
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprint(w, token)
+	})
+	// Barbican answers its unversioned root with 300 and a versions document
+	// whose entries sit under "values".
+	mux.HandleFunc("GET /key-manager/{$}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMultipleChoices)
+		_, _ = fmt.Fprint(w, `{"versions":{"values":[{"id":"v1","status":"stable"}]}}`)
 	})
 	mux.HandleFunc("GET /network/v2.0/v2.0/networks", func(w http.ResponseWriter, r *http.Request) {
 		tok := r.Header.Get("X-Auth-Token")
@@ -387,6 +398,7 @@ func TestConstructorsEnableReauth(t *testing.T) {
 		{"NewBlockStorageClient", NewBlockStorageClient},
 		{"NewIdentityClient", NewIdentityClient},
 		{"NewImageClient", NewImageClient},
+		{"NewKeyManagerClient", NewKeyManagerClient},
 		{"NewComputeStack", computeClient},
 	}
 
@@ -403,6 +415,50 @@ func TestConstructorsEnableReauth(t *testing.T) {
 				t.Errorf("%s built a provider client that never re-authenticates", tc.name)
 			}
 		})
+	}
+}
+
+// TestNewKeyManagerClientResolvesV1 asserts the key-manager client accepts the
+// unversioned catalog URL Barbican publishes and addresses its resources below
+// v1/ of it.
+func TestNewKeyManagerClientResolvesV1(t *testing.T) {
+	fc := newFakeCloud(t)
+	writeClouds(t, credentialAuth(fc.authURL()))
+
+	client, err := NewKeyManagerClient(t.Context(), "fake")
+	if err != nil {
+		t.Fatalf("NewKeyManagerClient: %v", err)
+	}
+	if want := fc.srv.URL + "/key-manager/"; client.Endpoint != want {
+		t.Errorf("key manager endpoint = %q, want %q", client.Endpoint, want)
+	}
+	if got, want := client.ServiceURL("secrets"), fc.srv.URL+"/key-manager/v1/secrets"; got != want {
+		t.Errorf("secrets URL = %q, want %q", got, want)
+	}
+}
+
+// TestNewKeyManagerClientWithoutEndpoint asserts a cloud whose catalog offers
+// no key-manager endpoint for the entry's region fails in the constructor with
+// the wrapped endpoint lookup error.
+func TestNewKeyManagerClientWithoutEndpoint(t *testing.T) {
+	fc := newFakeCloud(t)
+	t.Setenv("OS_REGION_NAME", "")
+	t.Setenv("OS_INTERFACE", "")
+	writeCloudsWith(t, "region_name: RegionTwo\n", credentialAuth(fc.authURL()))
+
+	client, err := NewKeyManagerClient(t.Context(), "fake")
+	if err == nil {
+		t.Fatalf("NewKeyManagerClient = %v, want an error", client)
+	}
+	if client != nil {
+		t.Errorf("expected nil client on error, got %v", client)
+	}
+	if !strings.HasPrefix(err.Error(), "creating key manager v1 client: ") {
+		t.Errorf("error %q does not start with %q", err.Error(), "creating key manager v1 client: ")
+	}
+	var notFound *gophercloud.ErrEndpointNotFound
+	if !errors.As(err, &notFound) {
+		t.Errorf("error %v does not wrap gophercloud.ErrEndpointNotFound", err)
 	}
 }
 
