@@ -579,6 +579,14 @@ distribution:
   payload_bytes:         { min: 64, max: 8192 }   # synthetic payload per stored secret, in raw bytes
   retrieve_ratio:        0.5                      # fraction of stored secrets read back and byte-compared
   secrets_per_container: { min: 1, max: 3 }       # distinct stored secrets referenced per container
+
+chaos:                                 # `barbican chaos --scenario scenarios/barbican/small.yaml` runs as-is
+  duration: 5m                         # total runtime; the only hard stop besides Ctrl-C
+  interval: { min: 200ms, max: 3s }    # random delay drawn per churn tick
+  parallel: { max: 4 }                 # per-tick fan-out, drawn in [1, max]; capped by --concurrency
+  churn_ratio: 0.5                     # create bias at steady state (0..1)
+  target_fill: 0.8                     # fraction of the envelope kept populated (0..1)
+  retrieve_ratio: 0.3                  # probability per step of reading back a live secret marked for read-back
 ```
 
 Every secret is stored by dizzy with a **synthetic payload** of `payload_bytes`
@@ -603,9 +611,16 @@ secrets and read back the same ones. The payload bytes are not in the plan: they
 are derived from the plan seed and the secret's logical name, so a run stores
 byte-identical data every time and a read-back compares against the same bytes.
 
-A Barbican scenario takes no `chaos:` block. `barbican` has no `chaos` command,
-and a scenario carrying the key fails to parse like any other unknown key, with
-`field chaos not found in type scenario.Scenario`.
+The two `retrieve_ratio` keys do different jobs. `distribution.retrieve_ratio`
+picks the read-back candidates: the plan marks each stored secret for read-back
+or not, and both `apply` and `chaos` read back only the marked ones.
+`chaos.retrieve_ratio` is the probability per churn step that `barbican chaos`
+reads back one live marked secret, and a secret is read back at most once per
+lifetime. It picks no candidates of its own, so with
+`distribution.retrieve_ratio: 0` a churn run reads nothing back.
+`chaos.retrieve_ratio: 0` or `--retrieve-ratio 0` turns the churn read-backs
+off. `apply` ignores the `chaos:` block, so it still reads back every marked
+secret.
 
 The schema sets no payload cap of its own. Barbican's limit is its
 `max_allowed_secret_in_bytes` setting, checked against the base64 text, whose
@@ -618,11 +633,11 @@ default of 20000 admits up to 15000 raw bytes. The shipped profiles stay at
 Expanded counts at each profile's shipped seed, as `barbican apply --dry-run`
 prints them:
 
-| Profile | Secrets | Payload total | Read-backs | Orders | Containers | References |
-|---|---|---|---|---|---|---|
-| `small` | 10 | 40565 bytes | 7 | 5 | 3 | 8 |
-| `medium` | 40 | 171992 bytes | 19 | 15 | 10 | 22 |
-| `large` | 100 | 435955 bytes | 48 | 40 | 25 | 48 |
+| Profile | Secrets | Payload total | Read-backs | Orders | Containers | References | Chaos duration |
+|---|---|---|---|---|---|---|---|
+| `small` | 10 | 40565 bytes | 7 | 5 | 3 | 8 | 5m |
+| `medium` | 40 | 171992 bytes | 19 | 15 | 10 | 22 | 30m |
+| `large` | 100 | 435955 bytes | 48 | 40 | 25 | 48 | 1h |
 
 Each order generates a secret on top of the stored ones, so the profiles need
 15, 55, and 140 secrets against the secrets quota. Barbican's project quotas
@@ -894,10 +909,10 @@ chaos:                                # the block shipped by scenarios/neutron/m
 | `token_ratio` | ratio | keystone | Probability per step of issuing a token as a live, assigned user |
 | `lifecycle_ratio` | ratio | nova | Probability per step of mutating a live server (stop/start, resize, or live-migrate) |
 | `lifecycle_ratio` | ratio | glance | Probability per step of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, or metadata churn) |
+| `retrieve_ratio` | ratio | barbican | Probability per step of reading back the payload of a live secret the plan marks for read-back and byte-comparing it |
 
-All eighteen built-in profiles of the namespaces with a `chaos` command carry a
-`chaos:` block, so `chaos` runs any of them with no flags at all; the three
-Barbican profiles carry none. A mix scenario's block holds only `duration`,
+All twenty-one built-in profiles carry a `chaos:` block, so `chaos` runs any of
+them with no flags at all. A mix scenario's block holds only `duration`,
 `parallel.max` and `bucket_width`; its interval, churn ratio and target fill
 are set per persona. A background lane of a mix run reads its own scenario's
 block instead; see [Lanes](#lanes). See [The churn engine](../explanation/churn-engine.md) for

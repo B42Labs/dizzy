@@ -2,8 +2,7 @@
 
 A single binary, `dizzy`, with one command namespace per OpenStack service:
 `neutron`, `cinder`, `keystone`, `nova`, `glance`, and `barbican`. Each
-namespace offers the same verbs, except that `barbican` has no `chaos` and no
-`monitor`.
+namespace offers the same verbs, except that `barbican` has no `monitor`.
 
 | Verb | Touches the API | Purpose |
 |---|---|---|
@@ -180,9 +179,8 @@ so the live population never exceeds the scenario's counts and only planned
 resources are ever created. See [The churn engine](../explanation/churn-engine.md).
 
 Every flag can instead be set in a `chaos:` block in the scenario YAML; flags
-override the block. All eighteen built-in profiles of the namespaces with a
-`chaos` command ship such a block, so `chaos` runs them with no extra flags;
-the three Barbican profiles carry none.
+override the block. All twenty-one built-in profiles ship such a block, so
+`chaos` runs them with no extra flags.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -205,7 +203,21 @@ Namespace-specific:
 | `--token-ratio <float>` | `keystone` | `0.3` | Probability per churn step of issuing a token as a live, assigned user; `0` disables |
 | `--lifecycle-ratio <float>` | `nova` | `0.3` | Probability per churn step of mutating a live server (stop/start, resize, or live-migrate); `0` disables |
 | `--lifecycle-ratio <float>` | `glance` | `0.3` | Probability per churn step of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, or metadata churn); `0` disables |
+| `--retrieve-ratio <float>` | `barbican` | `0.3` | Probability per churn step of reading back the payload of a live stored secret the plan marks for read-back and byte-comparing it; `0` disables |
 | `--privilege`, `--domain`, `--roles` | `keystone` | | As for `apply` |
+
+`barbican chaos` churns stored secrets and containers and never touches the
+plan's orders. A container is created only while the secrets it references are
+live, and a secret is not deleted while a live container references it. Before
+it creates anything, the command runs the quota pre-check of `barbican apply`
+against the plan's secrets and containers only; an abort there writes no run
+record. It reads back only the secrets the plan marks for read-back, each at
+most once per lifetime. A read-back that returns different bytes does not stop
+the churn: the run finishes, tears down unless `--no-cleanup` is set, and then
+exits non-zero. The run record's `error` names the count, e.g.
+`payload read-back mismatch (run <id>): 2 read-back(s) returned different bytes`.
+The leak check finds a secret by its `dizzy_run` metadata, so it cannot see a
+stored secret whose stamp failed.
 
 By default a churn run tears its resources down at the end **or when
 interrupted**, then runs a leak check. `--no-cleanup` is the single opt-out,
