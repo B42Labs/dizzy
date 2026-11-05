@@ -2,7 +2,9 @@ package scenario
 
 import (
 	"encoding/base64"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/B42Labs/dizzy/internal/barbican/plan"
 	"github.com/B42Labs/dizzy/scenarios"
@@ -51,10 +53,54 @@ func TestProfilesGenerateValidPlans(t *testing.T) {
 
 // TestSmallProfileMatchesGoldenFixture asserts the shipped small profile equals
 // the smallScenario fixture, tying it transitively to the golden plan locked by
-// TestGenerateGolden. Scenario holds no pointer, so == compares every field.
+// TestGenerateGolden. It uses reflect.DeepEqual rather than == because Scenario
+// carries a *Chaos pointer, which == would compare by identity.
 func TestSmallProfileMatchesGoldenFixture(t *testing.T) {
-	if got, want := readProfile(t, "small"), smallScenario(); got != want {
+	if got, want := readProfile(t, "small"), smallScenario(); !reflect.DeepEqual(got, want) {
 		t.Errorf("scenarios/barbican/small.yaml = %+v, want %+v", got, want)
+	}
+}
+
+// TestProfilesShipChaosBlock asserts every shipped Barbican profile carries a
+// chaos block, so `barbican chaos --scenario scenarios/barbican/<profile>.yaml`
+// runs without extra flags: the duration grows from small to large, while the
+// interval, fan-out, churn ratio, target fill, and retrieve ratio are the same
+// in all three.
+func TestProfilesShipChaosBlock(t *testing.T) {
+	wantDuration := map[string]time.Duration{
+		"small":  5 * time.Minute,
+		"medium": 30 * time.Minute,
+		"large":  time.Hour,
+	}
+	for _, name := range profileNames {
+		t.Run(name, func(t *testing.T) {
+			want, ok := wantDuration[name]
+			if !ok {
+				t.Fatalf("profile barbican/%s.yaml has no expected chaos duration in this test", name)
+			}
+			c := readProfile(t, name).Chaos
+			if c == nil {
+				t.Fatalf("profile barbican/%s.yaml has no chaos block", name)
+			}
+			if got := time.Duration(c.Duration); got != want {
+				t.Errorf("profile barbican/%s.yaml chaos.duration = %s, want %s", name, got, want)
+			}
+			if got, want := c.Interval, (Interval{Min: Duration(200 * time.Millisecond), Max: Duration(3 * time.Second)}); got != want {
+				t.Errorf("profile barbican/%s.yaml chaos.interval = %s-%s, want %s-%s", name, time.Duration(got.Min), time.Duration(got.Max), time.Duration(want.Min), time.Duration(want.Max))
+			}
+			if c.Parallel.Max != 4 {
+				t.Errorf("profile barbican/%s.yaml chaos.parallel.max = %d, want 4", name, c.Parallel.Max)
+			}
+			if c.ChurnRatio != 0.5 {
+				t.Errorf("profile barbican/%s.yaml chaos.churn_ratio = %v, want 0.5", name, c.ChurnRatio)
+			}
+			if c.TargetFill != 0.8 {
+				t.Errorf("profile barbican/%s.yaml chaos.target_fill = %v, want 0.8", name, c.TargetFill)
+			}
+			if c.RetrieveRatio == nil || *c.RetrieveRatio != 0.3 {
+				t.Errorf("profile barbican/%s.yaml chaos.retrieve_ratio = %s, want &0.3", name, describeRatio(c.RetrieveRatio))
+			}
+		})
 	}
 }
 
