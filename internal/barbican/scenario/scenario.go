@@ -1,7 +1,8 @@
 // Package scenario defines the human-authored YAML scenario format for Barbican
 // (the secret, order, and container counts, the payload-size range, the
-// read-back ratio, the container fan-in, and the seed) and the deterministic
-// generator that expands a scenario plus its seed into a fully-enumerated plan.
+// read-back ratio, the container fan-in, the seed, and the optional chaos block
+// of the churn mode) and the deterministic generator that expands a scenario
+// plus its seed into a fully-enumerated plan.
 // The same scenario and seed always yield a byte-identical plan. Barbican gets
 // its own scenario schema rather than sharing another service's: the services
 // share no resources, and separate schemas keep yaml.UnmarshalStrict failing
@@ -12,6 +13,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v2"
 )
@@ -19,14 +21,74 @@ import (
 // Scenario is the parametrized description of a desired Barbican workload. It
 // is parsed from YAML, validated, optionally overridden via Set, and expanded
 // into a plan by Generate. Every stored secret carries a synthetic payload dizzy
-// derives from the seed, so a run references no pre-existing secret. The schema
-// has no chaos block, so a scenario carrying a chaos key fails Parse like any
-// other unknown key.
+// derives from the seed, so a run references no pre-existing secret.
 type Scenario struct {
 	Name         string       `yaml:"name"`
 	Seed         int64        `yaml:"seed"`
 	Resources    Resources    `yaml:"resources"`
 	Distribution Distribution `yaml:"distribution"`
+	// Chaos, when present, configures the random churn/soak mode (the barbican
+	// chaos subcommand). It is a pointer so an absent block stays nil and apply
+	// and generate ignore it entirely. It mirrors the other services' scenario
+	// chaos blocks, duplicated by design so a typo in any service's scenario keeps
+	// failing loudly.
+	Chaos *Chaos `yaml:"chaos,omitempty"`
+}
+
+// Chaos holds the churn-mode knobs read from a scenario's chaos block. Every
+// field has a corresponding chaos CLI flag that overrides it; an unset field
+// falls back to the command's default. Duration is intentionally not required
+// here (a flag may supply it); the merged "duration must be set" check lives in
+// the command. RetrieveRatio is the key-manager-specific knob: the per-step
+// probability of reading back the payload of a live stored secret and
+// byte-comparing it with the bytes it was stored with. It only picks how often a
+// read-back happens; distribution.retrieve_ratio still decides which secrets the
+// plan marks as read-back candidates. It is a pointer so an omitted key (nil)
+// falls back to the command's default while an explicit retrieve_ratio: 0
+// disables read-backs — the one knob where 0 reads as an on/off switch rather
+// than a degenerate value.
+//
+// BucketWidth is the width of one time bucket of a run without an end, which
+// only --duration 0 selects; zero means unset, and a bounded run ignores it.
+type Chaos struct {
+	Duration      Duration `yaml:"duration"`
+	Interval      Interval `yaml:"interval"`
+	Parallel      Parallel `yaml:"parallel"`
+	ChurnRatio    float64  `yaml:"churn_ratio"`
+	TargetFill    float64  `yaml:"target_fill"`
+	RetrieveRatio *float64 `yaml:"retrieve_ratio"`
+	BucketWidth   Duration `yaml:"bucket_width"`
+}
+
+// Interval is the random delay range between scheduled churn actions.
+type Interval struct {
+	Min Duration `yaml:"min"`
+	Max Duration `yaml:"max"`
+}
+
+// Parallel bounds the fan-out of a churn tick: the actual number of actions
+// launched per tick is drawn randomly in [1, Max].
+type Parallel struct {
+	Max int `yaml:"max"`
+}
+
+// Duration is a time.Duration that decodes from a Go duration string (e.g.
+// "30m", "200ms") under strict YAML, since yaml.v2 has no native duration
+// decoding.
+type Duration time.Duration
+
+// UnmarshalYAML decodes a Go duration string into a Duration.
+func (d *Duration) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var s string
+	if err := unmarshal(&s); err != nil {
+		return err
+	}
+	parsed, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("parsing duration %q: %w", s, err)
+	}
+	*d = Duration(parsed)
+	return nil
 }
 
 // Resources holds the fixed counts of top-level resources to create: opaque
@@ -121,6 +183,44 @@ func (s Scenario) Validate() error {
 		return fmt.Errorf("distribution.secrets_per_container.max (%d) exceeds resources.secrets (%d)", s.Distribution.SecretsPerContainer.Max, s.Resources.Secrets)
 	}
 
+	if err := s.Chaos.validate(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validate checks the chaos block for semantic consistency. A nil receiver (no
+// chaos block) is valid. Duration is not required here because a CLI flag may
+// supply it; only the values that are present must be sane.
+func (c *Chaos) validate() error {
+	if c == nil {
+		return nil
+	}
+	if c.Duration < 0 {
+		return fmt.Errorf("chaos.duration must not be negative, got %s", time.Duration(c.Duration))
+	}
+	if c.BucketWidth < 0 {
+		return fmt.Errorf("chaos.bucket_width must not be negative, got %s", time.Duration(c.BucketWidth))
+	}
+	if c.Interval.Min < 0 {
+		return fmt.Errorf("chaos.interval.min must not be negative, got %s", time.Duration(c.Interval.Min))
+	}
+	if c.Interval.Min > c.Interval.Max {
+		return fmt.Errorf("chaos.interval.min (%s) must not exceed chaos.interval.max (%s)", time.Duration(c.Interval.Min), time.Duration(c.Interval.Max))
+	}
+	if c.Parallel.Max < 0 {
+		return fmt.Errorf("chaos.parallel.max must not be negative, got %d", c.Parallel.Max)
+	}
+	if c.ChurnRatio < 0 || c.ChurnRatio > 1 {
+		return fmt.Errorf("chaos.churn_ratio must be between 0 and 1, got %v", c.ChurnRatio)
+	}
+	if c.TargetFill < 0 || c.TargetFill > 1 {
+		return fmt.Errorf("chaos.target_fill must be between 0 and 1, got %v", c.TargetFill)
+	}
+	if c.RetrieveRatio != nil && (*c.RetrieveRatio < 0 || *c.RetrieveRatio > 1) {
+		return fmt.Errorf("chaos.retrieve_ratio must be between 0 and 1, got %v", *c.RetrieveRatio)
+	}
 	return nil
 }
 

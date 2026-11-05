@@ -13,6 +13,14 @@ distribution:
   retrieve_ratio:        0.5
   secrets_per_container: { min: 1, max: 3 }
 
+chaos:                                 # `barbican chaos --scenario scenarios/barbican/medium.yaml` runs as-is
+  duration: 30m
+  interval: { min: 200ms, max: 3s }
+  parallel: { max: 4 }
+  churn_ratio: 0.5
+  target_fill: 0.8
+  retrieve_ratio: 0.3
+
 # Barbican's project quotas default to unlimited (-1), so this profile carries
 # no quota risk there. The payload range encodes to at most 10924 base64
 # characters, under Barbican's default max_allowed_secret_in_bytes of 20000.
