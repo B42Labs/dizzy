@@ -88,6 +88,12 @@ var ErrQuota = errors.New("barbican: quota exceeded")
 // retryable: the stored data is wrong, not the call.
 var ErrPayloadMismatch = errors.New("barbican: payload mismatch")
 
+// ErrKindMismatch is the error-kind label an ErrPayloadMismatch carries in the
+// metrics error breakdown and the churn engine's per-bucket errors. It is
+// exported so the churn classifier and the chaos command's mismatch count name
+// the one value errKind records, rather than each repeating the literal.
+const ErrKindMismatch = "mismatch"
+
 // ErrOrderFailed is the sentinel the order wait wraps when an order ended in
 // ERROR, or ACTIVE without a usable secret reference. It is never retryable.
 var ErrOrderFailed = errors.New("barbican: order failed")
@@ -240,7 +246,7 @@ func errKind(err error) string {
 	case err == nil:
 		return ""
 	case errors.Is(err, ErrPayloadMismatch):
-		return "mismatch"
+		return ErrKindMismatch
 	case errors.Is(err, ErrOrderFailed):
 		return "order_error"
 	case isQuota(err):
