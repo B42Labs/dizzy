@@ -62,7 +62,8 @@ func newBarbicanGenerateCmd(opts *globalOptions) *cobra.Command {
 
 // buildBarbicanPlanFromFlags loads the Barbican scenario file, applies the --set
 // overrides and the global --seed override, and expands it into a plan. It
-// returns the scenario too, in the shape the other services' builders have; the
+// returns the scenario too, in the shape the other services' builders have: the
+// chaos command merges its chaos block into the churn config, while the
 // generate and apply commands ignore it. It makes no API calls.
 func buildBarbicanPlanFromFlags(cmd *cobra.Command, opts *globalOptions, scenarioPath string, sets []string) (barbicanscenario.Scenario, *barbicanplan.Plan, error) {
 	data, err := os.ReadFile(scenarioPath)
