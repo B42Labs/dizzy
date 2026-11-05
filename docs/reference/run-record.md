@@ -31,7 +31,7 @@ same way.
 | `startedAt` | timestamp | RFC 3339 |
 | `finishedAt` | timestamp | RFC 3339 |
 | `created` | array | Every created resource; see below |
-| `error` | string | Present only when the run failed |
+| `error` | string | Present only when the run failed. A `barbican chaos` record that saw a read-back mismatch carries it too, e.g. `payload read-back mismatch (run <id>): 2 read-back(s) returned different bytes` |
 | `metrics` | object | Aggregate metrics; see below |
 | `volumeType` | string | Cinder only; the resolved volume type, for provenance |
 | `chaos` | object | Churn runs only; see below. Absent on a `mix` record, whose personas and lanes carry their own |
@@ -78,6 +78,9 @@ one and `secret` for the other, and in `id`. A secret whose metadata stamp
 failed, stored or generated, is still listed. For a stored secret this list is
 then its only cleanup handle; a generated one is also found through its order's
 `secret_ref`, without the record.
+
+On a `barbican chaos` record the list holds the secrets and containers still
+live at the end of the run, and no orders.
 
 This list is `cleanup`'s belt-and-suspenders handle. It is the *only* handle for
 resources that cannot be discovered by tag — Neutron address scopes, and Keystone
@@ -135,7 +138,7 @@ Present only on a run record written by `chaos`.
 |---|---|---|
 | `creates` | int | Create operations issued |
 | `deletes` | int | Delete operations issued |
-| `mutates` | int | Cinder extends, Keystone token issues, or Nova server lifecycle mutations; omitted when zero |
+| `mutates` | int | Cinder extends, Keystone token issues, Nova server or Glance image lifecycle mutations, or Barbican payload read-backs; omitted when zero |
 | `cycles` | int | Completed create→delete cycles |
 | `popMin` | int | Minimum live population over the run |
 | `popMax` | int | Maximum live population |

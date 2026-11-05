@@ -58,7 +58,10 @@ right lifecycle without a line of Cinder-specific lifecycle code: a snapshot onl
 exists while its volume does, a volume with live snapshots is never deleted, and
 snapshots naturally churn faster than the volumes under them. Keystone's domains
 and roles form a stable scaffold, provisioned once; projects, users, and
-assignments churn inside it.
+assignments churn inside it. Barbican's stored secrets have no parents; a
+generic container is parented on the secrets it references. So a container is
+created only while its secrets are live, and a secret a live container
+references is never deleted. Barbican's orders take no part in the churn.
 
 ## Keeping the population honest
 
@@ -163,27 +166,36 @@ schedule stays the same.
 
 Create and delete change the population. Some interesting operations don't.
 
-Cinder's **extend**, Keystone's **token issue**, Nova's **server lifecycle**, and
-Glance's **image lifecycle** are modeled as *mutations*: with probability
-`resize_ratio` (or `token_ratio`, or `lifecycle_ratio`), a churn step mutates an
-existing resource instead of changing the population. A volume is extended to its
+Cinder's **extend**, Keystone's **token issue**, Nova's **server lifecycle**,
+Glance's **image lifecycle**, and Barbican's **payload read-back** are modeled
+as *mutations*: with probability `resize_ratio` (or `token_ratio`,
+`lifecycle_ratio`, or `retrieve_ratio`), a churn step mutates an existing
+resource instead of changing the population. A volume is extended to its
 plan's target; a user with a live project assignment authenticates for a scoped
 token; a live server is stop/started, resized-and-confirmed, or live-migrated, in
 that fixed precedence; a live image is metadata-churned, shared with a member
 added/accepted/removed, deactivated-and-reactivated, and flipped to community and
-public visibility, in that fixed precedence.
+public visibility, in that fixed precedence. A live secret the plan marks for
+read-back has its payload read back and compared byte for byte with the bytes it
+was stored with.
 
 Because mutations leave the population untouched, the controller's economics
 above are unaffected. They still count against the per-tick fan-out, since they
 are API calls like any other.
 
+A failed mutation counts as an error in the statistics, like any failed call,
+and does not fail the run. The one exception is a Barbican read-back that
+returns different bytes: the run still goes on to its end and tears down, but
+`barbican chaos` then exits non-zero, because a mismatch is a correctness
+failure, not a latency one.
+
 Each resource *instance* is mutated at most once per lifetime — a volume is
 extended to its planned target and not further, a grant issues one token, a
-server runs its planned lifecycle once, an image runs its planned lifecycle once
-— and is re-armed when it is deleted and recreated. For Cinder this is what keeps a
-week-long soak's gigabyte consumption inside the envelope that the quota
-pre-check validated (the sum of planned final sizes), rather than growing without
-bound.
+server runs its planned lifecycle once, an image runs its planned lifecycle once,
+a secret is read back once — and is re-armed when it is deleted and recreated.
+For Cinder this is what keeps a week-long soak's gigabyte consumption inside the
+envelope that the quota pre-check validated (the sum of planned final sizes),
+rather than growing without bound.
 
 A pinned node is exempt from that bound: it is never deleted, so it has a single
 lifetime, and the engine may draw its mutation any number of times in it. Each

@@ -11,9 +11,8 @@ For what the knobs actually control, see
 
 ## Run a built-in profile
 
-All eighteen profiles of the namespaces with a `chaos` command ship a `chaos:`
-block, so they run with no flags at all; the three Barbican profiles carry
-none, since `barbican` has no `chaos` command:
+All twenty-one profiles ship a `chaos:` block, so they run with no flags at
+all:
 
 ```console
 $ dizzy neutron chaos --scenario scenarios/neutron/small.yaml    # 5m
@@ -21,6 +20,7 @@ $ dizzy cinder chaos  --scenario scenarios/cinder/small.yaml     # 5m
 $ dizzy keystone chaos --scenario scenarios/keystone/small.yaml  # 5m
 $ dizzy nova chaos --scenario scenarios/nova/small.yaml          # 5m
 $ dizzy glance chaos --scenario scenarios/glance/small.yaml      # 5m
+$ dizzy barbican chaos --scenario scenarios/barbican/small.yaml  # 5m
 $ dizzy mix chaos --scenario scenarios/mix/small.yaml            # 5m
 ```
 
@@ -94,8 +94,8 @@ pool is the real ceiling.
 
 ## Add mutations
 
-Cinder and Keystone can mutate live resources instead of only creating and
-deleting them. Mutations do not change the population.
+Cinder, Keystone, Nova, Glance, and Barbican can mutate live resources instead
+of only creating and deleting them. Mutations do not change the population.
 
 ```console
 $ dizzy cinder chaos --scenario scenarios/cinder/medium.yaml \
@@ -103,11 +103,25 @@ $ dizzy cinder chaos --scenario scenarios/cinder/medium.yaml \
 
 $ dizzy keystone chaos --scenario scenarios/keystone/small.yaml \
     --duration 30m --token-ratio 0.5
+
+$ dizzy barbican chaos --scenario scenarios/barbican/small.yaml \
+    --duration 30m --retrieve-ratio 0.5
 ```
 
 `--resize-ratio` is the probability per churn step of extending a live,
 not-yet-resized volume to its planned target. `--token-ratio` is the probability
-of issuing a scoped token as a live, assigned user. Set either to `0` to disable.
+of issuing a scoped token as a live, assigned user. `--retrieve-ratio` is the
+probability of reading back the payload of a live secret the plan marks for
+read-back and comparing it byte for byte with the payload stored. Set any of
+them to `0` to disable.
+
+A Barbican read-back that returns different bytes does not stop the churn. The
+run finishes and tears down as usual, then `barbican chaos` exits non-zero, and
+the run record's `error` names the count, e.g.
+`payload read-back mismatch (run <id>): 2 read-back(s) returned different bytes`.
+No other `chaos` command fails on an operation error. This one does because a
+mismatch means the key manager returned wrong data, which is a correctness
+failure rather than a latency one.
 
 Each resource instance is mutated at most once per lifetime, and re-armed when it
 is deleted and recreated. The exception is the `mix` Legacy persona: its
