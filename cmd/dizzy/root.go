@@ -40,8 +40,9 @@ func newRootCmd() *cobra.Command {
 		Short: "Scenario-driven load and consistency tester for OpenStack",
 		Long: "dizzy builds large, randomized but reproducible Neutron\n" +
 			"topologies, Cinder volume workloads, Keystone identity workloads,\n" +
-			"Nova server fleets, and Glance image lifecycles, records how long\n" +
-			"every operation takes, and tracks the states the resources reach.\n\n" +
+			"Nova server fleets, Glance image lifecycles, and Barbican secret\n" +
+			"lifecycles, records how long every operation takes, and tracks the\n" +
+			"states the resources reach.\n\n" +
 			"dizzy mix runs several workload personas side by side in one churn run.",
 		// Version is set from the main package's build-time variable, so
 		// "dizzy --version" prints the release tag (or "dev" for local builds).
@@ -71,7 +72,7 @@ func newRootCmd() *cobra.Command {
 	flags.StringVar(&opts.logLevel, "log-level", "info", "log level: debug, info, warn, or error")
 	flags.BoolVar(&opts.otel, "otel", false, "export metrics via OpenTelemetry OTLP; endpoint, protocol, headers, and TLS come from the OTEL_EXPORTER_OTLP_* environment variables")
 
-	cmd.AddCommand(newNeutronCmd(opts), newCinderCmd(opts), newKeystoneCmd(opts), newNovaCmd(opts), newGlanceCmd(opts), newMixCmd(opts))
+	cmd.AddCommand(newNeutronCmd(opts), newCinderCmd(opts), newKeystoneCmd(opts), newNovaCmd(opts), newGlanceCmd(opts), newBarbicanCmd(opts), newMixCmd(opts))
 
 	return cmd
 }
