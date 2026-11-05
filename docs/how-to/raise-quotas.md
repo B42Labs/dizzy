@@ -1,8 +1,8 @@
 # Deal with the quota pre-check
 
-`neutron apply`, `cinder apply`, and `nova apply` compare the expanded plan
-against your project's quotas **before creating anything**, and abort with an
-itemized message if the quotas are too low:
+`neutron apply`, `cinder apply`, `nova apply`, and `barbican apply` compare the
+expanded plan against your project's quotas **before creating anything**, and
+abort with an itemized message if the quotas are too low:
 
 > `glance apply` runs **no** quota pre-check. Glance exposes no project-quota API
 > to compare a plan against — its image count and per-image size caps are
@@ -47,6 +47,9 @@ follows:
 For Cinder, the names are `volumes`, `snapshots`, and `gigabytes`. With
 `--volume-type` set, the per-type quotas `volumes_<type>`, `snapshots_<type>`,
 and `gigabytes_<type>` are checked as well.
+
+For Barbican, the names are `secrets`, `orders`, and `containers`, the keys of
+Barbican's project quotas.
 
 ## Option 2: Shrink the plan
 
@@ -106,12 +109,29 @@ group on its own, so the check compares the largest group with the limit
 alone, without usage. The bundled `mix` profiles need 1, 2 and 3 server groups
 of up to 2, 3 and 6 members, within Nova's defaults of 10 and 10.
 
+For Barbican, the pre-check counts **secrets**, **orders**, and **containers**.
+The secrets include one per order on top of the stored ones, since every order
+that turns ACTIVE generates a secret that counts against the same quota: the
+`small` profile's 10 secrets and 5 orders need 15 secrets. A negative limit,
+which is Barbican's default for every quota, means unlimited and never blocks.
+Like Cinder's, the check compares the plan with the limit, not with what the
+project has left.
+
 ## When the pre-check cannot run
 
 If the project cannot read its own quota, the pre-check **fails open**: it logs a
 warning and proceeds. The executor's quota fast-fail is the backstop — the first
 over-quota response from the API (HTTP 409 for Neutron, HTTP 413 for Cinder,
 HTTP 403 for Nova) stops the run immediately rather than retrying.
+
+Barbican's pre-check reads its quotas with Cinder's policy. A denied read (HTTP
+403) logs `quota pre-check skipped: quota read denied` and proceeds; any other
+read failure, including an answer that carries no `quotas` object, aborts the
+apply with `reading Barbican quotas for pre-check: …` before anything is
+created. Barbican answers an over-quota create with HTTP 403 as well. The
+executor counts a 403 as a quota rejection only when its body names a quota,
+so a 403 from Barbican's policy stops the run as `http_403` rather than as
+`quota`.
 
 The pre-check exists to give a good error message early, not to be a second
 authorization system. It must never refuse work the cloud would have allowed.

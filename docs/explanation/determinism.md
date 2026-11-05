@@ -38,6 +38,16 @@ everything downstream. Adding one network changes the RNG's position for every
 draw after it. That is expected and harmless — determinism means *the same inputs
 give the same output*, not that similar inputs give similar outputs.
 
+The bytes a run writes are derived the same way. A Glance image upload and a
+Barbican secret store take their payload from `internal/payload`, which seeds it
+from the plan seed and the resource's logical name: the plan seed XOR the
+FNV-64a hash of the name. The plan records only the payload's size, so two runs
+of one plan write byte-identical data, no two resources in a plan share a
+payload, and a Barbican read-back compares what the cloud returns with the same
+bytes derived again. The package's tests pin the seed derived for one logical
+name and the SHA-256 of one payload, so a change that would alter the bytes
+fails them.
+
 ## Addresses are allocated, not drawn
 
 CIDRs are not random. They are handed out sequentially from non-overlapping

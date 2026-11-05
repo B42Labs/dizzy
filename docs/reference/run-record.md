@@ -25,7 +25,7 @@ same way.
 | Field | Type | Notes |
 |---|---|---|
 | `runID` | string | The run id; also the tag/metadata/name-prefix value |
-| `service` | string | `neutron`, `cinder`, `keystone`, `nova`, `glance`, or `mix`. Omitted on older records |
+| `service` | string | `neutron`, `cinder`, `keystone`, `nova`, `glance`, `barbican`, or `mix`. Omitted on older records |
 | `scenario` | string | Scenario name |
 | `seed` | int | The seed the plan was expanded from |
 | `startedAt` | timestamp | RFC 3339 |
@@ -69,6 +69,15 @@ while it entered its [stages](#stages). A run that failed while it made the
 reader grants or entered a stage lists the grants made up to the failure, so
 `cleanup` reclaims them like any other grant. The `reader` role itself is not
 in the list, and no teardown deletes it.
+
+On a `barbican` record the list holds the stored secrets in plan order, then
+each order followed by the secret Barbican generated for it, then the
+containers. An order and its generated secret share `logical` and `name`, e.g.
+`ord-0001` and `dizzy-a1b2c3d4-ord-0001`, and differ in `kind`, `order` for the
+one and `secret` for the other, and in `id`. A secret whose metadata stamp
+failed, stored or generated, is still listed. For a stored secret this list is
+then its only cleanup handle; a generated one is also found through its order's
+`secret_ref`, without the record.
 
 This list is `cleanup`'s belt-and-suspenders handle. It is the *only* handle for
 resources that cannot be discovered by tag — Neutron address scopes, and Keystone
@@ -114,7 +123,9 @@ The `kind` in an `errors[]` entry is the service client's classification:
 service actually returns, or `http_other`. These are the same values the OTLP
 `error.kind` attribute carries — see [Metrics](metrics.md).
 A `keystone pressure` record adds `accepted`, for a `bad_token` request that
-a service answered with a 2xx.
+a service answered with a 2xx. A `barbican` record adds `mismatch`, for a
+read-back that returned different bytes, and `order_error`, for an order that
+ended in ERROR.
 
 ## `chaos`
 

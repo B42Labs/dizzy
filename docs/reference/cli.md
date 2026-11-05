@@ -1,8 +1,9 @@
 # CLI reference
 
 A single binary, `dizzy`, with one command namespace per OpenStack service:
-`neutron`, `cinder`, `keystone`, `nova`, and `glance`. Each namespace offers the
-same verbs.
+`neutron`, `cinder`, `keystone`, `nova`, `glance`, and `barbican`. Each
+namespace offers the same verbs, except that `barbican` has no `chaos` and no
+`monitor`.
 
 | Verb | Touches the API | Purpose |
 |---|---|---|
@@ -20,7 +21,7 @@ stub that returns "not implemented yet").
 `keystone` additionally has `pressure`, a closed-loop load on Keystone's token
 validation, revocation and role listings; see [`pressure`](#pressure).
 
-A sixth namespace, `mix`, runs several workload personas side by side in one
+A seventh namespace, `mix`, runs several workload personas side by side in one
 churn run. It has its own subset of the verbs; see
 [The `mix` namespace](#the-mix-namespace).
 
@@ -108,14 +109,15 @@ Namespace-specific flags:
 | `--domain <name>` | `keystone` | In-scope domain for domain-manager mode (default: the token's domain; ignored in admin mode) |
 | `--roles <csv>` | `keystone` | Existing roles to reuse in domain-manager mode (default `member,reader`; ignored in admin mode) |
 
-`neutron apply`, `cinder apply`, and `nova apply` run a read-only **quota
-pre-check** against the expanded plan and abort with an itemized message before
-creating anything if the quotas are insufficient. `keystone apply` runs a
-read-only **privilege pre-check** instead, since Keystone has no default
-per-resource quotas. `glance apply` runs **no** pre-check: Glance exposes no
-project-quota API (its image count and size caps are deployment config), so an
-over-limit request surfaces as a fast-failed 413 during the run rather than being
-caught up front. See [Deal with the quota pre-check](../how-to/raise-quotas.md)
+`neutron apply`, `cinder apply`, `nova apply`, and `barbican apply` run a
+read-only **quota pre-check** against the expanded plan and abort with an
+itemized message before creating anything if the quotas are insufficient.
+`keystone apply` runs a read-only **privilege pre-check** instead, since
+Keystone has no default per-resource quotas. `glance apply` runs **no**
+pre-check: Glance exposes no project-quota API (its image count and size caps
+are deployment config), so an over-limit request surfaces as a fast-failed 413
+during the run rather than being caught up front. See
+[Deal with the quota pre-check](../how-to/raise-quotas.md)
 and [Keystone's privilege model](../explanation/privilege-model.md).
 
 `nova apply` takes no service-specific flags: the boot image, flavor, and resize
@@ -138,6 +140,32 @@ data-upload path into the cloud's default store. A payload larger than the
 default `--timeout` allows may need `--timeout` raised, since each upload is one
 operation bounded by it.
 
+`barbican apply` takes no service-specific flags: every secret is stored by
+dizzy with a synthetic payload whose size `distribution.payload_bytes` draws, so
+a run references no pre-existing secret. It runs four stages in order. It
+stores each secret and stamps the run's `dizzy_run` metadata onto it, submits
+each AES-256 key order and waits for it to turn ACTIVE before stamping the
+secret Barbican generated, groups stored secrets into generic containers, and
+reads back the payloads the plan selects, byte-comparing each with the bytes it
+stored. A read-back that returns different bytes, or an order that ends in
+ERROR, fails the run without a retry. Each order wait is one operation bounded
+by `--timeout`, and an order still pending at the deadline fails the run too.
+
+Its quota pre-check reads the project's effective Barbican quotas and compares
+them with the plan's secrets, orders, and containers, counting one secret per
+order on top of the stored ones, since each order generates a secret. A denied
+quota read (HTTP 403) skips the pre-check with a warning; any other read
+failure, including an answer without a `quotas` object, aborts the run before
+anything is created. Barbican limits a secret by its
+`max_allowed_secret_in_bytes` setting, which it checks against the base64 text
+dizzy sends. The default of 20000 holds the shipped profiles' largest payload of
+8192 bytes, 10924 characters once encoded, but a deployment still on the older
+default of 10000 refuses a payload above 7500 bytes with HTTP 413, which fails
+the store as `http_413` without a retry. The project user needs a role that
+Barbican's policy allows to create secrets, orders, and containers: `creator` or
+`admin` under the legacy policy, `member` once the secure-RBAC defaults are
+enforced. Without one, the first store fails as `http_403`.
+
 **On interrupt.** SIGINT/SIGTERM writes the run record first, then tears the
 partial topology down in reverse dependency order, logs the deletion count, and
 exits non-zero naming the run id. A second signal aborts hard, leaving the record
@@ -152,8 +180,9 @@ so the live population never exceeds the scenario's counts and only planned
 resources are ever created. See [The churn engine](../explanation/churn-engine.md).
 
 Every flag can instead be set in a `chaos:` block in the scenario YAML; flags
-override the block. Every built-in profile ships such a block, so `chaos` runs
-them with no extra flags.
+override the block. All eighteen built-in profiles of the namespaces with a
+`chaos` command ship such a block, so `chaos` runs them with no extra flags;
+the three Barbican profiles carry none.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -707,7 +736,7 @@ Re-queries the current state of a run's resources from the API.
 ## `report`
 
 Renders metrics from a run record. Never touches the API. The same command
-builder backs all six namespaces, so `dizzy cinder report` and
+builder backs all seven namespaces, so `dizzy cinder report` and
 `dizzy neutron report` are the same code.
 
 | Flag | Default | Description |
@@ -860,6 +889,25 @@ Discovery differs per service, and so does what `--run-id` alone can reach:
   server-side by the list API's `tag` parameter, with the run record's created
   list as a fallback. Images are a single kind with no ordering, so a bare
   `--run-id` reaches everything the run created.
+- **barbican**: containers and secrets are found by their `dizzy-<runid>-` name
+  prefix, a secret only once its `dizzy_run=<id>` metadata confirms the run or
+  a discovered order names it as its `secret_ref`, and orders by the same
+  prefix on their `meta.name`, all filtered client side, with the run record's
+  created list as a fallback. Barbican spells the key `dizzy_run`, not the
+  `dizzy:run` of the other services, because its metadata keys must match
+  `[A-Za-z0-9_-]`. Containers are deleted first, since they reference secrets.
+  Then each discovered order's generated secret is deleted before the orders
+  themselves, since deleting an order leaves its secret behind and the order is
+  the only handle on a secret that was never stamped; a cleanup that stops in
+  between leaves the order for a rerun to find the secret through. The
+  remaining secrets, stored and generated alike, go last. Barbican deletes
+  synchronously, so nothing is waited on. A bare `--run-id` reaches every container and order
+  by the prefix, every secret that carries `dizzy_run`, and every secret a run
+  order generated, stamped or not. Only the record reaches a stored secret
+  whose metadata stamp failed. Neither reaches the unstamped duplicate a
+  retried store can leave behind after a lost create answer, which the store's
+  `create failed; a secret with this name may be orphaned in the cloud`
+  warning names.
 
 See [Resource identity and cleanup](../explanation/resource-identity.md).
 
