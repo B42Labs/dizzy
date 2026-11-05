@@ -1,0 +1,95 @@
+{
+  "scenario": "small",
+  "seed": 42,
+  "secrets": [
+    {
+      "name": "sec-0001",
+      "payloadBytes": 64,
+      "retrieve": true
+    },
+    {
+      "name": "sec-0002",
+      "payloadBytes": 7138,
+      "retrieve": true
+    },
+    {
+      "name": "sec-0003",
+      "payloadBytes": 6312,
+      "retrieve": true
+    },
+    {
+      "name": "sec-0004",
+      "payloadBytes": 2703,
+      "retrieve": true
+    },
+    {
+      "name": "sec-0005",
+      "payloadBytes": 553
+    },
+    {
+      "name": "sec-0006",
+      "payloadBytes": 2778,
+      "retrieve": true
+    },
+    {
+      "name": "sec-0007",
+      "payloadBytes": 6316,
+      "retrieve": true
+    },
+    {
+      "name": "sec-0008",
+      "payloadBytes": 4181,
+      "retrieve": true
+    },
+    {
+      "name": "sec-0009",
+      "payloadBytes": 5735
+    },
+    {
+      "name": "sec-0010",
+      "payloadBytes": 4785
+    }
+  ],
+  "orders": [
+    {
+      "name": "ord-0001"
+    },
+    {
+      "name": "ord-0002"
+    },
+    {
+      "name": "ord-0003"
+    },
+    {
+      "name": "ord-0004"
+    },
+    {
+      "name": "ord-0005"
+    }
+  ],
+  "containers": [
+    {
+      "name": "ctr-0001",
+      "secrets": [
+        "sec-0004",
+        "sec-0005"
+      ]
+    },
+    {
+      "name": "ctr-0002",
+      "secrets": [
+        "sec-0002",
+        "sec-0004",
+        "sec-0006"
+      ]
+    },
+    {
+      "name": "ctr-0003",
+      "secrets": [
+        "sec-0003",
+        "sec-0007",
+        "sec-0008"
+      ]
+    }
+  ]
+}
