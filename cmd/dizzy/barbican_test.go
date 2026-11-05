@@ -27,8 +27,11 @@ import (
 
 // recordingBarbicanCleaner is a fake barbicanexec.Cleaner that records what it
 // deletes and whether the contexts it is handed were cancelled. Its listings
-// return nothing, so the only deletes are the recorded resources passed through
-// the created list. A delete of a kind in failKinds returns deleteErr instead.
+// return nothing by default, so the only deletes are the recorded resources
+// passed through the created list. ListContainersByRun returns leftover on every
+// call, so a container still listed after its delete shows up in the chaos leak
+// check, and every listing fails with listErr when it is set. A delete of a kind
+// in failKinds returns deleteErr instead.
 type recordingBarbicanCleaner struct {
 	mu                 sync.Mutex
 	recordWritten      *bool
@@ -38,6 +41,8 @@ type recordingBarbicanCleaner struct {
 	deleted            []resource.Resource
 	failKinds          map[resource.Kind]bool
 	deleteErr          error
+	leftover           []resource.Resource
+	listErr            error
 }
 
 func (c *recordingBarbicanCleaner) observe(ctx context.Context) {
@@ -54,11 +59,14 @@ func (c *recordingBarbicanCleaner) list(ctx context.Context) ([]resource.Resourc
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.observe(ctx)
-	return nil, nil
+	return nil, c.listErr
 }
 
 func (c *recordingBarbicanCleaner) ListContainersByRun(ctx context.Context, _ string) ([]resource.Resource, error) {
-	return c.list(ctx)
+	if _, err := c.list(ctx); err != nil {
+		return nil, err
+	}
+	return c.leftover, nil
 }
 func (c *recordingBarbicanCleaner) ListOrdersByRun(ctx context.Context, _ string) (orders, secrets []resource.Resource, err error) {
 	orders, err = c.list(ctx)
@@ -107,7 +115,7 @@ func shippedBarbicanProfile(t *testing.T, name string) string {
 }
 
 // TestBarbicanHelpListsSubcommands confirms dizzy barbican --help lists the
-// five subcommands the namespace offers.
+// six subcommands the namespace offers.
 func TestBarbicanHelpListsSubcommands(t *testing.T) {
 	root := newRootCmd()
 	var out bytes.Buffer
@@ -123,7 +131,7 @@ func TestBarbicanHelpListsSubcommands(t *testing.T) {
 			listed[fields[0]] = true
 		}
 	}
-	for _, name := range []string{"generate", "apply", "status", "report", "cleanup"} {
+	for _, name := range []string{"generate", "apply", "chaos", "status", "report", "cleanup"} {
 		if !listed[name] {
 			t.Errorf("barbican --help does not list %q:\n%s", name, out.String())
 		}
