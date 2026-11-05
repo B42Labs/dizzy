@@ -24,6 +24,7 @@ import (
 
 	"github.com/B42Labs/dizzy/internal/glance"
 	"github.com/B42Labs/dizzy/internal/glance/plan"
+	"github.com/B42Labs/dizzy/internal/payload"
 	"github.com/B42Labs/dizzy/internal/resource"
 )
 
@@ -150,7 +151,7 @@ func (e *applier) provisionImage(ctx context.Context, img plan.Image) (resource.
 	slog.Info("created resource", "kind", res.Kind, "logical", res.Logical, "id", res.ID)
 
 	if err := WithRetry(ctx, e.opTimeout, func(ctx context.Context) error {
-		return e.c.UploadImageData(ctx, res, img.SizeMiB, glance.PayloadSeed(e.seed, img.Name))
+		return e.c.UploadImageData(ctx, res, img.SizeMiB, payload.Seed(e.seed, img.Name))
 	}); err != nil {
 		return res, err
 	}

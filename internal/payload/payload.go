@@ -1,4 +1,12 @@
-package glance
+// Package payload derives the deterministic synthetic payloads dizzy writes to a
+// cloud. A payload's bytes follow from a seed and a length alone, and Seed
+// derives that seed from the plan seed and a resource's logical name, so a
+// scenario writes byte-identical data on every run while two resources in one
+// plan never share a payload. Every service that writes a payload derives it
+// here: a Glance image upload streams it through NewReader, and Bytes returns
+// the same bytes whole for a caller that sends them in one request body, such as
+// a Barbican secret store, or compares them against what the cloud returns.
+package payload
 
 import (
 	"errors"
@@ -28,14 +36,16 @@ type payload struct {
 	released chan struct{} // closed once the transport stops reading the current attempt
 }
 
-// payloadReader returns a reader that yields exactly n bytes of deterministic,
+// NewReader returns a reader that yields exactly n bytes of deterministic,
 // pseudo-random data drawn from seed. math/rand v1's Read is frozen for
-// compatibility, so the same seed and size always produce byte-identical data —
-// which lets a scenario push an identical synthetic payload every run. The bytes
-// are valid raw image data (a raw image is an unstructured byte blob), so no
-// format inspection rejects them. The only supported seek is a rewind to the
-// start, which regenerates the stream from seed instead of buffering it.
-func payloadReader(seed, n int64) io.ReadSeekCloser {
+// compatibility, so the same seed and size always produce byte-identical data,
+// which lets a scenario write an identical synthetic payload every run. The
+// bytes carry no structure, so they are valid raw image data (a raw image is an
+// unstructured byte blob) and a valid opaque secret alike, and no format
+// inspection rejects them. The only supported seek is a rewind to the start,
+// which regenerates the stream from seed instead of buffering it, so a streamed
+// upload of any size can be repeated without holding it in memory.
+func NewReader(seed, n int64) io.ReadSeekCloser {
 	p := &payload{seed: seed, n: n}
 	p.rewind()
 	return p
@@ -79,13 +89,23 @@ func (p *payload) rewind() {
 	p.released = make(chan struct{})
 }
 
-// PayloadSeed derives the per-image payload seed from the plan seed and the
-// image's logical name, so two images in one plan get distinct payloads while the
+// Bytes returns the n bytes NewReader(seed, n) yields, in one slice. It serves
+// a caller that sends the payload in a single request body or compares a
+// payload read back from the cloud with the one it wrote. Reading from a
+// math/rand source never fails, so Bytes has no error to return.
+func Bytes(seed, n int64) []byte {
+	b, _ := io.ReadAll(NewReader(seed, n))
+	return b
+}
+
+// Seed derives a resource's payload seed from the plan seed and the resource's
+// logical name, so two resources in one plan get distinct payloads while the
 // whole plan stays reproducible from its single seed. It XORs the plan seed with
-// the FNV-64a hash of the logical name. It is exported so the apply executor and
-// the chaos graph derive the same seed the client uploads with, keeping a
-// scenario's synthetic payloads byte-identical across both paths.
-func PayloadSeed(planSeed int64, logical string) int64 {
+// the FNV-64a hash of the logical name. It is exported so every path that
+// writes or checks a payload derives the same seed: the Glance apply executor
+// and chaos graph both hand it to the client that uploads, keeping a scenario's
+// synthetic payloads byte-identical across both paths.
+func Seed(planSeed int64, logical string) int64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(logical))
 	return planSeed ^ int64(h.Sum64())

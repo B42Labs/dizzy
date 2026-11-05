@@ -14,6 +14,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2"
 
 	"github.com/B42Labs/dizzy/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/payload"
 	"github.com/B42Labs/dizzy/internal/resource"
 )
 
@@ -30,6 +31,16 @@ func imageRes(id string) resource.Resource {
 	return resource.Resource{Kind: KindImage, Logical: "img-0001", Name: "dizzy-run0-img-0001", ID: id}
 }
 
+// readAll drains a payload reader into a byte slice.
+func readAll(t *testing.T, r io.Reader) []byte {
+	t.Helper()
+	b, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("reading payload: %v", err)
+	}
+	return b
+}
+
 // TestUploadImageDataResendsWholePayloadAfterReauth asserts an upload answered
 // with 401 is repeated after re-authentication with the whole payload, not the
 // drained remainder of the first attempt. Glance's auth middleware rejects an
@@ -37,7 +48,7 @@ func imageRes(id string) resource.Resource {
 // transport is still sending the first attempt's body.
 func TestUploadImageDataResendsWholePayloadAfterReauth(t *testing.T) {
 	const sizeMiB, seed = 8, 7
-	want := sha256.Sum256(readAll(t, payloadReader(seed, sizeMiB<<20)))
+	want := sha256.Sum256(readAll(t, payload.NewReader(seed, sizeMiB<<20)))
 	tests := []struct {
 		name     string
 		readBody bool // the server reads the whole first attempt before its 401

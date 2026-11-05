@@ -10,6 +10,7 @@ import (
 
 	"github.com/B42Labs/dizzy/internal/glance"
 	"github.com/B42Labs/dizzy/internal/glance/plan"
+	"github.com/B42Labs/dizzy/internal/payload"
 	"github.com/B42Labs/dizzy/internal/resource"
 )
 
@@ -283,7 +284,7 @@ func TestApplyUploadUsesDeterministicSeed(t *testing.T) {
 	if got1 != got2 {
 		t.Errorf("upload seed differed across runs: %d vs %d", got1, got2)
 	}
-	if want := glance.PayloadSeed(p.Seed, "img-0001"); got1 != want {
-		t.Errorf("upload seed = %d, want PayloadSeed(seed, name) = %d", got1, want)
+	if want := payload.Seed(p.Seed, "img-0001"); got1 != want {
+		t.Errorf("upload seed = %d, want payload.Seed(seed, name) = %d", got1, want)
 	}
 }
