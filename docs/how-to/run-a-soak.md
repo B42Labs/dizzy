@@ -11,7 +11,9 @@ For what the knobs actually control, see
 
 ## Run a built-in profile
 
-All eighteen profiles ship a `chaos:` block, so they run with no flags at all:
+All eighteen profiles of the namespaces with a `chaos` command ship a `chaos:`
+block, so they run with no flags at all; the three Barbican profiles carry
+none, since `barbican` has no `chaos` command:
 
 ```console
 $ dizzy neutron chaos --scenario scenarios/neutron/small.yaml    # 5m

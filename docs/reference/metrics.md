@@ -245,7 +245,7 @@ These identify one installation across time.
 | `service.version` | The build version |
 | `cloud` | The `--os-cloud` name; for a `mix` persona or lane, the `clouds.yaml` entry it authenticated with |
 | `scenario` | The scenario name; for a `mix` lane, the name of its plan, e.g. `small/keystone` |
-| `service` | `neutron`, `cinder`, `keystone`, `nova`, `glance`, or `mix` |
+| `service` | `neutron`, `cinder`, `keystone`, `nova`, `glance`, `barbican`, or `mix` |
 | `persona` | `mix` only; the persona name, `ci`, `gardener` or `legacy` |
 | `lane` | `mix` only; the background lane name, `cinder`, `glance`, `keystone` or `neutron`. A resource carries `persona` or `lane`, never both |
 
@@ -270,7 +270,7 @@ same backend. It mirrors the run record's `service` field.
 | `dizzy.iteration.operations` | counter | | `result` |
 | `dizzy.iterations` | counter | | `outcome` |
 
-All five services share this schema; no service adds an instrument.
+All six services share this schema; no service adds an instrument.
 
 ### Attribute values
 
@@ -278,11 +278,11 @@ Every value set is bounded.
 
 | Attribute | Values |
 |---|---|
-| `kind` | **neutron:** `address-scope`, `subnet-pool`, `network`, `subnet`, `router`, `router-interface`, `security-group`, `security-group-rule`, `port`, `floating-ip` — **cinder:** `volume`, `snapshot` — **keystone:** `domain`, `project`, `user`, `role`, `implied_role` (an implied-role rule), `role_assignment`, `token`, and for `keystone pressure` also `probe`, `bad_token` and `propagation` (a request to Nova, Neutron, Cinder or Glance) and, on `dizzy.resource.time_to_ready` only, `revocation` (the propagation delay) — **nova:** `server`, `network`, `subnet`, `port`, `volume`, `server_group` (only the `mix` Gardener persona creates server groups) — **glance:** `image` |
-| `operation` | `create`, `delete`, `get`, `list`, `tag`, `attach`, `detach`, `extend` (cinder resize), `update` (keystone domain disable-before-delete; glance property churn), `validate`, `revoke` (keystone token validation and revocation; `keystone pressure` only), `stop`, `start`, `reboot`, `resize`, `confirm-resize`, `live-migrate`, `cold-migrate` (nova server lifecycle; `cold-migrate` only for the `mix` Legacy persona), `upload`, `visibility`, `deactivate`, `reactivate`, `member-add`, `member-accept`, `member-remove` (glance image lifecycle), `nova`, `neutron`, `cinder`, `glance` (the service a `probe`, `bad_token` or `propagation` request went to; `keystone pressure` only) |
+| `kind` | **neutron:** `address-scope`, `subnet-pool`, `network`, `subnet`, `router`, `router-interface`, `security-group`, `security-group-rule`, `port`, `floating-ip` — **cinder:** `volume`, `snapshot` — **keystone:** `domain`, `project`, `user`, `role`, `implied_role` (an implied-role rule), `role_assignment`, `token`, and for `keystone pressure` also `probe`, `bad_token` and `propagation` (a request to Nova, Neutron, Cinder or Glance) and, on `dizzy.resource.time_to_ready` only, `revocation` (the propagation delay) — **nova:** `server`, `network`, `subnet`, `port`, `volume`, `server_group` (only the `mix` Gardener persona creates server groups) — **glance:** `image`; **barbican:** `secret` (a stored secret and the secret an order generates alike), `order`, `container` |
+| `operation` | `create`, `delete`, `get`, `list`, `tag`, `attach`, `detach`, `extend` (cinder resize), `update` (keystone domain disable-before-delete; glance property churn; barbican secret metadata stamp), `validate`, `revoke` (keystone token validation and revocation; `keystone pressure` only), `stop`, `start`, `reboot`, `resize`, `confirm-resize`, `live-migrate`, `cold-migrate` (nova server lifecycle; `cold-migrate` only for the `mix` Legacy persona), `upload`, `visibility`, `deactivate`, `reactivate`, `member-add`, `member-accept`, `member-remove` (glance image lifecycle), `download` (barbican payload read-back), `nova`, `neutron`, `cinder`, `glance` (the service a `probe`, `bad_token` or `propagation` request went to; `keystone pressure` only) |
 | `outcome` | `success`, `error`, `timeout` for an operation; `success`, `timeout` for time-to-ready, where `timeout` under `kind=revocation` is a propagation probe that reached its ceiling; `success`, `failure` for an iteration |
 | `result` | `attempted`, `succeeded`, `failed` |
-| `error.kind` | `quota`, `timeout`, `canceled`, `other`, `http_<status>` for the statuses the service returns, `http_other` for the rest, `accepted` for a `bad_token` request that a service answered with a 2xx |
+| `error.kind` | `quota`, `timeout`, `canceled`, `other`, `http_<status>` for the statuses the service returns, `http_other` for the rest, `accepted` for a `bad_token` request that a service answered with a 2xx, `mismatch` for a barbican read-back that returned different bytes, `order_error` for a barbican order that ended in ERROR |
 
 > **Cardinality rule.** Run IDs, resource IDs, and resource names are **never**
 > metric attributes. They live in the run records and the logs.
@@ -315,6 +315,19 @@ with `outcome=timeout` for a probe that reached its ceiling. The per-draw
 samples of the `Pressure` section and the per-service samples of the
 `pressure` object stay in the run record and are not exported, so no call
 is exported twice.
+
+Barbican records `dizzy.resource.time_to_ready` under `kind=order`, for the
+wait from the return of an order's create until Barbican reports the order
+ACTIVE: the PENDING to ACTIVE time of its key generation. An order that ends in
+ERROR, disappears, or is still pending when its wait gives up records
+`outcome=timeout`. The polls of the wait record no operation sample, except the
+poll that finds the order in ERROR, or ACTIVE without a secret reference, which
+records one failed `order`/`get` with `error.kind=order_error`. A payload read-back records as
+`secret`/`download`, timed around the request and the byte comparison
+together, so a read-back that returns different bytes records `outcome=error`
+with `error.kind=mismatch`. The metadata stamp after each store and each order
+records as `secret`/`update`, and the metadata reads of cleanup's secret
+discovery as `secret`/`get`.
 
 ### Prometheus naming
 

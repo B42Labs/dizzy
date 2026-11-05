@@ -54,10 +54,30 @@ persona's other resources.
 `dizzy:run=<id>` and `dizzy:type=image` — as Glance image tags, set atomically at
 create via the create call rather than a follow-up tag request, and the image
 list API filters on a tag server-side. Discovery is therefore a single tag query,
-the cleanest of the five: images are one kind with no dependency ordering, so a
+the cleanest of the six: images are one kind with no dependency ordering, so a
 bare `--run-id` reclaims everything the run created.
 
-All five converge on the same deterministic naming: a resource with logical name
+**Barbican layers a name prefix with secret metadata.** Barbican has no tags
+and no server-side prefix filter, so identity starts with the Keystone handle,
+the name prefix `dizzy-<runid>-`, and every listing is filtered client side.
+Secrets and containers carry the prefixed name as their name. An order carries
+it as `meta.name`, which Barbican also gives the secret the order generates and
+returns in its order list. Only secrets carry metadata, so each secret gets the
+two keys `dizzy_run=<id>` and `dizzy_type=secret` as Barbican secret metadata,
+written in a second call: after the store for a stored secret, and once its
+order is ACTIVE for a generated one. Barbican spells them with an underscore
+where every other service writes `dizzy:run` and `dizzy:type`, because its
+metadata keys must match `[A-Za-z0-9_-]`. Discovery takes containers and orders
+on the prefix alone, and a secret only once its `dizzy_run` metadata confirms
+the prefix or a discovered order names it as its `secret_ref`, so discovery
+never deletes a secret that merely carries a run's name. Cleanup works in
+dependency order: containers first, since they reference secrets, then each
+discovered order's generated secret and only after it the orders, since
+deleting an order leaves the secret it generated and the order is the only
+handle on one that was never stamped, then the remaining secrets, stored and
+generated alike. Barbican deletes synchronously, so cleanup waits for nothing.
+
+All six converge on the same deterministic naming: a resource with logical name
 `net-0001` in run `a1b2c3d4` is called `dizzy-a1b2c3d4-net-0001` on the cloud.
 That is what makes it findable in Horizon, in `openstack network list`, and by
 prefix scan.
@@ -88,12 +108,37 @@ are reclaimed from the **run record's created list**, by id:
   record it goes with its roles, since Keystone deletes a role's implied-role
   rules when it deletes the role.
 
+Barbican adds secrets that never got their metadata, because the stamp is a
+second call after the secret exists. Discovery never takes a secret on its name
+alone: it confirms one by its `dizzy_run` metadata, or as the `secret_ref` of
+an order discovered by the run's name prefix. A bare `--run-id` therefore
+reaches every container and order by that prefix, every secret that carries
+`dizzy_run`, and every secret an order of the run generated, stamped or not.
+That covers the secret of a late order, an order whose wait ended before
+Barbican had generated its key, at the `--timeout` deadline or because the run
+stopped, and that turned ACTIVE afterwards: dizzy never stamped or recorded
+that secret, and cleanup deletes it through its order. Two stored secrets stay
+out of that reach:
+
+- **A stored Barbican secret whose stamp failed.** The store succeeded and the
+  metadata write did not. The run record lists the secret, so `cleanup --run`
+  deletes it by id, while a bare `--run-id` leaves it.
+- **The unstamped duplicate of a retried store.** A store whose answer was
+  lost after Barbican had kept the secret, for example a 5xx sent after the
+  commit, leaves that secret behind, and the retry stores a second one under
+  the same name. The first carries neither metadata nor a place in the run
+  record, so no cleanup reaches it. The store logs
+  `create failed; a secret with this name may be orphaned in the cloud` with
+  that name, for an operator to find the secret and delete it by hand.
+
 The practical consequence is a real asymmetry in the `cleanup` command:
 
 - `cleanup --run <path>` uses the record, and reaches everything.
 - `cleanup --run-id <id>` has no record. It reclaims everything discoverable by
   tag, metadata, or prefix — which is most things — but it cannot remove address
-  scopes or role assignments.
+  scopes, role assignments, or a stored Barbican secret whose stamp failed.
+- Neither reaches the unstamped duplicate of a retried Barbican store above,
+  which the `create failed` warning names. It is the only secret both miss.
 
 This is why `--run-id` exists at all: it is the recovery path for a run whose
 record was lost, and it is honest about being incomplete.

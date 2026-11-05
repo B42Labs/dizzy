@@ -564,6 +564,72 @@ admin-only on most clouds; raise it only against a cloud that grants the policy.
 Glance exposes no project-quota API, so none of the profiles is pre-checked — an
 over-limit request surfaces as a fast-failed 413.
 
+## Barbican
+
+```yaml
+name: small
+seed: 42
+
+resources:
+  secrets:    10                # opaque secrets stored with a payload
+  orders:     5                 # AES-256 key orders, each generating one more secret
+  containers: 3                 # generic containers referencing stored secrets
+
+distribution:
+  payload_bytes:         { min: 64, max: 8192 }   # synthetic payload per stored secret, in raw bytes
+  retrieve_ratio:        0.5                      # fraction of stored secrets read back and byte-compared
+  secrets_per_container: { min: 1, max: 3 }       # distinct stored secrets referenced per container
+```
+
+Every secret is stored by dizzy with a **synthetic payload** of `payload_bytes`
+raw bytes, sent base64-encoded in the create request, so a run references no
+pre-existing secret. Each order asks Barbican to generate a 256-bit AES key in
+CBC mode server side and is polled until ACTIVE; its key is never read back,
+since there are no expected bytes to compare it with. A container references
+stored secrets only, never the secret of an order.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `resources.secrets` | int | Opaque secrets to store, each with a synthetic payload |
+| `resources.orders` | int | AES-256 key orders to submit; each generates one more secret once ACTIVE |
+| `resources.containers` | int | Generic containers to create, each referencing stored secrets |
+| `distribution.payload_bytes` | range | Synthetic payload size drawn per stored secret, in raw bytes; `min >= 1` when `secrets > 0` |
+| `distribution.retrieve_ratio` | ratio | Fraction of stored secrets whose payload is read back and byte-compared with the bytes stored |
+| `distribution.secrets_per_container` | range | Distinct stored secrets drawn per container; `max <= resources.secrets` when `containers > 0` |
+
+The payload sizes, the read-back decisions, and the secrets each container
+references live **in the plan**, so the same scenario and seed store the same
+secrets and read back the same ones. The payload bytes are not in the plan: they
+are derived from the plan seed and the secret's logical name, so a run stores
+byte-identical data every time and a read-back compares against the same bytes.
+
+A Barbican scenario takes no `chaos:` block. `barbican` has no `chaos` command,
+and a scenario carrying the key fails to parse like any other unknown key, with
+`field chaos not found in type scenario.Scenario`.
+
+The schema sets no payload cap of its own. Barbican's limit is its
+`max_allowed_secret_in_bytes` setting, checked against the base64 text, whose
+default of 20000 admits up to 15000 raw bytes. The shipped profiles stay at
+8192, 10924 characters once encoded. A deployment still on the older default of
+10000 refuses a payload above 7500 bytes with HTTP 413.
+
+### Profiles
+
+Expanded counts at each profile's shipped seed, as `barbican apply --dry-run`
+prints them:
+
+| Profile | Secrets | Payload total | Read-backs | Orders | Containers | References |
+|---|---|---|---|---|---|---|
+| `small` | 10 | 40565 bytes | 7 | 5 | 3 | 8 |
+| `medium` | 40 | 171992 bytes | 19 | 15 | 10 | 22 |
+| `large` | 100 | 435955 bytes | 48 | 40 | 25 | 48 |
+
+Each order generates a secret on top of the stored ones, so the profiles need
+15, 55, and 140 secrets against the secrets quota. Barbican's project quotas
+default to unlimited (`-1`), so none of the profiles carries a quota risk there;
+on a project with lowered quotas the `apply` pre-check names the ones that
+block.
+
 ## Mix
 
 A mix scenario describes a combined run: the workload personas that run side by
@@ -829,8 +895,9 @@ chaos:                                # the block shipped by scenarios/neutron/m
 | `lifecycle_ratio` | ratio | nova | Probability per step of mutating a live server (stop/start, resize, or live-migrate) |
 | `lifecycle_ratio` | ratio | glance | Probability per step of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, or metadata churn) |
 
-All eighteen built-in profiles carry a `chaos:` block, so `chaos` runs any of
-them with no flags at all. A mix scenario's block holds only `duration`,
+All eighteen built-in profiles of the namespaces with a `chaos` command carry a
+`chaos:` block, so `chaos` runs any of them with no flags at all; the three
+Barbican profiles carry none. A mix scenario's block holds only `duration`,
 `parallel.max` and `bucket_width`; its interval, churn ratio and target fill
 are set per persona. A background lane of a mix run reads its own scenario's
 block instead; see [Lanes](#lanes). See [The churn engine](../explanation/churn-engine.md) for
