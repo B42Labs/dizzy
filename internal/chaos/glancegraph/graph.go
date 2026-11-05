@@ -22,6 +22,7 @@ import (
 	"github.com/B42Labs/dizzy/internal/glance"
 	glanceexec "github.com/B42Labs/dizzy/internal/glance/executor"
 	glanceplan "github.com/B42Labs/dizzy/internal/glance/plan"
+	"github.com/B42Labs/dizzy/internal/payload"
 	"github.com/B42Labs/dizzy/internal/resource"
 )
 
@@ -106,7 +107,7 @@ func createImage(ctx context.Context, opTimeout time.Duration, c Glance, img gla
 		return resource.Resource{}, err
 	}
 	if err := glanceexec.WithRetry(ctx, opTimeout, func(ctx context.Context) error {
-		return c.UploadImageData(ctx, res, img.SizeMiB, glance.PayloadSeed(seed, img.Name))
+		return c.UploadImageData(ctx, res, img.SizeMiB, payload.Seed(seed, img.Name))
 	}); err != nil {
 		return res, err
 	}

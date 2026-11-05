@@ -154,10 +154,10 @@ func (s Scenario) legacyNova(servers int) novascenario.Scenario {
 }
 
 // PersonaSeed derives a persona's seed from the scenario seed and the persona
-// name: the seed XOR the FNV-64a hash of the name, the derivation
-// glance.PayloadSeed uses. Two personas of one run draw from distinct seeds
-// while the whole run stays reproducible from its single seed. A background
-// lane derives its seed the same way from its name.
+// name: the seed XOR the FNV-64a hash of the name, the derivation payload.Seed
+// uses. Two personas of one run draw from distinct seeds while the whole run
+// stays reproducible from its single seed. A background lane derives its seed
+// the same way from its name.
 func PersonaSeed(seed int64, name string) int64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(name))

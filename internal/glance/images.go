@@ -14,6 +14,7 @@ import (
 
 	glanceplan "github.com/B42Labs/dizzy/internal/glance/plan"
 	"github.com/B42Labs/dizzy/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/payload"
 	"github.com/B42Labs/dizzy/internal/resource"
 )
 
@@ -69,7 +70,7 @@ func (c *Client) CreateImage(ctx context.Context, img glanceplan.Image) (resourc
 // data every run.
 func (c *Client) UploadImageData(ctx context.Context, r resource.Resource, sizeMiB int, seed int64) error {
 	err := c.timed(ctx, "upload", func(ctx context.Context) error {
-		return imagedata.Upload(ctx, c.image, r.ID, payloadReader(seed, int64(sizeMiB)<<20)).ExtractErr()
+		return imagedata.Upload(ctx, c.image, r.ID, payload.NewReader(seed, int64(sizeMiB)<<20)).ExtractErr()
 	})
 	if err != nil {
 		return fmt.Errorf("uploading data to image %q: %w", r.Logical, err)
