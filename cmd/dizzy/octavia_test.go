@@ -220,17 +220,35 @@ func TestOctaviaGenerateSeedOverride(t *testing.T) {
 	}
 }
 
+// TestOctaviaGenerateIgnoresChaosBlock confirms generate accepts an Octavia
+// scenario carrying a chaos block and prints the same plan as for the scenario
+// without it: the block configures octavia chaos, and generate ignores it.
+func TestOctaviaGenerateIgnoresChaosBlock(t *testing.T) {
+	without, err := execRoot(t, "octavia", "generate", "--scenario", writeScenario(t, sampleOctaviaScenarioYAML))
+	if err != nil {
+		t.Fatalf("generate without a chaos block: %v", err)
+	}
+	with, err := execRoot(t, "octavia", "generate", "--scenario", writeScenario(t, sampleOctaviaScenarioYAML+"chaos:\n  duration: 1m\n"))
+	if err != nil {
+		t.Fatalf("generate with a chaos block: %v", err)
+	}
+	var p octaviaplan.Plan
+	if err := json.Unmarshal([]byte(without), &p); err != nil {
+		t.Fatalf("stdout is not valid plan JSON: %v", err)
+	}
+	if with != without {
+		t.Errorf("generate with a chaos block printed:\n%s\nwant the plan printed without it:\n%s", with, without)
+	}
+}
+
 // TestOctaviaGenerateErrors confirms generate rejects a missing or unreadable
-// scenario, another service's scenario, an Octavia scenario with a chaos block,
-// an unknown override key, and a malformed --set.
+// scenario, another service's scenario, an unknown override key, and a
+// malformed --set.
 func TestOctaviaGenerateErrors(t *testing.T) {
 	valid := writeScenario(t, sampleOctaviaScenarioYAML)
 	// A Glance scenario's keys are unknown to the Octavia schema, so strict
 	// parsing must reject it.
 	glanceScenario := writeScenario(t, sampleGlanceScenarioYAML)
-	// The chaos block belongs to the chaos driver, so an apply scenario that
-	// carries one fails strict parsing like any unknown key.
-	withChaos := writeScenario(t, sampleOctaviaScenarioYAML+"chaos:\n  duration: 1m\n")
 
 	tests := []struct {
 		name    string
@@ -240,7 +258,6 @@ func TestOctaviaGenerateErrors(t *testing.T) {
 		{"missing scenario flag", []string{"octavia", "generate"}, `"scenario" not set`},
 		{"nonexistent file", []string{"octavia", "generate", "--scenario", filepath.Join(t.TempDir(), "nope.yaml")}, "reading scenario"},
 		{"glance scenario", []string{"octavia", "generate", "--scenario", glanceScenario}, "not found"},
-		{"chaos block", []string{"octavia", "generate", "--scenario", withChaos}, "parsing scenario"},
 		{"unknown set key", []string{"octavia", "generate", "--scenario", valid, "--set", "pools=3"}, `unknown override key "pools"`},
 		{"malformed set", []string{"octavia", "generate", "--scenario", valid, "--set", "provider"}, `invalid --set "provider": want key=value`},
 	}

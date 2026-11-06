@@ -23,3 +23,11 @@ resources:
 distribution:
   listener_port: { min: 1024, max: 65535 }
   member_port:   { min: 1024, max: 65535 }
+
+chaos:                                 # `octavia chaos --scenario scenarios/octavia/large.yaml` runs as-is
+  duration: 1h
+  interval: { min: 200ms, max: 3s }
+  parallel: { max: 4 }
+  churn_ratio: 0.5
+  target_fill: 0.8
+  update_ratio: 0.3
