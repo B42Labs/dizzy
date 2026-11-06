@@ -55,7 +55,7 @@ func planNeeds(p *plan.Plan) needs {
 // transient 5xx, a timeout) is returned so the plan aborts before creating
 // anything rather than hitting the real quota wall mid-apply.
 func PrecheckQuota(ctx context.Context, lb *gophercloud.ServiceClient, p *plan.Plan) error {
-	projectID, ok := projectIDFromAuth(lb)
+	projectID, ok := ProjectIDFromAuth(lb)
 	if !ok {
 		slog.Warn("quota pre-check skipped: project id unavailable from auth result")
 		return nil
@@ -74,11 +74,13 @@ func PrecheckQuota(ctx context.Context, lb *gophercloud.ServiceClient, p *plan.P
 	return checkQuota(planNeeds(p), quota)
 }
 
-// projectIDFromAuth extracts the authenticated project id from the v3 token auth
+// ProjectIDFromAuth extracts the authenticated project id from the v3 token auth
 // result. It returns false when the result was not recorded (e.g. a manually
-// supplied token) or is not a v3 create-token result, so the caller can skip the
-// pre-check rather than guess.
-func projectIDFromAuth(gc *gophercloud.ServiceClient) (string, bool) {
+// supplied token), is not a v3 create-token result, or names no project (a
+// domain-scoped token), so the caller can skip the pre-check rather than guess.
+// It also scopes the monitor's pre-flight sweep: ListByTypeTag refuses to list
+// without a project, and octavia monitor refuses to start without one.
+func ProjectIDFromAuth(gc *gophercloud.ServiceClient) (string, bool) {
 	ar := gc.GetAuthResult()
 	if ar == nil {
 		return "", false

@@ -22,29 +22,52 @@ import (
 // client side, so a server that ignores the tags query never widens the result
 // beyond what the tool tagged. The call is timed under <kind>/list.
 func (c *Client) ListByTag(ctx context.Context, kind resource.Kind, runID string) ([]resource.Resource, error) {
-	tag := runTag(runID)
+	return c.listByTag(ctx, kind, "", runTag(runID))
+}
+
+// ListByTypeTag returns the resources of kind carrying dizzy:type=<kind> in the
+// token's project, whatever run tagged them: the discovery step of the monitor's
+// pre-flight sweep, which must reclaim leftovers of a crashed iteration whose
+// run id it no longer holds. Octavia and Neutron list every project's objects
+// for an administrator, so the listing is filtered to the project of the auth
+// result server side and again client side, and it is refused with
+// ErrNoProject when the auth result names no project. It covers the kinds
+// ListByTag covers and is timed under <kind>/list.
+func (c *Client) ListByTypeTag(ctx context.Context, kind resource.Kind) ([]resource.Resource, error) {
+	projectID, ok := ProjectIDFromAuth(c.lb)
+	if !ok {
+		return nil, fmt.Errorf("listing %s by type tag: %w", kind, ErrNoProject)
+	}
+	return c.listByTag(ctx, kind, projectID, metaType+"="+string(kind))
+}
+
+// listByTag is the shared timed body behind ListByTag and ListByTypeTag: it
+// lists kind filtered to tag and, when projectID is not empty, to that project,
+// both server side and again client side. An empty projectID sends no
+// project_id query and checks no project.
+func (c *Client) listByTag(ctx context.Context, kind resource.Kind, projectID, tag string) ([]resource.Resource, error) {
 	var list func(ctx context.Context) ([]resource.Resource, error)
 	switch kind {
 	case KindLoadBalancer:
 		list = func(ctx context.Context) ([]resource.Resource, error) {
-			return listTagged(ctx, kind, loadbalancers.List(c.lb, loadbalancers.ListOpts{Tags: []string{tag}}),
-				loadbalancers.ExtractLoadBalancers, func(it loadbalancers.LoadBalancer) (string, string, []string) {
-					return it.Name, it.ID, it.Tags
-				}, tag)
+			return listTagged(ctx, kind, loadbalancers.List(c.lb, loadbalancers.ListOpts{ProjectID: projectID, Tags: []string{tag}}),
+				loadbalancers.ExtractLoadBalancers, func(it loadbalancers.LoadBalancer) (string, string, string, []string) {
+					return it.Name, it.ID, it.ProjectID, it.Tags
+				}, tag, projectID)
 		}
 	case KindNetwork:
 		list = func(ctx context.Context) ([]resource.Resource, error) {
-			return listTagged(ctx, kind, networks.List(c.network, networks.ListOpts{Tags: tag}),
-				networks.ExtractNetworks, func(it networks.Network) (string, string, []string) {
-					return it.Name, it.ID, it.Tags
-				}, tag)
+			return listTagged(ctx, kind, networks.List(c.network, networks.ListOpts{ProjectID: projectID, Tags: tag}),
+				networks.ExtractNetworks, func(it networks.Network) (string, string, string, []string) {
+					return it.Name, it.ID, it.ProjectID, it.Tags
+				}, tag, projectID)
 		}
 	case KindSubnet:
 		list = func(ctx context.Context) ([]resource.Resource, error) {
-			return listTagged(ctx, kind, subnets.List(c.network, subnets.ListOpts{Tags: tag}),
-				subnets.ExtractSubnets, func(it subnets.Subnet) (string, string, []string) {
-					return it.Name, it.ID, it.Tags
-				}, tag)
+			return listTagged(ctx, kind, subnets.List(c.network, subnets.ListOpts{ProjectID: projectID, Tags: tag}),
+				subnets.ExtractSubnets, func(it subnets.Subnet) (string, string, string, []string) {
+					return it.Name, it.ID, it.ProjectID, it.Tags
+				}, tag, projectID)
 		}
 	default:
 		return nil, fmt.Errorf("list by tag not supported for kind %q", kind)
