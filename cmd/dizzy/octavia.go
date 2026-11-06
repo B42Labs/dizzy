@@ -11,10 +11,10 @@ import (
 )
 
 // newOctaviaCmd builds the "octavia" command namespace and attaches its
-// subcommands: generate, apply, status, report, and cleanup. report is the same
-// service-agnostic builder the other namespaces use. The namespace has no chaos
-// and no monitor command yet; those drivers build on this one's plan, client,
-// and cleanup.
+// subcommands: generate, apply, chaos, status, report, and cleanup. report is
+// the same service-agnostic builder the other namespaces use. The namespace has
+// no monitor command yet; that driver builds on this one's plan, client, and
+// cleanup.
 func newOctaviaCmd(opts *globalOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "octavia",
@@ -24,6 +24,7 @@ func newOctaviaCmd(opts *globalOptions) *cobra.Command {
 	cmd.AddCommand(
 		newOctaviaGenerateCmd(opts),
 		newOctaviaApplyCmd(opts),
+		newOctaviaChaosCmd(opts),
 		newOctaviaStatusCmd(opts),
 		newReportCmd(opts),
 		newOctaviaCleanupCmd(opts),
