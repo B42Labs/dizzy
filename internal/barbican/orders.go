@@ -134,6 +134,19 @@ func (c *Client) ListOrdersByRun(ctx context.Context, runID string) (found, gene
 	return found, generated, nil
 }
 
+// ListOrdersByAnyRun returns every order whose meta.name carries the dizzy-
+// name prefix, regardless of run id, and the secrets those orders generated:
+// the pre-flight sweep's handle for reclaiming a crashed iteration's orders,
+// and through them a generated secret that was never stamped, once the run id
+// is lost. An order without a secret_ref contributes no secret.
+func (c *Client) ListOrdersByAnyRun(ctx context.Context) (found, generated []resource.Resource, err error) {
+	found, generated, err = c.listOrders(ctx, namePrefix)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listing orders by any run: %w", err)
+	}
+	return found, generated, nil
+}
+
 // listOrders streams the project's order list a page at a time and keeps only
 // those whose meta.name carries prefix, along with the secret each kept order's
 // secret_ref names, recording the whole listing under the list op. The whole

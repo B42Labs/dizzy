@@ -66,6 +66,18 @@ func (c *Client) ListContainersByRun(ctx context.Context, runID string) ([]resou
 	return found, nil
 }
 
+// ListContainersByAnyRun returns every container carrying the dizzy- name
+// prefix, regardless of run id: the pre-flight sweep's handle for reclaiming a
+// crashed iteration's containers once its run id is lost. Containers carry no
+// metadata, so the prefix is their whole identity.
+func (c *Client) ListContainersByAnyRun(ctx context.Context) ([]resource.Resource, error) {
+	found, err := c.listContainers(ctx, namePrefix)
+	if err != nil {
+		return nil, fmt.Errorf("listing containers by any run: %w", err)
+	}
+	return found, nil
+}
+
 // listContainers streams the project's container list a page at a time and
 // keeps only those whose name carries prefix, recording the whole listing under
 // the list op. The whole paged listing is one request under the request

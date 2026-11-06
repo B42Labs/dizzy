@@ -607,3 +607,101 @@ func TestListSecretsByRunRequestTimeout(t *testing.T) {
 		})
 	}
 }
+
+// TestListSecretsByType confirms the sweep's discovery walks both pages, reads
+// metadata only for names with the dizzy- prefix, and keeps every secret whose
+// metadata carries dizzy_type=secret, whatever its dizzy_run: an unstamped
+// prefix match and one whose metadata read answers 404 are dropped, and a
+// stamped secret without the prefix is never read.
+func TestListSecretsByType(t *testing.T) {
+	f := &secretsFake{
+		t: t,
+		pages: [2]string{
+			`{"secrets":[` + strings.Join([]string{
+				secretEntry("dizzy-run0-sec-0001", "s1"),
+				secretEntry("dizzy-run9-sec-0001", "s2"),
+				secretEntry("dizzy-run9-sec-0002", "s3"),
+			}, ",") + `],"total":6,"next":"NEXT"}`,
+			`{"secrets":[` + strings.Join([]string{
+				secretEntry("unrelated", "s4"),
+				secretEntry("dizzy-run9-sec-0003", "s5"),
+				secretEntry("dizzy-run9-ord-0001", "s6"),
+			}, ",") + `],"total":6}`,
+		},
+		metadata: map[string]string{
+			"s1": `{"metadata":{"dizzy_run":"run0","dizzy_type":"secret"}}`,
+			"s2": `{"metadata":{"dizzy_run":"run9","dizzy_type":"secret"}}`,
+			"s3": `{"metadata":{}}`,
+			"s4": `{"metadata":{"dizzy_type":"secret"}}`,
+			"s6": `{"metadata":{"dizzy_type":"secret"}}`,
+		},
+	}
+	ts := httptest.NewServer(f)
+	defer ts.Close()
+	c, m := testClient(ts)
+
+	got, err := c.ListSecretsByType(context.Background())
+	if err != nil {
+		t.Fatalf("ListSecretsByType: %v", err)
+	}
+	want := []resource.Resource{
+		{Kind: KindSecret, Name: "dizzy-run0-sec-0001", ID: "s1"},
+		{Kind: KindSecret, Name: "dizzy-run9-sec-0001", ID: "s2"},
+		{Kind: KindSecret, Name: "dizzy-run9-ord-0001", ID: "s6"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("ListSecretsByType = %+v, want %+v", got, want)
+	}
+	if wantReads := []string{"s1", "s2", "s3", "s5", "s6"}; fmt.Sprint(f.reads) != fmt.Sprint(wantReads) {
+		t.Errorf("metadata reads = %v, want %v (prefix matches only)", f.reads, wantReads)
+	}
+	// One list sample plus one get per metadata read, the 404 among them failed.
+	if st := statsOf(m.Aggregate(time.Second), "secret"); st.Attempted != 6 || st.Failed != 1 {
+		t.Errorf("secret samples = %+v, want 6 attempted and 1 failed", st)
+	}
+}
+
+// TestListSecretsByTypeEmptyAndErrors confirms an empty project lists nothing
+// without error, and that a failed list or a failed metadata read is returned
+// with its context.
+func TestListSecretsByTypeEmptyAndErrors(t *testing.T) {
+	t.Run("empty project", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusOK, `{"secrets":[],"total":0}`)
+		}))
+		defer ts.Close()
+		c, _ := testClient(ts)
+		got, err := c.ListSecretsByType(context.Background())
+		if err != nil || len(got) != 0 {
+			t.Errorf("ListSecretsByType = (%v, %v), want an empty result and nil", got, err)
+		}
+	})
+
+	t.Run("list 500", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusInternalServerError, `{"code":500}`)
+		}))
+		defer ts.Close()
+		c, _ := testClient(ts)
+		_, err := c.ListSecretsByType(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "listing secrets by type") {
+			t.Errorf("ListSecretsByType error = %v, want one containing %q", err, "listing secrets by type")
+		}
+	})
+
+	t.Run("metadata 500", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/metadata") {
+				writeJSON(w, http.StatusInternalServerError, `{"code":500}`)
+				return
+			}
+			writeJSON(w, http.StatusOK, `{"secrets":[`+secretEntry("dizzy-run0-sec-0001", "s1")+`],"total":1}`)
+		}))
+		defer ts.Close()
+		c, _ := testClient(ts)
+		_, err := c.ListSecretsByType(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "reading metadata of secret s1") {
+			t.Errorf("ListSecretsByType error = %v, want one containing %q", err, "reading metadata of secret s1")
+		}
+	})
+}

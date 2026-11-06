@@ -169,3 +169,74 @@ func TestListContainersByRunEmptyAndError(t *testing.T) {
 		}
 	})
 }
+
+// TestListContainersByAnyRun confirms the sweep's discovery walks both pages
+// and keeps every container whose name carries the dizzy- prefix, whatever its
+// run id, and never one without it.
+func TestListContainersByAnyRun(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/containers" {
+			t.Errorf("request %s %s, want GET /v1/containers", r.Method, r.URL.Path)
+		}
+		if got := r.URL.Query().Get("limit"); got != "100" {
+			t.Errorf("list limit = %q, want 100", got)
+		}
+		if r.URL.Query().Get("offset") == "100" {
+			writeJSON(w, http.StatusOK, `{"containers":[`+strings.Join([]string{
+				containerEntry("dizzy-run9-ctr-0001", "c3"),
+				containerEntry("dizzy-run01-ctr-0001", "c4"),
+			}, ",")+`],"total":4}`)
+			return
+		}
+		writeJSON(w, http.StatusOK, `{"containers":[`+strings.Join([]string{
+			containerEntry("dizzy-run0-ctr-0001", "c1"),
+			containerEntry("someone-elses", "c2"),
+		}, ",")+`],"total":4,"next":"http://`+r.Host+`/v1/containers?limit=100&offset=100"}`)
+	}))
+	defer ts.Close()
+	c, m := testClient(ts)
+
+	got, err := c.ListContainersByAnyRun(context.Background())
+	if err != nil {
+		t.Fatalf("ListContainersByAnyRun: %v", err)
+	}
+	want := []resource.Resource{
+		{Kind: KindContainer, Name: "dizzy-run0-ctr-0001", ID: "c1"},
+		{Kind: KindContainer, Name: "dizzy-run9-ctr-0001", ID: "c3"},
+		{Kind: KindContainer, Name: "dizzy-run01-ctr-0001", ID: "c4"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("ListContainersByAnyRun = %+v, want %+v", got, want)
+	}
+	if st := statsOf(m.Aggregate(time.Second), "container"); st.Attempted != 1 || st.Succeeded != 1 {
+		t.Errorf("container samples = %+v, want one list", st)
+	}
+}
+
+// TestListContainersByAnyRunEmptyAndError confirms an empty project lists
+// nothing without error and a failed list is returned with its context.
+func TestListContainersByAnyRunEmptyAndError(t *testing.T) {
+	t.Run("empty project", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusOK, `{"containers":[],"total":0}`)
+		}))
+		defer ts.Close()
+		c, _ := testClient(ts)
+		got, err := c.ListContainersByAnyRun(context.Background())
+		if err != nil || len(got) != 0 {
+			t.Errorf("ListContainersByAnyRun = (%v, %v), want an empty result and nil", got, err)
+		}
+	})
+
+	t.Run("list 500", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusInternalServerError, `{"code":500}`)
+		}))
+		defer ts.Close()
+		c, _ := testClient(ts)
+		_, err := c.ListContainersByAnyRun(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "listing containers by any run") {
+			t.Errorf("ListContainersByAnyRun error = %v, want one containing %q", err, "listing containers by any run")
+		}
+	})
+}
