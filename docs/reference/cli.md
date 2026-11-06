@@ -2,7 +2,7 @@
 
 A single binary, `dizzy`, with one command namespace per OpenStack service:
 `neutron`, `cinder`, `keystone`, `nova`, `glance`, and `barbican`. Each
-namespace offers the same verbs, except that `barbican` has no `monitor`.
+namespace offers the same verbs.
 
 | Verb | Touches the API | Purpose |
 |---|---|---|
@@ -727,11 +727,20 @@ across iterations. To broaden coverage, run several monitors with different
 `--seed` values.
 
 > **Do not run `monitor` concurrently with another `dizzy` run in the same
-> project.** For `neutron`, `cinder`, `nova`, and `glance` the pre-flight sweep is
-> always on and reclaims any tester-created resource in the project, so it would
-> tear a concurrent run down mid-flight. For `keystone` the equivalent sweep is opt-in
-> via `--reclaim-orphans`, and because an admin token lists cloud-wide it is only
-> safe when no other `dizzy` process targets the cloud at all.
+> project.** For `neutron`, `cinder`, `nova`, `glance`, and `barbican` the
+> pre-flight sweep is always on and reclaims any tester-created resource in the
+> project, so it would tear a concurrent run down mid-flight. For `keystone` the
+> equivalent sweep is opt-in via `--reclaim-orphans`, and because an admin token
+> lists cloud-wide it is only safe when no other `dizzy` process targets the
+> cloud at all.
+
+`barbican monitor` runs the quota pre-check once at startup, where an
+oversized plan exits before the first iteration, and again in each
+iteration's apply, where it fails that iteration. Its sweep takes `dizzy-`
+containers and orders by name, and a secret only when its `dizzy_type=secret`
+metadata confirms it or a swept order generated it. A read-back mismatch fails
+its iteration while the loop goes on, so the command exits 0 and the mismatch
+shows as a failed iteration and as `error.kind=mismatch`.
 
 **On interrupt.** SIGINT/SIGTERM stops the loop, tears the current iteration
 down on a context that survives the signal, flushes the metrics exporter, and

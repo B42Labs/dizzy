@@ -323,7 +323,7 @@ otel-grafana:
 	echo "Opening Grafana: $$url"; \
 	open "$$url" 2>/dev/null || xdg-open "$$url" 2>/dev/null || echo "open the URL above in your browser"
 
-## devstack-osism-monitor: Run monitor --otel (DEVSTACK_OSISM_SERVICE=neutron|cinder|keystone|nova|glance) against the OSISM testbed, exporting to VictoriaMetrics.
+## devstack-osism-monitor: Run monitor --otel (DEVSTACK_OSISM_SERVICE=neutron|cinder|keystone|nova|glance|barbican) against the OSISM testbed, exporting to VictoriaMetrics.
 # monitor applies and cleans up each iteration's resources itself, so this target
 # runs no post-run cleanup: unlike `devstack-osism`, scanning run-*.json in the
 # shared working directory would tear down the resources of a concurrent

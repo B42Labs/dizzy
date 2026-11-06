@@ -172,7 +172,7 @@ That makes the sweep self-healing and makes concurrent runs unsafe:
 > **Do not run `monitor` alongside another `dizzy` process in the same project.**
 > The sweep would tear the other run's resources down mid-flight.
 
-Neutron, Cinder, Nova, and Glance sweep unconditionally — all four are
+Neutron, Cinder, Nova, Glance, and Barbican sweep unconditionally — all five are
 project-scoped. Keystone does not: because an admin token lists **cloud-wide** rather than
 within one project, a Keystone sweep would
 reach across the entire cloud, deleting a concurrent run's in-flight users, roles,
@@ -181,6 +181,17 @@ default, and safe only when no other `dizzy` process targets that cloud at all.
 
 Left off, a Keystone monitor still cleans up after each of its own iterations. It
 just does not adopt orphans it did not create.
+
+Barbican has no type tag, so its sweep widens the name prefix to `dizzy-`. It
+takes containers and orders on that prefix, each secret a swept order names as
+its `secret_ref`, and any other secret only once its `dizzy_type=secret`
+metadata confirms it. A stored secret whose stamp failed is therefore never
+swept. Its own iteration's cleanup deletes it through the created list, so
+only an iteration whose cleanup does not finish leaves one behind: a cleanup
+that stops at its first listing or delete error, a second signal, a killed
+process. Without `--keep-run-records` nothing holds its id afterwards, and an
+operator deletes it by hand; with it, `barbican cleanup --run` on that
+iteration's record reaches it.
 
 ## What cleanup will never do
 
