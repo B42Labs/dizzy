@@ -54,7 +54,7 @@ persona's other resources.
 `dizzy:run=<id>` and `dizzy:type=image` — as Glance image tags, set atomically at
 create via the create call rather than a follow-up tag request, and the image
 list API filters on a tag server-side. Discovery is therefore a single tag query,
-the cleanest of the six: images are one kind with no dependency ordering, so a
+the cleanest of the seven: images are one kind with no dependency ordering, so a
 bare `--run-id` reclaims everything the run created.
 
 **Barbican layers a name prefix with secret metadata.** Barbican has no tags
@@ -77,7 +77,30 @@ deleting an order leaves the secret it generated and the order is the only
 handle on one that was never stamped, then the remaining secrets, stored and
 generated alike. Barbican deletes synchronously, so cleanup waits for nothing.
 
-All six converge on the same deterministic naming: a resource with logical name
+**Octavia tags every object, and cleanup deletes through the cascade.** Load
+balancers, listeners, pools, members, and health monitors carry the tag pair
+`dizzy:run=<id>` and `dizzy:type=<kind>` as Octavia tags, set in the create
+call itself, which needs Octavia API version 2.5 (Stein) or later. The VIP
+networks and their subnets are Neutron resources and carry the same pair as
+Neutron tags, as Nova's companion networks do. Discovery lists load balancers,
+subnets, and networks by the run tag. Cleanup deletes each load balancer with
+cascade, so Octavia removes its listeners, pools, members, and health monitors
+with it; none of them is deleted on its own. Cleanup waits until each load
+balancer is gone, then deletes the subnets and then the networks. The VIP port
+is Octavia's: Octavia creates it for the load balancer and removes it with the
+load balancer, so it carries no dizzy identity, and cleanup never deletes a
+port. A subnet that stays in use after its load balancers are gone holds a port
+dizzy did not create, and cleanup reports it rather than deleting it. A create
+whose answer was lost is adopted rather than posted again, because Octavia
+refuses a second listener on a port, a second default pool on a listener, a
+second member at an address and port, or a second monitor on a pool with HTTP
+409, and a second load balancer would boot a second amphora. dizzy looks the
+name up among the objects that carry the run tag, skipping any in
+`PENDING_DELETE` or `DELETED`, and adopts a match. Each logical name is created
+once per apply, so name and run tag identify the instance without a create
+token.
+
+All seven converge on the same deterministic naming: a resource with logical name
 `net-0001` in run `a1b2c3d4` is called `dizzy-a1b2c3d4-net-0001` on the cloud.
 That is what makes it findable in Horizon, in `openstack network list`, and by
 prefix scan.
