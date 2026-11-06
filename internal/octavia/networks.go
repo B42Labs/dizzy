@@ -163,17 +163,19 @@ func (c *Client) tagWithRetry(ctx context.Context, kind resource.Kind, id string
 }
 
 // listTagged runs a tagged list pager to completion and collects into
-// Resources of kind the items whose tags contain tag. describe pulls the cloud
-// name, id, and tags from each item. The tag check is the client-side backstop
-// the tagged list paths apply, so a server that ignores the tags query never
-// widens the result beyond what the tool actually tagged.
+// Resources of kind the items whose tags contain tag and, when projectID is not
+// empty, whose project is projectID. describe pulls the cloud name, id,
+// project, and tags from each item. Both checks are the client-side backstop
+// the tagged list paths apply, so a server that ignores the tags or project_id
+// query never widens the result beyond what the tool tagged in that project. An
+// item whose answer omits its project fails a project-scoped check.
 func listTagged[T any](
 	ctx context.Context,
 	kind resource.Kind,
 	pager pagination.Pager,
 	extract func(pagination.Page) ([]T, error),
-	describe func(T) (name, id string, tags []string),
-	tag string,
+	describe func(T) (name, id, project string, tags []string),
+	tag, projectID string,
 ) ([]resource.Resource, error) {
 	pages, err := pager.AllPages(ctx)
 	if err != nil {
@@ -185,8 +187,8 @@ func listTagged[T any](
 	}
 	out := make([]resource.Resource, 0, len(items))
 	for _, it := range items {
-		name, id, tags := describe(it)
-		if !slices.Contains(tags, tag) {
+		name, id, project, tags := describe(it)
+		if !slices.Contains(tags, tag) || (projectID != "" && project != projectID) {
 			continue
 		}
 		out = append(out, resource.Resource{Kind: kind, Name: name, ID: id})

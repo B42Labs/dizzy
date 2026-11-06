@@ -78,6 +78,10 @@ var ErrQuota = errors.New("octavia: quota exceeded")
 // apply the change, and the load balancer refuses every further write.
 var ErrProvisioning = errors.New("octavia: provisioning failed")
 
+// ErrNoProject is the sentinel ListByTypeTag wraps when the auth result names
+// no project: the sweep never lists beyond the token's project.
+var ErrNoProject = errors.New("octavia: project id unavailable from the auth result; the sweep never lists beyond the token's project")
+
 // Client wraps the two authenticated service clients an Octavia run drives —
 // load balancer (Octavia) and network (Neutron) — binding every created
 // resource to a run id and recording timing into a Collector.

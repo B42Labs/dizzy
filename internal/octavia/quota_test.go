@@ -209,13 +209,13 @@ func TestPrecheckQuotaWithoutProjectID(t *testing.T) {
 // result, and that a client without one reports none rather than guessing.
 func TestProjectIDFromAuth(t *testing.T) {
 	f := newFake(t, scripted(t, map[string][]reply{}))
-	if id, ok := projectIDFromAuth(f.lbClient()); id != "" || ok {
-		t.Errorf("projectIDFromAuth without an auth result = (%q, %v), want (\"\", false)", id, ok)
+	if id, ok := ProjectIDFromAuth(f.lbClient()); id != "" || ok {
+		t.Errorf("ProjectIDFromAuth without an auth result = (%q, %v), want (\"\", false)", id, ok)
 	}
-	if id, ok := projectIDFromAuth(domainScopedClient(t, f)); id != "" || ok {
-		t.Errorf("projectIDFromAuth with a domain-scoped result = (%q, %v), want (\"\", false)", id, ok)
+	if id, ok := ProjectIDFromAuth(domainScopedClient(t, f)); id != "" || ok {
+		t.Errorf("ProjectIDFromAuth with a domain-scoped result = (%q, %v), want (\"\", false)", id, ok)
 	}
-	if id, ok := projectIDFromAuth(quotaClient(t, f)); id != "proj-1" || !ok {
-		t.Errorf("projectIDFromAuth = (%q, %v), want (\"proj-1\", true)", id, ok)
+	if id, ok := ProjectIDFromAuth(quotaClient(t, f)); id != "proj-1" || !ok {
+		t.Errorf("ProjectIDFromAuth = (%q, %v), want (\"proj-1\", true)", id, ok)
 	}
 }
