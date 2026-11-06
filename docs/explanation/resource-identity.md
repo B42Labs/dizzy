@@ -203,8 +203,8 @@ That makes the sweep self-healing and makes concurrent runs unsafe:
 > **Do not run `monitor` alongside another `dizzy` process in the same project.**
 > The sweep would tear the other run's resources down mid-flight.
 
-Neutron, Cinder, Nova, Glance, and Barbican sweep unconditionally — all five are
-project-scoped. Keystone does not: because an admin token lists **cloud-wide** rather than
+Neutron, Cinder, Nova, Glance, Barbican, and Octavia sweep unconditionally — all
+six are project-scoped. Keystone does not: because an admin token lists **cloud-wide** rather than
 within one project, a Keystone sweep would
 reach across the entire cloud, deleting a concurrent run's in-flight users, roles,
 and whole domains. It is therefore opt-in via `--reclaim-orphans`, off by
@@ -223,6 +223,21 @@ that stops at its first listing or delete error, a second signal, a killed
 process. Without `--keep-run-records` nothing holds its id afterwards, and an
 operator deletes it by hand; with it, `barbican cleanup --run` on that
 iteration's record reaches it.
+
+Octavia's sweep filters on `dizzy:type=<kind>` and on the token's project.
+Octavia lists every project's load balancers for an administrator, and Neutron
+every project's networks, so a sweep on the type tag alone would reach other
+projects' runs. It therefore sends the project id of the auth result as
+`project_id` with each listing and checks each answer's project again, and
+`octavia monitor` refuses to start when the auth result names no project. It
+deletes the load balancers with cascade, waits until each is gone, then
+deletes the subnets and the networks. Neutron and Nova runs tag their networks
+and subnets with the same `dizzy:type` values, so the sweep takes their
+leftovers in the project too, as the Nova sweep takes Neutron's. The monitor
+runs the quota pre-check of `octavia apply` once at startup and again in every
+iteration. An amphora provider needs `--timeout 5m`, because an amphora build
+outlasts the default of 60s that bounds both the wait for a new load balancer
+and the sweep's wait until a deleted one is gone.
 
 ## What cleanup will never do
 
