@@ -128,6 +128,32 @@ func (c *Client) ListSecretsByRun(ctx context.Context, runID string) ([]resource
 	if err != nil {
 		return nil, fmt.Errorf("listing secrets by run: %w", err)
 	}
+	return c.confirmSecrets(ctx, candidates, func(md map[string]string) bool {
+		return md[metaRun] == runID
+	})
+}
+
+// ListSecretsByType returns the secrets carrying the dizzy- name prefix of any
+// tester run whose metadata confirms dizzy_type=secret, regardless of their
+// dizzy_run: the pre-flight sweep's handle for reclaiming a crashed iteration's
+// secrets once its run id is lost. As in ListSecretsByRun, the prefix alone is
+// never enough, so a secret whose stamp never landed is not discovered, and a
+// candidate whose metadata read returns 404 is dropped.
+func (c *Client) ListSecretsByType(ctx context.Context) ([]resource.Resource, error) {
+	candidates, err := c.listSecrets(ctx, namePrefix)
+	if err != nil {
+		return nil, fmt.Errorf("listing secrets by type: %w", err)
+	}
+	return c.confirmSecrets(ctx, candidates, func(md map[string]string) bool {
+		return md[metaType] == string(KindSecret)
+	})
+}
+
+// confirmSecrets reads the metadata of each prefix-matched candidate and keeps,
+// in list order, those whose metadata keep accepts. A candidate whose metadata
+// read returns 404 was deleted meanwhile and is dropped; any other read error
+// stops the discovery and is returned with the secret's id.
+func (c *Client) confirmSecrets(ctx context.Context, candidates []resource.Resource, keep func(md map[string]string) bool) ([]resource.Resource, error) {
 	var found []resource.Resource
 	for _, r := range candidates {
 		md, err := c.secretMetadata(ctx, r)
@@ -137,7 +163,7 @@ func (c *Client) ListSecretsByRun(ctx context.Context, runID string) ([]resource
 		case err != nil:
 			return nil, fmt.Errorf("reading metadata of secret %s: %w", r.ID, err)
 		}
-		if md[metaRun] == runID {
+		if keep(md) {
 			found = append(found, r)
 		}
 	}

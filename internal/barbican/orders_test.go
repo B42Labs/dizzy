@@ -397,3 +397,76 @@ func TestListOrdersByRunEmptyAndError(t *testing.T) {
 		}
 	})
 }
+
+// TestListOrdersByAnyRun confirms the sweep's discovery keeps every order whose
+// meta.name carries the dizzy- prefix, whatever its run id, and returns the
+// generated secret of each kept order that has a secret_ref: a PENDING order
+// contributes no secret, and an order without the prefix or with an empty meta
+// is never kept.
+func TestListOrdersByAnyRun(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/orders" {
+			t.Errorf("request %s %s, want GET /v1/orders", r.Method, r.URL.Path)
+		}
+		writeJSON(w, http.StatusOK, `{"orders":[`+strings.Join([]string{
+			orderEntry("dizzy-run0-ord-0001", "o1", "ACTIVE", "https://kv/v1/secrets/g1"),
+			orderEntry("dizzy-run9-ord-0001", "o2", "PENDING", ""),
+			orderEntry("other-order", "o3", "ACTIVE", "https://kv/v1/secrets/g3"),
+			`{"type":"key","status":"ACTIVE","order_ref":"https://kv/v1/orders/o4","secret_ref":"https://kv/v1/secrets/g4","meta":{}}`,
+		}, ",")+`],"total":4}`)
+	}))
+	defer ts.Close()
+	c, m := testClient(ts)
+
+	gotOrders, gotSecrets, err := c.ListOrdersByAnyRun(context.Background())
+	if err != nil {
+		t.Fatalf("ListOrdersByAnyRun: %v", err)
+	}
+	wantOrders := []resource.Resource{
+		{Kind: KindOrder, Name: "dizzy-run0-ord-0001", ID: "o1"},
+		{Kind: KindOrder, Name: "dizzy-run9-ord-0001", ID: "o2"},
+	}
+	if fmt.Sprint(gotOrders) != fmt.Sprint(wantOrders) {
+		t.Errorf("ListOrdersByAnyRun orders = %+v, want %+v", gotOrders, wantOrders)
+	}
+	wantSecrets := []resource.Resource{
+		{Kind: KindSecret, Name: "dizzy-run0-ord-0001", ID: "g1"},
+	}
+	if fmt.Sprint(gotSecrets) != fmt.Sprint(wantSecrets) {
+		t.Errorf("ListOrdersByAnyRun secrets = %+v, want %+v (the ACTIVE prefixed order's only)", gotSecrets, wantSecrets)
+	}
+	if st := statsOf(m.Aggregate(time.Second), "order"); st.Attempted != 1 || st.Succeeded != 1 {
+		t.Errorf("order samples = %+v, want one list", st)
+	}
+}
+
+// TestListOrdersByAnyRunEmptyAndError confirms an empty project lists nothing
+// without error and a failed list is returned with its context and no results.
+func TestListOrdersByAnyRunEmptyAndError(t *testing.T) {
+	t.Run("empty project", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusOK, `{"orders":[],"total":0}`)
+		}))
+		defer ts.Close()
+		c, _ := testClient(ts)
+		gotOrders, gotSecrets, err := c.ListOrdersByAnyRun(context.Background())
+		if err != nil || len(gotOrders) != 0 || len(gotSecrets) != 0 {
+			t.Errorf("ListOrdersByAnyRun = (%v, %v, %v), want empty results and nil", gotOrders, gotSecrets, err)
+		}
+	})
+
+	t.Run("list 500", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusInternalServerError, `{"code":500}`)
+		}))
+		defer ts.Close()
+		c, _ := testClient(ts)
+		gotOrders, gotSecrets, err := c.ListOrdersByAnyRun(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "listing orders by any run") {
+			t.Errorf("ListOrdersByAnyRun error = %v, want one containing %q", err, "listing orders by any run")
+		}
+		if gotOrders != nil || gotSecrets != nil {
+			t.Errorf("ListOrdersByAnyRun = (%v, %v) with an error, want no results", gotOrders, gotSecrets)
+		}
+	})
+}

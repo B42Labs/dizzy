@@ -10,7 +10,9 @@
 // also gives the secret it generates). Barbican has no tags and no server-side
 // prefix filter, so a run's resources are discovered client side by that name
 // prefix, and a secret is confirmed by its dizzy_run=<id> metadata or as the
-// secret_ref of a discovered order. StampSecret writes dizzy_run and
+// secret_ref of a discovered order. The monitor's pre-flight sweep discovers
+// any tester run's resources by namePrefix alone instead, confirming a secret
+// by its dizzy_type=secret metadata. StampSecret writes dizzy_run and
 // dizzy_type=secret onto a stored secret after its store and onto a generated
 // secret once its order turns ACTIVE. Each call is timed through a
 // metrics.Collector and, when enabled, mirrored into OTEL. Barbican deletes are
