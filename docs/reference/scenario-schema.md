@@ -11,6 +11,7 @@ Every scenario shares this top-level shape:
 name: <string>       # profile name, recorded in the run record
 seed: <int>          # deterministic; same seed => same plan
 image / flavor / resize_flavor   # nova only; referenced by name, never created
+provider: <string>   # octavia only; empty selects the cloud's default
 resources:  { … }    # fixed counts
 distribution: { … }  # ranges and ratios drawn per resource
 topology:   { … }    # neutron only
@@ -645,6 +646,89 @@ default to unlimited (`-1`), so none of the profiles carries a quota risk there;
 on a project with lowered quotas the `apply` pre-check names the ones that
 block.
 
+## Octavia
+
+```yaml
+name: small
+seed: 42
+provider: ""                    # empty selects the cloud's default; --set provider=ovn or amphora
+
+resources:
+  networks:        1            # VIP networks, one /24 subnet each
+  loadbalancers:   2            # load balancers with their VIP on those subnets
+  listeners:       4            # TCP listeners, each with one default pool
+  members:         8            # pool members at synthetic addresses
+  health_monitors: 2            # TCP health monitors on a drawn subset of the pools
+
+distribution:
+  listener_port: { min: 1024, max: 65535 }   # TCP port drawn per listener, distinct per load balancer
+  member_port:   { min: 1024, max: 65535 }   # TCP port drawn per member
+```
+
+Every object is created by dizzy, so a run references no pre-existing load
+balancer, network, or backend. A member's address is synthetic and nothing
+answers there, so its operating status reads `ERROR` under a health monitor
+and `NO_MONITOR` without one; neither is a failure. `provider` is passed to
+Octavia as given, without a local check, and Octavia answers an unknown or
+disabled provider with HTTP 400 at the first load balancer create. Every
+listener has exactly one pool, so `resources.listeners` is also the pool count
+and there is no `pools` key.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `seed` | int | Seed of the listener-port, member-port, and monitored-pool draws; the global `--seed` flag overrides it |
+| `provider` | string | Octavia provider driver, e.g. `ovn` or `amphora`; empty selects the cloud's default |
+| `resources.networks` | int | VIP networks dizzy creates, one `/24` subnet each; at most 255, and at least 1 when `loadbalancers > 0` |
+| `resources.loadbalancers` | int | Load balancers, each with its VIP on a VIP subnet; at least 1 when `listeners > 0`, and at most `listeners` |
+| `resources.listeners` | int | TCP listeners, each with one default TCP pool, so also the pool count; at least 1 when `members > 0`, and at most `members` |
+| `resources.members` | int | Pool members at synthetic addresses; at most 127 on one VIP network |
+| `resources.health_monitors` | int | TCP health monitors, one each on a drawn subset of the pools; at most `listeners` |
+| `distribution.listener_port.min` / `distribution.listener_port.max` | range | TCP port drawn per listener, within 1 to 65535; it must span at least as many ports as one load balancer gets listeners |
+| `distribution.member_port.min` / `distribution.member_port.max` | range | TCP port drawn per member, within 1 to 65535 |
+
+The plan assigns every object deterministically and draws only the ports and
+the monitored pools, so the same scenario and seed always build the same tree:
+
+- VIP network `i`, counting from 1, is `net-<nnnn>` with subnet `sub-<nnnn>`
+  and CIDR `10.0.<i>.0/24`, as Nova's companion networks are. The subnet's
+  gateway is `.1` and its allocation pool `.2` to `.127`, so Neutron never
+  hands a VIP or an amphora port an address the plan gives a member.
+- Load balancers go round-robin over the networks: `lb-0001` on `net-0001`,
+  `lb-0002` on `net-0002` when there is one, and so on.
+- Listeners go round-robin over the load balancers. Each listener's port is
+  drawn from `listener_port` in listener order, and a port its load balancer
+  already has steps to the next free one, wrapping from `max` to `min`.
+- Pool `pool-<nnnn>` is the default pool of listener `lsn-<nnnn>`.
+- Members go round-robin over the pools and are named `<pool>-member-<nn>`,
+  counting each pool's members from 1, e.g. `pool-0001-member-01`. Each takes
+  the next unused address of its load balancer's network counting up from
+  `.128`, so one network holds at most 127 members. Each member's port is
+  drawn from `member_port` in member order.
+- Health monitors `hm-<nnnn>` go to `health_monitors` distinct pools drawn
+  from all of them, in ascending pool order.
+
+`octavia` has no `chaos` command, so an Octavia scenario takes no `chaos:`
+block; one is rejected like any unknown key.
+
+### Profiles
+
+Expanded counts at each profile's shipped seed, as `octavia apply --dry-run`
+prints them:
+
+| Profile | Networks | Load balancers | Listeners | Pools | Members | Health monitors | Provider |
+|---|---|---|---|---|---|---|---|
+| `small` | 1 | 2 | 4 | 4 | 8 | 2 | cloud default |
+| `medium` | 2 | 5 | 10 | 10 | 30 | 5 | cloud default |
+| `large` | 3 | 15 | 30 | 30 | 120 | 15 | cloud default |
+
+Every profile leaves `provider` empty and so runs against the cloud's default
+provider; `--set provider=ovn` or `--set provider=amphora` selects one. An
+amphora load balancer needs `--timeout 5m`. An OVN provider without TCP health
+monitor support runs a profile with `--set resources.health_monitors=0`.
+Octavia's project quotas default to unlimited (`-1`), so the profiles are
+bounded by build time rather than by quota; on a project with lowered quotas
+the `apply` pre-check names the ones that block.
+
 ## Mix
 
 A mix scenario describes a combined run: the workload personas that run side by
@@ -911,8 +995,9 @@ chaos:                                # the block shipped by scenarios/neutron/m
 | `lifecycle_ratio` | ratio | glance | Probability per step of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, or metadata churn) |
 | `retrieve_ratio` | ratio | barbican | Probability per step of reading back the payload of a live secret the plan marks for read-back and byte-comparing it |
 
-All twenty-one built-in profiles carry a `chaos:` block, so `chaos` runs any of
-them with no flags at all. A mix scenario's block holds only `duration`,
+All twenty-one built-in profiles of the namespaces with a `chaos` command carry
+a `chaos:` block, so `chaos` runs any of them with no flags at all. A mix
+scenario's block holds only `duration`,
 `parallel.max` and `bucket_width`; its interval, churn ratio and target fill
 are set per persona. A background lane of a mix run reads its own scenario's
 block instead; see [Lanes](#lanes). See [The churn engine](../explanation/churn-engine.md) for

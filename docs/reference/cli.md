@@ -1,8 +1,9 @@
 # CLI reference
 
 A single binary, `dizzy`, with one command namespace per OpenStack service:
-`neutron`, `cinder`, `keystone`, `nova`, `glance`, and `barbican`. Each
-namespace offers the same verbs.
+`neutron`, `cinder`, `keystone`, `nova`, `glance`, `barbican`, and `octavia`.
+Each namespace offers the same verbs, except that `octavia` has no `chaos` and
+no `monitor`.
 
 | Verb | Touches the API | Purpose |
 |---|---|---|
@@ -20,7 +21,7 @@ stub that returns "not implemented yet").
 `keystone` additionally has `pressure`, a closed-loop load on Keystone's token
 validation, revocation and role listings; see [`pressure`](#pressure).
 
-A seventh namespace, `mix`, runs several workload personas side by side in one
+An eighth namespace, `mix`, runs several workload personas side by side in one
 churn run. It has its own subset of the verbs; see
 [The `mix` namespace](#the-mix-namespace).
 
@@ -108,9 +109,10 @@ Namespace-specific flags:
 | `--domain <name>` | `keystone` | In-scope domain for domain-manager mode (default: the token's domain; ignored in admin mode) |
 | `--roles <csv>` | `keystone` | Existing roles to reuse in domain-manager mode (default `member,reader`; ignored in admin mode) |
 
-`neutron apply`, `cinder apply`, `nova apply`, and `barbican apply` run a
-read-only **quota pre-check** against the expanded plan and abort with an
-itemized message before creating anything if the quotas are insufficient.
+`neutron apply`, `cinder apply`, `nova apply`, `barbican apply`, and
+`octavia apply` run a read-only **quota pre-check** against the expanded plan
+and abort with an itemized message before creating anything if the quotas are
+insufficient.
 `keystone apply` runs a read-only **privilege pre-check** instead, since
 Keystone has no default per-resource quotas. `glance apply` runs **no**
 pre-check: Glance exposes no project-quota API (its image count and size caps
@@ -165,6 +167,45 @@ Barbican's policy allows to create secrets, orders, and containers: `creator` or
 `admin` under the legacy policy, `member` once the secure-RBAC defaults are
 enforced. Without one, the first store fails as `http_403`.
 
+`octavia apply` takes no service-specific flags: dizzy creates every object
+itself, and the scenario names the provider (`provider`, empty for the cloud's
+default). It runs six stages in order. It creates the VIP networks with one
+subnet each, then the load balancers with their VIP on those subnets, then the
+TCP listeners, one default pool per listener, the members at synthetic
+addresses in the upper half of each VIP subnet, and the TCP health monitors on
+the pools the plan selects. After every write it waits until the load balancer
+is ACTIVE again and records that wait as the time-to-ready of the kind it just
+created. A load balancer that reaches ERROR fails the run as
+`provisioning_error` without a retry, and one that is not ACTIVE again at the
+`--timeout` deadline fails it too.
+
+Writes to one load balancer are serialized, because a load balancer that is not
+ACTIVE answers the next write with HTTP 409, so concurrent writes would measure
+retries rather than the provider. Up to `--concurrency` load balancers proceed
+in parallel. `--set provider=ovn` or `--set provider=amphora` selects a
+provider. The provider each load balancer reports back binds the algorithm of
+its pools, `SOURCE_IP_PORT` for `ovn` and `ROUND_ROBIN` for any other, and the
+log names the pair as `load balancer provider bound`.
+
+An amphora load balancer boots a VM and takes one to two minutes to build,
+longer than the default `--timeout` of `1m`, so run an amphora provider with
+`--timeout 5m`. A load balancer still building at the deadline fails the run
+with an error that says to raise `--timeout`. Every object carries the run
+tags, which needs Octavia API version 2.5 (Stein) or later; an older API
+refuses the `tags` attribute with HTTP 400 at the first load balancer create.
+For an OVN provider without TCP health monitor support, run a profile with
+`--set resources.health_monitors=0`. A member's operating status is not a
+failure: nothing answers at its synthetic address, so it reads `ERROR` under a
+health monitor and `NO_MONITOR` without one. dizzy waits on the load balancer's
+provisioning status only.
+
+The project user needs a role that Octavia's policy allows to create load
+balancers: `load-balancer_member` under Octavia's default policy, `member`
+under the secure-RBAC defaults. Without one, the first load balancer create
+fails as `http_403`. Each amphora load balancer boots one VM, two in an
+`ACTIVE_STANDBY` topology, so the `large` profile's 15 load balancers hold 15
+to 30 amphorae until cleanup.
+
 **On interrupt.** SIGINT/SIGTERM writes the run record first, then tears the
 partial topology down in reverse dependency order, logs the deletion count, and
 exits non-zero naming the run id. A second signal aborts hard, leaving the record
@@ -179,8 +220,8 @@ so the live population never exceeds the scenario's counts and only planned
 resources are ever created. See [The churn engine](../explanation/churn-engine.md).
 
 Every flag can instead be set in a `chaos:` block in the scenario YAML; flags
-override the block. All twenty-one built-in profiles ship such a block, so
-`chaos` runs them with no extra flags.
+override the block. All twenty-one built-in profiles of the namespaces with a
+`chaos` command ship such a block, so `chaos` runs them with no extra flags.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -757,7 +798,7 @@ Re-queries the current state of a run's resources from the API.
 ## `report`
 
 Renders metrics from a run record. Never touches the API. The same command
-builder backs all seven namespaces, so `dizzy cinder report` and
+builder backs all eight namespaces, so `dizzy cinder report` and
 `dizzy neutron report` are the same code.
 
 | Flag | Default | Description |
@@ -929,6 +970,18 @@ Discovery differs per service, and so does what `--run-id` alone can reach:
   retried store can leave behind after a lost create answer, which the store's
   `create failed; a secret with this name may be orphaned in the cloud`
   warning names.
+- **octavia** — everything is found by the `dizzy:run=<id>` tag: load
+  balancers, VIP networks, and subnets are discovered by it, with the run
+  record's created list as a fallback. Load balancers are deleted first, with
+  cascade, so Octavia removes their listeners, pools, members, health monitors,
+  and VIP ports with them; the recorded children are never deleted on their
+  own. A delete refused with HTTP 409 while a load balancer is still in a
+  `PENDING_*` status is re-sent until `--timeout`, and each accepted delete is
+  waited on until the load balancer is gone. Subnets go next, then networks. A
+  subnet or network still in use at `--timeout` holds a port dizzy did not
+  create: cleanup stops with an error that says so and never deletes a port.
+  Everything an Octavia run creates carries the tag, so a bare `--run-id`
+  reaches all of it.
 
 See [Resource identity and cleanup](../explanation/resource-identity.md).
 

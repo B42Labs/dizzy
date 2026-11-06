@@ -25,7 +25,7 @@ same way.
 | Field | Type | Notes |
 |---|---|---|
 | `runID` | string | The run id; also the tag/metadata/name-prefix value |
-| `service` | string | `neutron`, `cinder`, `keystone`, `nova`, `glance`, `barbican`, or `mix`. Omitted on older records |
+| `service` | string | `neutron`, `cinder`, `keystone`, `nova`, `glance`, `barbican`, `octavia`, or `mix`. Omitted on older records |
 | `scenario` | string | Scenario name |
 | `seed` | int | The seed the plan was expanded from |
 | `startedAt` | timestamp | RFC 3339 |
@@ -82,6 +82,14 @@ then its only cleanup handle; a generated one is also found through its order's
 On a `barbican chaos` record the list holds the secrets and containers still
 live at the end of the run, and no orders.
 
+On an `octavia` record the list holds each VIP network followed by its subnet,
+in plan order, then the load balancers, then the listeners, pools, members, and
+health monitors, each grouped by load balancer. A member's `logical` is
+`<pool>-member-<nn>`, e.g. `pool-0001-member-01`. The record keeps no parent
+reference, so that name is how `status` finds the pool it observes the member
+through. `cleanup` deletes the recorded listeners, pools, members, and health
+monitors only through their load balancer's cascade delete, never one by one.
+
 This list is `cleanup`'s belt-and-suspenders handle. It is the *only* handle for
 resources that cannot be discovered by tag — Neutron address scopes, and Keystone
 role assignments.
@@ -128,7 +136,8 @@ service actually returns, or `http_other`. These are the same values the OTLP
 A `keystone pressure` record adds `accepted`, for a `bad_token` request that
 a service answered with a 2xx. A `barbican` record adds `mismatch`, for a
 read-back that returned different bytes, and `order_error`, for an order that
-ended in ERROR.
+ended in ERROR. An `octavia` record adds `provisioning_error`, for a load
+balancer that reached ERROR after a write.
 
 ## `chaos`
 

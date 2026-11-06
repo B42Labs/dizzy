@@ -4,7 +4,7 @@ A scenario-driven load and consistency tester for OpenStack control planes.
 
 `dizzy` builds large, randomized but **reproducible** workloads through the
 OpenStack APIs, records how long every operation takes and which states the
-resources reach, and cleans up after itself. It covers six services today:
+resources reach, and cleans up after itself. It covers seven services today:
 
 | Namespace | Service | What it exercises |
 |---|---|---|
@@ -14,13 +14,15 @@ resources reach, and cleans up after itself. It covers six services today:
 | `dizzy nova` | Compute | Server boot (image / volume), stop/start (soft / hard), resize + confirm, live migration, volume & port attach/detach, multi-network, user data |
 | `dizzy glance` | Image | Image create + synthetic data upload, metadata/property churn, visibility transitions (private / shared / community / public), member add/accept/remove, deactivate/reactivate, delete |
 | `dizzy barbican` | Key manager | Secret store with a synthetic payload and metadata stamp, AES-256 key orders polled to ACTIVE, generic containers, byte-compared payload read-back |
+| `dizzy octavia` | Load balancer | VIP networks, load balancers polled to ACTIVE after every write, TCP listeners, pools, synthetic members, TCP health monitors |
 | `dizzy mix` | Combined | Several workload personas side by side, each in its own project, in one churn run: the CI persona (short-lived servers on one network each, with data volumes), the Gardener persona (Kubernetes-style clusters of workers in anti-affinity server groups, each worker with a data volume, replaced one at a time) and the Legacy persona (long-lived servers that are stopped and started, resized, live- and cold-migrated, and have their volumes and ports detached and re-attached until teardown), plus optional background lanes that run the Cinder, Glance, Keystone or Neutron churn next to them |
 
-Every service namespace offers the same five verbs — `generate`, `apply`,
-`chaos`, `monitor`, `cleanup` — plus `status` and `report`. A scenario expands
-deterministically into a plan; applying that plan produces a run record you can
-re-query, report on, and tear down by tag.
+Every service namespace but `dizzy octavia` offers the same five verbs —
+`generate`, `apply`, `chaos`, `monitor`, `cleanup` — plus `status` and
+`report`. A scenario expands deterministically into a plan; applying that plan
+produces a run record you can re-query, report on, and tear down by tag.
 `dizzy mix` offers `generate`, `chaos`, `status`, `report` and `cleanup`.
+`dizzy octavia` offers `generate`, `apply`, `status`, `report` and `cleanup`.
 
 `dizzy keystone` additionally offers `pressure`, a closed-loop load on
 Keystone's token validation, revocation and role-listing path for a lab cloud.
@@ -31,8 +33,7 @@ to measure keystonemiddleware inside those services; see
 runs.
 
 It is **not** a correctness suite like Tempest. It measures latency, error
-rates, and state convergence under load. The two are complementary. It creates
-no load balancers (no Octavia).
+rates, and state convergence under load. The two are complementary.
 
 ## Installation
 
@@ -73,7 +74,7 @@ $ dizzy neutron report --run run-<id>.json                     # see the timings
 $ dizzy neutron cleanup --run run-<id>.json                    # tear it down
 ```
 
-`--scenario` takes a filesystem path, and the twenty-one built-in profiles live under
+`--scenario` takes a filesystem path, and the twenty-four built-in profiles live under
 `scenarios/` in this repository — so clone it even if you installed a release
 binary; the container image carries them under `/usr/share/dizzy/scenarios`. The
 `small` profile fits Neutron's default per-project quotas and runs against a
@@ -123,7 +124,8 @@ matches what you are doing right now.
   or, for `dizzy mix`, of the entry each persona and lane names.
 - Every resource it creates carries a run identifier — a Neutron tag, Cinder
   metadata, a Keystone name prefix, (for Nova) server and volume metadata, (for
-  Glance) an image tag, or (for Barbican) a name prefix plus secret metadata.
+  Glance) an image tag, (for Barbican) a name prefix plus secret metadata, or
+  (for Octavia) a tag on every load balancer object and VIP network.
   `cleanup` deletes strictly on that identifier, so it never touches resources
   the tool did not create.
 - `apply --dry-run` previews a plan without making a single API call.

@@ -11,8 +11,8 @@ For what the knobs actually control, see
 
 ## Run a built-in profile
 
-All twenty-one profiles ship a `chaos:` block, so they run with no flags at
-all:
+All twenty-one profiles of the namespaces with a `chaos` command ship a
+`chaos:` block, so they run with no flags at all:
 
 ```console
 $ dizzy neutron chaos --scenario scenarios/neutron/small.yaml    # 5m

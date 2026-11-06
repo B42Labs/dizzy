@@ -1,8 +1,9 @@
 # Deal with the quota pre-check
 
-`neutron apply`, `cinder apply`, `nova apply`, and `barbican apply` compare the
-expanded plan against your project's quotas **before creating anything**, and
-abort with an itemized message if the quotas are too low:
+`neutron apply`, `cinder apply`, `nova apply`, `barbican apply`, and
+`octavia apply` compare the expanded plan against your project's quotas
+**before creating anything**, and abort with an itemized message if the quotas
+are too low:
 
 > `glance apply` runs **no** quota pre-check. Glance exposes no project-quota API
 > to compare a plan against — its image count and per-image size caps are
@@ -50,6 +51,15 @@ and `gigabytes_<type>` are checked as well.
 
 For Barbican, the names are `secrets`, `orders`, and `containers`, the keys of
 Barbican's project quotas.
+
+For Octavia, the names are `loadbalancer`, `listener`, `pool`, `member`, and
+`healthmonitor`, the keys of Octavia's project quotas. Raise them with the
+load-balancer client:
+
+```console
+$ openstack loadbalancer quota set --loadbalancer <n> --listener <n> \
+    --pool <n> --member <n> --healthmonitor <n> <project>
+```
 
 ## Option 2: Shrink the plan
 
@@ -117,6 +127,15 @@ which is Barbican's default for every quota, means unlimited and never blocks.
 Like Cinder's, the check compares the plan with the limit, not with what the
 project has left.
 
+For Octavia, the pre-check counts **load balancers**, **listeners**,
+**pools**, **members**, and **health monitors**, with one pool per listener. A
+negative limit, which is Octavia's default for every quota, means unlimited and
+never blocks. Octavia's quota API reports limits and no usage, so the check
+compares the plan with the limits, not with what the project has left: load
+balancers already in the project are not counted. The Neutron networks,
+subnets, and VIP ports a run consumes are *not* pre-checked, as for Nova's
+companion resources. The executor's quota fast-fail is the backstop there.
+
 ## When the pre-check cannot run
 
 If the project cannot read its own quota, the pre-check **fails open**: it logs a
@@ -132,6 +151,14 @@ created. Barbican answers an over-quota create with HTTP 403 as well. The
 executor counts a 403 as a quota rejection only when its body names a quota,
 so a 403 from Barbican's policy stops the run as `http_403` rather than as
 `quota`.
+
+Octavia's pre-check follows Nova's quota-read policy. A project id the auth
+result does not carry, or a denied read (HTTP 403), skips the pre-check with a
+warning; any other read failure aborts the apply with
+`reading Octavia quotas for pre-check: …` before anything is created. Octavia
+answers an over-quota create with HTTP 403 as well, with a body that reads
+`Quota has been met`, so the executor counts it as `quota`, while a 403 from
+Octavia's policy stops the run as `http_403`.
 
 The pre-check exists to give a good error message early, not to be a second
 authorization system. It must never refuse work the cloud would have allowed.
