@@ -85,8 +85,10 @@ networks and their subnets are Neutron resources and carry the same pair as
 Neutron tags, as Nova's companion networks do. Discovery lists load balancers,
 subnets, and networks by the run tag. Cleanup deletes each load balancer with
 cascade, so Octavia removes its listeners, pools, members, and health monitors
-with it; none of them is deleted on its own. Cleanup waits until each load
-balancer is gone, then deletes the subnets and then the networks. The VIP port
+with it; none of them is deleted on its own. `octavia chaos` deletes them one
+at a time while it churns, and its teardown is this cleanup. Cleanup waits
+until each load balancer is gone, then deletes the subnets and then the
+networks. The VIP port
 is Octavia's: Octavia creates it for the load balancer and removes it with the
 load balancer, so it carries no dizzy identity, and cleanup never deletes a
 port. A subnet that stays in use after its load balancers are gone holds a port
@@ -98,7 +100,13 @@ second member at an address and port, or a second monitor on a pool with HTTP
 name up among the objects that carry the run tag, skipping any in
 `PENDING_DELETE` or `DELETED`, and adopts a match. Each logical name is created
 once per apply, so name and run tag identify the instance without a create
-token.
+token. `octavia chaos` creates a name again only once the delete of its
+previous instance has finished. When that delete succeeded, Octavia has removed
+the instance by then, so the churn needs no create token either. A load
+balancer whose delete Octavia refused with HTTP 400, because a child whose own
+delete failed is still attached, stays next to its successor of the same name
+until a later delete or the teardown removes it; a lookup that finds both
+adopts the first and logs the other.
 
 All seven converge on the same deterministic naming: a resource with logical name
 `net-0001` in run `a1b2c3d4` is called `dizzy-a1b2c3d4-net-0001` on the cloud.

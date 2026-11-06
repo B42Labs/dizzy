@@ -63,6 +63,21 @@ generic container is parented on the secrets it references. So a container is
 created only while its secrets are live, and a secret a live container
 references is never deleted. Barbican's orders take no part in the churn.
 
+Octavia's graph follows the parent chain of a load balancer: a VIP network, its
+subnet, the load balancer with its VIP on that subnet, the load balancer's
+listeners, one pool under each listener, and the members and any health monitor
+under each pool. Octavia locks a load balancer in a `PENDING_*` status while it
+applies a write and answers a second write with 409, so every node of one load
+balancer's family shares a gate, the construct Nova uses per server. The engine
+lets one operation per gate be in flight and takes the gate before a
+concurrency slot, so the operations on one load balancer run one after another,
+an operation waiting for a busy load balancer holds no slot, and different load
+balancers proceed in parallel. Every create in the family, every delete of a
+listener, pool, member, or health monitor, and every admin-state toggle
+includes the wait until the load balancer is `ACTIVE` again, and a load
+balancer delete includes the wait until it is gone. A churn delete removes a
+single object and never cascades; the cascade is reserved for the teardown.
+
 ## Keeping the population honest
 
 A naive "flip a coin, create or delete" walk does one of two bad things: it
@@ -167,17 +182,20 @@ schedule stays the same.
 Create and delete change the population. Some interesting operations don't.
 
 Cinder's **extend**, Keystone's **token issue**, Nova's **server lifecycle**,
-Glance's **image lifecycle**, and Barbican's **payload read-back** are modeled
-as *mutations*: with probability `resize_ratio` (or `token_ratio`,
-`lifecycle_ratio`, or `retrieve_ratio`), a churn step mutates an existing
-resource instead of changing the population. A volume is extended to its
+Glance's **image lifecycle**, Barbican's **payload read-back**, and Octavia's
+**admin-state toggle** are modeled as *mutations*: with probability
+`resize_ratio` (or `token_ratio`, `lifecycle_ratio`, `retrieve_ratio`, or
+`update_ratio`), a churn step mutates an existing resource instead of changing
+the population. A volume is extended to its
 plan's target; a user with a live project assignment authenticates for a scoped
 token; a live server is stop/started, resized-and-confirmed, or live-migrated, in
 that fixed precedence; a live image is metadata-churned, shared with a member
 added/accepted/removed, deactivated-and-reactivated, and flipped to community and
 public visibility, in that fixed precedence. A live secret the plan marks for
 read-back has its payload read back and compared byte for byte with the bytes it
-was stored with.
+was stored with. A live listener or member is set to `admin_state_up=false` and
+back to `true`, and each change waits until its load balancer is `ACTIVE`
+again.
 
 Because mutations leave the population untouched, the controller's economics
 above are unaffected. They still count against the per-tick fan-out, since they
@@ -192,7 +210,8 @@ failure, not a latency one.
 Each resource *instance* is mutated at most once per lifetime — a volume is
 extended to its planned target and not further, a grant issues one token, a
 server runs its planned lifecycle once, an image runs its planned lifecycle once,
-a secret is read back once — and is re-armed when it is deleted and recreated.
+a secret is read back once, a listener or member is disabled and re-enabled
+once — and is re-armed when it is deleted and recreated.
 For Cinder this is what keeps a week-long soak's gigabyte consumption inside the
 envelope that the quota pre-check validated (the sum of planned final sizes),
 rather than growing without bound.

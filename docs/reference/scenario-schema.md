@@ -663,6 +663,14 @@ resources:
 distribution:
   listener_port: { min: 1024, max: 65535 }   # TCP port drawn per listener, distinct per load balancer
   member_port:   { min: 1024, max: 65535 }   # TCP port drawn per member
+
+chaos:                                 # `octavia chaos --scenario scenarios/octavia/small.yaml` runs as-is
+  duration: 5m                         # total runtime; the only hard stop besides Ctrl-C
+  interval: { min: 200ms, max: 3s }    # random delay drawn per churn tick
+  parallel: { max: 4 }                 # per-tick fan-out, drawn in [1, max]; capped by --concurrency
+  churn_ratio: 0.5                     # create bias at steady state (0..1)
+  target_fill: 0.8                     # fraction of the envelope kept populated (0..1)
+  update_ratio: 0.3                    # probability per step of an admin-state toggle on a live listener or member
 ```
 
 Every object is created by dizzy, so a run references no pre-existing load
@@ -707,19 +715,21 @@ the monitored pools, so the same scenario and seed always build the same tree:
 - Health monitors `hm-<nnnn>` go to `health_monitors` distinct pools drawn
   from all of them, in ascending pool order.
 
-`octavia` has no `chaos` command, so an Octavia scenario takes no `chaos:`
-block; one is rejected like any unknown key.
+Only `octavia chaos` reads the `chaos:` block, and `generate` and `apply`
+ignore it; see [The `chaos:` block](#the-chaos-block) for its keys, among them
+`update_ratio`, the probability per churn step of an admin-state toggle on a
+live listener or member.
 
 ### Profiles
 
 Expanded counts at each profile's shipped seed, as `octavia apply --dry-run`
 prints them:
 
-| Profile | Networks | Load balancers | Listeners | Pools | Members | Health monitors | Provider |
-|---|---|---|---|---|---|---|---|
-| `small` | 1 | 2 | 4 | 4 | 8 | 2 | cloud default |
-| `medium` | 2 | 5 | 10 | 10 | 30 | 5 | cloud default |
-| `large` | 3 | 15 | 30 | 30 | 120 | 15 | cloud default |
+| Profile | Networks | Load balancers | Listeners | Pools | Members | Health monitors | Provider | Chaos duration |
+|---|---|---|---|---|---|---|---|---|
+| `small` | 1 | 2 | 4 | 4 | 8 | 2 | cloud default | 5m |
+| `medium` | 2 | 5 | 10 | 10 | 30 | 5 | cloud default | 30m |
+| `large` | 3 | 15 | 30 | 30 | 120 | 15 | cloud default | 1h |
 
 Every profile leaves `provider` empty and so runs against the cloud's default
 provider; `--set provider=ovn` or `--set provider=amphora` selects one. An
@@ -994,10 +1004,10 @@ chaos:                                # the block shipped by scenarios/neutron/m
 | `lifecycle_ratio` | ratio | nova | Probability per step of mutating a live server (stop/start, resize, or live-migrate) |
 | `lifecycle_ratio` | ratio | glance | Probability per step of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, or metadata churn) |
 | `retrieve_ratio` | ratio | barbican | Probability per step of reading back the payload of a live secret the plan marks for read-back and byte-comparing it |
+| `update_ratio` | ratio | octavia | Probability per step of setting a live listener or member to `admin_state_up=false` and back to `true` |
 
-All twenty-one built-in profiles of the namespaces with a `chaos` command carry
-a `chaos:` block, so `chaos` runs any of them with no flags at all. A mix
-scenario's block holds only `duration`,
+All twenty-four built-in profiles carry a `chaos:` block, so `chaos` runs any
+of them with no flags at all. A mix scenario's block holds only `duration`,
 `parallel.max` and `bucket_width`; its interval, churn ratio and target fill
 are set per persona. A background lane of a mix run reads its own scenario's
 block instead; see [Lanes](#lanes). See [The churn engine](../explanation/churn-engine.md) for
