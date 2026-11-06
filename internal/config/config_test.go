@@ -269,7 +269,10 @@ func credentialAuth(authURL string) string {
 // endpoints carry their major version, so the client skips discovery, and
 // Neutron's client appends v2.0 once more. The key-manager endpoint carries no
 // version, as Barbican's catalog URL does not, so the fake also answers its
-// version document, and the key-manager client appends v1 to it.
+// version document, and the key-manager client appends v1 to it. The
+// load-balancer endpoint carries no version either, as Octavia's catalog URL
+// does not, so the fake answers Octavia's version document as well, and the
+// load-balancer client appends v2.0 to it.
 type fakeCloud struct {
 	srv *httptest.Server
 
@@ -302,6 +305,8 @@ func newFakeCloud(t *testing.T) *fakeCloud {
 	}
 	catalog = append(catalog, fmt.Sprintf(`{"type":"key-manager","endpoints":[{"interface":"public","region":"RegionOne","url":%q}]}`,
 		fc.srv.URL+"/key-manager/"))
+	catalog = append(catalog, fmt.Sprintf(`{"type":"load-balancer","endpoints":[{"interface":"public","region":"RegionOne","url":%q}]}`,
+		fc.srv.URL+"/load-balancer/"))
 	token := `{"token":{"expires_at":"2030-01-01T00:00:00Z","project":{"id":"pid"},"catalog":[` + strings.Join(catalog, ",") + `]}}`
 
 	mux.HandleFunc("POST /v3/auth/tokens", func(w http.ResponseWriter, _ *http.Request) {
@@ -330,6 +335,12 @@ func newFakeCloud(t *testing.T) *fakeCloud {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusMultipleChoices)
 		_, _ = fmt.Fprint(w, `{"versions":{"values":[{"id":"v1","status":"stable"}]}}`)
+	})
+	// Octavia answers its unversioned root with 200 and a flat list of its v2
+	// minor versions, the newest marked CURRENT.
+	mux.HandleFunc("GET /load-balancer/{$}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"versions":[{"id":"v2.0","status":"SUPPORTED"},{"id":"v2.27","status":"CURRENT"}]}`)
 	})
 	mux.HandleFunc("GET /network/v2.0/v2.0/networks", func(w http.ResponseWriter, r *http.Request) {
 		tok := r.Header.Get("X-Auth-Token")
@@ -390,6 +401,13 @@ func TestConstructorsEnableReauth(t *testing.T) {
 		}
 		return cs.Compute, nil
 	}
+	loadBalancerClient := func(ctx context.Context, cloudName string) (*gophercloud.ServiceClient, error) {
+		ls, err := NewLoadBalancerStack(ctx, cloudName)
+		if err != nil {
+			return nil, err
+		}
+		return ls.LoadBalancer, nil
+	}
 	tests := []struct {
 		name  string
 		build func(context.Context, string) (*gophercloud.ServiceClient, error)
@@ -400,6 +418,7 @@ func TestConstructorsEnableReauth(t *testing.T) {
 		{"NewImageClient", NewImageClient},
 		{"NewKeyManagerClient", NewKeyManagerClient},
 		{"NewComputeStack", computeClient},
+		{"NewLoadBalancerStack", loadBalancerClient},
 	}
 
 	for _, tc := range tests {
@@ -455,6 +474,50 @@ func TestNewKeyManagerClientWithoutEndpoint(t *testing.T) {
 	}
 	if !strings.HasPrefix(err.Error(), "creating key manager v1 client: ") {
 		t.Errorf("error %q does not start with %q", err.Error(), "creating key manager v1 client: ")
+	}
+	var notFound *gophercloud.ErrEndpointNotFound
+	if !errors.As(err, &notFound) {
+		t.Errorf("error %v does not wrap gophercloud.ErrEndpointNotFound", err)
+	}
+}
+
+// TestNewLoadBalancerStackResolvesV2 asserts the load-balancer client accepts
+// the unversioned catalog URL Octavia publishes and addresses its resources
+// below v2.0/ of it, and that the stack carries a network client too.
+func TestNewLoadBalancerStackResolvesV2(t *testing.T) {
+	fc := newFakeCloud(t)
+	writeClouds(t, credentialAuth(fc.authURL()))
+
+	stack, err := NewLoadBalancerStack(t.Context(), "fake")
+	if err != nil {
+		t.Fatalf("NewLoadBalancerStack: %v", err)
+	}
+	if got, want := stack.LoadBalancer.ServiceURL("lbaas", "loadbalancers"), fc.srv.URL+"/load-balancer/v2.0/lbaas/loadbalancers"; got != want {
+		t.Errorf("load balancers URL = %q, want %q", got, want)
+	}
+	if stack.Network == nil {
+		t.Error("NewLoadBalancerStack returned no network client")
+	}
+}
+
+// TestNewLoadBalancerStackWithoutEndpoint asserts a cloud whose catalog offers
+// no load-balancer endpoint for the entry's region fails in the constructor
+// with the wrapped endpoint lookup error, before the network client is built.
+func TestNewLoadBalancerStackWithoutEndpoint(t *testing.T) {
+	fc := newFakeCloud(t)
+	t.Setenv("OS_REGION_NAME", "")
+	t.Setenv("OS_INTERFACE", "")
+	writeCloudsWith(t, "region_name: RegionTwo\n", credentialAuth(fc.authURL()))
+
+	stack, err := NewLoadBalancerStack(t.Context(), "fake")
+	if err == nil {
+		t.Fatalf("NewLoadBalancerStack = %v, want an error", stack)
+	}
+	if stack != nil {
+		t.Errorf("expected nil stack on error, got %v", stack)
+	}
+	if !strings.HasPrefix(err.Error(), "creating load balancer v2 client: ") {
+		t.Errorf("error %q does not start with %q", err.Error(), "creating load balancer v2 client: ")
 	}
 	var notFound *gophercloud.ErrEndpointNotFound
 	if !errors.As(err, &notFound) {

@@ -217,3 +217,39 @@ func NewComputeStack(ctx context.Context, cloudName string) (*ComputeStack, erro
 
 	return &ComputeStack{Compute: compute, Network: network, BlockStorage: blockStorage, Image: image}, nil
 }
+
+// LoadBalancerStack bundles the two service clients an Octavia run needs, both
+// built from one authentication: LoadBalancer (Octavia) for the load balancers,
+// listeners, pools, members, and health monitors, and Network (Neutron) for the
+// VIP networks and their subnets.
+type LoadBalancerStack struct {
+	LoadBalancer *gophercloud.ServiceClient // Octavia v2
+	Network      *gophercloud.ServiceClient // Neutron, for the VIP networks
+}
+
+// NewLoadBalancerStack authenticates once against the cloud described in
+// clouds.yaml and returns the two service clients an Octavia run drives. The
+// load-balancer client resolves the load-balancer catalog type and addresses
+// its resources below v2.0/ of the endpoint; Octavia takes no microversion
+// header. A cloud whose catalog has no load-balancer endpoint fails here, before
+// any resource is written. When cloudName is empty the cloud is selected from
+// the OS_CLOUD environment variable, following the standard clouds.yaml search
+// paths.
+func NewLoadBalancerStack(ctx context.Context, cloudName string) (*LoadBalancerStack, error) {
+	provider, endpointOptions, err := newProvider(ctx, cloudName)
+	if err != nil {
+		return nil, err
+	}
+
+	loadBalancer, err := openstack.NewLoadBalancerV2(provider, endpointOptions)
+	if err != nil {
+		return nil, fmt.Errorf("creating load balancer v2 client: %w", err)
+	}
+
+	network, err := openstack.NewNetworkV2(provider, endpointOptions)
+	if err != nil {
+		return nil, fmt.Errorf("creating network v2 client: %w", err)
+	}
+
+	return &LoadBalancerStack{LoadBalancer: loadBalancer, Network: network}, nil
+}
