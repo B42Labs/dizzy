@@ -5,8 +5,8 @@
 regressions, and error-rate changes become visible as trends instead of being
 buried in per-run JSON files.
 
-Available in every service namespace but `barbican`: `neutron monitor`,
-`cinder monitor`, `keystone monitor`, `nova monitor`, and `glance monitor`.
+Available in every service namespace: `neutron monitor`, `cinder monitor`,
+`keystone monitor`, `nova monitor`, `glance monitor`, and `barbican monitor`.
 
 > **One `dizzy` per project.** The pre-flight sweep reclaims any `dizzy`-tagged
 > resource it finds, so a concurrent `apply` or `chaos` in the same project would
@@ -111,6 +111,33 @@ by default — with an admin token it lists cloud-wide, so enabling it is only s
 when no other `dizzy` process targets the cloud at all. Left off, the loop still
 cleans up after each of its own iterations.
 
+## Monitor Barbican
+
+Same cadence, fixed-seed, and shutdown semantics:
+
+```console
+$ dizzy barbican monitor --scenario scenarios/barbican/small.yaml --otel
+```
+
+`barbican monitor` pre-checks the Barbican quotas once at startup, so an
+oversized plan fails before the loop begins, and again at the start of every
+iteration's apply, so a quota lowered during a long run fails that iteration
+with the itemized message rather than with a wall of rejected creates.
+
+A payload read-back that returns different bytes fails its iteration like any
+other apply error. The loop goes on and the command still exits 0, so watch the
+failed iterations and the `error.kind=mismatch` series. To gate CI on
+corruption, run `barbican apply` or `barbican chaos`, which exit non-zero on a
+mismatch.
+
+The sweep is always on. It reclaims every `dizzy-` container and order in the
+project, the secrets those orders generated, and any `dizzy-` secret whose
+`dizzy_type=secret` metadata confirms it. A stored secret whose metadata stamp
+failed is never swept: its own iteration deletes it, and only an iteration
+whose cleanup does not finish (a cleanup that stops on an error, or a hard
+abort) leaves one behind. Pass `--keep-run-records` if you want
+`barbican cleanup --run` to reach it; otherwise delete it by hand.
+
 ## Via the Makefile
 
 To run against the OSISM testbed, exporting into the local OTEL stack:
@@ -120,5 +147,6 @@ $ make otel-up
 $ make devstack-osism-monitor
 $ make devstack-osism-monitor MONITOR_INTERVAL=5m MONITOR_ITERATIONS=1
 $ make devstack-osism-monitor DEVSTACK_OSISM_SERVICE=cinder
+$ make devstack-osism-monitor DEVSTACK_OSISM_SERVICE=barbican
 $ make devstack-osism-monitor DEVSTACK_OSISM_SCENARIO=scenarios/neutron/medium.yaml ARGS="--error-wait 2m"
 ```

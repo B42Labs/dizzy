@@ -16,9 +16,8 @@ resources reach, and cleans up after itself. It covers six services today:
 | `dizzy barbican` | Key manager | Secret store with a synthetic payload and metadata stamp, AES-256 key orders polled to ACTIVE, generic containers, byte-compared payload read-back |
 | `dizzy mix` | Combined | Several workload personas side by side, each in its own project, in one churn run: the CI persona (short-lived servers on one network each, with data volumes), the Gardener persona (Kubernetes-style clusters of workers in anti-affinity server groups, each worker with a data volume, replaced one at a time) and the Legacy persona (long-lived servers that are stopped and started, resized, live- and cold-migrated, and have their volumes and ports detached and re-attached until teardown), plus optional background lanes that run the Cinder, Glance, Keystone or Neutron churn next to them |
 
-Every service namespace but `dizzy barbican` offers the same five verbs —
-`generate`, `apply`, `chaos`, `monitor`, `cleanup` — plus `status` and
-`report`. `dizzy barbican` offers every verb but `monitor`. A scenario expands
+Every service namespace offers the same five verbs — `generate`, `apply`,
+`chaos`, `monitor`, `cleanup` — plus `status` and `report`. A scenario expands
 deterministically into a plan; applying that plan produces a run record you can
 re-query, report on, and tear down by tag.
 `dizzy mix` offers `generate`, `chaos`, `status`, `report` and `cleanup`.
