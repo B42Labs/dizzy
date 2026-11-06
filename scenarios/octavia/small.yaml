@@ -1,0 +1,26 @@
+name: small
+seed: 42                        # deterministic; same seed => same plan
+
+# Select a provider with --set provider=ovn or --set provider=amphora; the empty
+# provider below leaves the choice to the cloud's default. An amphora load
+# balancer boots a VM, so a run against amphora needs --timeout 5m. Octavia's
+# default quotas are unlimited, so this profile's size is bounded by build time,
+# not by quota. An OVN provider without TCP health monitor support runs this
+# profile with --set resources.health_monitors=0.
+provider: ""
+
+# dizzy creates every VIP network itself, and every member is a synthetic
+# address in the upper half of its network's /24 that no backend answers on, so
+# a run references no pre-existing network or server. Load balancers go
+# round-robin over the networks, listeners over the load balancers, and members
+# over the pools; every listener gets exactly one default pool.
+resources:
+  networks:        1            # VIP networks, each with one /24 subnet
+  loadbalancers:   2            # each polled back to ACTIVE after every write
+  listeners:       4            # TCP listeners, and one default pool each
+  members:         8            # synthetic members, from .128 of their network up
+  health_monitors: 2            # TCP health monitors on that many distinct pools
+
+distribution:
+  listener_port: { min: 1024, max: 65535 }   # TCP port drawn per listener, distinct per load balancer
+  member_port:   { min: 1024, max: 65535 }   # TCP port drawn per member
