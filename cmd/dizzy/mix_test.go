@@ -500,9 +500,12 @@ func tenantClouds(t *testing.T, authURL string) {
 }
 
 // fakeKeystone serves a v3 token scoped to projectID whose catalog points every
-// service of the compute stack and the identity service at the server itself,
-// and returns its auth URL. The endpoints carry their major version, so the
-// client skips discovery. The token carries no role.
+// service of the compute stack, the identity service, and the key manager at
+// the server itself, and returns its auth URL. The endpoints carry their major
+// version, so the client skips discovery, except the key-manager endpoint,
+// which carries no version as Barbican's catalog URL does not: the fake answers
+// its version document, and the key-manager client appends v1 to it. The token
+// carries no role.
 func fakeKeystone(t *testing.T, projectID string) string {
 	t.Helper()
 	url, _ := fakeKeystoneLog(t, projectID, nil)
@@ -511,8 +514,10 @@ func fakeKeystone(t *testing.T, projectID string) string {
 
 // fakeKeystoneLog is fakeKeystone that also returns a function listing the
 // method and path of every request the server received, in order. A request
-// other than the token request is answered with the JSON body bodies holds for
-// its "<method> <path>", or else with 404.
+// other than the token request and the key-manager version document
+// (GET /key-manager/, answered 300) is answered with the JSON body bodies holds
+// for its "<method> <path>", or else with 404; bodies must not register
+// GET /key-manager/{$} again.
 func fakeKeystoneLog(t *testing.T, projectID string, bodies map[string]string) (string, func() []string) {
 	t.Helper()
 	var (
@@ -533,10 +538,19 @@ func fakeKeystoneLog(t *testing.T, projectID string, bodies map[string]string) (
 			catalog = append(catalog, fmt.Sprintf(`{"type":%q,"endpoints":[{"interface":"public","region":"RegionOne","url":%q}]}`,
 				svc[0], ts.URL+"/"+svc[0]+"/"+svc[1]+"/"))
 		}
+		catalog = append(catalog, fmt.Sprintf(`{"type":"key-manager","endpoints":[{"interface":"public","region":"RegionOne","url":%q}]}`,
+			ts.URL+"/key-manager/"))
 		w.Header().Set("X-Subject-Token", "tok")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		_, _ = fmt.Fprintf(w, `{"token":{"expires_at":"2030-01-01T00:00:00Z","project":{"id":%q},"catalog":[%s]}}`, projectID, strings.Join(catalog, ","))
+	})
+	// Barbican answers its unversioned root with 300 and a versions document
+	// whose entries sit under "values".
+	mux.HandleFunc("GET /key-manager/{$}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMultipleChoices)
+		_, _ = io.WriteString(w, `{"versions":{"values":[{"id":"v1","status":"stable"}]}}`)
 	})
 	for pattern, body := range bodies {
 		mux.HandleFunc(pattern, func(w http.ResponseWriter, _ *http.Request) {

@@ -14,8 +14,8 @@ import (
 )
 
 // newBarbicanCmd builds the "barbican" command namespace and attaches its
-// subcommands: generate, apply, chaos, status, report, and cleanup. report is
-// the same service-agnostic builder the other namespaces use.
+// subcommands: generate, apply, chaos, monitor, status, report, and cleanup.
+// report is the same service-agnostic builder the other namespaces use.
 func newBarbicanCmd(opts *globalOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "barbican",
@@ -26,6 +26,7 @@ func newBarbicanCmd(opts *globalOptions) *cobra.Command {
 		newBarbicanGenerateCmd(opts),
 		newBarbicanApplyCmd(opts),
 		newBarbicanChaosCmd(opts),
+		newBarbicanMonitorCmd(opts),
 		newBarbicanStatusCmd(opts),
 		newReportCmd(opts),
 		newBarbicanCleanupCmd(opts),
