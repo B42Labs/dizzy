@@ -283,6 +283,116 @@ func TestWaitForActiveDeadline(t *testing.T) {
 	}
 }
 
+// TestWaitForActiveAfterDeleteRecordsNothing confirms the wait after a churn
+// delete polls a load balancer from PENDING_UPDATE to ACTIVE without recording
+// a readiness sample or an operation sample, since a delete's settle time is
+// not the time-to-ready of any object.
+func TestWaitForActiveAfterDeleteRecordsNothing(t *testing.T) {
+	fastPolls(t)
+	f := newFake(t, scripted(t, map[string][]reply{
+		"GET " + loadBalancerPath: {
+			{http.StatusOK, lbAnswer("PENDING_UPDATE", "ovn")},
+			{http.StatusOK, lbAnswer("ACTIVE", "ovn")},
+		},
+	}))
+	c, m := f.client()
+
+	if err := c.WaitForActiveAfterDelete(waitCtx(t), createdLB, KindMember); err != nil {
+		t.Fatalf("WaitForActiveAfterDelete: %v", err)
+	}
+	f.wantLines(t, "GET "+loadBalancerPath, "GET "+loadBalancerPath)
+	agg := m.Aggregate(time.Second)
+	if len(agg.Readiness) != 0 {
+		t.Errorf("readiness = %+v, want none", agg.Readiness)
+	}
+	if agg.Overall.Attempted != 0 {
+		t.Errorf("recorded %d operation samples, want none", agg.Overall.Attempted)
+	}
+}
+
+// TestWaitForActiveAfterDeleteProvisioningError confirms a load balancer in
+// ERROR after a churn delete fails the wait with ErrProvisioning and records
+// no readiness sample, but still records the poll that found it as one failed
+// sample of the kind deleted, classified provisioning_error.
+func TestWaitForActiveAfterDeleteProvisioningError(t *testing.T) {
+	fastPolls(t)
+	f := newFake(t, scripted(t, map[string][]reply{
+		"GET " + loadBalancerPath: {
+			{http.StatusOK, lbAnswer("PENDING_UPDATE", "amphora")},
+			{http.StatusOK, lbAnswer("ERROR", "amphora")},
+		},
+	}))
+	c, m := f.client()
+
+	err := c.WaitForActiveAfterDelete(waitCtx(t), createdLB, KindListener)
+	if !errors.Is(err, ErrProvisioning) {
+		t.Fatalf("WaitForActiveAfterDelete = %v, want ErrProvisioning", err)
+	}
+	agg := m.Aggregate(time.Second)
+	if len(agg.Readiness) != 0 {
+		t.Errorf("readiness = %+v, want none", agg.Readiness)
+	}
+	if s := statsOf(agg, "listener"); s.Attempted != 1 || s.Failed != 1 {
+		t.Errorf("listener stats = %+v, want one failed sample", s)
+	}
+	if agg.Overall.Attempted != 1 {
+		t.Errorf("recorded %d operation samples, want only the failed listener get", agg.Overall.Attempted)
+	}
+	if len(agg.Errors) != 1 || agg.Errors[0].Kind != "provisioning_error" || agg.Errors[0].Count != 1 {
+		t.Errorf("errors = %+v, want one provisioning_error", agg.Errors)
+	}
+}
+
+// TestWaitForActiveAfterDeleteGone confirms a load balancer deleted out of
+// band aborts the wait after a churn delete at once with the gone error, and
+// records no readiness sample.
+func TestWaitForActiveAfterDeleteGone(t *testing.T) {
+	fastPolls(t)
+	f := newFake(t, scripted(t, map[string][]reply{
+		"GET " + loadBalancerPath: {{http.StatusNotFound, `{"faultstring":"Load Balancer lb-id-1 not found."}`}},
+	}))
+	c, m := f.client()
+
+	err := c.WaitForActiveAfterDelete(waitCtx(t), createdLB, KindPool)
+	if err == nil || !strings.HasPrefix(err.Error(), "load balancer lb-id-1 is gone while waiting for ACTIVE: ") || !IsNotFound(err) {
+		t.Errorf("WaitForActiveAfterDelete = %v, want the gone 404 error", err)
+	}
+	f.wantLines(t, "GET "+loadBalancerPath)
+	if agg := m.Aggregate(time.Second); agg.Overall.Attempted != 0 || len(agg.Readiness) != 0 {
+		t.Errorf("WaitForActiveAfterDelete recorded %+v, want nothing", agg)
+	}
+}
+
+// TestWaitForActiveAfterDeleteDeadline confirms a load balancer that never
+// returns to ACTIVE after a churn delete, or an already expired context, ends
+// the wait with context.DeadlineExceeded and no readiness sample.
+func TestWaitForActiveAfterDeleteDeadline(t *testing.T) {
+	fastPolls(t)
+	for _, tc := range []struct {
+		name    string
+		timeout time.Duration
+	}{
+		{"deadline during the wait", 20 * time.Millisecond},
+		{"expired context", -time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFake(t, scripted(t, map[string][]reply{
+				"GET " + loadBalancerPath: {{http.StatusOK, lbAnswer("PENDING_UPDATE", "amphora")}},
+			}))
+			c, m := f.client()
+			ctx, cancel := context.WithTimeout(context.Background(), tc.timeout)
+			defer cancel()
+
+			if err := c.WaitForActiveAfterDelete(ctx, createdLB, KindHealthMonitor); !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("WaitForActiveAfterDelete = %v, want context.DeadlineExceeded", err)
+			}
+			if agg := m.Aggregate(time.Second); agg.Overall.Attempted != 0 || len(agg.Readiness) != 0 {
+				t.Errorf("WaitForActiveAfterDelete recorded %+v, want nothing", agg)
+			}
+		})
+	}
+}
+
 // TestWaitForGone confirms the deletion wait ends on a 404 or a DELETED status,
 // polls through PENDING_DELETE and a transient error, records nothing, returns
 // the context's error when it never ends, and refuses a kind other than a load
