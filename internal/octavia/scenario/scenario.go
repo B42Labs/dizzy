@@ -1,19 +1,20 @@
 // Package scenario defines the human-authored YAML scenario format for Octavia
 // (the VIP network, load balancer, listener, member, and health monitor
-// counts, the listener and member port ranges, the provider, and the seed) and
-// the deterministic generator that expands a scenario plus its seed into a
-// fully-enumerated plan. The same scenario and seed always yield a
-// byte-identical plan. Octavia gets its own scenario schema rather than sharing
-// another service's: the services share no resources, and separate schemas keep
-// yaml.UnmarshalStrict failing loudly on a typo in any of them. The schema has
-// no chaos block yet, so a scenario carrying one fails Parse like any other
-// unknown key.
+// counts, the listener and member port ranges, the provider, the seed, and the
+// optional chaos block of the churn mode) and the deterministic generator that
+// expands a scenario plus its seed into a fully-enumerated plan. The same
+// scenario and seed always yield a byte-identical plan. The chaos block
+// configures octavia chaos; generate and apply ignore it. Octavia gets its own
+// scenario schema rather than sharing another service's: the services share no
+// resources, and separate schemas keep yaml.UnmarshalStrict failing loudly on a
+// typo in any of them.
 package scenario
 
 import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v2"
 )
@@ -34,6 +35,66 @@ type Scenario struct {
 	Provider     string       `yaml:"provider"`
 	Resources    Resources    `yaml:"resources"`
 	Distribution Distribution `yaml:"distribution"`
+	// Chaos, when present, configures the random churn/soak mode (the octavia
+	// chaos subcommand). It is a pointer so an absent block stays nil and apply
+	// and generate ignore it entirely. It mirrors the other services' scenario
+	// chaos blocks, duplicated by design so a typo in any service's scenario keeps
+	// failing loudly.
+	Chaos *Chaos `yaml:"chaos,omitempty"`
+}
+
+// Chaos holds the churn-mode knobs read from a scenario's chaos block. Every
+// field has a corresponding chaos CLI flag that overrides it; an unset field
+// falls back to the command's default. Duration is intentionally not required
+// here (a flag may supply it); the merged "duration must be set" check lives in
+// the command. UpdateRatio is the load-balancer-specific knob: the per-step
+// probability that octavia chaos sets a live listener or member to
+// admin_state_up=false and back to true. It is a pointer so an omitted key
+// (nil) falls back to the command's default while an explicit update_ratio: 0
+// disables the toggle; it is the one knob where 0 reads as an on/off switch
+// rather than a degenerate value.
+//
+// BucketWidth is the width of one time bucket of a run without an end, which
+// only --duration 0 selects; zero means unset, and a bounded run ignores it.
+type Chaos struct {
+	Duration    Duration `yaml:"duration"`
+	Interval    Interval `yaml:"interval"`
+	Parallel    Parallel `yaml:"parallel"`
+	ChurnRatio  float64  `yaml:"churn_ratio"`
+	TargetFill  float64  `yaml:"target_fill"`
+	UpdateRatio *float64 `yaml:"update_ratio"`
+	BucketWidth Duration `yaml:"bucket_width"`
+}
+
+// Interval is the random delay range between scheduled churn actions.
+type Interval struct {
+	Min Duration `yaml:"min"`
+	Max Duration `yaml:"max"`
+}
+
+// Parallel bounds the fan-out of a churn tick: the actual number of actions
+// launched per tick is drawn randomly in [1, Max].
+type Parallel struct {
+	Max int `yaml:"max"`
+}
+
+// Duration is a time.Duration that decodes from a Go duration string (e.g.
+// "30m", "200ms") under strict YAML, since yaml.v2 has no native duration
+// decoding.
+type Duration time.Duration
+
+// UnmarshalYAML decodes a Go duration string into a Duration.
+func (d *Duration) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var s string
+	if err := unmarshal(&s); err != nil {
+		return err
+	}
+	parsed, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("parsing duration %q: %w", s, err)
+	}
+	*d = Duration(parsed)
+	return nil
 }
 
 // Resources holds the fixed counts of resources to create. Every listener gets
@@ -108,7 +169,7 @@ const memberAddresses = 127
 // assignment has a non-zero divisor, every load balancer gets a listener and
 // every pool a member, the listener port range holds a distinct port for every
 // listener of one load balancer, and no VIP network gets more members than its
-// upper half has addresses.
+// upper half has addresses. A chaos block, when present, is checked last.
 func (s Scenario) Validate() error {
 	if s.Name == "" {
 		return fmt.Errorf("name must not be empty")
@@ -185,6 +246,44 @@ func (s Scenario) Validate() error {
 		}
 	}
 
+	if err := s.Chaos.validate(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validate checks the chaos block for semantic consistency. A nil receiver (no
+// chaos block) is valid. Duration is not required here because a CLI flag may
+// supply it; only the values that are present must be sane.
+func (c *Chaos) validate() error {
+	if c == nil {
+		return nil
+	}
+	if c.Duration < 0 {
+		return fmt.Errorf("chaos.duration must not be negative, got %s", time.Duration(c.Duration))
+	}
+	if c.BucketWidth < 0 {
+		return fmt.Errorf("chaos.bucket_width must not be negative, got %s", time.Duration(c.BucketWidth))
+	}
+	if c.Interval.Min < 0 {
+		return fmt.Errorf("chaos.interval.min must not be negative, got %s", time.Duration(c.Interval.Min))
+	}
+	if c.Interval.Min > c.Interval.Max {
+		return fmt.Errorf("chaos.interval.min (%s) must not exceed chaos.interval.max (%s)", time.Duration(c.Interval.Min), time.Duration(c.Interval.Max))
+	}
+	if c.Parallel.Max < 0 {
+		return fmt.Errorf("chaos.parallel.max must not be negative, got %d", c.Parallel.Max)
+	}
+	if c.ChurnRatio < 0 || c.ChurnRatio > 1 {
+		return fmt.Errorf("chaos.churn_ratio must be between 0 and 1, got %v", c.ChurnRatio)
+	}
+	if c.TargetFill < 0 || c.TargetFill > 1 {
+		return fmt.Errorf("chaos.target_fill must be between 0 and 1, got %v", c.TargetFill)
+	}
+	if c.UpdateRatio != nil && (*c.UpdateRatio < 0 || *c.UpdateRatio > 1) {
+		return fmt.Errorf("chaos.update_ratio must be between 0 and 1, got %v", *c.UpdateRatio)
+	}
 	return nil
 }
 
@@ -210,7 +309,8 @@ func networkName(i int) string {
 // Set applies a single dotted-key override of the form key=value, matching the
 // documented scenario fields. It returns an error for an unknown key or a value
 // that does not parse to the field's type. Any provider string is accepted,
-// and an empty one selects the cloud's default.
+// and an empty one selects the cloud's default. The chaos block has no override
+// keys; the chaos command's flags override its values.
 func (s *Scenario) Set(key, value string) error {
 	switch key {
 	case "seed":

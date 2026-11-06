@@ -63,9 +63,9 @@ func newOctaviaGenerateCmd(opts *globalOptions) *cobra.Command {
 
 // buildOctaviaPlanFromFlags loads the Octavia scenario file, applies the --set
 // overrides and the global --seed override, and expands it into a plan. It
-// returns the scenario too, in the shape the other namespaces' builders share,
-// so a command that reads more of the scenario than the plan carries can use
-// it; generate and apply ignore it. It makes no API calls.
+// returns the scenario too, in the shape the other services' builders have: the
+// chaos command merges its chaos block into the churn config, while the
+// generate and apply commands ignore it. It makes no API calls.
 func buildOctaviaPlanFromFlags(cmd *cobra.Command, opts *globalOptions, scenarioPath string, sets []string) (octaviascenario.Scenario, *octaviaplan.Plan, error) {
 	data, err := os.ReadFile(scenarioPath)
 	if err != nil {
