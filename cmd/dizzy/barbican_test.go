@@ -115,7 +115,7 @@ func shippedBarbicanProfile(t *testing.T, name string) string {
 }
 
 // TestBarbicanHelpListsSubcommands confirms dizzy barbican --help lists the
-// six subcommands the namespace offers.
+// seven subcommands the namespace offers.
 func TestBarbicanHelpListsSubcommands(t *testing.T) {
 	root := newRootCmd()
 	var out bytes.Buffer
@@ -131,7 +131,7 @@ func TestBarbicanHelpListsSubcommands(t *testing.T) {
 			listed[fields[0]] = true
 		}
 	}
-	for _, name := range []string{"generate", "apply", "chaos", "status", "report", "cleanup"} {
+	for _, name := range []string{"generate", "apply", "chaos", "monitor", "status", "report", "cleanup"} {
 		if !listed[name] {
 			t.Errorf("barbican --help does not list %q:\n%s", name, out.String())
 		}
