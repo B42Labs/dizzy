@@ -82,9 +82,12 @@ then its only cleanup handle; a generated one is also found through its order's
 On a `barbican chaos` record the list holds the secrets and containers still
 live at the end of the run, and no orders.
 
-On an `octavia` record the list holds each VIP network followed by its subnet,
-in plan order, then the load balancers, then the listeners, pools, members, and
-health monitors, each grouped by load balancer. A member's `logical` is
+On an `octavia apply` record the list holds each VIP network followed by its
+subnet, in plan order, then the load balancers, then the listeners, pools,
+members, and health monitors, each grouped by load balancer. On an
+`octavia chaos` record it holds the networks, subnets, load balancers,
+listeners, pools, members, and health monitors still live at the end of the
+run. A member's `logical` is
 `<pool>-member-<nn>`, e.g. `pool-0001-member-01`. The record keeps no parent
 reference, so that name is how `status` finds the pool it observes the member
 through. `cleanup` deletes the recorded listeners, pools, members, and health
@@ -147,7 +150,7 @@ Present only on a run record written by `chaos`.
 |---|---|---|
 | `creates` | int | Create operations issued |
 | `deletes` | int | Delete operations issued |
-| `mutates` | int | Cinder extends, Keystone token issues, Nova server or Glance image lifecycle mutations, or Barbican payload read-backs; omitted when zero |
+| `mutates` | int | Cinder extends, Keystone token issues, Nova server or Glance image lifecycle mutations, Barbican payload read-backs, or Octavia admin-state toggles; omitted when zero |
 | `cycles` | int | Completed create→delete cycles |
 | `popMin` | int | Minimum live population over the run |
 | `popMax` | int | Maximum live population |

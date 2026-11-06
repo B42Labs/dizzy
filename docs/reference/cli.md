@@ -2,8 +2,7 @@
 
 A single binary, `dizzy`, with one command namespace per OpenStack service:
 `neutron`, `cinder`, `keystone`, `nova`, `glance`, `barbican`, and `octavia`.
-Each namespace offers the same verbs, except that `octavia` has no `chaos` and
-no `monitor`.
+Each namespace offers the same verbs, except that `octavia` has no `monitor`.
 
 | Verb | Touches the API | Purpose |
 |---|---|---|
@@ -220,8 +219,8 @@ so the live population never exceeds the scenario's counts and only planned
 resources are ever created. See [The churn engine](../explanation/churn-engine.md).
 
 Every flag can instead be set in a `chaos:` block in the scenario YAML; flags
-override the block. All twenty-one built-in profiles of the namespaces with a
-`chaos` command ship such a block, so `chaos` runs them with no extra flags.
+override the block. All twenty-four built-in profiles ship such a block, so
+`chaos` runs them with no extra flags.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -245,6 +244,7 @@ Namespace-specific:
 | `--lifecycle-ratio <float>` | `nova` | `0.3` | Probability per churn step of mutating a live server (stop/start, resize, or live-migrate); `0` disables |
 | `--lifecycle-ratio <float>` | `glance` | `0.3` | Probability per churn step of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, or metadata churn); `0` disables |
 | `--retrieve-ratio <float>` | `barbican` | `0.3` | Probability per churn step of reading back the payload of a live stored secret the plan marks for read-back and byte-comparing it; `0` disables |
+| `--update-ratio <float>` | `octavia` | `0.3` | Probability per churn step of setting a live listener or member to `admin_state_up=false` and back to `true`; `0` disables |
 | `--privilege`, `--domain`, `--roles` | `keystone` | | As for `apply` |
 
 `barbican chaos` churns stored secrets and containers and never touches the
@@ -259,6 +259,40 @@ exits non-zero. The run record's `error` names the count, e.g.
 `payload read-back mismatch (run <id>): 2 read-back(s) returned different bytes`.
 The leak check finds a secret by its `dizzy_run` metadata, so it cannot see a
 stored secret whose stamp failed.
+
+`octavia chaos` churns seven kinds of node: the VIP networks, their subnets,
+the load balancers, listeners, pools, members, and health monitors. The subnet
+and the pool are nodes of their own, so the run record lists them as an
+`apply` record does. An object is created only while its parents are live and
+deleted only once its children are gone, along the chain network, subnet, load
+balancer, listener, pool, and then the members and health monitors of a pool.
+Operations on one load balancer and its objects run one at a time, because
+Octavia answers a write to a load balancer that is not ACTIVE with HTTP 409;
+different load balancers proceed in parallel. Every create in a load
+balancer's family, every delete of a listener, pool, member, or health
+monitor, and every admin-state toggle waits until the load balancer is ACTIVE
+again, and a load balancer delete waits until the load balancer is gone. A
+load balancer that reaches ERROR fails that operation as `provisioning_error`,
+and the churn goes on. During the churn each delete removes a single object,
+without cascade. When a child whose own delete failed is still attached,
+Octavia refuses the delete of its load balancer with HTTP 400; the run keeps
+that load balancer in the record and deletes it again before its next create.
+Only the teardown cascades, as `octavia cleanup` does.
+
+With probability `--update-ratio` per churn step, the command sets a live
+listener or member to `admin_state_up=false`, waits until the load balancer is
+ACTIVE again, sets the object back to `true`, and waits again. Each listener
+or member is toggled at most once per lifetime. A disable that fails sends no
+re-enable, and a re-enable that fails leaves the object disabled until its
+node's next delete. A provider that refuses the change answers HTTP 501, which
+records one failed `update` as `http_other`. Before it creates anything, the
+command runs the quota pre-check of `octavia apply` against the whole plan,
+since the churn populates every kind the plan holds; an abort there writes no
+run record. The leak check lists the run's load balancers, subnets, and
+networks by tag; listeners, pools, members, and health monitors cannot outlive
+the cascade of their load balancer. Run an amphora provider with
+`--timeout 5m`, as for `apply`: every time the churn creates a load balancer
+again, the provider boots a new amphora VM.
 
 By default a churn run tears its resources down at the end **or when
 interrupted**, then runs a leak check. `--no-cleanup` is the single opt-out,

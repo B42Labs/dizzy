@@ -22,7 +22,8 @@ Every service namespace but `dizzy octavia` offers the same five verbs —
 `report`. A scenario expands deterministically into a plan; applying that plan
 produces a run record you can re-query, report on, and tear down by tag.
 `dizzy mix` offers `generate`, `chaos`, `status`, `report` and `cleanup`.
-`dizzy octavia` offers `generate`, `apply`, `status`, `report` and `cleanup`.
+`dizzy octavia` offers `generate`, `apply`, `chaos`, `status`, `report` and
+`cleanup`.
 
 `dizzy keystone` additionally offers `pressure`, a closed-loop load on
 Keystone's token validation, revocation and role-listing path for a lab cloud.
