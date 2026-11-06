@@ -2,7 +2,7 @@
 
 A single binary, `dizzy`, with one command namespace per OpenStack service:
 `neutron`, `cinder`, `keystone`, `nova`, `glance`, `barbican`, and `octavia`.
-Each namespace offers the same verbs, except that `octavia` has no `monitor`.
+Each namespace offers the same verbs.
 
 | Verb | Touches the API | Purpose |
 |---|---|---|
@@ -802,12 +802,12 @@ across iterations. To broaden coverage, run several monitors with different
 `--seed` values.
 
 > **Do not run `monitor` concurrently with another `dizzy` run in the same
-> project.** For `neutron`, `cinder`, `nova`, `glance`, and `barbican` the
-> pre-flight sweep is always on and reclaims any tester-created resource in the
-> project, so it would tear a concurrent run down mid-flight. For `keystone` the
-> equivalent sweep is opt-in via `--reclaim-orphans`, and because an admin token
-> lists cloud-wide it is only safe when no other `dizzy` process targets the
-> cloud at all.
+> project.** For `neutron`, `cinder`, `nova`, `glance`, `barbican`, and
+> `octavia` the pre-flight sweep is always on and reclaims any tester-created
+> resource in the project, so it would tear a concurrent run down mid-flight.
+> For `keystone` the equivalent sweep is opt-in via `--reclaim-orphans`, and
+> because an admin token lists cloud-wide it is only safe when no other `dizzy`
+> process targets the cloud at all.
 
 `barbican monitor` runs the quota pre-check once at startup, where an
 oversized plan exits before the first iteration, and again in each
@@ -816,6 +816,25 @@ containers and orders by name, and a secret only when its `dizzy_type=secret`
 metadata confirms it or a swept order generated it. A read-back mismatch fails
 its iteration while the loop goes on, so the command exits 0 and the mismatch
 shows as a failed iteration and as `error.kind=mismatch`.
+
+`octavia monitor` needs a project-scoped credential: when the auth result
+names no project, it exits before the first iteration, because its sweep never
+lists beyond the token's project. Octavia and Neutron list every project's
+objects for an administrator, so the sweep sends `project_id` with each listing
+and checks each answer's project again. It runs the quota pre-check once at
+startup and again in each iteration's apply, as `barbican monitor` does. The
+sweep takes every load balancer tagged `dizzy:type=loadbalancer` in the project
+with cascade, waits until it is gone, then takes the subnets and networks
+tagged `dizzy:type=subnet` and `dizzy:type=network`, which Neutron and Nova
+runs carry too. A load balancer that a killed iteration left in
+`PENDING_CREATE` answers its delete with HTTP 409 until it settles. The sweep
+sends the delete again every 2s and takes the load balancer once Octavia
+accepts it, which delays the iteration. Only a load balancer still in a
+`PENDING_*` status at `--timeout` fails the iteration, and the next sweep takes
+it. A network that still holds a port, a Neutron run's router interface for
+example, fails every sweep until that run is cleaned up through its own
+namespace. An amphora load balancer takes one to two minutes to build, so run
+an amphora provider with `--timeout 5m`.
 
 **On interrupt.** SIGINT/SIGTERM stops the loop, tears the current iteration
 down on a context that survives the signal, flushes the metrics exporter, and

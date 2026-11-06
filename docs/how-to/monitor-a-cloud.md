@@ -5,9 +5,9 @@
 regressions, and error-rate changes become visible as trends instead of being
 buried in per-run JSON files.
 
-Available in every service namespace but `octavia`: `neutron monitor`,
-`cinder monitor`, `keystone monitor`, `nova monitor`, `glance monitor`, and
-`barbican monitor`.
+Available in every service namespace: `neutron monitor`, `cinder monitor`,
+`keystone monitor`, `nova monitor`, `glance monitor`, `barbican monitor`, and
+`octavia monitor`.
 
 > **One `dizzy` per project.** The pre-flight sweep reclaims any `dizzy`-tagged
 > resource it finds, so a concurrent `apply` or `chaos` in the same project would
@@ -138,6 +138,46 @@ failed is never swept: its own iteration deletes it, and only an iteration
 whose cleanup does not finish (a cleanup that stops on an error, or a hard
 abort) leaves one behind. Pass `--keep-run-records` if you want
 `barbican cleanup --run` to reach it; otherwise delete it by hand.
+
+## Monitor Octavia
+
+Same cadence, fixed-seed, and shutdown semantics:
+
+```console
+$ dizzy octavia monitor --scenario scenarios/octavia/small.yaml --otel
+```
+
+In Octavia a degraded provider shows in time-to-ready, not in API latency, so
+watch `dizzy.resource.time_to_ready` with `kind=loadbalancer`: it is the time
+from a load balancer's create until it is first `ACTIVE`, the provider's build
+time. The listener, pool, member, and health monitor writes record their wait
+for `ACTIVE` under their own kinds. An amphora load balancer boots a VM and
+takes one to two minutes to build, longer than the default `--timeout` of `1m`,
+so run an amphora provider with a longer one:
+
+```console
+$ dizzy octavia monitor --scenario scenarios/octavia/small.yaml --set provider=amphora --timeout 5m --otel
+```
+
+Every iteration boots one amphora VM per load balancer, two in an
+`ACTIVE_STANDBY` topology, so the `small` profile's two load balancers boot two
+to four VMs per iteration. Set an `--interval` if that is more than the cloud
+should carry back-to-back.
+
+`octavia monitor` needs a project-scoped credential. Octavia and Neutron list
+every project's objects for an administrator, so the sweep lists only within
+the project of the token, and the monitor exits before its first iteration when
+the auth result names no project. It pre-checks the Octavia quotas once at
+startup and again at the start of every iteration's apply, as
+`barbican monitor` does.
+
+The sweep is always on. It takes every load balancer tagged
+`dizzy:type=loadbalancer` in the project with cascade, then every subnet and
+network tagged `dizzy:type=subnet` or `dizzy:type=network`, those a Neutron or
+Nova run left included. A network that still holds a port, a Neutron run's
+router interface for example, fails every sweep at `--timeout` until you clean
+that run up with its own namespace's `cleanup --run-id <id>`; the id is the
+second field of the network's `dizzy-<id>-<logical>` name.
 
 ## Via the Makefile
 

@@ -256,8 +256,9 @@ churns.
 
 `service` is a bespoke attribute, deliberately distinct from the semantic
 `service.name`. It keeps the iteration-level series — which carry no `kind` — 
-apart when a Neutron, a Cinder, a Keystone, a Nova, a Glance, and a Barbican
-monitor feed the same backend. It mirrors the run record's `service` field.
+apart when a Neutron, a Cinder, a Keystone, a Nova, a Glance, a Barbican, and
+an Octavia monitor feed the same backend. It mirrors the run record's `service`
+field.
 
 ### Instruments
 
