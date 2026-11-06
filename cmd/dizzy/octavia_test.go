@@ -94,18 +94,15 @@ func octaviaHelpListing(t *testing.T) (map[string]bool, string) {
 	return listed, out.String()
 }
 
-// TestOctaviaHelpListsVerbs confirms dizzy octavia --help lists generate,
-// apply, chaos, status, report, and cleanup, and not monitor, which the
-// namespace does not offer yet.
+// TestOctaviaHelpListsVerbs confirms dizzy octavia --help lists the seven
+// verbs the namespace offers: generate, apply, chaos, monitor, status, report,
+// and cleanup.
 func TestOctaviaHelpListsVerbs(t *testing.T) {
 	listed, out := octaviaHelpListing(t)
-	for _, name := range []string{"generate", "apply", "chaos", "status", "report", "cleanup"} {
+	for _, name := range []string{"generate", "apply", "chaos", "monitor", "status", "report", "cleanup"} {
 		if !listed[name] {
 			t.Errorf("octavia --help does not list %q:\n%s", name, out)
 		}
-	}
-	if listed["monitor"] {
-		t.Errorf("octavia --help lists %q, which the namespace does not offer:\n%s", "monitor", out)
 	}
 }
 
@@ -676,9 +673,10 @@ type octaviaReply struct {
 }
 
 // fakeOctaviaCloud is a Keystone, Octavia, and Neutron in one httptest server.
-// Its token is scoped to the project proj-oct, and its catalog points the
-// load-balancer service at /load-balancer/, without a version as Octavia's
-// catalog URL carries none, so the fake answers Octavia's version document and
+// Its token is scoped to the project proj-oct, or to the scope
+// newFakeOctaviaCloudInProject picks, and its catalog points the load-balancer
+// service at /load-balancer/, without a version as Octavia's catalog URL
+// carries none, so the fake answers Octavia's version document and
 // the load-balancer client appends v2.0/ to it. The network endpoint
 // /network/v2.0/ carries its major version, so the client skips discovery, and
 // Neutron's client appends v2.0/ once more. Every other request is answered
@@ -691,9 +689,21 @@ type fakeOctaviaCloud struct {
 
 // newFakeOctaviaCloud starts a fake Octavia cloud answering from replies and
 // points clouds.yaml discovery at it under the cloud name "oct", with OS_CLOUD
-// unset.
+// unset. Its token is scoped to the project proj-oct.
 func newFakeOctaviaCloud(t *testing.T, replies map[string]octaviaReply) *fakeOctaviaCloud {
 	t.Helper()
+	return newFakeOctaviaCloudInProject(t, "proj-oct", replies)
+}
+
+// newFakeOctaviaCloudInProject is newFakeOctaviaCloud with a token scoped to
+// projectID. An empty projectID issues a domain-scoped token, one that carries
+// "domain":{"id":"default"} and no project.
+func newFakeOctaviaCloudInProject(t *testing.T, projectID string, replies map[string]octaviaReply) *fakeOctaviaCloud {
+	t.Helper()
+	scope := fmt.Sprintf(`"project":{"id":%q}`, projectID)
+	if projectID == "" {
+		scope = `"domain":{"id":"default"}`
+	}
 	fc := &fakeOctaviaCloud{}
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -712,7 +722,7 @@ func newFakeOctaviaCloud(t *testing.T, replies map[string]octaviaReply) *fakeOct
 			w.Header().Set("X-Subject-Token", "tok")
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
-			_, _ = fmt.Fprintf(w, `{"token":{"expires_at":"2030-01-01T00:00:00Z","project":{"id":"proj-oct"},"catalog":%s}}`, catalog)
+			_, _ = fmt.Fprintf(w, `{"token":{"expires_at":"2030-01-01T00:00:00Z",%s,"catalog":%s}}`, scope, catalog)
 			return
 		}
 		// Octavia answers its unversioned root with 200 and a flat list of its v2
