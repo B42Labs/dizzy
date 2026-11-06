@@ -94,20 +94,18 @@ func octaviaHelpListing(t *testing.T) (map[string]bool, string) {
 	return listed, out.String()
 }
 
-// TestOctaviaHelpListsSingleShotVerbsOnly confirms dizzy octavia --help lists
-// generate, apply, status, report, and cleanup, and neither chaos nor monitor,
-// which the namespace does not offer yet.
-func TestOctaviaHelpListsSingleShotVerbsOnly(t *testing.T) {
+// TestOctaviaHelpListsVerbs confirms dizzy octavia --help lists generate,
+// apply, chaos, status, report, and cleanup, and not monitor, which the
+// namespace does not offer yet.
+func TestOctaviaHelpListsVerbs(t *testing.T) {
 	listed, out := octaviaHelpListing(t)
-	for _, name := range []string{"generate", "apply", "status", "report", "cleanup"} {
+	for _, name := range []string{"generate", "apply", "chaos", "status", "report", "cleanup"} {
 		if !listed[name] {
 			t.Errorf("octavia --help does not list %q:\n%s", name, out)
 		}
 	}
-	for _, name := range []string{"chaos", "monitor"} {
-		if listed[name] {
-			t.Errorf("octavia --help lists %q, which the namespace does not offer:\n%s", name, out)
-		}
+	if listed["monitor"] {
+		t.Errorf("octavia --help lists %q, which the namespace does not offer:\n%s", "monitor", out)
 	}
 }
 
