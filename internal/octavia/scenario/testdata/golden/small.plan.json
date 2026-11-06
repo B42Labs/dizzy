@@ -1,0 +1,121 @@
+{
+  "scenario": "small",
+  "seed": 42,
+  "networks": [
+    {
+      "name": "net-0001",
+      "subnet": "sub-0001",
+      "cidr": "10.0.1.0/24"
+    }
+  ],
+  "loadBalancers": [
+    {
+      "name": "lb-0001",
+      "network": "net-0001"
+    },
+    {
+      "name": "lb-0002",
+      "network": "net-0001"
+    }
+  ],
+  "listeners": [
+    {
+      "name": "lsn-0001",
+      "loadBalancer": "lb-0001",
+      "port": 27825
+    },
+    {
+      "name": "lsn-0002",
+      "loadBalancer": "lb-0002",
+      "port": 3147
+    },
+    {
+      "name": "lsn-0003",
+      "loadBalancer": "lb-0001",
+      "port": 10884
+    },
+    {
+      "name": "lsn-0004",
+      "loadBalancer": "lb-0002",
+      "port": 12862
+    }
+  ],
+  "pools": [
+    {
+      "name": "pool-0001",
+      "listener": "lsn-0001"
+    },
+    {
+      "name": "pool-0002",
+      "listener": "lsn-0002"
+    },
+    {
+      "name": "pool-0003",
+      "listener": "lsn-0003"
+    },
+    {
+      "name": "pool-0004",
+      "listener": "lsn-0004"
+    }
+  ],
+  "members": [
+    {
+      "name": "pool-0001-member-01",
+      "pool": "pool-0001",
+      "address": "10.0.1.128",
+      "port": 41951
+    },
+    {
+      "name": "pool-0002-member-01",
+      "pool": "pool-0002",
+      "address": "10.0.1.129",
+      "port": 51809
+    },
+    {
+      "name": "pool-0003-member-01",
+      "pool": "pool-0003",
+      "address": "10.0.1.130",
+      "port": 11173
+    },
+    {
+      "name": "pool-0004-member-01",
+      "pool": "pool-0004",
+      "address": "10.0.1.131",
+      "port": 32136
+    },
+    {
+      "name": "pool-0001-member-02",
+      "pool": "pool-0001",
+      "address": "10.0.1.132",
+      "port": 55152
+    },
+    {
+      "name": "pool-0002-member-02",
+      "pool": "pool-0002",
+      "address": "10.0.1.133",
+      "port": 43475
+    },
+    {
+      "name": "pool-0003-member-02",
+      "pool": "pool-0003",
+      "address": "10.0.1.134",
+      "port": 47609
+    },
+    {
+      "name": "pool-0004-member-02",
+      "pool": "pool-0004",
+      "address": "10.0.1.135",
+      "port": 56943
+    }
+  ],
+  "healthMonitors": [
+    {
+      "name": "hm-0001",
+      "pool": "pool-0002"
+    },
+    {
+      "name": "hm-0002",
+      "pool": "pool-0004"
+    }
+  ]
+}
