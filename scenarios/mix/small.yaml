@@ -7,7 +7,7 @@ seed: 42                        # deterministic; same seed => same plan
 image: cirros
 flavor: m1.tiny
 
-services: []                    # opt-in services bound to every persona; this build supports none
+services: []                    # opt-in services: octavia gives the gardener persona load balancers
 
 resources:
   servers: 6                    # the server envelope the personas divide by their shares
@@ -29,6 +29,11 @@ personas:
     policy: soft-anti-affinity                # or anti-affinity, which needs a compute host per worker of a cluster
     volume_gib:         { min: 1, max: 2 }    # size drawn for the one data volume of each worker
     interval:           { min: 10s, max: 1m } # random delay drawn per tick of the persona's engine
+    octavia:                                  # read only with services: [octavia]
+      provider: ""                            # "" uses the cloud's default; ovn or amphora (needs --timeout 5m)
+      loadbalancers: 1                        # per cluster, VIP on the cluster's network
+      listeners: 2                            # per load balancer: ports 80 and 443, each with a pool of every worker
+      health_monitors: true                   # a TCP health monitor on every pool
   legacy:                                     # long-lived servers changed in place until teardown
     share: 0.2                                # share of resources.servers
     cloud: ""                                 # clouds.yaml entry of the persona's project; "" uses --os-cloud

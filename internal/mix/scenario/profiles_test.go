@@ -140,6 +140,7 @@ func TestProfilesMatchDocumentedSizes(t *testing.T) {
 					Min: novascenario.Duration(10 * time.Second),
 					Max: novascenario.Duration(time.Minute),
 				},
+				Octavia: profileOctavia(),
 			}
 			if s.Personas.Gardener != wantGardener {
 				t.Errorf("personas.gardener = %+v, want %+v", s.Personas.Gardener, wantGardener)
@@ -181,6 +182,48 @@ func TestProfilesSplitServers(t *testing.T) {
 			}
 			if got != split[name] {
 				t.Errorf("ci/gardener/legacy servers = %v, want %v", got, split[name])
+			}
+		})
+	}
+}
+
+// TestProfilesOctavia confirms every shipped profile carries the documented
+// octavia block without opting in, so its plan has no frontend, and that
+// --set services=octavia gives the gardener persona the documented counts of
+// load balancers, listeners, pools, members and health monitors.
+func TestProfilesOctavia(t *testing.T) {
+	counts := map[string][5]int{"small": {1, 2, 2, 4, 2}, "medium": {2, 4, 4, 12, 4}, "large": {3, 6, 6, 36, 6}}
+	for _, name := range profileNames {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			s := readProfile(t, name)
+			if got := s.Personas.Gardener.Octavia; got != profileOctavia() {
+				t.Errorf("personas.gardener.octavia = %+v, want %+v", got, profileOctavia())
+			}
+			p, err := s.Generate(LaneScenarios{})
+			if err != nil {
+				t.Fatalf("Generate() = %v, want nil", err)
+			}
+			for _, ps := range p.Personas {
+				if ps.Octavia != nil {
+					t.Errorf("persona %s has a frontend without the opt-in", ps.Name)
+				}
+			}
+
+			if err := s.Set("services", "octavia"); err != nil {
+				t.Fatalf("Set: %v", err)
+			}
+			p, err = s.Generate(LaneScenarios{})
+			if err != nil {
+				t.Fatalf("Generate() with services=octavia = %v, want nil", err)
+			}
+			f := gardenerOf(t, p).Octavia
+			if f == nil {
+				t.Fatal("gardener persona has no frontend with services=octavia")
+			}
+			got := [5]int{len(f.LoadBalancers), len(f.Listeners), len(f.Pools), len(f.Members), len(f.HealthMonitors)}
+			if got != counts[name] {
+				t.Errorf("load balancers/listeners/pools/members/health monitors = %v, want %v", got, counts[name])
 			}
 		})
 	}

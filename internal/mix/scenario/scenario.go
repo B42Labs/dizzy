@@ -13,12 +13,14 @@ package scenario
 import (
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v2"
 
+	mixplan "github.com/B42Labs/dizzy/internal/mix/plan"
 	novascenario "github.com/B42Labs/dizzy/internal/nova/scenario"
 )
 
@@ -79,7 +81,8 @@ type CI struct {
 // "soft-anti-affinity". VolumeGiB is the size range of the data volumes.
 // Interval configures the persona's churn engine; a zero bound falls back to
 // the command's default. The persona keeps its clusters whole, so it has no
-// churn ratio or target fill.
+// churn ratio or target fill. Octavia shapes the load balancers every cluster
+// keeps in front of its workers; it is read only when services lists octavia.
 type Gardener struct {
 	Share     float64               `yaml:"share"`
 	Cloud     string                `yaml:"cloud"`
@@ -87,6 +90,21 @@ type Gardener struct {
 	Policy    string                `yaml:"policy"`
 	VolumeGiB novascenario.Range    `yaml:"volume_gib"`
 	Interval  novascenario.Interval `yaml:"interval"`
+	Octavia   GardenerOctavia       `yaml:"octavia"`
+}
+
+// GardenerOctavia is the Octavia shape of every Gardener cluster, as the
+// OpenStack cloud controller manager keeps it for Services of type
+// LoadBalancer: LoadBalancers load balancers with their VIP on the cluster's
+// network, Listeners TCP listeners on each, each listener with a default pool
+// that holds every worker of the cluster, and, with HealthMonitors, one TCP
+// health monitor per pool. Provider names the Octavia provider driver of every
+// load balancer.
+type GardenerOctavia struct {
+	Provider       string `yaml:"provider"`        // "" selects the cloud's default provider
+	LoadBalancers  int    `yaml:"loadbalancers"`   // per cluster
+	Listeners      int    `yaml:"listeners"`       // per load balancer, each with its default pool
+	HealthMonitors bool   `yaml:"health_monitors"` // one TCP health monitor per pool
 }
 
 // Legacy is the Legacy persona: long-lived servers on one network each that
@@ -191,10 +209,11 @@ func Parse(data []byte) (Scenario, error) {
 }
 
 // Validate checks the scenario for semantic consistency, returning an
-// actionable error that names the offending field. It checks every enabled
-// lane, in canonical order. It then runs the persona-specific checks of every
-// persona with a share above 0, builds its compute scenario and validates it
-// too.
+// actionable error that names the offending field. With octavia in services
+// the gardener persona needs a share above 0, since octavia binds to it alone.
+// It checks every enabled lane, in canonical order. It then runs the
+// persona-specific checks of every persona with a share above 0, builds its
+// compute scenario and validates it too.
 func (s Scenario) Validate() error {
 	if s.Name == "" {
 		return fmt.Errorf("name must not be empty")
@@ -257,6 +276,9 @@ func (s Scenario) Validate() error {
 		}
 		seen[name] = true
 	}
+	if slices.Contains(s.Services, mixplan.ServiceOctavia) && s.Personas.Gardener.Share == 0 {
+		return fmt.Errorf("opt-in service %q gives the gardener persona load balancers, but personas.gardener.share is 0", mixplan.ServiceOctavia)
+	}
 
 	if err := s.Lanes.validate(); err != nil {
 		return err
@@ -294,9 +316,9 @@ func validateInterval(key string, iv novascenario.Interval) error {
 // Set applies a single dotted-key override of the form key=value, matching the
 // documented scenario fields. services takes a comma-separated list, and the
 // empty string clears it; the interval bounds take Go duration strings, and
-// lanes.<name>.enabled and personas.legacy.cold_migration a boolean. It
-// returns an error for an unknown key or a value that does not parse to the
-// field's type.
+// lanes.<name>.enabled, personas.legacy.cold_migration and
+// personas.gardener.octavia.health_monitors a boolean. It returns an error for
+// an unknown key or a value that does not parse to the field's type.
 func (s *Scenario) Set(key, value string) error {
 	ci, gardener, legacy := &s.Personas.CI, &s.Personas.Gardener, &s.Personas.Legacy
 	switch key {
@@ -360,6 +382,15 @@ func (s *Scenario) Set(key, value string) error {
 		return setDuration(&gardener.Interval.Min, key, value)
 	case "personas.gardener.interval.max":
 		return setDuration(&gardener.Interval.Max, key, value)
+	case "personas.gardener.octavia.provider":
+		gardener.Octavia.Provider = value
+		return nil
+	case "personas.gardener.octavia.loadbalancers":
+		return setInt(&gardener.Octavia.LoadBalancers, key, value)
+	case "personas.gardener.octavia.listeners":
+		return setInt(&gardener.Octavia.Listeners, key, value)
+	case "personas.gardener.octavia.health_monitors":
+		return setBool(&gardener.Octavia.HealthMonitors, key, value)
 	case "personas.legacy.share":
 		return setFloat(&legacy.Share, key, value)
 	case "personas.legacy.cloud":

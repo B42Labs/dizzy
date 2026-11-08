@@ -129,8 +129,8 @@ func TestMixGenerateErrors(t *testing.T) {
 		{"unknown set key", []string{"mix", "generate", "--scenario", valid, "--set", "personas.ci.nope=1"}, `unknown override key "personas.ci.nope"`, false},
 		{"cold migration not a boolean", []string{"mix", "generate", "--scenario", valid, "--set", "personas.legacy.cold_migration=maybe"},
 			`override personas.legacy.cold_migration: "maybe" is not a boolean`, false},
-		{"unsupported service", []string{"mix", "generate", "--scenario", valid, "--set", "services=octavia"},
-			`opt-in service "octavia" is not supported by this build of dizzy (supported: none)`, false},
+		{"unsupported service", []string{"mix", "generate", "--scenario", valid, "--set", "services=barbican"},
+			`opt-in service "barbican" is not supported by this build of dizzy (supported: none)`, false},
 		{"no server to divide", []string{"mix", "generate", "--scenario", valid, "--set", "resources.servers=0"},
 			"generated plan failed validation: plan has no persona with at least one server", false},
 	}
@@ -320,8 +320,8 @@ func TestMixStatusErrors(t *testing.T) {
 		{"missing --run", nil, `required flag(s) "run" not set`, false},
 		{"missing record", []string{"--run", filepath.Join(t.TempDir(), "missing.json")}, "reading run record:", true},
 		{"nova record", []string{"--run", novaRec}, `run record is for service "nova", not "mix"`, false},
-		{"unsupported service", []string{"--run", writeMixRecord(t, "octavia")},
-			`opt-in service "octavia" is not supported by this build of dizzy (supported: none)`, false},
+		{"unsupported service", []string{"--run", writeMixRecord(t, "barbican")},
+			`opt-in service "barbican" is not supported by this build of dizzy (supported: none)`, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -451,10 +451,10 @@ func TestMixCleanupFlagErrors(t *testing.T) {
 		{"--run-id without --scenario", []string{"--run-id", "x"}, "--run-id needs --scenario to name the personas and their clouds"},
 		{"--run with --scenario", []string{"--run", "run-x.json", "--scenario", scenario}, "--scenario is only used with --run-id"},
 		{"nova record", []string{"--run", writeNovaRecord(t)}, `run record is for service "nova", not "mix"`},
-		{"unsupported service", []string{"--run", writeMixRecord(t, "octavia")},
-			`opt-in service "octavia" is not supported by this build of dizzy (supported: none)`},
-		{"unsupported service by run id", []string{"--run-id", "x", "--scenario", scenario, "--set", "services=octavia"},
-			`opt-in service "octavia" is not supported by this build of dizzy (supported: none)`},
+		{"unsupported service", []string{"--run", writeMixRecord(t, "barbican")},
+			`opt-in service "barbican" is not supported by this build of dizzy (supported: none)`},
+		{"unsupported service by run id", []string{"--run-id", "x", "--scenario", scenario, "--set", "services=barbican"},
+			`opt-in service "barbican" is not supported by this build of dizzy (supported: none)`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
