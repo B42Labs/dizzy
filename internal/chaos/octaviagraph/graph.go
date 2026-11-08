@@ -26,6 +26,15 @@
 // load balancer and recording its time-to-ready under the toggled kind. It
 // leaves the population untouched. Keeping the Octavia coupling here leaves the
 // chaos engine free of any service-specific import.
+//
+// BuildFrontend maps the Octavia frontend of the mix Gardener persona onto
+// nodes that join that persona's rolling graph instead of forming one of their
+// own: its load balancers sit on a cluster network of that graph and its
+// members stand for the cluster's workers, so it builds no network or subnet
+// node, and a create reads the subnet or server address it needs from Neutron.
+// Its load balancers, listeners, pools, and health monitors are pinned and
+// never mutated, and each member carries its worker's rolling set, so a roll
+// deletes a worker's members before the worker and creates them again after it.
 package octaviagraph
 
 import (
