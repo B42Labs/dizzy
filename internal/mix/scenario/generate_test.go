@@ -16,6 +16,7 @@ import (
 	mixplan "github.com/B42Labs/dizzy/internal/mix/plan"
 	novaplan "github.com/B42Labs/dizzy/internal/nova/plan"
 	novascenario "github.com/B42Labs/dizzy/internal/nova/scenario"
+	octaviaplan "github.com/B42Labs/dizzy/internal/octavia/plan"
 )
 
 var update = flag.Bool("update", false, "update golden files")
@@ -77,7 +78,8 @@ func legacyBlock() Legacy {
 	}
 }
 
-// gardenerBlock is the gardener block of the shipped small profile.
+// gardenerBlock is the gardener block of the shipped small profile, with its
+// octavia block, which only services: [octavia] reads.
 func gardenerBlock() Gardener {
 	return Gardener{
 		Share:     0.3,
@@ -88,7 +90,15 @@ func gardenerBlock() Gardener {
 			Min: novascenario.Duration(10 * time.Second),
 			Max: novascenario.Duration(time.Minute),
 		},
+		Octavia: profileOctavia(),
 	}
+}
+
+// profileOctavia is the octavia block every shipped profile carries: the
+// cloud's default provider, one load balancer per cluster with two listeners,
+// and a health monitor on every pool.
+func profileOctavia() GardenerOctavia {
+	return GardenerOctavia{LoadBalancers: 1, Listeners: 2, HealthMonitors: true}
 }
 
 // marshal encodes v as the indented JSON mix generate writes.
@@ -641,6 +651,238 @@ func TestGenerateGardenerOnly(t *testing.T) {
 	}
 	if len(p.Personas) != 1 || p.Personas[0].Name != "gardener" || p.Personas[0].Servers != 6 || !p.Personas[0].Rolling {
 		t.Errorf("personas = %+v, want gardener alone, rolling, with 6 servers", p.Personas)
+	}
+}
+
+// octaviaScenario returns the small fixture with octavia opted in.
+func octaviaScenario() Scenario {
+	s := smallScenario()
+	s.Services = []string{"octavia"}
+	return s
+}
+
+// gardenerOf returns the gardener persona of p, failing the test without one.
+func gardenerOf(t *testing.T, p *mixplan.Plan) mixplan.Persona {
+	t.Helper()
+	for _, ps := range p.Personas {
+		if ps.Name == "gardener" {
+			return ps
+		}
+	}
+	t.Fatalf("personas = %+v, want a gardener persona", p.Personas)
+	return mixplan.Persona{}
+}
+
+// TestGenerateGardenerFrontendSmall confirms the small fixture with octavia
+// opted in gives its one cluster one load balancer on the cluster's network
+// with listeners on 80 and 443, a pool of both workers behind each on one
+// NodePort per pool, and a health monitor per pool, and that the CI and
+// Legacy personas get no frontend.
+func TestGenerateGardenerFrontendSmall(t *testing.T) {
+	p, err := octaviaScenario().Generate(LaneScenarios{})
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	if !reflect.DeepEqual(p.Services, []string{"octavia"}) {
+		t.Errorf("services = %v, want [octavia]", p.Services)
+	}
+	want := &octaviaplan.Frontend{
+		LoadBalancers: []octaviaplan.LoadBalancer{{Name: "lb-0001", Network: "net-0001"}},
+		Listeners: []octaviaplan.Listener{
+			{Name: "lsn-0001", LoadBalancer: "lb-0001", Port: 80},
+			{Name: "lsn-0002", LoadBalancer: "lb-0001", Port: 443},
+		},
+		Pools: []octaviaplan.Pool{{Name: "pool-0001", Listener: "lsn-0001"}, {Name: "pool-0002", Listener: "lsn-0002"}},
+		Members: []octaviaplan.ServerMember{
+			{Name: "pool-0001-member-01", Pool: "pool-0001", Server: "srv-0001", Port: 30000},
+			{Name: "pool-0001-member-02", Pool: "pool-0001", Server: "srv-0002", Port: 30000},
+			{Name: "pool-0002-member-01", Pool: "pool-0002", Server: "srv-0001", Port: 30001},
+			{Name: "pool-0002-member-02", Pool: "pool-0002", Server: "srv-0002", Port: 30001},
+		},
+		HealthMonitors: []octaviaplan.HealthMonitor{{Name: "hm-0001", Pool: "pool-0001"}, {Name: "hm-0002", Pool: "pool-0002"}},
+	}
+	g := gardenerOf(t, p)
+	if !reflect.DeepEqual(g.Octavia, want) {
+		t.Errorf("gardener frontend = %+v, want %+v", g.Octavia, want)
+	}
+	if workers := []string{g.Nova.Servers[0].Name, g.Nova.Servers[1].Name}; len(g.Nova.Servers) != 2 || !reflect.DeepEqual(workers, []string{"srv-0001", "srv-0002"}) {
+		t.Errorf("gardener workers = %+v, want srv-0001 and srv-0002", g.Nova.Servers)
+	}
+	for _, ps := range p.Personas {
+		if ps.Name == "gardener" {
+			continue
+		}
+		if ps.Octavia != nil || bytes.Contains(marshal(t, ps), []byte(`"octavia"`)) {
+			t.Errorf("persona %s has an octavia frontend: %s", ps.Name, marshal(t, ps))
+		}
+	}
+}
+
+// TestGenerateGardenerFrontendClusters confirms a frontend over several
+// clusters: two load balancers per cluster on its network, three listeners
+// each on 80, 443 and 8080, and every pool holding exactly the workers of its
+// load balancer's cluster, in plan order, on a NodePort of its own.
+func TestGenerateGardenerFrontendClusters(t *testing.T) {
+	s := octaviaScenario()
+	s.Resources.Servers = 7
+	s.Personas.CI.Share, s.Personas.Legacy.Share = 0, 0
+	s.Personas.Gardener.Clusters = 3
+	s.Personas.Gardener.Octavia.LoadBalancers = 2
+	s.Personas.Gardener.Octavia.Listeners = 3
+	p, err := s.Generate(LaneScenarios{})
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	g := gardenerOf(t, p)
+	f := g.Octavia
+	if f == nil {
+		t.Fatal("gardener persona has no frontend")
+	}
+	if len(f.LoadBalancers) != 6 || len(f.Listeners) != 18 || len(f.Pools) != 18 || len(f.HealthMonitors) != 18 {
+		t.Fatalf("frontend has %d load balancers, %d listeners, %d pools and %d health monitors, want 6, 18, 18 and 18",
+			len(f.LoadBalancers), len(f.Listeners), len(f.Pools), len(f.HealthMonitors))
+	}
+
+	lbNetwork := map[string]string{}
+	for _, lb := range f.LoadBalancers {
+		lbNetwork[lb.Name] = lb.Network
+	}
+	wantNetworks := map[string]string{
+		"lb-0001": "net-0001", "lb-0002": "net-0001",
+		"lb-0003": "net-0002", "lb-0004": "net-0002",
+		"lb-0005": "net-0003", "lb-0006": "net-0003",
+	}
+	if !reflect.DeepEqual(lbNetwork, wantNetworks) {
+		t.Errorf("load balancer networks = %v, want %v", lbNetwork, wantNetworks)
+	}
+
+	listenerLB := map[string]string{}
+	lbPorts := map[string][]int{}
+	for _, l := range f.Listeners {
+		listenerLB[l.Name] = l.LoadBalancer
+		lbPorts[l.LoadBalancer] = append(lbPorts[l.LoadBalancer], l.Port)
+	}
+	for lb, ports := range lbPorts {
+		if !reflect.DeepEqual(ports, []int{80, 443, 8080}) {
+			t.Errorf("load balancer %s listens on %v, want [80 443 8080]", lb, ports)
+		}
+	}
+
+	workers := map[string][]string{} // network to its cluster's workers, in plan order
+	for _, srv := range g.Nova.Servers {
+		workers[srv.Networks[0]] = append(workers[srv.Networks[0]], srv.Name)
+	}
+	if got := map[string]int{"net-0001": len(workers["net-0001"]), "net-0002": len(workers["net-0002"]), "net-0003": len(workers["net-0003"])}; !reflect.DeepEqual(got, map[string]int{"net-0001": 3, "net-0002": 2, "net-0003": 2}) {
+		t.Fatalf("cluster sizes = %v, want 3, 2 and 2", got)
+	}
+
+	poolServers := map[string][]string{}
+	poolPorts := map[string][]int{}
+	for _, m := range f.Members {
+		poolServers[m.Pool] = append(poolServers[m.Pool], m.Server)
+		poolPorts[m.Pool] = append(poolPorts[m.Pool], m.Port)
+	}
+	var ports []int
+	for _, pl := range f.Pools {
+		network := lbNetwork[listenerLB[pl.Listener]]
+		if !reflect.DeepEqual(poolServers[pl.Name], workers[network]) {
+			t.Errorf("pool %s members are %v, want the workers %v of %s", pl.Name, poolServers[pl.Name], workers[network], network)
+		}
+		port := poolPorts[pl.Name][0]
+		for _, other := range poolPorts[pl.Name] {
+			if other != port {
+				t.Errorf("pool %s members listen on %v, want one port", pl.Name, poolPorts[pl.Name])
+			}
+		}
+		ports = append(ports, port)
+	}
+	var wantPorts []int
+	for port := 30000; port <= 30017; port++ {
+		wantPorts = append(wantPorts, port)
+	}
+	if !reflect.DeepEqual(ports, wantPorts) {
+		t.Errorf("member ports by pool = %v, want 30000 to 30017", ports)
+	}
+}
+
+// TestGenerateGardenerFrontendWithoutHealthMonitors confirms health_monitors:
+// false gives an empty, non-nil health monitor list that encodes as [], and
+// that the frontend carries the block's provider.
+func TestGenerateGardenerFrontendWithoutHealthMonitors(t *testing.T) {
+	s := octaviaScenario()
+	s.Personas.Gardener.Octavia.HealthMonitors = false
+	s.Personas.Gardener.Octavia.Provider = "ovn"
+	p, err := s.Generate(LaneScenarios{})
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	f := gardenerOf(t, p).Octavia
+	if f == nil || f.HealthMonitors == nil || len(f.HealthMonitors) != 0 {
+		t.Fatalf("frontend = %+v, want an empty, non-nil health monitor list", f)
+	}
+	if f.Provider != "ovn" || len(f.Pools) != 2 {
+		t.Errorf("frontend provider %q with %d pools, want ovn with 2", f.Provider, len(f.Pools))
+	}
+	if data := marshal(t, f); !bytes.Contains(data, []byte(`"healthMonitors": []`)) || !bytes.Contains(data, []byte(`"provider": "ovn"`)) {
+		t.Errorf("frontend JSON = %s, want \"healthMonitors\": [] and provider ovn", data)
+	}
+}
+
+// TestGenerateOctaviaWithoutGardenerServer confirms octavia with a gardener
+// persona that receives no server fails, instead of a plan that claims
+// Octavia load it cannot produce.
+func TestGenerateOctaviaWithoutGardenerServer(t *testing.T) {
+	s := octaviaScenario()
+	s.Resources.Servers = 1
+	_, err := s.Generate(LaneScenarios{})
+	want := `opt-in service "octavia" gives the gardener persona load balancers, but the gardener persona received no server of resources.servers (1)`
+	if err == nil || err.Error() != want {
+		t.Errorf("Generate() = %v, want %q", err, want)
+	}
+}
+
+// TestGenerateOctaviaDeterministic confirms two runs with octavia opted in
+// produce byte-identical plans, and that the opt-in adds the gardener's
+// frontend and changes nothing else: the frontend draws nothing, so the
+// compute plans stay those of the plan without it.
+func TestGenerateOctaviaDeterministic(t *testing.T) {
+	p1, err := octaviaScenario().Generate(LaneScenarios{})
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	p2, err := octaviaScenario().Generate(LaneScenarios{})
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	if !bytes.Equal(marshal(t, p1), marshal(t, p2)) {
+		t.Error("the same scenario with octavia produced different plans")
+	}
+
+	without, err := smallScenario().Generate(LaneScenarios{})
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	if bytes.Contains(marshal(t, without), []byte(`"octavia"`)) {
+		t.Errorf("plan without the opt-in has an octavia key:\n%s", marshal(t, without))
+	}
+	p1.Services = []string{}
+	for i := range p1.Personas {
+		p1.Personas[i].Octavia = nil
+	}
+	if !bytes.Equal(marshal(t, p1), marshal(t, without)) {
+		t.Errorf("plan with octavia, its frontend removed, = %s, want the plan without the opt-in", marshal(t, p1))
+	}
+}
+
+// TestListenerPort confirms the listener ports of a Gardener load balancer:
+// 80, 443, then consecutive ports from 8080 up to the tenth listener.
+func TestListenerPort(t *testing.T) {
+	var got []int
+	for l := range maxGardenerListeners {
+		got = append(got, listenerPort(l))
+	}
+	if want := []int{80, 443, 8080, 8081, 8082, 8083, 8084, 8085, 8086, 8087}; !reflect.DeepEqual(got, want) {
+		t.Errorf("listener ports = %v, want %v", got, want)
 	}
 }
 

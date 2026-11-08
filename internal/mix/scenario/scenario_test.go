@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -17,11 +18,12 @@ import (
 
 func TestParseRejectsUnknownKey(t *testing.T) {
 	for key, data := range map[string]string{
-		"personas.nope":           "name: x\npersonas:\n  nope:\n    share: 1\n",
-		"personas.legacy.nope":    "name: x\npersonas:\n  legacy:\n    nope: 1\n",
-		"personas.gardener.nope":  "name: x\npersonas:\n  gardener:\n    nope: 1\n",
-		"lanes.cinder.volumetype": "name: x\nlanes:\n  cinder:\n    volumetype: x\n",
-		"lanes.swift":             "name: x\nlanes:\n  swift: {}\n",
+		"personas.nope":                  "name: x\npersonas:\n  nope:\n    share: 1\n",
+		"personas.legacy.nope":           "name: x\npersonas:\n  legacy:\n    nope: 1\n",
+		"personas.gardener.nope":         "name: x\npersonas:\n  gardener:\n    nope: 1\n",
+		"personas.gardener.octavia.nope": "name: x\npersonas:\n  gardener:\n    octavia:\n      nope: 1\n",
+		"lanes.cinder.volumetype":        "name: x\nlanes:\n  cinder:\n    volumetype: x\n",
+		"lanes.swift":                    "name: x\nlanes:\n  swift: {}\n",
 	} {
 		t.Run(key, func(t *testing.T) {
 			t.Parallel()
@@ -170,6 +172,37 @@ personas:
 	}
 	if s.Personas.Gardener != want {
 		t.Errorf("personas.gardener = %+v, want %+v", s.Personas.Gardener, want)
+	}
+}
+
+// TestParseGardenerOctaviaBlock confirms every key of the gardener's octavia
+// block decodes into its field, and that a block without it decodes to the
+// zero block.
+func TestParseGardenerOctaviaBlock(t *testing.T) {
+	s, err := Parse([]byte(`
+personas:
+  gardener:
+    share: 0.3
+    octavia:
+      provider: ovn
+      loadbalancers: 2
+      listeners: 3
+      health_monitors: true
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	want := GardenerOctavia{Provider: "ovn", LoadBalancers: 2, Listeners: 3, HealthMonitors: true}
+	if s.Personas.Gardener.Octavia != want {
+		t.Errorf("personas.gardener.octavia = %+v, want %+v", s.Personas.Gardener.Octavia, want)
+	}
+
+	s, err = Parse([]byte("personas:\n  gardener:\n    share: 0.3\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if s.Personas.Gardener.Octavia != (GardenerOctavia{}) {
+		t.Errorf("personas.gardener.octavia without the block = %+v, want the zero block", s.Personas.Gardener.Octavia)
 	}
 }
 
@@ -464,6 +497,80 @@ func TestValidateGardener(t *testing.T) {
 	}
 }
 
+// TestValidateGardenerOctavia covers the opt-in of octavia: the gardener
+// persona must have a share, and its octavia block is checked against the
+// listener cap and the NodePort range, in that order, only when services lists
+// octavia.
+func TestValidateGardenerOctavia(t *testing.T) {
+	// threeClusters gives the gardener persona 3 servers in 3 clusters with
+	// 3000 pools, beyond the 2768 node ports.
+	threeClusters := func(s *Scenario) {
+		s.Resources.Servers = 10
+		s.Personas.Gardener.Clusters = 3
+		s.Personas.Gardener.Octavia.LoadBalancers = 100
+		s.Personas.Gardener.Octavia.Listeners = 10
+	}
+	tests := []struct {
+		name     string
+		services []string
+		mutate   func(*Scenario)
+		want     string
+	}{
+		{"profile block", []string{"octavia"}, func(*Scenario) {}, ""},
+		{"zero gardener share", []string{"octavia"}, func(s *Scenario) { s.Personas.Gardener.Share = 0 },
+			`opt-in service "octavia" gives the gardener persona load balancers, but personas.gardener.share is 0`},
+		{"zero gardener share after other services", []string{"barbican", "octavia"}, func(s *Scenario) { s.Personas.Gardener.Share = 0 },
+			`opt-in service "octavia" gives the gardener persona load balancers, but personas.gardener.share is 0`},
+		{"no load balancer", []string{"octavia"}, func(s *Scenario) { threeClusters(s); s.Personas.Gardener.Octavia.LoadBalancers = 0 },
+			"personas.gardener.octavia.loadbalancers must be at least 1, got 0"},
+		{"negative load balancers", []string{"octavia"}, func(s *Scenario) { s.Personas.Gardener.Octavia.LoadBalancers = -1 },
+			"personas.gardener.octavia.loadbalancers must be at least 1, got -1"},
+		{"no listener", []string{"octavia"}, func(s *Scenario) { s.Personas.Gardener.Octavia.Listeners = 0 },
+			"personas.gardener.octavia.listeners must be between 1 and 10, got 0"},
+		{"eleven listeners", []string{"octavia"}, func(s *Scenario) { threeClusters(s); s.Personas.Gardener.Octavia.Listeners = 11 },
+			"personas.gardener.octavia.listeners must be between 1 and 10, got 11"},
+		{"pools beyond the node ports", []string{"octavia"}, threeClusters,
+			"personas.gardener.octavia: 3000 pools (clusters x loadbalancers x listeners) exceed the 2768 node ports 30000-32767"},
+		{"pools filling the node ports", []string{"octavia"}, func(s *Scenario) {
+			threeClusters(s)
+			s.Personas.Gardener.Clusters = 2
+			s.Personas.Gardener.Octavia.LoadBalancers = 692
+			s.Personas.Gardener.Octavia.Listeners = 2
+		}, ""},
+		{"one pool beyond the node ports", []string{"octavia"}, func(s *Scenario) {
+			s.Personas.Gardener.Octavia.LoadBalancers = 2769
+			s.Personas.Gardener.Octavia.Listeners = 1
+		},
+			"personas.gardener.octavia: 2769 pools (clusters x loadbalancers x listeners) exceed the 2768 node ports 30000-32767"},
+		{"pool count beyond an int", []string{"octavia"}, func(s *Scenario) { threeClusters(s); s.Personas.Gardener.Octavia.LoadBalancers = math.MaxInt / 4 },
+			fmt.Sprintf("personas.gardener.octavia: %d pools (clusters x loadbalancers x listeners) exceed the 2768 node ports 30000-32767", math.MaxInt)},
+		{"block not read without octavia", nil, func(s *Scenario) {
+			s.Personas.Gardener.Octavia.LoadBalancers = 0
+			s.Personas.Gardener.Octavia.Listeners = 99
+		}, ""},
+		{"block not read for another service", []string{"barbican"}, func(s *Scenario) {
+			s.Personas.Gardener.Share = 0
+			s.Personas.Gardener.Octavia.LoadBalancers = 0
+			s.Personas.Gardener.Octavia.Listeners = 99
+		}, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := smallScenario()
+			s.Services = tc.services
+			tc.mutate(&s)
+			err := s.Validate()
+			switch {
+			case tc.want == "" && err != nil:
+				t.Errorf("Validate() = %v, want nil", err)
+			case tc.want != "" && (err == nil || err.Error() != tc.want):
+				t.Errorf("Validate() = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestSet(t *testing.T) {
 	tests := []struct {
 		key, value string
@@ -502,6 +609,12 @@ func TestSet(t *testing.T) {
 		{"personas.gardener.interval.max", "2m", func(s Scenario) bool {
 			return s.Personas.Gardener.Interval.Max == novascenario.Duration(2*time.Minute)
 		}},
+		{"personas.gardener.octavia.provider", "ovn", func(s Scenario) bool { return s.Personas.Gardener.Octavia.Provider == "ovn" }},
+		{"personas.gardener.octavia.provider", "", func(s Scenario) bool { return s.Personas.Gardener.Octavia.Provider == "" }},
+		{"personas.gardener.octavia.loadbalancers", "3", func(s Scenario) bool { return s.Personas.Gardener.Octavia.LoadBalancers == 3 }},
+		{"personas.gardener.octavia.listeners", " 4 ", func(s Scenario) bool { return s.Personas.Gardener.Octavia.Listeners == 4 }},
+		{"personas.gardener.octavia.health_monitors", "false", func(s Scenario) bool { return !s.Personas.Gardener.Octavia.HealthMonitors }},
+		{"personas.gardener.octavia.health_monitors", "true", func(s Scenario) bool { return s.Personas.Gardener.Octavia.HealthMonitors }},
 		{"personas.legacy.share", "0.3", func(s Scenario) bool { return s.Personas.Legacy.Share == 0.3 }},
 		{"personas.legacy.cloud", "tenant-legacy", func(s Scenario) bool { return s.Personas.Legacy.Cloud == "tenant-legacy" }},
 		{"personas.legacy.networks", "2", func(s Scenario) bool { return s.Personas.Legacy.Networks == 2 }},
@@ -597,6 +710,10 @@ func TestSetErrors(t *testing.T) {
 		{"personas.legacy.networks", "two", `override personas.legacy.networks: "two" is not an integer`},
 		{"personas.gardener.nope", "1", `unknown override key "personas.gardener.nope"`},
 		{"personas.gardener.clusters", "x", `override personas.gardener.clusters: "x" is not an integer`},
+		{"personas.gardener.octavia.nope", "1", `unknown override key "personas.gardener.octavia.nope"`},
+		{"personas.gardener.octavia.loadbalancers", "one", `override personas.gardener.octavia.loadbalancers: "one" is not an integer`},
+		{"personas.gardener.octavia.listeners", "x", `override personas.gardener.octavia.listeners: "x" is not an integer`},
+		{"personas.gardener.octavia.health_monitors", "maybe", `override personas.gardener.octavia.health_monitors: "maybe" is not a boolean`},
 		{"personas.legacy.cold_migration", "", `override personas.legacy.cold_migration: "" is not a boolean`},
 		{"personas.legacy.cold_migration", "maybe", `override personas.legacy.cold_migration: "maybe" is not a boolean`},
 		{"lanes.cinder.enabled", "maybe", `override lanes.cinder.enabled: "maybe" is not a boolean`},
@@ -623,6 +740,7 @@ func FuzzParse(f *testing.F) {
 	f.Add([]byte("name: x\nresources: { servers: 2 }\npersonas:\n  legacy: { share: 1, networks: 1, resize_flavor: m1.small, ports_per_server: { min: 0, max: 1 } }\n"))
 	f.Add([]byte("name: x\nresources: { servers: 2 }\npersonas:\n  legacy: { share: 1, networks: 1, cold_migration: false }\n"))
 	f.Add([]byte("name: x\nresources: { servers: 3 }\npersonas:\n  gardener: { share: 1, clusters: 2, policy: anti-affinity, volume_gib: { min: 1, max: 1 } }\n"))
+	f.Add([]byte("name: x\nservices: [octavia]\nresources: { servers: 3 }\npersonas:\n  gardener: { share: 1, clusters: 2, policy: anti-affinity, volume_gib: { min: 1, max: 1 }, octavia: { loadbalancers: 9223372036854775807, listeners: 10 } }\n"))
 	f.Add([]byte("name: x\nlanes:\n  cinder: { enabled: true, profile: small, scenario: c.yaml }\n  keystone: { enabled: true, profile: small, privilege: root }\n"))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		s, err := Parse(data)

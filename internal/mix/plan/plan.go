@@ -8,13 +8,20 @@ package plan
 
 import (
 	"fmt"
+	"slices"
 
 	cinderplan "github.com/B42Labs/dizzy/internal/cinder/plan"
 	glanceplan "github.com/B42Labs/dizzy/internal/glance/plan"
 	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
 	novaplan "github.com/B42Labs/dizzy/internal/nova/plan"
+	octaviaplan "github.com/B42Labs/dizzy/internal/octavia/plan"
 	neutronplan "github.com/B42Labs/dizzy/internal/plan"
 )
+
+// ServiceOctavia is the opt-in service that gives the gardener persona load
+// balancers in front of its clusters. It is a name of Plan.Services, the list
+// a scenario's services key and a run record share.
+const ServiceOctavia = "octavia"
 
 // Plan is the expanded state of one mix run. Scenario and Seed record the
 // provenance that produced it, Services lists the opt-in services bound to the
@@ -35,15 +42,19 @@ type Plan struct {
 // persona name. LongLived marks a persona whose resources are kept until the
 // run's teardown and mutated repeatedly. Rolling marks a persona whose servers
 // are replaced one at a time within their server group. Nova is the compute
-// plan the persona churns.
+// plan the persona churns. Octavia is the load-balancer frontend in front of
+// the compute plan's servers; only the gardener persona of a plan whose
+// services list octavia has one, so a plan without the opt-in encodes without
+// an octavia key.
 type Persona struct {
-	Name      string         `json:"name"`
-	Share     float64        `json:"share"`
-	Servers   int            `json:"servers"`
-	Seed      int64          `json:"seed"`
-	LongLived bool           `json:"longLived,omitempty"`
-	Rolling   bool           `json:"rolling,omitempty"`
-	Nova      *novaplan.Plan `json:"nova"`
+	Name      string                `json:"name"`
+	Share     float64               `json:"share"`
+	Servers   int                   `json:"servers"`
+	Seed      int64                 `json:"seed"`
+	LongLived bool                  `json:"longLived,omitempty"`
+	Rolling   bool                  `json:"rolling,omitempty"`
+	Nova      *novaplan.Plan        `json:"nova"`
+	Octavia   *octaviaplan.Frontend `json:"octavia,omitempty"`
 }
 
 // Lane is one background lane of a mix run: the churn of a single service, in
@@ -105,9 +116,11 @@ func (l Lane) validate() error {
 
 // Validate checks the plan for well-formedness: at least one persona has a
 // server, no persona appears twice, and every persona has a valid compute plan
-// with exactly its share of servers. No lane appears twice, and every lane is
-// one this build defines with a valid plan of its service. It returns an error
-// naming the first offending persona or lane.
+// with exactly its share of servers. A persona with an octavia frontend needs
+// services to list octavia, and its frontend must be valid and sit on the
+// networks and servers of the persona's compute plan. No lane appears twice,
+// and every lane is one this build defines with a valid plan of its service.
+// It returns an error naming the first offending persona or lane.
 func (p *Plan) Validate() error {
 	hasServers := false
 	for _, ps := range p.Personas {
@@ -135,6 +148,11 @@ func (p *Plan) Validate() error {
 		if err := ps.Nova.Validate(); err != nil {
 			return fmt.Errorf("persona %q: %w", ps.Name, err)
 		}
+		if ps.Octavia != nil {
+			if err := p.validateFrontend(ps); err != nil {
+				return err
+			}
+		}
 	}
 
 	lanes := make(map[string]bool, len(p.Lanes))
@@ -145,6 +163,62 @@ func (p *Plan) Validate() error {
 		lanes[l.Name] = true
 		if err := l.validate(); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// validateFrontend checks the octavia frontend of persona ps, whose compute
+// plan is valid: the plan's services list octavia, the frontend is valid on its
+// own, every load balancer sits on a network of the compute plan, and every
+// member is a server of the compute plan on the network of the load balancer
+// it serves, reached through the member's pool and that pool's listener.
+// Frontend.Validate leaves the networks and servers to this check because only
+// the compute plan creates them, and a member off its load balancer's network
+// would be unreachable from the VIP without a router.
+func (p *Plan) validateFrontend(ps Persona) error {
+	if !slices.Contains(p.Services, ServiceOctavia) {
+		return fmt.Errorf("persona %q has an octavia plan, but services does not list %q", ps.Name, ServiceOctavia)
+	}
+	f := ps.Octavia
+	if err := f.Validate(); err != nil {
+		return fmt.Errorf("persona %q: octavia: %w", ps.Name, err)
+	}
+
+	networks := make(map[string]bool, len(ps.Nova.Networks))
+	for _, n := range ps.Nova.Networks {
+		networks[n.Name] = true
+	}
+	lbNetwork := make(map[string]string, len(f.LoadBalancers))
+	for _, lb := range f.LoadBalancers {
+		if !networks[lb.Network] {
+			return fmt.Errorf("persona %q: load balancer %q sits on network %q, which the compute plan does not create", ps.Name, lb.Name, lb.Network)
+		}
+		lbNetwork[lb.Name] = lb.Network
+	}
+
+	// Frontend.Validate resolved every member's pool and every pool's
+	// listener, so these lookups find the load balancer of each member.
+	listenerLB := make(map[string]string, len(f.Listeners))
+	for _, l := range f.Listeners {
+		listenerLB[l.Name] = l.LoadBalancer
+	}
+	poolLB := make(map[string]string, len(f.Pools))
+	for _, pl := range f.Pools {
+		poolLB[pl.Name] = listenerLB[pl.Listener]
+	}
+	serverNetworks := make(map[string][]string, len(ps.Nova.Servers))
+	for _, srv := range ps.Nova.Servers {
+		serverNetworks[srv.Name] = srv.Networks
+	}
+	for _, m := range f.Members {
+		on, ok := serverNetworks[m.Server]
+		if !ok {
+			return fmt.Errorf("persona %q: member %q references server %q, which the compute plan does not create", ps.Name, m.Name, m.Server)
+		}
+		lb := poolLB[m.Pool]
+		if network := lbNetwork[lb]; !slices.Contains(on, network) {
+			return fmt.Errorf("persona %q: member %q puts server %q behind load balancer %q, but the server is not on network %q", ps.Name, m.Name, m.Server, lb, network)
 		}
 	}
 	return nil
