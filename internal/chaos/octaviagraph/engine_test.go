@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/B42Labs/dizzy/internal/chaos"
+	"github.com/B42Labs/dizzy/internal/nova"
 	"github.com/B42Labs/dizzy/internal/octavia"
 	"github.com/B42Labs/dizzy/internal/octavia/plan"
 	octaviascenario "github.com/B42Labs/dizzy/internal/octavia/scenario"
@@ -39,8 +40,13 @@ type object struct {
 // the invariants the churn graph must never violate: no object is created on an
 // absent parent, none is deleted while a live object depends on it, every
 // toggle and delete targets a live object, and no load balancer ever has two
-// calls or waits in flight at once. It is safe for concurrent use by the
-// engine's operation tasks.
+// calls or waits in flight at once. For a frontend graph it also holds the
+// network and servers of the graph the frontend joins, which test nodes create
+// through addNetwork and bootServer, answers the lookups of FrontendOctavia
+// from them, and checks that no member reads its server's address or is
+// created before the server's create returned, and that no server is deleted
+// before the delete of each of its members returned. It is safe for concurrent
+// use by the engine's operation tasks.
 type fakeOctavia struct {
 	mu       sync.Mutex
 	nextID   int
@@ -56,6 +62,22 @@ type fakeOctavia struct {
 	toggles      int
 	cur, max     map[resource.Kind]int
 	violations   []string
+
+	subnetOf       map[string]string  // network id -> the id of its one subnet
+	serverAddr     map[string]string  // server id -> the address of that instance
+	addrServer     map[string]string  // address -> the id of the server instance it belongs to
+	booted         map[string]bool    // server id -> its create returned and it was not deleted since
+	memberDeleting map[string]string  // load balancer id -> the server of the member whose delete waits on it
+	addressErrs    map[string][]error // server logical -> the errors its next ServerAddress calls return
+	serverLog      []string           // "address <server> ok|failed" and "delete <server>", in call order
+	lbSubnets      []string           // the subnet every load balancer create was given
+	memberCreates  []memberCreate     // every create of a member backed by a server
+}
+
+// memberCreate is what one create of a member backed by a server was given:
+// the address and subnet, and the server instance that address belongs to.
+type memberCreate struct {
+	member, address, subnet, server string
 }
 
 func newFakeOctavia() *fakeOctavia {
@@ -66,6 +88,13 @@ func newFakeOctavia() *fakeOctavia {
 		lastListener: make(map[string]string),
 		cur:          make(map[resource.Kind]int),
 		max:          make(map[resource.Kind]int),
+
+		subnetOf:       make(map[string]string),
+		serverAddr:     make(map[string]string),
+		addrServer:     make(map[string]string),
+		booted:         make(map[string]bool),
+		memberDeleting: make(map[string]string),
+		addressErrs:    make(map[string][]error),
 	}
 }
 
@@ -177,6 +206,7 @@ func (f *fakeOctavia) WaitForReady(context.Context, resource.Resource) error { r
 func (f *fakeOctavia) CreateLoadBalancer(_ context.Context, lb plan.LoadBalancer, subnetID, _ string) (resource.Resource, string, error) {
 	f.mu.Lock()
 	res := f.add(octavia.KindLoadBalancer, lb.Name, "", subnetID)
+	f.lbSubnets = append(f.lbSubnets, subnetID)
 	f.mu.Unlock()
 	f.enter(res.ID)
 	defer f.exit(res.ID)
@@ -209,7 +239,17 @@ func (f *fakeOctavia) CreateMember(_ context.Context, m plan.Member, poolID, sub
 	defer f.exit(lb)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.add(octavia.KindMember, m.Name, lb, poolID, subnetID), nil
+	parents := []string{poolID, subnetID}
+	// A member at the address of a server depends on that server instance, so
+	// remove flags a delete of the server while the member is live.
+	if server, ok := f.addrServer[m.Address]; ok {
+		if !f.booted[server] {
+			f.violate("member %s created on server %s before its create returned", m.Name, server)
+		}
+		parents = append(parents, server)
+		f.memberCreates = append(f.memberCreates, memberCreate{member: m.Name, address: m.Address, subnet: subnetID, server: server})
+	}
+	return f.add(octavia.KindMember, m.Name, lb, parents...), nil
 }
 
 func (f *fakeOctavia) CreateHealthMonitor(_ context.Context, h plan.HealthMonitor, poolID string) (resource.Resource, error) {
@@ -235,6 +275,9 @@ func (f *fakeOctavia) WaitForActive(_ context.Context, lb resource.Resource, kin
 func (f *fakeOctavia) WaitForActiveAfterDelete(_ context.Context, lb resource.Resource, _ resource.Kind) error {
 	f.enter(lb.ID)
 	defer f.exit(lb.ID)
+	f.mu.Lock()
+	delete(f.memberDeleting, lb.ID) // the member delete this wait ends has returned
+	f.mu.Unlock()
 	return nil
 }
 
@@ -273,6 +316,15 @@ func (f *fakeOctavia) DeleteMember(_ context.Context, r resource.Resource, poolI
 	if o := f.objects[r.ID]; o != nil && !contains(o.parents, poolID) {
 		f.violate("member %s deleted through pool %s, not its own", r.Logical, poolID)
 	}
+	// A member backed by a server is deleted only once the wait after this call
+	// returns, so its server must not be deleted until then.
+	if o := f.objects[r.ID]; o != nil {
+		for _, p := range o.parents {
+			if _, ok := f.serverAddr[p]; ok {
+				f.memberDeleting[lb] = p
+			}
+		}
+	}
 	f.remove(r.ID)
 	return nil
 }
@@ -297,6 +349,89 @@ func (f *fakeOctavia) SetListenerAdminState(_ context.Context, r resource.Resour
 func (f *fakeOctavia) SetMemberAdminState(_ context.Context, r resource.Resource, _ string, _ bool) error {
 	f.toggle(r)
 	return nil
+}
+
+// addNetwork creates a live network named name with its one subnet named
+// subnet, standing for a cluster network of the graph a frontend joins, and
+// returns the network.
+func (f *fakeOctavia) addNetwork(name, subnet string) resource.Resource {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	net := f.add(nova.KindNetwork, name, "")
+	f.subnetOf[net.ID] = f.add(nova.KindSubnet, subnet, "", net.ID).ID
+	return net
+}
+
+// bootServer creates a live server named logical on the network networkID,
+// standing for a worker of the graph a frontend joins, with an address of its
+// own instance. The server is live at once and holds the fake's delay before
+// its create returns, the window a member create must not reach into.
+func (f *fakeOctavia) bootServer(logical, networkID string) resource.Resource {
+	f.mu.Lock()
+	res := f.add(nova.KindServer, logical, "", networkID)
+	address := fmt.Sprintf("10.0.%d.%d", f.nextID/256, f.nextID%256)
+	f.serverAddr[res.ID] = address
+	f.addrServer[address] = res.ID
+	f.mu.Unlock()
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
+	f.mu.Lock()
+	f.booted[res.ID] = true
+	f.mu.Unlock()
+	return res
+}
+
+// deleteServer deletes the server r, flagging a member of it that is still
+// live or whose delete has not returned.
+func (f *fakeOctavia) deleteServer(r resource.Resource) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for lb, server := range f.memberDeleting {
+		if server == r.ID {
+			f.violate("server %s deleted before the member delete on load balancer %s returned", r.Logical, lb)
+		}
+	}
+	f.serverLog = append(f.serverLog, "delete "+r.Logical)
+	f.booted[r.ID] = false
+	f.remove(r.ID)
+}
+
+// NetworkSubnet returns the subnet addNetwork created with the network
+// networkID.
+func (f *fakeOctavia) NetworkSubnet(_ context.Context, networkID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	subnet, ok := f.subnetOf[networkID]
+	if !ok {
+		return "", fmt.Errorf("network %s has no subnet", networkID)
+	}
+	return subnet, nil
+}
+
+// ServerAddress returns the address of the server instance serverID and the
+// subnet of the network networkID, or the next error queued for the server in
+// addressErrs. It flags a server that is not live or whose create has not
+// returned.
+func (f *fakeOctavia) ServerAddress(_ context.Context, serverID, networkID string) (string, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	o := f.objects[serverID]
+	if o == nil || !o.live || !f.booted[serverID] {
+		f.violate("address of server %s read before its create returned or after its delete", serverID)
+		return "", "", fmt.Errorf("server %s has no IPv4 address on network %s", serverID, networkID)
+	}
+	if errs := f.addressErrs[o.logical]; len(errs) > 0 {
+		f.addressErrs[o.logical] = errs[1:]
+		f.serverLog = append(f.serverLog, "address "+o.logical+" failed")
+		return "", "", errs[0]
+	}
+	subnet, ok := f.subnetOf[networkID]
+	if !ok {
+		f.violate("address of server %s read on network %s, which has no subnet", o.logical, networkID)
+	}
+	f.serverLog = append(f.serverLog, "address "+o.logical+" ok")
+	return f.serverAddr[serverID], subnet, nil
 }
 
 // fakeClock is a virtual clock: Sleep advances time instantly, so the scheduler
