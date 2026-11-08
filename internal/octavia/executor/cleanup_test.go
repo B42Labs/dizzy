@@ -404,3 +404,144 @@ func TestCleanupParentCancellationStopsTheConflictLoop(t *testing.T) {
 		t.Errorf("Cleanup() = %q, want a cancellation, not the leak message", err)
 	}
 }
+
+func TestCleanupLoadBalancersRefusesEmptyRunID(t *testing.T) {
+	f := newFakeCleaner(r(octavia.KindLoadBalancer, "lb1"))
+	n, err := CleanupLoadBalancers(context.Background(), f, "", []resource.Resource{r(octavia.KindLoadBalancer, "lb1")}, 4, time.Second)
+	if want := "cleanup: empty run id; refusing to delete by empty identity"; err == nil || err.Error() != want {
+		t.Errorf("CleanupLoadBalancers() = %v, want %q", err, want)
+	}
+	if n != 0 {
+		t.Errorf("deleted = %d, want 0", n)
+	}
+	if calls := f.snapshot(); len(calls) != 0 {
+		t.Errorf("calls = %v, want none", calls)
+	}
+}
+
+func TestCleanupLoadBalancersEmptyListingAndNoRecord(t *testing.T) {
+	f := newFakeCleaner()
+	deleted, err := CleanupLoadBalancers(context.Background(), f, "run0", nil, 4, time.Second)
+	if err != nil || deleted != 0 {
+		t.Errorf("CleanupLoadBalancers() = %d, %v, want 0, nil", deleted, err)
+	}
+	if calls := f.snapshot(); !slices.Equal(calls, []string{"list:loadbalancer:run0"}) {
+		t.Errorf("calls = %v, want only the load balancer listing", calls)
+	}
+}
+
+func TestCleanupLoadBalancersDeletesOnlyRecorded(t *testing.T) {
+	f := newFakeCleaner()
+	// Discovery misses lb1, but the record names it and it is still live.
+	f.live["lb1"] = true
+	deleted, err := CleanupLoadBalancers(context.Background(), f, "run0", []resource.Resource{r(octavia.KindLoadBalancer, "lb1")}, 4, time.Second)
+	if err != nil {
+		t.Fatalf("CleanupLoadBalancers() = %v, want nil", err)
+	}
+	if deleted != 1 {
+		t.Errorf("deleted = %d, want 1", deleted)
+	}
+	want := []string{"list:loadbalancer:run0", "delete:loadbalancer:lb1", "wait:loadbalancer:lb1"}
+	if calls := f.snapshot(); !slices.Equal(calls, want) {
+		t.Errorf("calls = %v, want %v", calls, want)
+	}
+	if f.live["lb1"] {
+		t.Error("lb1 is still live")
+	}
+}
+
+func TestCleanupLoadBalancersListedAndRecordedDeletedOnce(t *testing.T) {
+	f := newFakeCleaner(r(octavia.KindLoadBalancer, "lb1"))
+	deleted, err := CleanupLoadBalancers(context.Background(), f, "run0", []resource.Resource{r(octavia.KindLoadBalancer, "lb1")}, 4, time.Second)
+	if err != nil {
+		t.Fatalf("CleanupLoadBalancers() = %v, want nil", err)
+	}
+	if deleted != 1 {
+		t.Errorf("deleted = %d, want 1", deleted)
+	}
+	calls := f.snapshot()
+	if n := len(indexes(calls, "delete:loadbalancer:lb1")); n != 1 {
+		t.Errorf("lb1 deleted %d times, want once: %v", n, calls)
+	}
+	if n := len(indexes(calls, "wait:loadbalancer:lb1")); n != 1 {
+		t.Errorf("lb1 waited on %d times, want once: %v", n, calls)
+	}
+}
+
+func TestCleanupLoadBalancersNotFoundCountsNothing(t *testing.T) {
+	f := newFakeCleaner(r(octavia.KindLoadBalancer, "lb1"))
+	// The record names a load balancer already gone.
+	deleted, err := CleanupLoadBalancers(context.Background(), f, "run0", []resource.Resource{r(octavia.KindLoadBalancer, "lb-gone")}, 4, time.Second)
+	if err != nil {
+		t.Fatalf("CleanupLoadBalancers() = %v, want nil", err)
+	}
+	if deleted != 1 {
+		t.Errorf("deleted = %d, want 1 (the 404 counts nothing)", deleted)
+	}
+	calls := f.snapshot()
+	if !slices.Contains(calls, "delete:loadbalancer:lb-gone") {
+		t.Errorf("calls lack the delete of lb-gone: %v", calls)
+	}
+	if slices.Contains(calls, "wait:loadbalancer:lb-gone") {
+		t.Errorf("a load balancer whose delete answered 404 was waited on: %v", calls)
+	}
+}
+
+func TestCleanupLoadBalancersResendsWhileConflicting(t *testing.T) {
+	shrinkDelays(t)
+	f := newFakeCleaner(r(octavia.KindLoadBalancer, "lb1"))
+	f.conflicts["lb1"] = 1
+	deleted, err := CleanupLoadBalancers(context.Background(), f, "run0", nil, 4, time.Second)
+	if err != nil {
+		t.Fatalf("CleanupLoadBalancers() = %v, want nil", err)
+	}
+	if deleted != 1 {
+		t.Errorf("deleted = %d, want 1", deleted)
+	}
+	want := []string{"list:loadbalancer:run0", "delete:loadbalancer:lb1", "delete:loadbalancer:lb1", "wait:loadbalancer:lb1"}
+	if calls := f.snapshot(); !slices.Equal(calls, want) {
+		t.Errorf("calls = %v, want %v (one 409, then accepted and waited on)", calls, want)
+	}
+}
+
+func TestCleanupLoadBalancersListingErrorReturnedUnchanged(t *testing.T) {
+	f := newFakeCleaner(r(octavia.KindLoadBalancer, "lb1"))
+	listErr := errors.New("listing loadbalancer by tag: boom")
+	f.listErr[octavia.KindLoadBalancer] = listErr
+	deleted, err := CleanupLoadBalancers(context.Background(), f, "run0", []resource.Resource{r(octavia.KindLoadBalancer, "lb1")}, 4, time.Second)
+	if err != listErr || deleted != 0 {
+		t.Errorf("CleanupLoadBalancers() = %d, %v, want 0 and the listing error unchanged", deleted, err)
+	}
+	if calls := f.snapshot(); !slices.Equal(calls, []string{"list:loadbalancer:run0"}) {
+		t.Errorf("calls = %v, want only the load balancer listing", calls)
+	}
+}
+
+func TestCleanupLoadBalancersNeverTouchesSubnetsOrNetworks(t *testing.T) {
+	f := newFakeCleaner(r(octavia.KindLoadBalancer, "lb1"), r(octavia.KindSubnet, "sub1"), r(octavia.KindNetwork, "net1"))
+	f.live["sub2"], f.live["net2"] = true, true
+	// The record names subnets and networks too, as a mix lane's record names
+	// the Nova cluster networks the load balancers sit on.
+	recorded := []resource.Resource{
+		r(octavia.KindNetwork, "net1"), r(octavia.KindSubnet, "sub1"), r(octavia.KindLoadBalancer, "lb1"),
+		r(octavia.KindNetwork, "net2"), r(octavia.KindSubnet, "sub2"),
+	}
+	deleted, err := CleanupLoadBalancers(context.Background(), f, "run0", recorded, 4, time.Second)
+	if err != nil {
+		t.Fatalf("CleanupLoadBalancers() = %v, want nil", err)
+	}
+	if deleted != 1 {
+		t.Errorf("deleted = %d, want 1 (the load balancer)", deleted)
+	}
+	calls := f.snapshot()
+	for _, prefix := range []string{"list:subnet:", "list:network:", "delete:subnet:", "delete:network:"} {
+		if got := indexes(calls, prefix); len(got) > 0 {
+			t.Errorf("calls include %s: %v", prefix, calls)
+		}
+	}
+	for _, id := range []string{"sub1", "sub2", "net1", "net2"} {
+		if !f.live[id] {
+			t.Errorf("%s was deleted", id)
+		}
+	}
+}
