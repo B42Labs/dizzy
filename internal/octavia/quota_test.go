@@ -219,3 +219,103 @@ func TestProjectIDFromAuth(t *testing.T) {
 		t.Errorf("ProjectIDFromAuth = (%q, %v), want (\"proj-1\", true)", id, ok)
 	}
 }
+
+// smallFrontend builds a valid frontend with the counts the bundled small mix
+// profile gives the Gardener persona with Octavia opted in: 1 load balancer, 2
+// listeners, 2 pools, 4 members, and 2 health monitors.
+func smallFrontend(t *testing.T) *plan.Frontend {
+	t.Helper()
+	f := &plan.Frontend{
+		LoadBalancers: []plan.LoadBalancer{{Name: "lb-0001", Network: "net-0001"}},
+		Listeners: []plan.Listener{
+			{Name: "lsn-0001", LoadBalancer: "lb-0001", Port: 80},
+			{Name: "lsn-0002", LoadBalancer: "lb-0001", Port: 443},
+		},
+		Pools: []plan.Pool{
+			{Name: "pool-0001", Listener: "lsn-0001"},
+			{Name: "pool-0002", Listener: "lsn-0002"},
+		},
+		Members: []plan.ServerMember{
+			{Name: "pool-0001-member-01", Pool: "pool-0001", Server: "srv-0001", Port: 30000},
+			{Name: "pool-0001-member-02", Pool: "pool-0001", Server: "srv-0002", Port: 30000},
+			{Name: "pool-0002-member-01", Pool: "pool-0002", Server: "srv-0001", Port: 30001},
+			{Name: "pool-0002-member-02", Pool: "pool-0002", Server: "srv-0002", Port: 30001},
+		},
+		HealthMonitors: []plan.HealthMonitor{
+			{Name: "hm-0001", Pool: "pool-0001"},
+			{Name: "hm-0002", Pool: "pool-0002"},
+		},
+	}
+	if err := f.Validate(); err != nil {
+		t.Fatalf("small frontend is invalid: %v", err)
+	}
+	return f
+}
+
+// TestPrecheckFrontendQuotaWithoutFrontend confirms a nil frontend passes
+// without a request and without a warning, also on a client that would reach
+// the quota read.
+func TestPrecheckFrontendQuotaWithoutFrontend(t *testing.T) {
+	logs := captureLog(t)
+	f := newFake(t, scripted(t, map[string][]reply{}))
+
+	if err := PrecheckFrontendQuota(context.Background(), quotaClient(t, f), nil); err != nil {
+		t.Errorf("PrecheckFrontendQuota(nil) = %v, want nil", err)
+	}
+	f.wantLines(t)
+	if logs.Len() != 0 {
+		t.Errorf("PrecheckFrontendQuota(nil) logged %q, want nothing", logs.String())
+	}
+}
+
+// TestPrecheckFrontendQuota confirms the frontend pre-check reads
+// <endpoint>/v2.0/quotas/<project> and nothing else, passes the small frontend
+// on unlimited quotas and on quotas it fills exactly, names its 4 members
+// against a member quota of 3, skips with one warning on a 403, and aborts on a
+// 500, as PrecheckQuota does for a plan.
+func TestPrecheckFrontendQuota(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		status   int
+		body     string
+		wantErr  string // the error's prefix when it ends in ": ", otherwise a part of it
+		wantWarn bool
+	}{
+		{"unlimited passes", http.StatusOK,
+			`{"quota":{"loadbalancer":-1,"listener":-1,"pool":-1,"member":-1,"healthmonitor":-1,"l7policy":-1,"l7rule":-1}}`, "", false},
+		{"exactly enough passes", http.StatusOK,
+			`{"quota":{"loadbalancer":1,"listener":2,"pool":2,"member":4,"healthmonitor":2,"l7policy":-1,"l7rule":-1}}`, "", false},
+		{"member limit fails", http.StatusOK,
+			`{"quota":{"loadbalancer":-1,"listener":-1,"pool":-1,"member":3,"healthmonitor":-1,"l7policy":-1,"l7rule":-1}}`, "member need 4, quota 3", false},
+		{"403 skips", http.StatusForbidden,
+			`{"faultcode":"Client","faultstring":"Policy does not allow this request to be performed."}`, "", true},
+		{"500 aborts", http.StatusInternalServerError,
+			`{"faultstring":"Internal Server Error"}`, "reading Octavia quotas for pre-check: ", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLog(t)
+			f := newFake(t, scripted(t, map[string][]reply{"GET " + quotaPath: {{tc.status, tc.body}}}))
+
+			err := PrecheckFrontendQuota(context.Background(), quotaClient(t, f), smallFrontend(t))
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Errorf("PrecheckFrontendQuota = %v, want nil", err)
+			case strings.HasSuffix(tc.wantErr, ": ") && (err == nil || !strings.HasPrefix(err.Error(), tc.wantErr)):
+				t.Errorf("PrecheckFrontendQuota = %v, want an error starting with %q", err, tc.wantErr)
+			case tc.wantErr != "" && !strings.HasSuffix(tc.wantErr, ": ") && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Errorf("PrecheckFrontendQuota = %v, want an error containing %q", err, tc.wantErr)
+			}
+			f.wantLines(t, "GET "+quotaPath)
+			wantWarnings := 0
+			if tc.wantWarn {
+				wantWarnings = 1
+			}
+			if got := strings.Count(logs.String(), "level=WARN"); got != wantWarnings {
+				t.Errorf("warnings logged = %d, want %d; log %q", got, wantWarnings, logs.String())
+			}
+			if warned := strings.Contains(logs.String(), "quota pre-check skipped: quota read denied"); warned != tc.wantWarn {
+				t.Errorf("skip warning logged = %v, want %v; log %q", warned, tc.wantWarn, logs.String())
+			}
+		})
+	}
+}

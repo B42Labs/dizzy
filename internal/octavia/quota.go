@@ -55,6 +55,33 @@ func planNeeds(p *plan.Plan) needs {
 // transient 5xx, a timeout) is returned so the plan aborts before creating
 // anything rather than hitting the real quota wall mid-apply.
 func PrecheckQuota(ctx context.Context, lb *gophercloud.ServiceClient, p *plan.Plan) error {
+	return precheck(ctx, lb, planNeeds(p))
+}
+
+// PrecheckFrontendQuota is PrecheckQuota for the Octavia frontend of a mix
+// persona: it reads the project's Octavia quotas from
+// <endpoint>/v2.0/quotas/<project> and returns an itemized error if the
+// frontend's load balancers, listeners, pools, members, or health monitors
+// would exceed the loadbalancer, listener, pool, member, or healthmonitor
+// quota, before any resource is created. A nil frontend needs nothing, so it
+// returns nil without a request. The read, its fail-open paths, and its errors
+// are PrecheckQuota's.
+func PrecheckFrontendQuota(ctx context.Context, lb *gophercloud.ServiceClient, f *plan.Frontend) error {
+	if f == nil {
+		return nil
+	}
+	return precheck(ctx, lb, needs{
+		loadBalancers:  len(f.LoadBalancers),
+		listeners:      len(f.Listeners),
+		pools:          len(f.Pools),
+		members:        len(f.Members),
+		healthMonitors: len(f.HealthMonitors),
+	})
+}
+
+// precheck reads the project's Octavia quotas and compares need against them,
+// the shared body of PrecheckQuota and PrecheckFrontendQuota.
+func precheck(ctx context.Context, lb *gophercloud.ServiceClient, need needs) error {
 	projectID, ok := ProjectIDFromAuth(lb)
 	if !ok {
 		slog.Warn("quota pre-check skipped: project id unavailable from auth result")
@@ -71,7 +98,7 @@ func PrecheckQuota(ctx context.Context, lb *gophercloud.ServiceClient, p *plan.P
 	if quota == nil {
 		return errors.New("reading Octavia quotas for pre-check: response carries no quota object")
 	}
-	return checkQuota(planNeeds(p), quota)
+	return checkQuota(need, quota)
 }
 
 // ProjectIDFromAuth extracts the authenticated project id from the v3 token auth
