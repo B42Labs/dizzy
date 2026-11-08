@@ -84,7 +84,7 @@ func TestMixChaosRejectsBeforeCloud(t *testing.T) {
 		prefix bool
 	}{
 		{"unsupported service", []string{"--scenario", path, "--set", "services=barbican"},
-			`opt-in service "barbican" is not supported by this build of dizzy (supported: none)`, false},
+			`opt-in service "barbican" is not supported by this build of dizzy (supported: octavia)`, false},
 		{"missing file", []string{"--scenario", filepath.Join(t.TempDir(), "nope.yaml")}, "reading scenario:", true},
 		{"set without value", []string{"--scenario", path, "--set", "nokey"}, `invalid --set "nokey": want key=value`, false},
 		{"narrow bucket width", []string{"--scenario", path, "--duration", "0", "--bucket-width", "30s"},

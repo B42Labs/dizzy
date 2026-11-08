@@ -130,7 +130,7 @@ func TestMixGenerateErrors(t *testing.T) {
 		{"cold migration not a boolean", []string{"mix", "generate", "--scenario", valid, "--set", "personas.legacy.cold_migration=maybe"},
 			`override personas.legacy.cold_migration: "maybe" is not a boolean`, false},
 		{"unsupported service", []string{"mix", "generate", "--scenario", valid, "--set", "services=barbican"},
-			`opt-in service "barbican" is not supported by this build of dizzy (supported: none)`, false},
+			`opt-in service "barbican" is not supported by this build of dizzy (supported: octavia)`, false},
 		{"no server to divide", []string{"mix", "generate", "--scenario", valid, "--set", "resources.servers=0"},
 			"generated plan failed validation: plan has no persona with at least one server", false},
 	}
@@ -280,6 +280,45 @@ func TestMixGenerateLane(t *testing.T) {
 	}
 }
 
+// TestMixGenerateOctavia confirms opting the shipped small profile in to
+// Octavia with --set services=octavia gives the gardener persona, and no other,
+// an octavia key, and that the profile as shipped prints no octavia anywhere.
+func TestMixGenerateOctavia(t *testing.T) {
+	data, err := scenarios.Files.ReadFile("mix/small.yaml")
+	if err != nil {
+		t.Fatalf("reading shipped profile: %v", err)
+	}
+	out, err := execRoot(t, "mix", "generate", "--scenario", writeScenario(t, string(data)), "--set", "services=octavia")
+	if err != nil {
+		t.Fatalf("generate --set services=octavia: %v", err)
+	}
+	var raw struct {
+		Personas []map[string]json.RawMessage `json:"personas"`
+	}
+	if err := json.Unmarshal([]byte(out), &raw); err != nil {
+		t.Fatalf("output is not valid mix plan JSON: %v", err)
+	}
+	withKey := map[string]bool{}
+	for _, ps := range raw.Personas {
+		var name string
+		if err := json.Unmarshal(ps["name"], &name); err != nil {
+			t.Fatalf("persona name: %v", err)
+		}
+		_, withKey[name] = ps["octavia"]
+	}
+	if want := map[string]bool{"ci": false, "gardener": true, "legacy": false}; !reflect.DeepEqual(withKey, want) {
+		t.Errorf("personas with an octavia key = %v, want %v", withKey, want)
+	}
+
+	without, err := execRoot(t, "mix", "generate", "--scenario", writeScenario(t, string(data)))
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if strings.Contains(without, `"octavia"`) {
+		t.Errorf("plan of the small profile as shipped names octavia:\n%s", without)
+	}
+}
+
 // TestMixGenerateRejectsGardenerPolicy confirms a Gardener policy other than
 // the two anti-affinity policies fails the small profile before any API call.
 func TestMixGenerateRejectsGardenerPolicy(t *testing.T) {
@@ -321,7 +360,7 @@ func TestMixStatusErrors(t *testing.T) {
 		{"missing record", []string{"--run", filepath.Join(t.TempDir(), "missing.json")}, "reading run record:", true},
 		{"nova record", []string{"--run", novaRec}, `run record is for service "nova", not "mix"`, false},
 		{"unsupported service", []string{"--run", writeMixRecord(t, "barbican")},
-			`opt-in service "barbican" is not supported by this build of dizzy (supported: none)`, false},
+			`opt-in service "barbican" is not supported by this build of dizzy (supported: octavia)`, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -452,9 +491,9 @@ func TestMixCleanupFlagErrors(t *testing.T) {
 		{"--run with --scenario", []string{"--run", "run-x.json", "--scenario", scenario}, "--scenario is only used with --run-id"},
 		{"nova record", []string{"--run", writeNovaRecord(t)}, `run record is for service "nova", not "mix"`},
 		{"unsupported service", []string{"--run", writeMixRecord(t, "barbican")},
-			`opt-in service "barbican" is not supported by this build of dizzy (supported: none)`},
+			`opt-in service "barbican" is not supported by this build of dizzy (supported: octavia)`},
 		{"unsupported service by run id", []string{"--run-id", "x", "--scenario", scenario, "--set", "services=barbican"},
-			`opt-in service "barbican" is not supported by this build of dizzy (supported: none)`},
+			`opt-in service "barbican" is not supported by this build of dizzy (supported: octavia)`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -672,6 +711,58 @@ func TestRecordLaneInputs(t *testing.T) {
 	if in := inputs[0]; in.name != "ci" || in.runID != "mix00001-ci" || in.cloud != "tenant-ci" || in.project != "proj-ci" || in.persona != nil || in.overall != overall {
 		t.Errorf("lane input = %+v, want ci under the record's identity, cloud and project, without a persona", in)
 	}
+}
+
+// TestLaneInputsCarryServices confirms the lane inputs of a plan carry the
+// plan's opt-in services and no recorded entries, and the lane inputs of a
+// record carry the record's opt-in services and, for each persona, the created
+// entries of that persona only.
+func TestLaneInputsCarryServices(t *testing.T) {
+	overall := metrics.NewCollector()
+
+	t.Run("plan", func(t *testing.T) {
+		p := &mixplan.Plan{Services: []string{"octavia"}, Personas: []mixplan.Persona{{Name: "ci"}, {Name: "gardener"}}}
+		inputs, err := planLaneInputs(parseMix(t, sampleMixScenarioYAML), p, "run1234", overall)
+		if err != nil {
+			t.Fatalf("planLaneInputs: %v", err)
+		}
+		if len(inputs) != 2 {
+			t.Fatalf("got %d lane inputs, want 2", len(inputs))
+		}
+		for _, in := range inputs {
+			if !slices.Equal(in.services, []string{"octavia"}) || in.recorded != nil {
+				t.Errorf("lane input %s services %v, recorded %v, want the plan's [octavia] and none", in.name, in.services, in.recorded)
+			}
+		}
+	})
+
+	t.Run("record", func(t *testing.T) {
+		rec := &run.Record{
+			Services: []string{"octavia"},
+			Created: []resource.Resource{
+				{Kind: "server", ID: "s1", Persona: "ci"},
+				{Kind: "loadbalancer", ID: "lb1", Persona: "gardener"},
+				{Kind: "image", ID: "i1", Lane: "glance"},
+				{Kind: "pool", ID: "pool1", Persona: "gardener"},
+				{Kind: "server", ID: "s2", Persona: "legacy"},
+			},
+			Personas: []run.PersonaStats{{Name: "ci", RunID: "mix00001-ci"}, {Name: "gardener", RunID: "mix00001-gardener"}},
+		}
+		inputs := recordLaneInputs(rec, overall)
+		if len(inputs) != 2 {
+			t.Fatalf("got %d lane inputs, want 2", len(inputs))
+		}
+		for i, want := range [][]string{{"s1"}, {"lb1", "pool1"}} {
+			in := inputs[i]
+			var ids []string
+			for _, r := range in.recorded {
+				ids = append(ids, r.ID)
+			}
+			if !slices.Equal(in.services, []string{"octavia"}) || !slices.Equal(ids, want) {
+				t.Errorf("lane input %s services %v, recorded %v, want the record's [octavia] and %v", in.name, in.services, ids, want)
+			}
+		}
+	})
 }
 
 // writeNovaRecord writes a nova run record and returns its path.
