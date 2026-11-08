@@ -6,6 +6,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/loadbalancer/v2/listeners"
 	"github.com/gophercloud/gophercloud/v2/openstack/loadbalancer/v2/monitors"
 	"github.com/gophercloud/gophercloud/v2/openstack/loadbalancer/v2/pools"
+	"github.com/gophercloud/gophercloud/v2/pagination"
 
 	"github.com/B42Labs/dizzy/internal/octavia/plan"
 	"github.com/B42Labs/dizzy/internal/resource"
@@ -90,15 +91,31 @@ func (c *Client) CreatePool(ctx context.Context, p plan.Pool, lbID, listenerID, 
 // on the VIP subnet subnetID, which the OVN provider requires, with the
 // deterministic name and the run tags. A create whose answer was lost is
 // adopted (see createAdopting). Octavia's member list takes no tags filter, so
-// its lookup lists the pool's members by name and checks the run tag client
-// side only.
+// its lookup lists the pool's members by name, address, and port and checks
+// the run tag client side only. The address and port are part of the lookup,
+// and checked client side too, because one name does not always stand for one
+// address: the mix Gardener persona creates a member under the same name for
+// every instance of its worker, each at that instance's address, and the
+// orphan of an earlier instance must not be adopted for the next one.
 func (c *Client) CreateMember(ctx context.Context, m plan.Member, poolID, subnetID string) (resource.Resource, error) {
 	tag := runTag(c.runID)
 	r, _, err := createAdopting(ctx, c, KindMember, m.Name,
 		func(ctx context.Context, name string) (pools.Member, bool, error) {
 			return lookupLost(ctx, KindMember, name, tag,
-				pools.ListMembers(c.lb, poolID, pools.ListMembersOpts{Name: name}),
-				pools.ExtractMembers,
+				pools.ListMembers(c.lb, poolID, pools.ListMembersOpts{Name: name, Address: m.Address, ProtocolPort: m.Port}),
+				func(page pagination.Page) ([]pools.Member, error) {
+					all, err := pools.ExtractMembers(page)
+					if err != nil {
+						return nil, err
+					}
+					var same []pools.Member
+					for _, it := range all {
+						if it.Address == m.Address && it.ProtocolPort == m.Port {
+							same = append(same, it)
+						}
+					}
+					return same, nil
+				},
 				func(it pools.Member) (string, string, []string, string) {
 					return it.Name, it.ID, it.Tags, it.ProvisioningStatus
 				})
