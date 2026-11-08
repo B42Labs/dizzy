@@ -52,21 +52,30 @@ func newMixCmd(opts *globalOptions) *cobra.Command {
 // run record says the persona ran in, empty without one; buildMixLane refuses
 // a lane whose cloud authenticates against another project. persona is nil for
 // the cleanup-only lanes of status and cleanup, which need neither cfg nor
-// scenario. Each lane's client records into a child of overall.
+// scenario. services are the opt-in services of the plan or record the lane
+// comes from, which bindMixServices binds to the personas that use them.
+// recorded are the created entries of the record whose persona is the lane's
+// name, nil without a record; a service binding reads what the record knows
+// from them, such as the pool ids its members are observed below. Each lane's
+// client records into a child of overall.
 type mixLaneInput struct {
 	name, cloud, runID, scenario string
 	project                      string
 	persona                      *mixplan.Persona
 	cfg                          chaos.Config
 	overall                      *metrics.Collector
+	services                     []string
+	recorded                     []resource.Resource
 }
 
 // buildMixLane authenticates one lane against its cloud and binds its compute
 // client, under the lane identity, to the lane's cleanup, leak-check and
 // observe handles. For a persona lane it also sets up the persona's telemetry,
 // resolves image and flavor and pre-checks the compute quota of the persona's
-// project against the persona's plan, and builds its churn graph. It creates
-// nothing in the cloud.
+// project against the persona's plan, and builds its churn graph. Then, for
+// both kinds of lane, it binds the opt-in services of in to the lane through
+// bindMixServices, so a cleanup-only lane tears down and observes what a
+// service added to the persona too. It creates nothing in the cloud.
 func buildMixLane(ctx context.Context, opts *globalOptions, in mixLaneInput) (_ *mix.Lane, err error) {
 	cloud := in.cloud
 	if cloud == "" {
@@ -123,19 +132,24 @@ func buildMixLane(ctx context.Context, opts *globalOptions, in mixLaneInput) (_ 
 		},
 		Observe: client.Observe,
 	}
-	if in.persona == nil {
-		return l, nil
+	if in.persona != nil {
+		resolved, err := resolveNovaRefs(ctx, cs, in.persona.Nova)
+		if err != nil {
+			return nil, fmt.Errorf("persona %q: %w", in.name, err)
+		}
+		nodes, err := buildPersonaNodes(in.persona, client, resolved, opts.timeout)
+		if err != nil {
+			return nil, fmt.Errorf("building churn graph for persona %q: %w", in.name, err)
+		}
+		l.Nodes, l.Seed, l.Config = nodes, in.persona.Seed, in.cfg
 	}
 
-	resolved, err := resolveNovaRefs(ctx, cs, in.persona.Nova)
-	if err != nil {
-		return nil, fmt.Errorf("persona %q: %w", in.name, err)
+	// The services extend the graph and config set above, and the handles of a
+	// cleanup-only lane as well. The error goes through the named result, so a
+	// failing binding still flushes the persona's telemetry.
+	if err = bindMixServices(ctx, opts, in, cloud, l, mixServices); err != nil {
+		return nil, err
 	}
-	nodes, err := buildPersonaNodes(in.persona, client, resolved, opts.timeout)
-	if err != nil {
-		return nil, fmt.Errorf("building churn graph for persona %q: %w", in.name, err)
-	}
-	l.Nodes, l.Seed, l.Config = nodes, in.persona.Seed, in.cfg
 	return l, nil
 }
 
@@ -273,8 +287,9 @@ func logColdMigrationOff(s mixscenario.Scenario, name string) {
 
 // planLaneInputs returns the lane input of every persona of p, under the cloud
 // the scenario names for it and the lane identity "<runID>-<persona>", which is
-// built here only. It sets no persona, so the inputs bind cleanup-only lanes;
-// mix chaos sets persona, scenario and cfg on each itself.
+// built here only, with the plan's opt-in services. It sets no persona, so the
+// inputs bind cleanup-only lanes; mix chaos sets persona, scenario and cfg on
+// each itself.
 func planLaneInputs(s mixscenario.Scenario, p *mixplan.Plan, runID string, overall *metrics.Collector) ([]mixLaneInput, error) {
 	inputs := make([]mixLaneInput, 0, len(p.Personas))
 	for _, ps := range p.Personas {
@@ -282,7 +297,7 @@ func planLaneInputs(s mixscenario.Scenario, p *mixplan.Plan, runID string, overa
 		if err != nil {
 			return nil, err
 		}
-		inputs = append(inputs, mixLaneInput{name: ps.Name, cloud: cloud, runID: runID + "-" + ps.Name, overall: overall})
+		inputs = append(inputs, mixLaneInput{name: ps.Name, cloud: cloud, runID: runID + "-" + ps.Name, overall: overall, services: p.Services})
 	}
 	return inputs, nil
 }
@@ -305,11 +320,19 @@ func resourcesOfLane(created []resource.Resource, l *mix.Lane) []resource.Resour
 }
 
 // recordLaneInputs returns the cleanup-only lane input of every persona of a
-// mix record, under the cloud, identity and project the record names.
+// mix record, under the cloud, identity and project the record names, with the
+// record's opt-in services and the created entries of that persona alone.
 func recordLaneInputs(rec *run.Record, overall *metrics.Collector) []mixLaneInput {
 	inputs := make([]mixLaneInput, 0, len(rec.Personas))
 	for _, ps := range rec.Personas {
-		inputs = append(inputs, mixLaneInput{name: ps.Name, cloud: ps.Cloud, runID: ps.RunID, project: ps.ProjectID, overall: overall})
+		var recorded []resource.Resource
+		for _, r := range rec.Created {
+			if r.Persona == ps.Name {
+				recorded = append(recorded, r)
+			}
+		}
+		inputs = append(inputs, mixLaneInput{name: ps.Name, cloud: ps.Cloud, runID: ps.RunID, project: ps.ProjectID, overall: overall,
+			services: rec.Services, recorded: recorded})
 	}
 	return inputs
 }
