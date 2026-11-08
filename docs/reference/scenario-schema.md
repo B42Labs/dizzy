@@ -753,7 +753,7 @@ seed: 42
 image: cirros          # shared by every persona; referenced by name
 flavor: m1.tiny        # shared by every persona; referenced by name
 
-services: []           # opt-in services bound to every persona; this build supports none
+services: []           # opt-in services: octavia gives the gardener persona load balancers
 
 resources:
   servers: 6           # the server envelope the personas divide by their shares
@@ -775,6 +775,11 @@ personas:
     policy: soft-anti-affinity                # or anti-affinity
     volume_gib:         { min: 1, max: 2 }
     interval:           { min: 10s, max: 1m }
+    octavia:                                  # read only with services: [octavia]
+      provider: ""                            # "" uses the cloud's default; ovn or amphora (needs --timeout 5m)
+      loadbalancers: 1                        # per cluster, VIP on the cluster's network
+      listeners: 2                            # per load balancer: ports 80 and 443, each with a pool of every worker
+      health_monitors: true                   # a TCP health monitor on every pool
   legacy:
     share: 0.2
     cloud: ""
@@ -813,6 +818,15 @@ it again under the same name. The clusters are replaced concurrently. The block
 has no `churn_ratio` or `target_fill`, because the persona keeps its clusters
 whole.
 
+With `octavia` under `services`, every cluster also keeps the load balancers
+its `octavia` block describes, each with its VIP on the cluster's network. Each
+listener has one pool that holds every worker of the cluster on the pool's
+NodePort, counting from 30000 over the persona's pools in plan order. The load
+balancers, listeners, pools and health monitors stay until the run's teardown,
+which deletes the load balancers before the networks. A worker's members are
+deleted before the worker and created again once its replacement is up. See
+[Opt-in services](../explanation/combined-runs.md#opt-in-services).
+
 The Legacy persona boots long-lived servers: each on one of the persona's
 networks, with its data volumes and extra ports. Its servers, volumes and ports
 are created before anything else and stay until the run's teardown. Each
@@ -829,7 +843,7 @@ because the persona keeps every planned resource.
 |---|---|---|
 | `image` | string | Boot image of every persona, referenced by name (or id) |
 | `flavor` | string | Boot flavor of every persona, referenced by name (or id) |
-| `services` | list of strings | Opt-in services bound to every persona; no entry may be empty or appear twice. This build supports none |
+| `services` | list of strings | Opt-in services, each bound to the personas that use it; no entry may be empty or appear twice. This build supports `octavia`, which gives the Gardener persona load balancers and needs a Gardener persona with a server |
 | `resources.servers` | int | Server envelope the personas divide by their shares, from 0 to 1,000,000; a plan needs at least 1 |
 | `personas.ci.share` | float | Share of `resources.servers`, a finite number of at least 0; at least one persona needs a share above 0 |
 | `personas.ci.cloud` | string | `clouds.yaml` entry the persona authenticates with; empty uses `--os-cloud` |
@@ -845,6 +859,10 @@ because the persona keeps every planned resource.
 | `personas.gardener.policy` | string | Policy of every cluster's server group, `anti-affinity` or `soft-anti-affinity`; required with a share above 0. `anti-affinity` needs a compute host per worker of a cluster |
 | `personas.gardener.volume_gib` | range | Size drawn for the one data volume of each worker; `min >= 1` |
 | `personas.gardener.interval.min` / `personas.gardener.interval.max` | duration | Random delay range drawn per tick of the persona's engine; `0` falls back to `200ms` / `3s` |
+| `personas.gardener.octavia.provider` | string | Octavia provider driver of every load balancer, e.g. `ovn` or `amphora`; empty selects the cloud's default. Like the three keys below, read only when `services` lists `octavia`, and the bounds below are checked only then |
+| `personas.gardener.octavia.loadbalancers` | int | Load balancers per cluster, each with its VIP on the cluster's network; at least 1 |
+| `personas.gardener.octavia.listeners` | int | TCP listeners per load balancer, each with a default pool of every worker of the cluster; from 1 to 10. They listen on ports 80, 443, then 8080 onward |
+| `personas.gardener.octavia.health_monitors` | bool | `true` puts one TCP health monitor on every pool; `false` creates none |
 | `personas.legacy.share` | float | Share of `resources.servers`, a finite number of at least 0; at least one persona needs a share above 0 |
 | `personas.legacy.cloud` | string | `clouds.yaml` entry the persona authenticates with; empty uses `--os-cloud` |
 | `personas.legacy.networks` | int | Networks the persona's servers are spread over, one per server; at least 1 when the persona has servers |
@@ -867,6 +885,11 @@ because the persona keeps every planned resource.
 | `chaos.parallel.max` | int | Per-tick fan-out of each persona's engine, drawn in `[1, max]` |
 | `chaos.bucket_width` | duration | Width of one time bucket of a run with `--duration 0`, for every persona and lane |
 
+With `octavia` under `services`, every pool of the Gardener persona takes one
+NodePort, so its pools, `clusters × loadbalancers × listeners`, number at most
+2768, the ports 30000 to 32767. A larger block fails with
+`personas.gardener.octavia: <n> pools (clusters x loadbalancers x listeners) exceed the 2768 node ports 30000-32767`.
+
 The `--set` keys are `seed`, `image`, `flavor`, `resources.servers`,
 `services` (a comma-separated list; an empty value clears it), and every
 `personas.ci.*`, `personas.gardener.*` and `personas.legacy.*` key of the
@@ -875,7 +898,14 @@ ranges and Go duration strings for the intervals, e.g.
 `--set personas.ci.interval.max=2s`,
 `--set personas.gardener.policy=anti-affinity`,
 `--set personas.legacy.resize_flavor=` or
-`--set personas.legacy.cold_migration=false`. They also include
+`--set personas.legacy.cold_migration=false`. The Gardener persona's Octavia
+block has the keys `personas.gardener.octavia.provider`,
+`personas.gardener.octavia.loadbalancers`,
+`personas.gardener.octavia.listeners` and
+`personas.gardener.octavia.health_monitors`, with `true` or `false` for
+`health_monitors`, e.g.
+`--set services=octavia --set personas.gardener.octavia.provider=ovn`. The
+`--set` keys also include
 `lanes.<name>.enabled`, `lanes.<name>.cloud`, `lanes.<name>.profile` and
 `lanes.<name>.scenario` for `cinder`, `glance`, `keystone` and `neutron`, with
 `true` or `false` for `enabled`, and `lanes.cinder.volume_type`,
@@ -958,9 +988,11 @@ and `chaos.parallel.max: 4`. They give the CI persona `share: 0.5`,
 `cloud: ""`, `volumes_per_server: { min: 0, max: 1 }`,
 `volume_gib: { min: 1, max: 2 }`, `interval: { min: 100ms, max: 1s }`,
 `churn_ratio: 0.5` and `target_fill: 0.6`; the Gardener persona `share: 0.3`,
-`cloud: ""`, `policy: soft-anti-affinity`, `volume_gib: { min: 1, max: 2 }` and
-`interval: { min: 10s, max: 1m }`; and the Legacy persona `share: 0.2`,
-`cloud: ""`, `resize_flavor: m1.small`, `volumes_per_server: { min: 1, max: 2 }`,
+`cloud: ""`, `policy: soft-anti-affinity`, `volume_gib: { min: 1, max: 2 }`,
+`interval: { min: 10s, max: 1m }` and an `octavia` block of `provider: ""`,
+`loadbalancers: 1`, `listeners: 2` and `health_monitors: true`; and the Legacy
+persona `share: 0.2`, `cloud: ""`, `resize_flavor: m1.small`,
+`volumes_per_server: { min: 1, max: 2 }`,
 `volume_gib: { min: 1, max: 2 }`, `ports_per_server: { min: 0, max: 1 }` and
 `interval: { min: 10s, max: 1m }`. Each needs the flavor `m1.small` for the
 Legacy persona's resizes. None sets `cold_migration`, so each cold-migrates
@@ -970,6 +1002,25 @@ workers.
 `small` fits Nova's common default quota of 10 instances and its default
 limits of 10 server groups and 10 members per group; `medium` and `large` need
 raised quotas.
+
+`services` stays empty, so the profiles run on a cloud without an Octavia
+endpoint, and `--set services=octavia` opts a run in. The Gardener persona
+then keeps, per profile:
+
+| Profile | Load balancers | Listeners | Pools | Members | Health monitors |
+|---|---|---|---|---|---|
+| `small` | 1 | 2 | 2 | 4 | 2 |
+| `medium` | 2 | 4 | 4 | 12 | 4 |
+| `large` | 3 | 6 | 6 | 36 | 6 |
+
+Every profile leaves `provider` empty and so runs against the cloud's default
+provider; `--set personas.gardener.octavia.provider=ovn` or
+`--set personas.gardener.octavia.provider=amphora` selects one. An amphora
+load balancer needs `--timeout 5m`. An OVN release without TCP health monitor
+support runs a profile with
+`--set personas.gardener.octavia.health_monitors=false`. Octavia's project
+quotas default to unlimited (`-1`); on a project with lowered quotas the
+Gardener persona's pre-check names the ones that block.
 
 All three carry the same four lanes, each with `enabled: false`, `cloud: ""`
 and `profile: small`. They use the services' `small` profiles because
