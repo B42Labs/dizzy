@@ -263,8 +263,88 @@ its own plan.
 ## Opt-in services
 
 A mix scenario can list opt-in services under `services`. Such a service binds
-its own resources to every persona's lane: it adds nodes to the lane's engine
-and wraps the lane's teardown and leak check so its resources go first. This
-build supports none, so `mix generate`, `mix chaos`, `mix status` and
-`mix cleanup` reject a scenario or record that names one before they touch the
-cloud.
+its own resources to the lanes of the personas that use it: it adds nodes to
+the lane's engine and wraps the lane's teardown, leak check and status lookups,
+so its resources go first and are found again. This build supports one,
+`octavia`, which binds to the `gardener` persona; the CI and Legacy personas
+run as before. `mix generate`, `mix chaos`, `mix status` and `mix cleanup`
+reject a scenario or record that names any other service before they touch the
+cloud. A scenario that does not list `octavia` never reads the
+`personas.gardener.octavia` block: its plan, graph and decisions are those of
+a run without load balancers.
+
+With `octavia`, every Gardener cluster keeps load balancers in front of its
+workers, the way the OpenStack cloud controller manager keeps one for each
+Kubernetes `Service` of type `LoadBalancer`. The block
+`personas.gardener.octavia` sets the shape of one cluster: `loadbalancers`
+load balancers, `listeners` TCP listeners on each, one pool per listener, and
+with `health_monitors` one TCP health monitor per pool. `provider` names the
+Octavia provider driver of every load balancer, and an empty value selects the
+cloud's default.
+
+A load balancer's VIP sits on the network of its cluster. dizzy creates no VIP
+network and no router for these load balancers. The cloud controller manager
+puts the VIP on the node subnet as well, and the OVN provider needs its members
+on a subnet the VIP reaches without a router. On the cluster's own network the
+VIP reaches every worker directly.
+
+The listeners of a load balancer listen on 80 and 443, then on 8080, 8081 and
+onward. Each pool holds every worker of its cluster, at the worker's own
+address, on a NodePort that belongs to the pool: the persona's first pool uses
+30000, the second 30001, and so on, the same port on every worker, as a
+Kubernetes NodePort is. The plan draws none of this, so the frontend follows
+from the persona's compute plan and the block alone.
+
+The load balancers, listeners, pools and health monitors are pinned: the
+engine creates them once the cluster's network exists, never mutates them and
+keeps them until the teardown. The members belong to the rolling set of their
+worker instead. A roll deletes the worker's members before the worker and,
+once the replacement is `ACTIVE`, creates them again. Every delete of a roll
+waits for the last operation of every node in the set, members included, so
+the next replacement in the cluster starts only after the previous worker's
+members have joined their pools or failed. A slow member update, or a load
+balancer that stays in a `PENDING_*` status, therefore holds up the next
+replacement, as it holds up a node rollout in production.
+
+No create hands back a server's fixed IP or a network's subnet id, so the
+frontend reads both from Neutron when it needs them. A load balancer create
+lists the subnets of its cluster network, which must have exactly one, and a
+member create lists the worker's ports on that network and takes the first
+IPv4 address and its subnet. Both lookups go through the retry policy of the
+Octavia calls and record as `subnet` and `port` `list` samples of the persona.
+A worker without an IPv4 address on the network fails its members' creates,
+and the rolls go on. A load balancer whose create failed stays failed for the
+run, as a pinned network does: the creates of its members are skipped, and the
+workers keep rolling.
+
+Before anything is created, the Gardener lane also runs the quota pre-check of
+`octavia apply` against its frontend: the load balancers, listeners, pools,
+members and health monitors it plans, against the Octavia quotas of the
+persona's project. Like the compute pre-check, it sees only the persona's own
+plan.
+
+The teardown deletes the persona's load balancers first, with cascade, and
+waits until each is gone. The Nova teardown then deletes the workers, their
+volumes, the server groups and the networks. The order matters because a
+load balancer's VIP port is a port Octavia owns on the cluster network, the
+Nova teardown deletes no port that has an owner, and so the network delete
+fails while the load balancer exists. Both stages always run, and the teardown
+reports the errors of both, so a load balancer left behind shows next to the
+network delete it blocked. The leak check lists the run's load balancers next
+to its Nova resources; see
+[Resource identity and cleanup](resource-identity.md#cleanup-is-idempotent-and-ordered).
+
+A scenario that lists `octavia` but cannot put a load balancer in front of a
+Gardener server stops before any API call, so a run record never claims
+Octavia load the run did not produce. A Gardener share of 0 is refused with
+`opt-in service "octavia" gives the gardener persona load balancers, but personas.gardener.share is 0`,
+and a Gardener persona that the division of `resources.servers` leaves without
+a server with
+`opt-in service "octavia" gives the gardener persona load balancers, but the gardener persona received no server of resources.servers (<n>)`.
+
+`mix status` and `mix cleanup` bind `octavia` to the Gardener lane in the same
+way when the record lists it, or, for `mix cleanup --run-id`, the scenario and
+its overrides. They need the cloud's load-balancer endpoint as well:
+`mix status` re-queries the persona's load balancers, listeners, pools,
+members and health monitors, and `mix cleanup` deletes the load balancers
+before the networks.

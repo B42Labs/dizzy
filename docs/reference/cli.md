@@ -1069,13 +1069,15 @@ time, which a one-shot build does not have.
 separately. A run of three personas and two lanes can have up to five times
 `--concurrency` API calls in flight.
 
+This build supports one opt-in service, `octavia`, which gives the `gardener`
+persona load balancers in front of its clusters; see [`mix chaos`](#mix-chaos).
 `mix generate`, `mix chaos`, `mix status` and `mix cleanup` reject an opt-in
 service under `services` that this build does not support, before they make
 any API call:
 
 ```console
-$ dizzy mix generate --scenario scenarios/mix/small.yaml --set services=octavia
-error: opt-in service "octavia" is not supported by this build of dizzy (supported: none)
+$ dizzy mix generate --scenario scenarios/mix/small.yaml --set services=barbican
+error: opt-in service "barbican" is not supported by this build of dizzy (supported: octavia)
 ```
 
 ### `mix generate`
@@ -1123,6 +1125,34 @@ logs one line after its pre-check lines:
 ```text
 level=INFO msg="cold migration disabled for this run" reason="personas.legacy.cold_migration is false"
 ```
+
+With `--set services=octavia`, or `octavia` under the scenario's `services`,
+the `gardener` persona keeps load balancers in front of its clusters, shaped
+per cluster by the `personas.gardener.octavia` block: load balancers with their
+VIP on the cluster's network, TCP listeners on ports 80, 443 and then 8080
+onward, one pool per listener with every worker of the cluster as a member,
+and a TCP health monitor per pool. The persona then also authenticates against
+the load-balancer endpoint of its cloud and, before anything is created, runs
+the quota pre-check of `octavia apply` against these objects in its own
+project. A failure there ends the run with an error that starts with
+`persona "gardener": opt-in service "octavia": `. Once Octavia is bound to the
+persona's lane, the run logs one line, with `provider` the block's provider or
+`cloud default` when that is empty:
+
+```text
+level=INFO msg="opt-in service bound" service=octavia persona=gardener run=1a2b3c4d-gardener provider="cloud default" loadbalancers=1 listeners=2 members=4 healthMonitors=2
+```
+
+The load balancers, listeners, pools and health monitors stay for the whole
+run. A replacement of a worker deletes the worker's members first and creates
+them again once the new server is `ACTIVE`, and the next replacement in the
+cluster waits for them. An amphora load balancer takes one to two minutes to
+build, longer than the default `--timeout` of `1m`, so run an amphora provider
+with `--timeout 5m`. The teardown deletes the persona's load balancers with
+cascade and waits until each is gone before it deletes the Gardener networks,
+which a VIP port would otherwise hold, and the leak check lists the run's load
+balancers too. See
+[Opt-in services](../explanation/combined-runs.md#opt-in-services).
 
 After the personas, each enabled lane authenticates with the `clouds.yaml`
 entry its block names under `cloud`, or with `--os-cloud` when that is empty,
@@ -1237,6 +1267,11 @@ persona and lane and exits non-zero when any table failed, with
 `re-querying <n> of <m> personas failed`, or
 `re-querying <n> of <m> personas and lanes failed` for a record with lanes.
 
+For a record whose `services` lists `octavia`, the command binds Octavia to
+the `gardener` persona as `mix chaos` does, so the persona's cloud needs a
+load-balancer endpoint, and its table also holds the persona's load balancers,
+listeners, pools, members and health monitors.
+
 ### `mix report`
 
 The shared [`report`](#report). A mix record adds per-persona and per-lane
@@ -1253,6 +1288,16 @@ persona's server groups are found by the name prefix
 `dizzy-<run-id>-<persona>-` and deleted after its other resources, even when
 one of those deletes failed. A lane follows the discovery rules of its
 service's `cleanup`. Idempotent.
+
+When the record, or with `--run-id` the scenario and its overrides, lists
+`octavia` under `services`, the command binds Octavia to the `gardener`
+persona as `mix chaos` does, so the persona's cloud needs a load-balancer
+endpoint. It deletes the persona's load balancers first, found by the
+`dizzy:run` tag and in the record, with cascade, and waits until each is gone.
+The persona's Nova cleanup runs next, also when a load balancer delete failed.
+A VIP port left on a cluster network blocks that network's delete, and the
+command then reports both errors. With `--run-id`, pass
+`--set services=octavia` when the run had it.
 
 | Flag | Description |
 |---|---|

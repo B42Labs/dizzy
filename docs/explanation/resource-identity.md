@@ -188,6 +188,19 @@ teardown can simply be rerun.
 After a `chaos` run's teardown, a **leak check** lists any resource still carrying
 the run's tag. It is the assertion that teardown actually finished.
 
+The Gardener persona of a `mix` run with `octavia` under `services` adds one
+stage in front of its Nova teardown. It deletes the persona's load balancers,
+found by the run tag and in the record, with cascade, and waits until each is
+gone. The workers, server groups and cluster networks go after it, because a
+load balancer's VIP port sits on its cluster network and the Nova teardown
+leaves a port that Octavia owns alone, so the network delete would fail. The
+lane does not reuse `octavia cleanup` for this stage. That cleanup also deletes
+every subnet and network carrying the run tag, and in the Gardener lane those
+are the Nova cluster networks, which carry the same `dizzy:run` tag and belong
+to the Nova teardown that follows. The lane runs only the load-balancer stage,
+then the Nova teardown even when that stage failed, and reports the errors of
+both. `mix cleanup` takes the same order.
+
 ## The one dangerous exception: the monitor sweep
 
 Everything above is scoped to *one run*. The `monitor` loop needs something

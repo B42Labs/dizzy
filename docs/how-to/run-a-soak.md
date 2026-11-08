@@ -231,6 +231,31 @@ The project needs room for one server group per cluster in its
 `server_groups` quota; the quota pre-check stops the run before it creates
 anything when it lacks it.
 
+To put load balancers in front of the Gardener clusters, opt in to Octavia
+with `--set services=octavia`. In the bundled profiles each cluster then keeps
+one load balancer on its own network, with listeners on ports 80 and 443 whose
+pools hold every worker of the cluster. A replacement takes the worker's
+members out of the pools before it deletes the worker and adds them again once
+the new server is up, so a slow member update holds up the next replacement
+in the cluster. The Gardener persona's cloud needs a load-balancer endpoint
+and a role Octavia's policy allows to create load balancers. An amphora
+provider boots a VM per load balancer and needs a longer `--timeout`:
+
+```console
+$ dizzy mix chaos --scenario scenarios/mix/small.yaml --os-cloud soak \
+    --set personas.ci.cloud=tenant-ci --set personas.gardener.cloud=tenant-gardener \
+    --set personas.legacy.cloud=tenant-legacy \
+    --set services=octavia --set personas.gardener.octavia.provider=amphora \
+    --timeout 5m
+```
+
+On an OVN provider, set `personas.gardener.octavia.provider=ovn` and leave
+`--timeout` at its default; a release without TCP health monitors also needs
+`--set personas.gardener.octavia.health_monitors=false`. The run logs
+`opt-in service bound` with the numbers of load balancers, listeners, members
+and health monitors the persona keeps, and its teardown deletes the load
+balancers before the cluster networks.
+
 The Legacy persona's servers stay for the whole run and are stopped and
 started, resized between `flavor` and `resize_flavor`, and live- and
 cold-migrated; their volumes and ports are detached and attached again. The
@@ -286,7 +311,7 @@ $ dizzy mix cleanup --run run-<id>.json --os-cloud soak
 ```
 
 Without a record, pass the run id together with the scenario and every `--set`
-the run used, the lane keys included:
+the run used, the lane keys and `services` included:
 
 ```console
 $ dizzy mix cleanup --run-id <id> --scenario scenarios/mix/small.yaml --os-cloud soak \

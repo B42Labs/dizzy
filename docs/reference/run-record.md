@@ -35,7 +35,7 @@ same way.
 | `metrics` | object | Aggregate metrics; see below |
 | `volumeType` | string | Cinder only; the resolved volume type, for provenance |
 | `chaos` | object | Churn runs only; see below. Absent on a `mix` record, whose personas and lanes carry their own |
-| `services` | array of strings | `mix` only; the opt-in services bound to the personas. Omitted when empty |
+| `services` | array of strings | `mix` only; the opt-in services bound to the personas. This build supports `octavia`, with which the `gardener` persona's `created` entries include its load balancers, listeners, pools, members and health monitors. Omitted when empty |
 | `personas` | array | `mix` only; one entry per persona; see below |
 | `lanes` | array | `mix` only; one entry per background lane; see below. Omitted when the run had none |
 | `pressure` | object | `keystone pressure` runs only; see below. Absent on every other record |
@@ -139,8 +139,9 @@ service actually returns, or `http_other`. These are the same values the OTLP
 A `keystone pressure` record adds `accepted`, for a `bad_token` request that
 a service answered with a 2xx. A `barbican` record adds `mismatch`, for a
 read-back that returned different bytes, and `order_error`, for an order that
-ended in ERROR. An `octavia` record adds `provisioning_error`, for a load
-balancer that reached ERROR after a write.
+ended in ERROR. An `octavia` record, and a `mix` record whose `services` lists
+`octavia`, adds `provisioning_error`, for a load balancer that reached ERROR
+after a write.
 
 ## `chaos`
 
