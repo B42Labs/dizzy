@@ -325,7 +325,7 @@ func TestCreateWithDoneContextSkipsLookup(t *testing.T) {
 // TestLookupFiltersPerKind confirms each kind's lookup lists by name, its
 // parent, and the run tag where the API takes one: a load balancer by name and
 // tag, a listener and a pool by load balancer, a monitor by pool, and a member
-// below its pool by name alone, its tag checked client side only.
+// below its pool by name, address, and port, its tag checked client side only.
 func TestLookupFiltersPerKind(t *testing.T) {
 	tag := "dizzy%3Arun%3Drun0"
 	for _, tc := range []struct {
@@ -361,14 +361,16 @@ func TestLookupFiltersPerKind(t *testing.T) {
 			wantID:    "pool-id-1",
 		},
 		{
-			name:     "member",
-			post:     "/v2.0/lbaas/pools/pool-id-1/members",
-			list:     "/v2.0/lbaas/pools/pool-id-1/members",
-			listBody: `{"members":[` + item("mem-id-x", "dizzy-run0-pool-0001-member-01", "ACTIVE") + `,` + item("mem-id-1", "dizzy-run0-pool-0001-member-01", "ACTIVE", "dizzy:run=run0", "dizzy:type=member") + `]}`,
+			name: "member",
+			post: "/v2.0/lbaas/pools/pool-id-1/members",
+			list: "/v2.0/lbaas/pools/pool-id-1/members",
+			listBody: `{"members":[` +
+				`{"id":"mem-id-x","name":"dizzy-run0-pool-0001-member-01","provisioning_status":"ACTIVE","tags":[],"address":"10.0.1.128","protocol_port":8080},` +
+				`{"id":"mem-id-1","name":"dizzy-run0-pool-0001-member-01","provisioning_status":"ACTIVE","tags":["dizzy:run=run0","dizzy:type=member"],"address":"10.0.1.128","protocol_port":8080}]}`,
 			create: func(c *Client) (resource.Resource, error) {
 				return c.CreateMember(context.Background(), plan.Member{Name: "pool-0001-member-01", Pool: "pool-0001", Address: "10.0.1.128", Port: 8080}, "pool-id-1", "sub-id-1")
 			},
-			wantQuery: "name=dizzy-run0-pool-0001-member-01",
+			wantQuery: "address=10.0.1.128&name=dizzy-run0-pool-0001-member-01&protocol_port=8080",
 			wantID:    "mem-id-1",
 		},
 		{
@@ -403,4 +405,51 @@ func TestLookupFiltersPerKind(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCreateMemberAdoptsOnlyItsOwnAddress confirms a lost member create is
+// adopted only by a create of the same member at the same address and port.
+// The mix Gardener persona creates a member under one logical name for every
+// instance of its worker, each at that instance's own address, so the orphan
+// of an earlier instance, found by name and run tag, is posted past instead of
+// adopted, and the lookup asks Octavia for the address and port as well.
+func TestCreateMemberAdoptsOnlyItsOwnAddress(t *testing.T) {
+	const (
+		membersPath = "/v2.0/lbaas/pools/pool-id-1/members"
+		name        = "dizzy-run0-pool-0001-member-01"
+	)
+	orphan := `{"members":[{"id":"mem-id-old","name":"` + name + `","provisioning_status":"ACTIVE",` +
+		`"tags":["dizzy:run=run0","dizzy:type=member"],"address":"10.0.1.5","protocol_port":30000}]}`
+	f := newFake(t, scripted(t, map[string][]reply{
+		"POST " + membersPath: {
+			{http.StatusServiceUnavailable, `{}`},
+			{http.StatusCreated, `{"member":{"id":"mem-id-new","name":"` + name + `","provisioning_status":"PENDING_CREATE",` +
+				`"tags":["dizzy:run=run0","dizzy:type=member"],"address":"10.0.1.9","protocol_port":30000}}`},
+		},
+		"GET " + membersPath: {
+			{http.StatusOK, `{"members":[]}`},
+			{http.StatusOK, orphan},
+		},
+	}))
+	c, _ := f.client()
+
+	old := plan.Member{Name: "pool-0001-member-01", Pool: "pool-0001", Address: "10.0.1.5", Port: 30000}
+	if _, err := c.CreateMember(context.Background(), old, "pool-id-1", "sub-id-1"); err == nil {
+		t.Fatal("CreateMember answered 503 = nil error, want the POST error")
+	}
+
+	replacement := old
+	replacement.Address = "10.0.1.9"
+	got, err := c.CreateMember(context.Background(), replacement, "pool-id-1", "sub-id-1")
+	if err != nil {
+		t.Fatalf("CreateMember of the replacement: %v", err)
+	}
+	if got.ID != "mem-id-new" {
+		t.Fatalf("CreateMember of the replacement = %+v, want the posted mem-id-new, not the earlier instance's member", got)
+	}
+	f.wantLines(t,
+		"POST "+membersPath,
+		"GET "+membersPath+"?address=10.0.1.5&name="+name+"&protocol_port=30000",
+		"GET "+membersPath+"?address=10.0.1.9&name="+name+"&protocol_port=30000",
+		"POST "+membersPath)
 }

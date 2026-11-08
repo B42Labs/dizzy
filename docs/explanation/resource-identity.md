@@ -98,7 +98,11 @@ refuses a second listener on a port, a second default pool on a listener, a
 second member at an address and port, or a second monitor on a pool with HTTP
 409, and a second load balancer would boot a second amphora. dizzy looks the
 name up among the objects that carry the run tag, skipping any in
-`PENDING_DELETE` or `DELETED`, and adopts a match. Each logical name is created
+`PENDING_DELETE` or `DELETED`, and adopts a match. A member is looked up by its
+address and port as well, because the Gardener persona of `mix` creates a
+member under the same name for every instance of its worker, each at that
+instance's address, and the orphan of an earlier instance must not stand in
+for the next one. Each logical name is created
 once per apply, so name and run tag identify the instance without a create
 token. `octavia chaos` creates a name again only once the delete of its
 previous instance has finished. When that delete succeeded, Octavia has removed
