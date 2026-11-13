@@ -3,7 +3,7 @@ module github.com/B42Labs/dizzy
 go 1.26.1
 
 require (
-	github.com/gophercloud/gophercloud/v2 v2.15.0
+	github.com/gophercloud/gophercloud/v2 v2.16.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.1.0
 	go.opentelemetry.io/otel v1.44.0
