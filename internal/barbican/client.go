@@ -12,9 +12,12 @@
 // prefix, and a secret is confirmed by its dizzy_run=<id> metadata or as the
 // secret_ref of a discovered order. The monitor's pre-flight sweep discovers
 // any tester run's resources by namePrefix alone instead, confirming a secret
-// by its dizzy_type=secret metadata. StampSecret writes dizzy_run and
-// dizzy_type=secret onto a stored secret after its store and onto a generated
-// secret once its order turns ACTIVE. Each call is timed through a
+// by its dizzy_type=secret metadata. Both also confirm a prefix-matched secret
+// without any metadata, such as one whose store Barbican completed after dizzy
+// gave up on the answer, by its creator_id: it counts as dizzy's when the user
+// of dizzy's own token created it (SetCreatorID). StampSecret writes dizzy_run
+// and dizzy_type=secret onto a stored secret after its store and onto a
+// generated secret once its order turns ACTIVE. Each call is timed through a
 // metrics.Collector and, when enabled, mirrored into OTEL. Barbican deletes are
 // synchronous, so there is no wait for a resource to be gone.
 package barbican
@@ -28,6 +31,7 @@ import (
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
 	"github.com/gophercloud/gophercloud/v2/openstack/keymanager/v1/containers"
 	"github.com/gophercloud/gophercloud/v2/openstack/keymanager/v1/orders"
 	"github.com/gophercloud/gophercloud/v2/openstack/keymanager/v1/secrets"
@@ -109,6 +113,7 @@ type Client struct {
 	metrics        *metrics.Collector
 	tel            *telemetry.Telemetry
 	requestTimeout time.Duration
+	creatorID      string
 }
 
 // New returns a Client that names and stamps resources for runID and records
@@ -134,6 +139,34 @@ func (c *Client) SetTelemetry(t *telemetry.Telemetry) {
 // New) adds no bound, leaving each request to the caller's context.
 func (c *Client) SetRequestTimeout(d time.Duration) {
 	c.requestTimeout = d
+}
+
+// SetCreatorID names the Keystone user discovery confirms a secret without run
+// metadata by: a prefix-matched secret whose metadata set is empty counts as
+// dizzy's only when Barbican records this user as its creator_id. An empty id
+// (the default after New) leaves every such secret alone.
+func (c *Client) SetCreatorID(id string) {
+	c.creatorID = id
+}
+
+// UserIDFromAuth extracts the authenticated user id from the v3 token auth
+// result. It returns false when the result was not recorded (e.g. a manually
+// supplied token), is not a v3 create-token result, or names no user, so the
+// caller leaves the creator confirmation off rather than guess.
+func UserIDFromAuth(kv *gophercloud.ServiceClient) (string, bool) {
+	ar := kv.GetAuthResult()
+	if ar == nil {
+		return "", false
+	}
+	tr, ok := ar.(tokens.CreateResult)
+	if !ok {
+		return "", false
+	}
+	user, err := tr.ExtractUser()
+	if err != nil || user == nil || user.ID == "" {
+		return "", false
+	}
+	return user.ID, true
 }
 
 // requestContext returns ctx bounded by the request timeout SetRequestTimeout

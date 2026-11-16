@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -286,6 +287,35 @@ func TestResourceNameAndRunPrefix(t *testing.T) {
 	}
 	if !strings.HasPrefix(resourceName("abc123", "sec-0001"), runPrefix("abc123")) {
 		t.Error("resourceName does not carry runPrefix")
+	}
+}
+
+// TestUserIDFromAuth confirms the user id is read from a v3 token auth result,
+// and that a client without one, a result naming no user, and a user with an
+// empty id all report false, so the creator confirmation stays off.
+func TestUserIDFromAuth(t *testing.T) {
+	withAuth := func(t *testing.T, token map[string]any) *gophercloud.ServiceClient {
+		t.Helper()
+		kv := &gophercloud.ServiceClient{ProviderClient: &gophercloud.ProviderClient{}}
+		ar := tokens.CreateResult{}
+		ar.Body = map[string]any{"token": token}
+		if err := kv.SetTokenAndAuthResult(ar); err != nil {
+			t.Fatalf("SetTokenAndAuthResult: %v", err)
+		}
+		return kv
+	}
+
+	if id, ok := UserIDFromAuth(&gophercloud.ServiceClient{ProviderClient: &gophercloud.ProviderClient{}}); id != "" || ok {
+		t.Errorf("UserIDFromAuth without an auth result = (%q, %v), want (\"\", false)", id, ok)
+	}
+	if id, ok := UserIDFromAuth(withAuth(t, map[string]any{"user": map[string]any{"id": "u1"}})); id != "u1" || !ok {
+		t.Errorf("UserIDFromAuth = (%q, %v), want (\"u1\", true)", id, ok)
+	}
+	if id, ok := UserIDFromAuth(withAuth(t, map[string]any{})); id != "" || ok {
+		t.Errorf("UserIDFromAuth with a result naming no user = (%q, %v), want (\"\", false)", id, ok)
+	}
+	if id, ok := UserIDFromAuth(withAuth(t, map[string]any{"user": map[string]any{"id": ""}})); id != "" || ok {
+		t.Errorf("UserIDFromAuth with an empty user id = (%q, %v), want (\"\", false)", id, ok)
 	}
 }
 
