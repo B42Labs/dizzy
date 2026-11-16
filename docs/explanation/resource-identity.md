@@ -69,12 +69,16 @@ order is ACTIVE for a generated one. Barbican spells them with an underscore
 where every other service writes `dizzy:run` and `dizzy:type`, because its
 metadata keys must match `[A-Za-z0-9_-]`. Discovery takes containers and orders
 on the prefix alone, and a secret only once its `dizzy_run` metadata confirms
-the prefix or a discovered order names it as its `secret_ref`, so discovery
-never deletes a secret that merely carries a run's name. Cleanup works in
+the prefix, a discovered order names it as its `secret_ref`, or it carries no
+metadata at all and its `creator_id` is the user of dizzy's token. Barbican
+sets `creator_id` from the token that created the secret, and gives a
+generated secret the creator of its order, so discovery never deletes a secret
+that merely carries a run's name. Cleanup works in
 dependency order: containers first, since they reference secrets, then each
 discovered order's generated secret and only after it the orders, since
-deleting an order leaves the secret it generated and the order is the only
-handle on one that was never stamped, then the remaining secrets, stored and
+deleting an order leaves the secret it generated and the order is the one
+handle on an unstamped one that does not depend on who runs the cleanup, then
+the remaining secrets, stored and
 generated alike. Barbican deletes synchronously, so cleanup waits for nothing.
 
 **Octavia tags every object, and cleanup deletes through the cascade.** Load
@@ -145,35 +149,55 @@ are reclaimed from the **run record's created list**, by id:
 
 Barbican adds secrets that never got their metadata, because the stamp is a
 second call after the secret exists. Discovery never takes a secret on its name
-alone: it confirms one by its `dizzy_run` metadata, or as the `secret_ref` of
-an order discovered by the run's name prefix. A bare `--run-id` therefore
-reaches every container and order by that prefix, every secret that carries
-`dizzy_run`, and every secret an order of the run generated, stamped or not.
-That covers the secret of a late order, an order whose wait ended before
-Barbican had generated its key, at the `--timeout` deadline or because the run
-stopped, and that turned ACTIVE afterwards: dizzy never stamped or recorded
-that secret, and cleanup deletes it through its order. Two stored secrets stay
-out of that reach:
+alone: it confirms one by its `dizzy_run` metadata, as the `secret_ref` of an
+order discovered by the run's name prefix, or, when the secret carries no
+metadata at all, by its `creator_id`, which must be the user of dizzy's own
+token. A bare `--run-id` therefore reaches every container and order by that
+prefix, every secret that carries `dizzy_run`, every secret an order of the run
+generated, stamped or not, and every secret of the run without metadata that
+the token's user created. The last covers three secrets that no stamp names;
+the record lists only the first of them:
 
-- **A stored Barbican secret whose stamp failed.** The store succeeded and the
-  metadata write did not. The run record lists the secret, so `cleanup --run`
-  deletes it by id, while a bare `--run-id` leaves it.
-- **The unstamped duplicate of a retried store.** A store whose answer was
-  lost after Barbican had kept the secret, for example a 5xx sent after the
-  commit, leaves that secret behind, and the retry stores a second one under
-  the same name. The first carries neither metadata nor a place in the run
-  record, so no cleanup reaches it. The store logs
-  `create failed; a secret with this name may be orphaned in the cloud` with
-  that name, for an operator to find the secret and delete it by hand.
+- **A stored secret whose stamp failed.** The store succeeded and the metadata
+  write did not. The run record lists it too, so `cleanup --run` deletes it by
+  id whoever runs the cleanup.
+- **The secret of a store dizzy gave up on.** When one operation of an apply
+  stage fails, the stage cancels the stores still in flight, and Barbican
+  completes some of them. A lost answer, or a 5xx sent after the commit, leaves
+  the same secret, and the retry stores a second one under the same name. The
+  first carries neither metadata nor a place in the run record. The store
+  logs `create failed; a secret with this name may be orphaned in the cloud`
+  with that name.
+- **The secret of an order deleted while PENDING.** A worker that was already
+  generating the key when the order was deleted still keeps the secret, and no
+  order names it any more.
+
+The secret of a late order, an order whose wait ended before Barbican had
+generated its key, at the `--timeout` deadline or because the run stopped, and
+that turned ACTIVE afterwards, is found through its order while the order
+exists: dizzy never stamped or recorded that secret, and cleanup deletes it
+through its order.
+
+Two cases stay out of reach:
+
+- **Cleanup as another user.** A cleanup whose token names another user than
+  the one that stored the secret, or names no user at all, cannot confirm a
+  secret without metadata, and leaves it. It logs a warning that names the
+  secret, or, without a user, one that counts such secrets. `cleanup --run`
+  still deletes a stamp-failed secret by id from the record.
+- **A create Barbican commits after the listing.** A canceled store or order
+  that Barbican completes after the cleanup listed the secrets is not in that
+  listing. The next sweep of `barbican monitor` deletes it; after an
+  interrupted `barbican apply`, a second `barbican cleanup --run-id <id>` does.
 
 The practical consequence is a real asymmetry in the `cleanup` command:
 
-- `cleanup --run <path>` uses the record, and reaches everything.
+- `cleanup --run <path>` uses the record, and reaches everything the record
+  lists.
 - `cleanup --run-id <id>` has no record. It reclaims everything discoverable by
-  tag, metadata, or prefix — which is most things — but it cannot remove address
-  scopes, role assignments, or a stored Barbican secret whose stamp failed.
-- Neither reaches the unstamped duplicate of a retried Barbican store above,
-  which the `create failed` warning names. It is the only secret both miss.
+  tag, metadata, prefix, or a Barbican secret's creator — which is most things —
+  but it cannot remove address scopes, role assignments, or, run as another
+  user, a stored Barbican secret whose stamp failed.
 
 This is why `--run-id` exists at all: it is the recovery path for a run whose
 record was lost, and it is honest about being incomplete.
@@ -232,14 +256,13 @@ just does not adopt orphans it did not create.
 
 Barbican has no type tag, so its sweep widens the name prefix to `dizzy-`. It
 takes containers and orders on that prefix, each secret a swept order names as
-its `secret_ref`, and any other secret only once its `dizzy_type=secret`
-metadata confirms it. A stored secret whose stamp failed is therefore never
-swept. Its own iteration's cleanup deletes it through the created list, so
-only an iteration whose cleanup does not finish leaves one behind: a cleanup
-that stops at its first listing or delete error, a second signal, a killed
-process. Without `--keep-run-records` nothing holds its id afterwards, and an
-operator deletes it by hand; with it, `barbican cleanup --run` on that
-iteration's record reaches it.
+its `secret_ref`, any other secret once its `dizzy_type=secret` metadata
+confirms it, and a secret without any metadata once its `creator_id` is the
+user of the monitor's token. A secret whose stamp failed, or whose store the
+iteration gave up on, is therefore swept by the next iteration when the
+monitor keeps running as the same user; its own iteration's cleanup usually
+deletes it first. A monitor started as another user leaves such a secret and
+logs a warning naming it.
 
 Octavia's sweep filters on `dizzy:type=<kind>` and on the token's project.
 Octavia lists every project's load balancers for an administrator, and Neutron
@@ -261,7 +284,13 @@ and the sweep's wait until a deleted one is gone.
 It will never delete a resource that does not carry the run's stamp. Not on
 `cleanup`, not on an interrupted `apply`, not on a `chaos` teardown. The tag,
 metadata, and prefix filters are the whole authorization model, and they are
-applied server-side where the API allows it.
+applied server-side where the API allows it. Barbican secrets are the
+exception: discovery takes two kinds of secret without a stamp. One is the
+`secret_ref` of an order the run's name prefix discovered. The other is a
+secret that carries the name prefix, no metadata at all, and the user of
+dizzy's token as its `creator_id`. Barbican sets that field from the token
+that created the secret, so only a secret the same user created under a
+`dizzy-` name matches it.
 
 The `monitor` sweep is the single place where the filter widens from "this run"
 to "any dizzy run", and it is documented above precisely because it is the one

@@ -160,8 +160,9 @@ func TestCleanupDeletesKindsInDependencyOrder(t *testing.T) {
 
 func TestCleanupUnionsRecord(t *testing.T) {
 	// Discovery finds c1 and s1. The record holds s1 again, an order discovery
-	// missed, and a stored secret whose stamp never landed, which secret
-	// discovery cannot confirm and only the record reaches.
+	// missed, and a stored secret whose stamp never landed, which this fake's
+	// discovery does not return (as when another user created it), so only the
+	// record reaches it.
 	f := newFakeCleaner(ctr("c1"), sec("s1"))
 	f.live["o-rec"] = true
 	f.live["s-unstamped"] = true

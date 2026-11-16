@@ -20,13 +20,15 @@ import (
 // nothing. The run is identified either by its record (--run) or directly by id
 // (--run-id); exactly one is required. Containers are discovered by their
 // dizzy-<id>- name prefix, orders by the same prefix on their meta.name, and
-// secrets by the prefix confirmed by their dizzy_run=<id> metadata or as the
-// secret_ref of a discovered order. --run-id alone therefore reaches every
-// container and order, every stamped secret, and every secret a run order
-// generated, stamped or not. Only the record reaches a stored secret whose
-// metadata stamp never landed. Neither reaches the unstamped duplicate a
-// retried store can leave behind after a lost create answer, which the store's
-// "create failed" warning names.
+// secrets by the prefix confirmed by their dizzy_run=<id> metadata, as the
+// secret_ref of a discovered order, or, for a secret without any metadata, by
+// a creator_id equal to the user of this command's token. --run-id alone
+// therefore reaches every container and order, every stamped secret, every
+// secret a run order generated, stamped or not, and every unstamped secret of
+// the token's user: one whose stamp failed, one Barbican kept although its
+// store failed or was canceled, and the first secret of a retried store. Run as
+// another user, or with a token that names no user, it leaves the unstamped
+// ones, and only the record reaches a stamp-failed secret then.
 func newBarbicanCleanupCmd(opts *globalOptions) *cobra.Command {
 	var (
 		runPath string

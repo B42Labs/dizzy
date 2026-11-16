@@ -360,10 +360,10 @@ func finishBarbicanChurn(ctx context.Context, cmd *cobra.Command, c barbicanexec
 // barbicanLeakCheck counts the containers and secrets still carrying the run's
 // identity after teardown. Orders are not counted, since a churn run never
 // creates one. It takes the barbicanexec.Cleaner seam so the listings share the
-// teardown's bounds. Like the Glance check it cannot see a secret whose
-// identity stamp never landed, since secret discovery confirms a secret by its
-// dizzy_run metadata; teardown still reclaimed such a secret through the
-// created list.
+// teardown's bounds. It sees a secret whose identity stamp never landed only
+// when the token's user created it, since secret discovery confirms a secret
+// without metadata by its creator; teardown reclaimed a recorded one through
+// the created list either way.
 func barbicanLeakCheck(ctx context.Context, c barbicanexec.Cleaner, runID string) (int, error) {
 	containers, err := c.ListContainersByRun(ctx, runID)
 	if err != nil {
