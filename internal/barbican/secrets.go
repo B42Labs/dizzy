@@ -44,10 +44,12 @@ func (c *Client) StoreSecret(ctx context.Context, s barbicanplan.Secret, seed in
 		return err
 	})
 	if err != nil {
-		// A store that fails after the request reached Barbican (a lost response or
-		// a 5xx past commit) can leave a secret behind, and that secret carries no
-		// run metadata, so discovery never deletes it. Log the deterministic name so
-		// an operator can locate and remove any such orphan.
+		// A store that fails after the request reached Barbican (a canceled or lost
+		// response, or a 5xx past commit) can leave a secret behind that carries no
+		// run metadata and no place in the run record. Discovery confirms it by its
+		// creator (confirmSecrets), so cleanup and the monitor sweep reclaim it when
+		// they run as this token's user. Log the deterministic name so an operator
+		// can still locate the orphan when they do not.
 		slog.Warn("create failed; a secret with this name may be orphaned in the cloud",
 			"name", name, "error", err)
 		return resource.Resource{}, wrapCreate(KindSecret, s.Name, err)
@@ -116,13 +118,15 @@ func comparePayload(logical string, got, want []byte) error {
 }
 
 // ListSecretsByRun returns the secrets carrying this run's dizzy-<runID>- name
-// prefix whose metadata confirms dizzy_run=<runID>, the discovery step cleanup
-// deletes from. The prefix alone is not enough: a secret whose stamp never
-// landed is left to the run record, so discovery never deletes a secret the run
-// cannot prove it owns. A candidate whose metadata read returns 404 was deleted
-// meanwhile and is dropped. With a request timeout set (SetRequestTimeout), the
-// listing and each metadata read are bounded one by one, so a large run's
-// discovery is not cut short by a bound over the whole call.
+// prefix whose metadata confirms dizzy_run=<runID>, or whose metadata set is
+// empty and whose creator is the client's user (SetCreatorID), the discovery
+// step cleanup deletes from. The prefix alone is not enough: a secret whose
+// stamp never landed is taken only on its creator, so discovery never deletes a
+// secret the run cannot prove it owns. A candidate whose metadata read returns
+// 404 was deleted meanwhile and is dropped. With a request timeout set
+// (SetRequestTimeout), the listing and each metadata read are bounded one by
+// one, so a large run's discovery is not cut short by a bound over the whole
+// call.
 func (c *Client) ListSecretsByRun(ctx context.Context, runID string) ([]resource.Resource, error) {
 	candidates, err := c.listSecrets(ctx, runPrefix(runID))
 	if err != nil {
@@ -135,10 +139,11 @@ func (c *Client) ListSecretsByRun(ctx context.Context, runID string) ([]resource
 
 // ListSecretsByType returns the secrets carrying the dizzy- name prefix of any
 // tester run whose metadata confirms dizzy_type=secret, regardless of their
-// dizzy_run: the pre-flight sweep's handle for reclaiming a crashed iteration's
+// dizzy_run, or whose metadata set is empty and whose creator is the client's
+// user: the pre-flight sweep's handle for reclaiming a crashed iteration's
 // secrets once its run id is lost. As in ListSecretsByRun, the prefix alone is
-// never enough, so a secret whose stamp never landed is not discovered, and a
-// candidate whose metadata read returns 404 is dropped.
+// never enough, so a secret whose stamp never landed is discovered only on its
+// creator, and a candidate whose metadata read returns 404 is dropped.
 func (c *Client) ListSecretsByType(ctx context.Context) ([]resource.Resource, error) {
 	candidates, err := c.listSecrets(ctx, namePrefix)
 	if err != nil {
@@ -158,11 +163,19 @@ type secretCandidate struct {
 }
 
 // confirmSecrets reads the metadata of each prefix-matched candidate and keeps,
-// in list order, those whose metadata stamped accepts. A candidate whose
-// metadata read returns 404 was deleted meanwhile and is dropped; any other
-// read error stops the discovery and is returned with the secret's id.
+// in list order, those whose metadata stamped accepts, whoever created them,
+// and those whose metadata set is empty when the client's user (SetCreatorID)
+// is their creator. StampSecret writes the whole set at once, so a secret of
+// dizzy's carries either both run keys or none; one with any other metadata is
+// not dizzy's unstamped secret and is dropped silently. An unstamped secret of
+// another user is dropped with a warning naming it, and when the client knows
+// no user, every unstamped candidate is dropped and one warning counts them. A
+// candidate whose metadata read returns 404 was deleted meanwhile and is
+// dropped; any other read error stops the discovery and is returned with the
+// secret's id.
 func (c *Client) confirmSecrets(ctx context.Context, candidates []secretCandidate, stamped func(md map[string]string) bool) ([]resource.Resource, error) {
 	var found []resource.Resource
+	var unconfirmed int
 	for _, cand := range candidates {
 		r := cand.res
 		md, err := c.secretMetadata(ctx, r)
@@ -171,10 +184,23 @@ func (c *Client) confirmSecrets(ctx context.Context, candidates []secretCandidat
 			continue
 		case err != nil:
 			return nil, fmt.Errorf("reading metadata of secret %s: %w", r.ID, err)
-		}
-		if stamped(md) {
+		case stamped(md):
+			found = append(found, r)
+		case len(md) != 0:
+			continue
+		case c.creatorID == "":
+			unconfirmed++
+		case cand.creator != c.creatorID:
+			slog.Warn("leaving a secret without run metadata; another user created it",
+				"name", r.Name, "id", r.ID, "creator", cand.creator)
+		default:
+			slog.Info("confirmed a secret without run metadata by its creator", "name", r.Name, "id", r.ID)
 			found = append(found, r)
 		}
+	}
+	if unconfirmed > 0 {
+		slog.Warn("leaving secrets without run metadata; the token names no user to confirm them by",
+			"count", unconfirmed)
 	}
 	return found, nil
 }

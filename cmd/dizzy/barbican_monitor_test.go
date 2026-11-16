@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
 
+	"github.com/B42Labs/dizzy/internal/barbican"
 	barbicanplan "github.com/B42Labs/dizzy/internal/barbican/plan"
 	barbicanscenario "github.com/B42Labs/dizzy/internal/barbican/scenario"
 	"github.com/B42Labs/dizzy/internal/metrics"
@@ -243,6 +245,34 @@ func kmSecret(name, id string) string {
 	return fmt.Sprintf(`{"name":%q,"secret_ref":"https://kv/v1/secrets/%s","status":"ACTIVE"}`, name, id)
 }
 
+// kmSecretBy is kmSecret with the creator_id Barbican records for the secret.
+func kmSecretBy(name, id, creator string) string {
+	return fmt.Sprintf(`{"name":%q,"secret_ref":"https://kv/v1/secrets/%s","status":"ACTIVE","creator_id":%q}`, name, id, creator)
+}
+
+// barbicanTestClientAs serves f and returns a service client whose v3 auth
+// result names userID, and the client for run0 newBarbicanClient builds on it,
+// so the client confirms an unstamped secret by that user as a command's does.
+func barbicanTestClientAs(t *testing.T, f *fakeKeyManager, userID string) (*gophercloud.ServiceClient, *barbican.Client) {
+	t.Helper()
+	ts := httptest.NewServer(f)
+	t.Cleanup(ts.Close)
+	kv := &gophercloud.ServiceClient{ProviderClient: &gophercloud.ProviderClient{}, Endpoint: ts.URL + "/", ResourceBase: ts.URL + "/v1/"}
+	ar := tokens.CreateResult{}
+	ar.Body = map[string]any{"token": map[string]any{"user": map[string]any{"id": userID}}}
+	if err := kv.SetTokenAndAuthResult(ar); err != nil {
+		t.Fatalf("SetTokenAndAuthResult: %v", err)
+	}
+	return kv, newBarbicanClient(kv, "run0", metrics.NewCollector(), time.Second)
+}
+
+// barbicanTestDepsAs is barbicanTestDeps for a client authenticated as userID.
+func barbicanTestDepsAs(t *testing.T, f *fakeKeyManager, userID string) iterationDeps {
+	t.Helper()
+	kv, client := barbicanTestClientAs(t, f, userID)
+	return barbicanIterationDeps(kv, client, sampleBarbicanPlan(t), "run0", 2, time.Second)
+}
+
 // sampleBarbicanPlan expands sampleBarbicanScenarioYAML: 4 secrets, 2 orders,
 // and 2 containers, so the plan needs 6 secrets of quota.
 func sampleBarbicanPlan(t *testing.T) *barbicanplan.Plan {
@@ -374,6 +404,69 @@ func TestBarbicanPreflightSweepsAnyRun(t *testing.T) {
 		"DELETE /v1/secrets/s1",
 	}
 	if got := f.deletes(); !reflect.DeepEqual(got, want) {
+		t.Errorf("deletes = %q, want %q", got, want)
+	}
+}
+
+// TestBarbicanPreflightSweepsUnstampedSecretOfOwnUser confirms the sweep takes
+// a dizzy- secret without any metadata when the monitor's user created it,
+// including a generated secret no order names any more, while it leaves one
+// another user created and never touches an unprefixed secret.
+func TestBarbicanPreflightSweepsUnstampedSecretOfOwnUser(t *testing.T) {
+	f := &fakeKeyManager{
+		t: t,
+		secrets: []string{
+			kmSecretBy("dizzy-run9-sec-0001", "s1", "u1"),
+			kmSecretBy("dizzy-run9-sec-0002", "s2", "u2"),
+			kmSecretBy("dizzy-run8-ord-0001", "g9", "u1"),
+			kmSecretBy("unrelated", "s3", "u1"),
+		},
+		metadata: map[string]string{
+			"s1": `{"metadata":{}}`,
+			"s2": `{"metadata":{}}`,
+			"g9": `{"metadata":{}}`,
+			"s3": `{"metadata":{}}`,
+		},
+	}
+	swept, err := barbicanTestDepsAs(t, f, "u1").preflight(context.Background())
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	if swept != 2 {
+		t.Errorf("swept = %d, want 2", swept)
+	}
+	// The two deletes run concurrently, so their order is not asserted.
+	got := f.deletes()
+	slices.Sort(got)
+	if want := []string{"DELETE /v1/secrets/g9", "DELETE /v1/secrets/s1"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("deletes = %q, want %q", got, want)
+	}
+}
+
+// TestBarbicanCleanupReclaimsUnstampedSecretOfRun confirms an iteration's own
+// cleanup deletes the run's secret without any metadata that the iteration's
+// user created, though the created list does not hold it, and leaves another
+// run's.
+func TestBarbicanCleanupReclaimsUnstampedSecretOfRun(t *testing.T) {
+	f := &fakeKeyManager{
+		t: t,
+		secrets: []string{
+			kmSecretBy("dizzy-run0-sec-0002", "s2", "u1"),
+			kmSecretBy("dizzy-run1-sec-0001", "s9", "u1"),
+		},
+		metadata: map[string]string{
+			"s2": `{"metadata":{}}`,
+			"s9": `{"metadata":{}}`,
+		},
+	}
+	deleted, err := barbicanTestDepsAs(t, f, "u1").cleanup(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if deleted != 1 {
+		t.Errorf("deleted = %d, want 1", deleted)
+	}
+	if got, want := f.deletes(), []string{"DELETE /v1/secrets/s2"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("deletes = %q, want %q", got, want)
 	}
 }
