@@ -149,13 +149,22 @@ func (c *Client) ListSecretsByType(ctx context.Context) ([]resource.Resource, er
 	})
 }
 
+// secretCandidate is one prefix-matched entry of the secret list with the
+// creator Barbican recorded for it, the user whose token stored the secret or
+// submitted the order that generated it.
+type secretCandidate struct {
+	res     resource.Resource
+	creator string
+}
+
 // confirmSecrets reads the metadata of each prefix-matched candidate and keeps,
-// in list order, those whose metadata keep accepts. A candidate whose metadata
-// read returns 404 was deleted meanwhile and is dropped; any other read error
-// stops the discovery and is returned with the secret's id.
-func (c *Client) confirmSecrets(ctx context.Context, candidates []resource.Resource, keep func(md map[string]string) bool) ([]resource.Resource, error) {
+// in list order, those whose metadata stamped accepts. A candidate whose
+// metadata read returns 404 was deleted meanwhile and is dropped; any other
+// read error stops the discovery and is returned with the secret's id.
+func (c *Client) confirmSecrets(ctx context.Context, candidates []secretCandidate, stamped func(md map[string]string) bool) ([]resource.Resource, error) {
 	var found []resource.Resource
-	for _, r := range candidates {
+	for _, cand := range candidates {
+		r := cand.res
 		md, err := c.secretMetadata(ctx, r)
 		switch {
 		case IsNotFound(err):
@@ -163,7 +172,7 @@ func (c *Client) confirmSecrets(ctx context.Context, candidates []resource.Resou
 		case err != nil:
 			return nil, fmt.Errorf("reading metadata of secret %s: %w", r.ID, err)
 		}
-		if keep(md) {
+		if stamped(md) {
 			found = append(found, r)
 		}
 	}
@@ -171,12 +180,12 @@ func (c *Client) confirmSecrets(ctx context.Context, candidates []resource.Resou
 }
 
 // listSecrets streams the project's secret list a page at a time and keeps only
-// those whose name carries prefix, recording the whole listing under the list
-// op. The prefix match runs client side, so a secret the tool did not name is
-// never returned. The whole paged listing is one request under the request
-// timeout.
-func (c *Client) listSecrets(ctx context.Context, prefix string) ([]resource.Resource, error) {
-	var found []resource.Resource
+// those whose name carries prefix, with each one's creator_id, recording the
+// whole listing under the list op. The prefix match runs client side, so a
+// secret the tool did not name is never returned. The whole paged listing is
+// one request under the request timeout.
+func (c *Client) listSecrets(ctx context.Context, prefix string) ([]secretCandidate, error) {
+	var found []secretCandidate
 	err := c.timed(ctx, KindSecret, "list", func(ctx context.Context) error {
 		ctx, cancel := c.requestContext(ctx)
 		defer cancel()
@@ -194,7 +203,10 @@ func (c *Client) listSecrets(ctx context.Context, prefix string) ([]resource.Res
 				if err != nil {
 					return false, fmt.Errorf("secret %q: %w", s.Name, err)
 				}
-				found = append(found, resource.Resource{Kind: KindSecret, Name: s.Name, ID: id})
+				found = append(found, secretCandidate{
+					res:     resource.Resource{Kind: KindSecret, Name: s.Name, ID: id},
+					creator: s.CreatorID,
+				})
 			}
 			return true, nil
 		})
