@@ -124,6 +124,8 @@ matches what you are doing right now.
 - Every resource it creates carries a run identifier — a Neutron tag, Cinder
   metadata, a Keystone name prefix, (for Nova) server and volume metadata, (for
   Glance) an image tag, (for Barbican) a name prefix plus secret metadata, or
+  for a secret whose metadata never landed the name prefix plus the token's
+  user as its creator, or
   (for Octavia) a tag on every load balancer object and VIP network.
   `cleanup` deletes strictly on that identifier, so it never touches resources
   the tool did not create.

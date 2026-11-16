@@ -110,8 +110,8 @@ func Build(p *barbicanplan.Plan, c Barbican, seed int64, opTimeout time.Duration
 // derived from seed and the secret's logical name, the derivation apply uses,
 // then stamps the run identity onto it. A stamp failure still returns the
 // stored secret with the error, so the engine keeps it in the run record, skips
-// its containers and its read-back, and deletes it later; discovery could not
-// reclaim it, since it confirms a secret by the stamp that never landed.
+// its containers and its read-back, and deletes it later by id; discovery
+// reaches it only on its creator, since the stamp never landed.
 func storeSecret(ctx context.Context, opTimeout time.Duration, c Barbican, s barbicanplan.Secret, seed int64) (resource.Resource, error) {
 	res, err := createRetry(ctx, opTimeout, func(ctx context.Context) (resource.Resource, error) {
 		return c.StoreSecret(ctx, s, payload.Seed(seed, s.Name))

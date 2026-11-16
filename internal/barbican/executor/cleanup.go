@@ -12,7 +12,8 @@ import (
 // Cleaner is the identity-scoped teardown surface Cleanup drives: discover a
 // run's containers, orders, and secrets, and delete one. Containers and secrets
 // are found by their dizzy-<id>- name prefix, a secret only once its dizzy_run
-// metadata confirms the run, and orders by the same prefix on their meta.name.
+// metadata confirms the run or, carrying no metadata at all, its creator_id is
+// the user of dizzy's token, and orders by the same prefix on their meta.name.
 // ListOrdersByRun also returns the secret each discovered order's secret_ref
 // names, the order's generated secret, whether or not it was ever stamped.
 // Like Barbican it is the single ports-and-adapters seam to the cloud;
@@ -38,14 +39,18 @@ var _ Cleaner = (*barbican.Client)(nil)
 // The order listing also yields each discovered order's generated secret.
 // Deleting an order leaves that secret behind, and for a secret that was never
 // stamped (its order turned ACTIVE after the order wait gave up, or a retried
-// create left a duplicate order) the order is the only handle. So the orders
+// create left a duplicate order) the order is the one handle that does not
+// depend on the user cleanup runs as. So the orders
 // phase deletes those generated secrets first and the orders only after them:
 // a cleanup that stops in between leaves the order in place for a rerun to find
 // the secret through again. A secret is deleted when it is recorded, carries
-// dizzy_run=<run id> metadata, or is the secret_ref of an order whose meta.name
-// carries the run prefix, and in no other case: a stored secret whose metadata
-// stamp never landed is reached through the record alone, while a secret that
-// only matches the name prefix is never discovered and so never deleted.
+// dizzy_run=<run id> metadata, carries the run prefix and no metadata at all
+// and was created by the user of dizzy's token, or is the secret_ref of an
+// order whose meta.name carries the run prefix, and in no other case. The third
+// handle reaches a stored secret whose stamp never landed without the record,
+// including one Barbican kept although its store failed or was canceled, while
+// a secret that only matches the name prefix is never discovered and so never
+// deleted.
 //
 // Each batch of deletions runs through the same bounded worker pool Apply uses
 // (up to concurrency workers). Barbican deletes synchronously, so nothing is

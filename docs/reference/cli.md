@@ -257,8 +257,10 @@ most once per lifetime. A read-back that returns different bytes does not stop
 the churn: the run finishes, tears down unless `--no-cleanup` is set, and then
 exits non-zero. The run record's `error` names the count, e.g.
 `payload read-back mismatch (run <id>): 2 read-back(s) returned different bytes`.
-The leak check finds a secret by its `dizzy_run` metadata, so it cannot see a
-stored secret whose stamp failed.
+The leak check finds a secret by its `dizzy_run` metadata, or, for a secret
+without any metadata, by its `creator_id` being the user of the command's
+token; with a token that names no user, it cannot see a stored secret whose
+stamp failed.
 
 `octavia chaos` churns seven kinds of node: the VIP networks, their subnets,
 the load balancers, listeners, pools, members, and health monitors. The subnet
@@ -813,7 +815,8 @@ across iterations. To broaden coverage, run several monitors with different
 oversized plan exits before the first iteration, and again in each
 iteration's apply, where it fails that iteration. Its sweep takes `dizzy-`
 containers and orders by name, and a secret only when its `dizzy_type=secret`
-metadata confirms it or a swept order generated it. A read-back mismatch fails
+metadata confirms it, a swept order generated it, or it carries no metadata
+and the user of the monitor's token created it. A read-back mismatch fails
 its iteration while the loop goes on, so the command exits 0 and the mismatch
 shows as a failed iteration and as `error.kind=mismatch`.
 
@@ -1005,24 +1008,32 @@ Discovery differs per service, and so does what `--run-id` alone can reach:
   list as a fallback. Images are a single kind with no ordering, so a bare
   `--run-id` reaches everything the run created.
 - **barbican**: containers and secrets are found by their `dizzy-<runid>-` name
-  prefix, a secret only once its `dizzy_run=<id>` metadata confirms the run or
-  a discovered order names it as its `secret_ref`, and orders by the same
+  prefix, a secret only once its `dizzy_run=<id>` metadata confirms the run, a
+  discovered order names it as its `secret_ref`, or it carries no metadata at
+  all and its `creator_id` is the user of the command's token, and orders by
+  the same
   prefix on their `meta.name`, all filtered client side, with the run record's
   created list as a fallback. Barbican spells the key `dizzy_run`, not the
   `dizzy:run` of the other services, because its metadata keys must match
   `[A-Za-z0-9_-]`. Containers are deleted first, since they reference secrets.
   Then each discovered order's generated secret is deleted before the orders
   themselves, since deleting an order leaves its secret behind and the order is
-  the only handle on a secret that was never stamped; a cleanup that stops in
-  between leaves the order for a rerun to find the secret through. The
-  remaining secrets, stored and generated alike, go last. Barbican deletes
-  synchronously, so nothing is waited on. A bare `--run-id` reaches every container and order
-  by the prefix, every secret that carries `dizzy_run`, and every secret a run
-  order generated, stamped or not. Only the record reaches a stored secret
-  whose metadata stamp failed. Neither reaches the unstamped duplicate a
-  retried store can leave behind after a lost create answer, which the store's
+  the one handle on an unstamped secret that does not depend on who runs the
+  cleanup; a cleanup that stops in between leaves the order for a rerun to
+  find the secret through. The remaining secrets, stored and generated alike,
+  go last. Barbican deletes synchronously, so nothing is waited on. A bare
+  `--run-id` reaches every container and order by the prefix, every secret
+  that carries `dizzy_run`, every secret a run order generated, stamped or
+  not, and every secret of the run without metadata that the token's user
+  created: one whose stamp failed, one Barbican kept although the store failed
+  or was canceled (the store's
   `create failed; a secret with this name may be orphaned in the cloud`
-  warning names.
+  warning names it), and the first secret of a retried store. Two cases stay
+  out of reach. A cleanup run as another user, or with a token that names no
+  user, leaves a secret without metadata and logs a warning; `--run` still
+  deletes a stamp-failed one by id. A create Barbican commits after the
+  cleanup listed the secrets is left for the next `barbican monitor` sweep or
+  a second `barbican cleanup --run-id`.
 - **octavia** — everything is found by the `dizzy:run=<id>` tag: load
   balancers, VIP networks, and subnets are discovered by it, with the run
   record's created list as a fallback. Load balancers are deleted first, with

@@ -75,9 +75,10 @@ each order followed by the secret Barbican generated for it, then the
 containers. An order and its generated secret share `logical` and `name`, e.g.
 `ord-0001` and `dizzy-a1b2c3d4-ord-0001`, and differ in `kind`, `order` for the
 one and `secret` for the other, and in `id`. A secret whose metadata stamp
-failed, stored or generated, is still listed. For a stored secret this list is
-then its only cleanup handle; a generated one is also found through its order's
-`secret_ref`, without the record.
+failed, stored or generated, is still listed. Without the record, cleanup finds
+such a secret by its `creator_id` when it runs as the user that created it, and
+a generated one also through its order's `secret_ref`. Run as another user,
+`cleanup --run` reaches a stamp-failed stored secret through this list alone.
 
 On a `barbican chaos` record the list holds the secrets and containers still
 live at the end of the run, and no orders.

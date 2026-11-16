@@ -149,8 +149,9 @@ type orderResult struct {
 // storeSecret stores a secret (retrying transient errors) with the payload
 // derived from the plan seed and the secret's logical name, then stamps the run
 // identity onto it. A stamp failure still returns the stored secret with the
-// error, so the run record keeps it and cleanup reclaims it even though
-// discovery cannot confirm a secret without its stamp.
+// error, so the run record keeps it and cleanup reclaims it by id, even when
+// cleanup runs as another user and discovery therefore cannot confirm the
+// unstamped secret by its creator.
 func (e *applier) storeSecret(ctx context.Context, s plan.Secret) (resource.Resource, error) {
 	var res resource.Resource
 	if err := withCreate(ctx, e.opTimeout, func(ctx context.Context) (resource.Resource, error) {

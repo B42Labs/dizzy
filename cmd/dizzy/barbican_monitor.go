@@ -49,7 +49,8 @@ func newBarbicanMonitorCmd(opts *globalOptions) *cobra.Command {
 		Long: "Run sweep→apply→cleanup secret iterations continuously or on a cadence and export metrics.\n\n" +
 			"Run only one dizzy process per project: the pre-flight sweep is always on and, before every " +
 			"iteration, reclaims every dizzy- container and order in the project, the secrets those orders " +
-			"generated, and every dizzy- secret stamped dizzy_type=secret, so a concurrent apply, chaos, or " +
+			"generated, every dizzy- secret stamped dizzy_type=secret, and every dizzy- secret without metadata " +
+			"that the token's user created, so a concurrent apply, chaos, or " +
 			"monitor in the same project (including a fleet an earlier apply left in place) is torn down mid-flight.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, p, err := buildBarbicanPlanFromFlags(cmd, opts, scenarioPath, sets)
@@ -223,7 +224,8 @@ func barbicanIterationDeps(kv *gophercloud.ServiceClient, client *barbican.Clien
 // seam for the pre-flight sweep, discovering leftovers by the any-run identity
 // instead of one run's: containers and orders by the bare dizzy- name prefix,
 // the secrets those orders generated through their secret_ref, and any other
-// secret only once its dizzy_type=secret metadata confirms the prefix. It is the
+// secret only once its dizzy_type=secret metadata confirms the prefix or,
+// carrying no metadata at all, its creator_id is the token's user. It is the
 // key manager analog of the other services' orphan cleaners, so the sweep
 // reuses barbicanexec.Cleanup's exact containers, orders, secrets ordering
 // unchanged. Delete promotes from the embedded client.
@@ -246,7 +248,8 @@ func (o barbicanOrphanCleaner) ListOrdersByRun(ctx context.Context, _ string) (o
 }
 
 // ListSecretsByRun ignores the run id and lists the prefixed secrets whose
-// dizzy_type=secret metadata confirms them, whatever run stamped them.
+// dizzy_type=secret metadata confirms them, whatever run stamped them, and the
+// prefixed secrets without metadata that the token's user created.
 func (o barbicanOrphanCleaner) ListSecretsByRun(ctx context.Context, _ string) ([]resource.Resource, error) {
 	return o.ListSecretsByType(ctx)
 }

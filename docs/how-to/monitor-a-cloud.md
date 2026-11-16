@@ -132,12 +132,15 @@ corruption, run `barbican apply` or `barbican chaos`, which exit non-zero on a
 mismatch.
 
 The sweep is always on. It reclaims every `dizzy-` container and order in the
-project, the secrets those orders generated, and any `dizzy-` secret whose
-`dizzy_type=secret` metadata confirms it. A stored secret whose metadata stamp
-failed is never swept: its own iteration deletes it, and only an iteration
-whose cleanup does not finish (a cleanup that stops on an error, or a hard
-abort) leaves one behind. Pass `--keep-run-records` if you want
-`barbican cleanup --run` to reach it; otherwise delete it by hand.
+project, the secrets those orders generated, any `dizzy-` secret whose
+`dizzy_type=secret` metadata confirms it, and any `dizzy-` secret without
+metadata that the monitor's user created. That last rule covers a stored
+secret whose metadata stamp failed and a secret Barbican kept although the
+store failed or was canceled, which happens when a failed operation cancels
+the stores still in flight. Keep the monitor running as the same user, so the
+next iteration's sweep can confirm such a secret by its creator. A monitor
+started as another user leaves it and logs
+`leaving a secret without run metadata; another user created it` with its name.
 
 ## Monitor Octavia
 
