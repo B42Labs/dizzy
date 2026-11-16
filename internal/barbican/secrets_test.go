@@ -426,6 +426,193 @@ func secretEntry(name, id string) string {
 	return fmt.Sprintf(`{"name":%q,"secret_ref":"https://kv/v1/secrets/%s","status":"ACTIVE"}`, name, id)
 }
 
+// secretEntryBy renders one entry of a secret list page with the creator_id
+// Barbican records for it.
+func secretEntryBy(name, id, creator string) string {
+	return fmt.Sprintf(`{"name":%q,"secret_ref":"https://kv/v1/secrets/%s","status":"ACTIVE","creator_id":%q}`, name, id, creator)
+}
+
+// onePage renders a single secret list page holding entries, with no next link.
+func onePage(entries ...string) [2]string {
+	return [2]string{fmt.Sprintf(`{"secrets":[%s],"total":%d}`, strings.Join(entries, ","), len(entries))}
+}
+
+// TestListSecretsByRunConfirmsUnstampedByCreator confirms run discovery keeps a
+// run-prefixed secret without any metadata when the client's user created it,
+// whether its metadata answer is empty or null, and keeps a stamped secret
+// whoever created it. It drops an unstamped secret another user created or
+// that names no creator, logging each, and drops without a log line a secret
+// carrying other metadata or another run's stamp. A metadata read that answers
+// 404 drops the secret, and names outside the run prefix are never read.
+func TestListSecretsByRunConfirmsUnstampedByCreator(t *testing.T) {
+	logs := captureLog(t)
+	f := &secretsFake{
+		t: t,
+		pages: onePage(
+			secretEntryBy("dizzy-run0-sec-0001", "s1", "u1"),
+			secretEntryBy("dizzy-run0-sec-0002", "s2", "u2"),
+			secretEntry("dizzy-run0-sec-0003", "s3"),
+			secretEntryBy("dizzy-run0-sec-0004", "s4", "u1"),
+			secretEntryBy("dizzy-run0-sec-0005", "s5", "u1"),
+			secretEntryBy("dizzy-run0-sec-0006", "s6", "u1"),
+			secretEntryBy("dizzy-run0-ord-0001", "s7", "u1"),
+			secretEntryBy("dizzy-run0-sec-0008", "s8", "u2"),
+			secretEntryBy("dizzy-run01-sec-0001", "s9", "u1"),
+			secretEntryBy("unrelated", "s10", "u1"),
+		),
+		metadata: map[string]string{
+			"s1":  `{"metadata":{}}`,
+			"s2":  `{"metadata":{}}`,
+			"s3":  `{"metadata":{}}`,
+			"s4":  `{"metadata":{"owner":"ops"}}`,
+			"s5":  `{"metadata":{"dizzy_run":"other","dizzy_type":"secret"}}`,
+			"s7":  `{"metadata":null}`,
+			"s8":  `{"metadata":{"dizzy_run":"run0","dizzy_type":"secret"}}`,
+			"s9":  `{"metadata":{}}`,
+			"s10": `{"metadata":{}}`,
+		},
+	}
+	ts := httptest.NewServer(f)
+	defer ts.Close()
+	c, _ := testClient(ts)
+	c.SetCreatorID("u1")
+
+	got, err := c.ListSecretsByRun(context.Background(), "run0")
+	if err != nil {
+		t.Fatalf("ListSecretsByRun: %v", err)
+	}
+	want := []resource.Resource{
+		{Kind: KindSecret, Name: "dizzy-run0-sec-0001", ID: "s1"},
+		{Kind: KindSecret, Name: "dizzy-run0-ord-0001", ID: "s7"},
+		{Kind: KindSecret, Name: "dizzy-run0-sec-0008", ID: "s8"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("ListSecretsByRun = %+v, want %+v", got, want)
+	}
+	if wantReads := []string{"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"}; fmt.Sprint(f.reads) != fmt.Sprint(wantReads) {
+		t.Errorf("metadata reads = %v, want %v (run prefix matches only)", f.reads, wantReads)
+	}
+
+	lines := strings.Split(logs.String(), "\n")
+	hasLine := func(msg, name string) bool {
+		for _, l := range lines {
+			if strings.Contains(l, msg) && strings.Contains(l, "name="+name+" ") {
+				return true
+			}
+		}
+		return false
+	}
+	const confirmed = "confirmed a secret without run metadata by its creator"
+	const leaving = "leaving a secret without run metadata; another user created it"
+	for _, name := range []string{"dizzy-run0-sec-0001", "dizzy-run0-ord-0001"} {
+		if !hasLine(confirmed, name) {
+			t.Errorf("log lacks %q for %s:\n%s", confirmed, name, logs)
+		}
+	}
+	for _, name := range []string{"dizzy-run0-sec-0002", "dizzy-run0-sec-0003"} {
+		if !hasLine(leaving, name) {
+			t.Errorf("log lacks %q for %s:\n%s", leaving, name, logs)
+		}
+	}
+	for _, name := range []string{"dizzy-run0-sec-0004", "dizzy-run0-sec-0005"} {
+		if hasLine("leaving", name) {
+			t.Errorf("log has a leaving line for %s, which carries metadata:\n%s", name, logs)
+		}
+	}
+}
+
+// TestListSecretsByTypeConfirmsUnstampedByCreator confirms the sweep's
+// discovery keeps a dizzy-prefixed secret without any metadata when the
+// client's user created it, whatever run its name carries, and a secret
+// stamped dizzy_type=secret whoever created it, while it drops an unstamped
+// secret of another user and one carrying other metadata. Names without the
+// dizzy- prefix are never read.
+func TestListSecretsByTypeConfirmsUnstampedByCreator(t *testing.T) {
+	f := &secretsFake{
+		t: t,
+		pages: onePage(
+			secretEntryBy("dizzy-run9-sec-0001", "t1", "u1"),
+			secretEntryBy("dizzy-run8-ord-0001", "t2", "u1"),
+			secretEntryBy("dizzy-notes", "t3", "u2"),
+			secretEntryBy("dizzy-run9-sec-0002", "t4", "u2"),
+			secretEntryBy("dizzy-run9-sec-0003", "t5", "u1"),
+			secretEntryBy("unrelated", "t6", "u1"),
+		),
+		metadata: map[string]string{
+			"t1": `{"metadata":{}}`,
+			"t2": `{"metadata":{}}`,
+			"t3": `{"metadata":{}}`,
+			"t4": `{"metadata":{"dizzy_type":"secret"}}`,
+			"t5": `{"metadata":{"owner":"ops"}}`,
+			"t6": `{"metadata":{}}`,
+		},
+	}
+	ts := httptest.NewServer(f)
+	defer ts.Close()
+	c, _ := testClient(ts)
+	c.SetCreatorID("u1")
+
+	got, err := c.ListSecretsByType(context.Background())
+	if err != nil {
+		t.Fatalf("ListSecretsByType: %v", err)
+	}
+	want := []resource.Resource{
+		{Kind: KindSecret, Name: "dizzy-run9-sec-0001", ID: "t1"},
+		{Kind: KindSecret, Name: "dizzy-run8-ord-0001", ID: "t2"},
+		{Kind: KindSecret, Name: "dizzy-run9-sec-0002", ID: "t4"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("ListSecretsByType = %+v, want %+v", got, want)
+	}
+	if wantReads := []string{"t1", "t2", "t3", "t4", "t5"}; fmt.Sprint(f.reads) != fmt.Sprint(wantReads) {
+		t.Errorf("metadata reads = %v, want %v (dizzy- prefix matches only)", f.reads, wantReads)
+	}
+}
+
+// TestListSecretsWithoutCreatorLeavesUnstamped confirms a client that knows no
+// user (no SetCreatorID, as with a token that names none) keeps no secret
+// without metadata, whether Barbican names a creator or not, and that each
+// discovery call logs one warning counting the secrets it left.
+func TestListSecretsWithoutCreatorLeavesUnstamped(t *testing.T) {
+	const warning = "leaving secrets without run metadata; the token names no user to confirm them by"
+	for _, tc := range []struct {
+		name string
+		list func(*Client) ([]resource.Resource, error)
+	}{
+		{"by run", func(c *Client) ([]resource.Resource, error) { return c.ListSecretsByRun(context.Background(), "run0") }},
+		{"by type", func(c *Client) ([]resource.Resource, error) { return c.ListSecretsByType(context.Background()) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLog(t)
+			f := &secretsFake{
+				t: t,
+				pages: onePage(
+					secretEntryBy("dizzy-run0-sec-0001", "s1", "u1"),
+					secretEntry("dizzy-run0-sec-0002", "s2"),
+				),
+				metadata: map[string]string{
+					"s1": `{"metadata":{}}`,
+					"s2": `{"metadata":{}}`,
+				},
+			}
+			ts := httptest.NewServer(f)
+			defer ts.Close()
+			c, _ := testClient(ts)
+
+			got, err := tc.list(c)
+			if err != nil || len(got) != 0 {
+				t.Errorf("listing = (%v, %v), want an empty result and nil", got, err)
+			}
+			if n := strings.Count(logs.String(), warning); n != 1 {
+				t.Errorf("log carries %d warnings %q, want 1:\n%s", n, warning, logs)
+			}
+			if !strings.Contains(logs.String(), "count=2") {
+				t.Errorf("log %q lacks count=2", logs)
+			}
+		})
+	}
+}
+
 // TestListSecretsByRun confirms discovery walks both pages, reads metadata only
 // for names with the run prefix, and keeps only the secrets whose metadata
 // carries this run: a prefix match stamped for another run, one without

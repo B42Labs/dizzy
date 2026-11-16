@@ -65,10 +65,15 @@ func (t barbicanTimeoutCleaner) ListOrdersByRun(ctx context.Context, runID strin
 // discovery listing and secret metadata read bounded by opTimeout
 // (barbican.Client.SetRequestTimeout). barbicanTimeoutCleaner leaves secret
 // discovery to that bound, so every command builds its client here rather than
-// with barbican.New.
+// with barbican.New. The client also learns the user the token names
+// (barbican.UserIDFromAuth), so discovery confirms a secret without run metadata
+// that this user created; a token that names no user leaves such secrets alone.
 func newBarbicanClient(kv *gophercloud.ServiceClient, runID string, m *metrics.Collector, opTimeout time.Duration) *barbican.Client {
 	c := barbican.New(kv, runID, m)
 	c.SetRequestTimeout(opTimeout)
+	if id, ok := barbican.UserIDFromAuth(kv); ok {
+		c.SetCreatorID(id)
+	}
 	return c
 }
 

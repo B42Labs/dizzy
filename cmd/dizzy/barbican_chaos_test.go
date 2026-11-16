@@ -306,6 +306,23 @@ func TestFinishBarbicanChurnReportsLeak(t *testing.T) {
 	}
 }
 
+// TestBarbicanLeakCheckCountsUnstampedSecret confirms the leak check counts a
+// run secret without any metadata that the run's user created, the secret a
+// teardown leaves when Barbican commits a canceled store after its listing.
+func TestBarbicanLeakCheckCountsUnstampedSecret(t *testing.T) {
+	f := &fakeKeyManager{
+		t:        t,
+		secrets:  []string{kmSecretBy("dizzy-run0-sec-0001", "s1", "u1")},
+		metadata: map[string]string{"s1": `{"metadata":{}}`},
+	}
+	_, client := barbicanTestClientAs(t, f, "u1")
+
+	leaked, err := barbicanLeakCheck(context.Background(), barbicanTimeoutCleaner{client, time.Second}, "run0")
+	if err != nil || leaked != 1 {
+		t.Errorf("barbicanLeakCheck = (%d, %v), want (1, nil)", leaked, err)
+	}
+}
+
 // TestFinishBarbicanChurnTeardownError confirms a listing failure during
 // teardown is returned naming the run, wrapping the listing error, and that the
 // leak check never runs after it.
