@@ -24,19 +24,29 @@ func wellFormed() *Plan {
 			{Name: "ctr-0001", Secrets: []string{"sec-0001", "sec-0003"}},
 			{Name: "ctr-0002", Secrets: []string{"sec-0002"}},
 		},
+		ACLs: []ACL{
+			{Name: "acl-0001", Secret: "sec-0001", Users: []string{"u1", "u2"}},
+			{Name: "acl-0002", Secret: "sec-0003", Users: []string{"u3"}},
+		},
+		Consumers: []Consumer{
+			{Name: "con-0001", Container: "ctr-0001"},
+			{Name: "con-0002", Container: "ctr-0002"},
+		},
 	}
 }
 
 // TestValidate asserts Validate accepts the well-formed plan and rejects each
-// malformed variant with an error naming the offender.
+// malformed variant with the exact error naming the offender.
 func TestValidate(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*Plan)
-		// wantErr is a substring of the expected error; empty means valid.
+		// wantErr is the exact expected error; empty means valid.
 		wantErr string
 	}{
 		{name: "valid", mutate: func(*Plan) {}},
+		{name: "valid without acls or consumers", mutate: func(p *Plan) { p.ACLs, p.Consumers = nil, nil }},
+		{name: "two consumers on one container", mutate: func(p *Plan) { p.Consumers[1].Container = "ctr-0001" }},
 		{name: "container without references", mutate: func(p *Plan) { p.Containers[1].Secrets = []string{} }},
 		{name: "empty secret name", mutate: func(p *Plan) { p.Secrets[1].Name = "" }, wantErr: "secret has an empty name"},
 		{name: "empty order name", mutate: func(p *Plan) { p.Orders[1].Name = "" }, wantErr: "order has an empty name"},
@@ -50,6 +60,18 @@ func TestValidate(t *testing.T) {
 		{name: "reference to an order", mutate: func(p *Plan) { p.Containers[1].Secrets = []string{"ord-0001"} }, wantErr: `container "ctr-0002" references unknown secret "ord-0001"`},
 		{name: "empty reference", mutate: func(p *Plan) { p.Containers[1].Secrets = []string{"sec-0002", ""} }, wantErr: `container "ctr-0002" has an empty secret reference`},
 		{name: "repeated reference", mutate: func(p *Plan) { p.Containers[0].Secrets = []string{"sec-0001", "sec-0003", "sec-0001"} }, wantErr: `container "ctr-0001" references secret "sec-0001" more than once`},
+
+		{name: "empty acl name", mutate: func(p *Plan) { p.ACLs[1].Name = "" }, wantErr: "acl has an empty name"},
+		{name: "duplicate acl name", mutate: func(p *Plan) { p.ACLs[1].Name = "acl-0001" }, wantErr: `duplicate acl name "acl-0001"`},
+		{name: "acl on an unknown secret", mutate: func(p *Plan) { p.ACLs[1].Secret = "sec-0099" }, wantErr: `acl "acl-0002" references unknown secret "sec-0099"`},
+		{name: "acl on an order", mutate: func(p *Plan) { p.ACLs[1].Secret = "ord-0001" }, wantErr: `acl "acl-0002" references unknown secret "ord-0001"`},
+		{name: "second acl on a secret", mutate: func(p *Plan) { p.ACLs[1].Secret = "sec-0001" }, wantErr: `secret "sec-0001" carries more than one acl`},
+		{name: "acl without users", mutate: func(p *Plan) { p.ACLs[1].Users = nil }, wantErr: `acl "acl-0002" lists no users`},
+		{name: "acl with an empty user", mutate: func(p *Plan) { p.ACLs[1].Users = []string{"u3", ""} }, wantErr: `acl "acl-0002" has an empty user`},
+		{name: "acl repeating a user", mutate: func(p *Plan) { p.ACLs[1].Users = []string{"u3", "u3"} }, wantErr: `acl "acl-0002" lists user "u3" more than once`},
+		{name: "empty consumer name", mutate: func(p *Plan) { p.Consumers[1].Name = "" }, wantErr: "consumer has an empty name"},
+		{name: "duplicate consumer name", mutate: func(p *Plan) { p.Consumers[1].Name = "con-0001" }, wantErr: `duplicate consumer name "con-0001"`},
+		{name: "consumer on an unknown container", mutate: func(p *Plan) { p.Consumers[1].Container = "ctr-0099" }, wantErr: `consumer "con-0002" references unknown container "ctr-0099"`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -62,11 +84,8 @@ func TestValidate(t *testing.T) {
 				}
 				return
 			}
-			if err == nil {
-				t.Fatalf("Validate() = nil, want an error containing %q", tc.wantErr)
-			}
-			if !strings.Contains(err.Error(), tc.wantErr) {
-				t.Errorf("Validate() = %q, want it to contain %q", err, tc.wantErr)
+			if err == nil || err.Error() != tc.wantErr {
+				t.Errorf("Validate() = %v, want %q", err, tc.wantErr)
 			}
 		})
 	}
@@ -96,8 +115,14 @@ func TestCountHelpers(t *testing.T) {
 	if got := p.ContainerRefs(); got != 3 {
 		t.Errorf("ContainerRefs() = %d, want 3", got)
 	}
+	if got := p.ACLUsers(); got != 3 {
+		t.Errorf("ACLUsers() = %d, want 3", got)
+	}
 
 	empty := &Plan{}
+	if got := empty.ACLUsers(); got != 0 {
+		t.Errorf("empty ACLUsers() = %d, want 0", got)
+	}
 	if got := empty.TotalPayloadBytes(); got != 0 {
 		t.Errorf("empty TotalPayloadBytes() = %d, want 0", got)
 	}
@@ -110,28 +135,56 @@ func TestCountHelpers(t *testing.T) {
 }
 
 // TestSummary asserts Summary renders the header and the five count lines with
-// their values aligned, and renders the same bytes twice for one plan, the
-// property the dry-run preview relies on.
+// their values aligned for a plan without ACLs or consumers, adds the acls and
+// consumers lines after the containers line for a plan with them, and renders
+// the same bytes twice for one plan, the property the dry-run preview relies
+// on.
 func TestSummary(t *testing.T) {
-	p := wellFormed()
-	want := `Plan for scenario "t" (seed 1)
+	base := `Plan for scenario "t" (seed 1)
   secrets:         3
   payload total:   8356 bytes
   read-backs:      2
   orders:          2
   containers:      2 (3 secret references)
 `
-	first, second := p.Summary(), p.Summary()
-	if first != want {
-		t.Errorf("Summary() =\n%s\nwant\n%s", first, want)
+	without := wellFormed()
+	without.ACLs, without.Consumers = nil, nil
+
+	with := wellFormed()
+	with.ACLs = []ACL{
+		{Name: "acl-0001", Secret: "sec-0001", Users: []string{"u1", "u2", "u3"}},
+		{Name: "acl-0002", Secret: "sec-0002", Users: []string{"u4", "u5"}},
+		{Name: "acl-0003", Secret: "sec-0003", Users: []string{"u6", "u7"}},
 	}
-	if first != second {
-		t.Errorf("Summary() not deterministic:\n%s\n---\n%s", first, second)
+	with.Consumers = []Consumer{
+		{Name: "con-0001", Container: "ctr-0001"},
+		{Name: "con-0002", Container: "ctr-0002"},
+		{Name: "con-0003", Container: "ctr-0001"},
+	}
+
+	for _, tc := range []struct {
+		name string
+		p    *Plan
+		want string
+	}{
+		{"neither kind", without, base},
+		{"acls and consumers", with, base + "  acls:            3 (7 users)\n  consumers:       3\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			first, second := tc.p.Summary(), tc.p.Summary()
+			if first != tc.want {
+				t.Errorf("Summary() =\n%s\nwant\n%s", first, tc.want)
+			}
+			if first != second {
+				t.Errorf("Summary() not deterministic:\n%s\n---\n%s", first, second)
+			}
+		})
 	}
 }
 
 // TestJSONEncoding pins the JSON field names the plan file and the golden plan
-// use, and that a secret not read back omits retrieve.
+// use, that a secret not read back omits retrieve, and that a plan without ACLs
+// or consumers carries neither key.
 func TestJSONEncoding(t *testing.T) {
 	p := &Plan{
 		Scenario:   "t",
@@ -150,5 +203,18 @@ func TestJSONEncoding(t *testing.T) {
 		`"containers":[{"name":"ctr-0001","secrets":["sec-0001"]}]}`
 	if string(got) != want {
 		t.Errorf("json.Marshal(plan) =\n%s\nwant\n%s", got, want)
+	}
+
+	p.ACLs = []ACL{{Name: "acl-0001", Secret: "sec-0001", Users: []string{"u1", "u2"}}}
+	p.Consumers = []Consumer{{Name: "con-0001", Container: "ctr-0001"}}
+	got, err = json.Marshal(p)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	want = strings.TrimSuffix(want, "}") +
+		`,"acls":[{"name":"acl-0001","secret":"sec-0001","users":["u1","u2"]}]` +
+		`,"consumers":[{"name":"con-0001","container":"ctr-0001"}]}`
+	if string(got) != want {
+		t.Errorf("json.Marshal(plan with acls and consumers) =\n%s\nwant\n%s", got, want)
 	}
 }
