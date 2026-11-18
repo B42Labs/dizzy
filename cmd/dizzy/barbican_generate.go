@@ -45,6 +45,7 @@ func newBarbicanGenerateCmd(opts *globalOptions) *cobra.Command {
 
 			slog.Info("generated plan", "scenario", p.Scenario, "seed", p.Seed,
 				"secrets", len(p.Secrets), "orders", len(p.Orders), "containers", len(p.Containers),
+				"acls", len(p.ACLs), "consumers", len(p.Consumers),
 				"payloadBytes", p.TotalPayloadBytes(), "destination", dest)
 			return nil
 		},

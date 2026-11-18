@@ -28,7 +28,9 @@ import (
 // the token's user: one whose stamp failed, one Barbican kept although its
 // store failed or was canceled, and the first secret of a retried store. Run as
 // another user, or with a token that names no user, it leaves the unstamped
-// ones, and only the record reaches a stamp-failed secret then.
+// ones, and only the record reaches a stamp-failed secret then. Secret ACLs and
+// container consumers are not deleted on their own: Barbican deletes them with
+// their secret or container, and the deleted count leaves them out.
 func newBarbicanCleanupCmd(opts *globalOptions) *cobra.Command {
 	var (
 		runPath string
@@ -37,7 +39,7 @@ func newBarbicanCleanupCmd(opts *globalOptions) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "cleanup",
-		Short: "Delete all containers, orders, and secrets belonging to a run, by identity",
+		Short: "Delete all containers, orders, and secrets belonging to a run, by identity, and with them their consumers and ACLs",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id, rec, err := resolveRun(runPath, runID)
 			if err != nil {

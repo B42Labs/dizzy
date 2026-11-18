@@ -213,7 +213,7 @@ func TestBarbicanMismatchError(t *testing.T) {
 		{
 			"mismatch entry counted",
 			[]metrics.ErrorCount{{Kind: barbican.ErrKindMismatch, Count: 2}, {Kind: "http_503", Count: 1}},
-			"payload read-back mismatch (run run1234): 2 read-back(s) returned different bytes",
+			"read-back mismatch (run run1234): 2 read-back(s) returned data that differs from what was written",
 		},
 	}
 	for _, tc := range tests {
@@ -399,7 +399,7 @@ func TestFinishBarbicanChurnReturnsMismatch(t *testing.T) {
 		cmd.SetOut(&out)
 
 		err := finishBarbicanChurn(context.Background(), cmd, c, "run1234", "run-run1234.json", churnBarbicanCreated(), false, false, mismatchErr, 1, time.Second)
-		if err == nil || !strings.Contains(err.Error(), "payload read-back mismatch") {
+		if err == nil || !strings.Contains(err.Error(), "read-back mismatch (run run1234)") {
 			t.Fatalf("finishBarbicanChurn = %v, want the read-back mismatch error", err)
 		}
 		if len(c.deleted) != 2 {
@@ -417,7 +417,7 @@ func TestFinishBarbicanChurnReturnsMismatch(t *testing.T) {
 		cmd.SetOut(&out)
 
 		err := finishBarbicanChurn(context.Background(), cmd, c, "run1234", "run-run1234.json", churnBarbicanCreated(), false, true, mismatchErr, 1, time.Second)
-		if err == nil || !strings.Contains(err.Error(), "payload read-back mismatch") {
+		if err == nil || !strings.Contains(err.Error(), "read-back mismatch (run run1234)") {
 			t.Fatalf("finishBarbicanChurn = %v, want the read-back mismatch error", err)
 		}
 		if c.calls != 0 {
@@ -438,7 +438,7 @@ func TestFinishBarbicanChurnReturnsMismatch(t *testing.T) {
 		if err == nil {
 			t.Fatal("finishBarbicanChurn returned nil for a failed teardown with a mismatch")
 		}
-		for _, want := range []string{"tearing down run run1234:", "payload read-back mismatch"} {
+		for _, want := range []string{"tearing down run run1234:", "read-back mismatch (run run1234)"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("error %q does not contain %q", err.Error(), want)
 			}

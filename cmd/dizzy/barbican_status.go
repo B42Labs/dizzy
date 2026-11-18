@@ -15,15 +15,17 @@ import (
 
 // newBarbicanStatusCmd builds "barbican status", which loads a barbican run
 // record, authenticates against the cloud, and re-queries the live state of
-// every secret, order, and container the run created, printing a table of
-// logical name, kind, id, and current state. A resource that no longer exists
-// shows as "gone".
+// every secret, order, container, secret ACL, and consumer the run created,
+// printing a table of logical name, kind, id, and current state. A resource
+// that no longer exists shows as "gone", and so does an ACL that lists no user
+// or a consumer its container no longer lists; a live ACL or consumer, which
+// carries no status, shows as "present".
 func newBarbicanStatusCmd(opts *globalOptions) *cobra.Command {
 	var runPath string
 
 	cmd := &cobra.Command{
 		Use:   "status",
-		Short: "Re-query the current state of a barbican run's secrets, orders, and containers",
+		Short: "Re-query the current state of a barbican run's secrets, orders, containers, ACLs, and consumers",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			rec, err := run.Load(runPath)
 			if err != nil {
