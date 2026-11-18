@@ -125,8 +125,9 @@ oversized plan fails before the loop begins, and again at the start of every
 iteration's apply, so a quota lowered during a long run fails that iteration
 with the itemized message rather than with a wall of rejected creates.
 
-A payload read-back that returns different bytes fails its iteration like any
-other apply error. The loop goes on and the command still exits 0, so watch the
+A read-back that returns data that differs from what was written, whether a
+payload, an ACL or a container's consumers, fails its iteration like any other
+apply error. The loop goes on and the command still exits 0, so watch the
 failed iterations and the `error.kind=mismatch` series. To gate CI on
 corruption, run `barbican apply` or `barbican chaos`, which exit non-zero on a
 mismatch.

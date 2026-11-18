@@ -279,11 +279,11 @@ Every value set is bounded.
 
 | Attribute | Values |
 |---|---|
-| `kind` | **neutron:** `address-scope`, `subnet-pool`, `network`, `subnet`, `router`, `router-interface`, `security-group`, `security-group-rule`, `port`, `floating-ip` — **cinder:** `volume`, `snapshot` — **keystone:** `domain`, `project`, `user`, `role`, `implied_role` (an implied-role rule), `role_assignment`, `token`, `application_credential`, `trust`, and for `keystone pressure` also `probe`, `bad_token` and `propagation` (a request to Nova, Neutron, Cinder or Glance) and, on `dizzy.resource.time_to_ready` only, `revocation` (the propagation delay) — **nova:** `server`, `network`, `subnet`, `port`, `volume`, `server_group` (only the `mix` Gardener persona creates server groups) — **glance:** `image`; **barbican:** `secret` (a stored secret and the secret an order generates alike), `order`, `container` — **octavia:** `loadbalancer`, `listener`, `pool`, `member`, `healthmonitor`, `network`, `subnet`; the `mix` Gardener persona records `loadbalancer`, `listener`, `pool`, `member` and `healthmonitor` when Octavia is opted in with `services: [octavia]`, plus `port` and `subnet` samples of operation `list` from the address lookups of its member and load balancer creates |
+| `kind` | **neutron:** `address-scope`, `subnet-pool`, `network`, `subnet`, `router`, `router-interface`, `security-group`, `security-group-rule`, `port`, `floating-ip` — **cinder:** `volume`, `snapshot` — **keystone:** `domain`, `project`, `user`, `role`, `implied_role` (an implied-role rule), `role_assignment`, `token`, `application_credential`, `trust`, and for `keystone pressure` also `probe`, `bad_token` and `propagation` (a request to Nova, Neutron, Cinder or Glance) and, on `dizzy.resource.time_to_ready` only, `revocation` (the propagation delay) — **nova:** `server`, `network`, `subnet`, `port`, `volume`, `server_group` (only the `mix` Gardener persona creates server groups) — **glance:** `image`; **barbican:** `secret` (a stored secret and the secret an order generates alike), `order`, `container`, `acl` (a secret's read ACL), `consumer` (a container consumer) — **octavia:** `loadbalancer`, `listener`, `pool`, `member`, `healthmonitor`, `network`, `subnet`; the `mix` Gardener persona records `loadbalancer`, `listener`, `pool`, `member` and `healthmonitor` when Octavia is opted in with `services: [octavia]`, plus `port` and `subnet` samples of operation `list` from the address lookups of its member and load balancer creates |
 | `operation` | `create`, `delete`, `get`, `list`, `tag`, `attach`, `detach`, `extend` (cinder resize), `update` (keystone domain disable-before-delete; glance property churn; barbican secret metadata stamp; octavia listener and member admin-state toggle), `validate`, `revoke` (keystone token validation and revocation; `keystone pressure` only), `authenticate` (keystone authentication with an application credential or a trust), `stop`, `start`, `reboot`, `resize`, `confirm-resize`, `live-migrate`, `cold-migrate` (nova server lifecycle; `cold-migrate` only for the `mix` Legacy persona), `upload`, `visibility`, `deactivate`, `reactivate`, `member-add`, `member-accept`, `member-remove` (glance image lifecycle), `download` (barbican payload read-back), `nova`, `neutron`, `cinder`, `glance` (the service a `probe`, `bad_token` or `propagation` request went to; `keystone pressure` only) |
 | `outcome` | `success`, `error`, `timeout` for an operation; `success`, `timeout` for time-to-ready, where `timeout` under `kind=revocation` is a propagation probe that reached its ceiling; `success`, `failure` for an iteration |
 | `result` | `attempted`, `succeeded`, `failed` |
-| `error.kind` | `quota`, `timeout`, `canceled`, `other`, `http_<status>` for the statuses the service returns, `http_other` for the rest, `accepted` for a `bad_token` request that a service answered with a 2xx, `mismatch` for a barbican read-back that returned different bytes, `order_error` for a barbican order that ended in ERROR, `provisioning_error` for an octavia load balancer that reached ERROR |
+| `error.kind` | `quota`, `timeout`, `canceled`, `other`, `http_<status>` for the statuses the service returns, `http_other` for the rest, `accepted` for a `bad_token` request that a service answered with a 2xx, `mismatch` for a barbican read-back of a payload, an ACL or a container's consumers that returned data that differs from what was written, `order_error` for a barbican order that ended in ERROR, `provisioning_error` for an octavia load balancer that reached ERROR |
 
 > **Cardinality rule.** Run IDs, resource IDs, and resource names are **never**
 > metric attributes. They live in the run records and the logs.
@@ -344,6 +344,15 @@ together, so a read-back that returns different bytes records `outcome=error`
 with `error.kind=mismatch`. The metadata stamp after each store and each order
 records as `secret`/`update`, and the metadata reads of cleanup's secret
 discovery as `secret`/`get`.
+
+An ACL records its write as `acl`/`create` and its read as `acl`/`get`, and a
+consumer its registration as `consumer`/`create` and the listing of its
+container's consumers as `consumer`/`list`. The reads of `barbican status`
+record under the same two. A read-back compares inside the timed call, as the
+payload read-back does, so one that differs records `outcome=error` with
+`error.kind=mismatch`. The churn's deletes record as `acl`/`delete` and
+`consumer`/`delete`; they are the only deletes of either kind, since the
+teardown leaves both to Barbican.
 
 Octavia records `dizzy.resource.time_to_ready` for each create and each
 admin-state change, under the kind it wrote (`loadbalancer`, `listener`,

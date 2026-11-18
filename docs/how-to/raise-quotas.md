@@ -49,8 +49,8 @@ For Cinder, the names are `volumes`, `snapshots`, and `gigabytes`. With
 `--volume-type` set, the per-type quotas `volumes_<type>`, `snapshots_<type>`,
 and `gigabytes_<type>` are checked as well.
 
-For Barbican, the names are `secrets`, `orders`, and `containers`, the keys of
-Barbican's project quotas.
+For Barbican, the names are `secrets`, `orders`, `containers`, and
+`consumers`, the keys of Barbican's project quotas.
 
 For Octavia, the names are `loadbalancer`, `listener`, `pool`, `member`, and
 `healthmonitor`, the keys of Octavia's project quotas. Raise them with the
@@ -119,11 +119,13 @@ group on its own, so the check compares the largest group with the limit
 alone, without usage. The bundled `mix` profiles need 1, 2 and 3 server groups
 of up to 2, 3 and 6 members, within Nova's defaults of 10 and 10.
 
-For Barbican, the pre-check counts **secrets**, **orders**, and **containers**.
+For Barbican, the pre-check counts **secrets**, **orders**, **containers**,
+and **consumers**. Barbican has no quota for ACLs, so they are not counted.
 The secrets include one per order on top of the stored ones, since every order
 that turns ACTIVE generates a secret that counts against the same quota: the
-`small` profile's 10 secrets and 5 orders need 15 secrets. A negative limit,
-which is Barbican's default for every quota, means unlimited and never blocks.
+`small` profile's 10 secrets and 5 orders need 15 secrets. The pre-check of
+`barbican chaos` counts the consumers too. A negative limit, which is
+Barbican's default for every quota, means unlimited and never blocks.
 Like Cinder's, the check compares the plan with the limit, not with what the
 project has left.
 

@@ -142,29 +142,36 @@ operation bounded by it.
 
 `barbican apply` takes no service-specific flags: every secret is stored by
 dizzy with a synthetic payload whose size `distribution.payload_bytes` draws, so
-a run references no pre-existing secret. It runs four stages in order. It
+a run references no pre-existing secret. It runs eight stages in order. It
 stores each secret and stamps the run's `dizzy_run` metadata onto it, submits
 each AES-256 key order and waits for it to turn ACTIVE before stamping the
-secret Barbican generated, groups stored secrets into generic containers, and
+secret Barbican generated, groups stored secrets into generic containers, sets
+each ACL on its secret, and registers each consumer on its container. It then
 reads back the payloads the plan selects, byte-comparing each with the bytes it
-stored. A read-back that returns different bytes, or an order that ends in
-ERROR, fails the run without a retry. Each order wait is one operation bounded
-by `--timeout`, and an order still pending at the deadline fails the run too.
+stored, then every ACL, comparing its users with the plan's, and then the
+consumer list of each container that has consumers, which must hold exactly
+the plan's consumers of that container. A read-back that returns data that
+differs from what was written, or an order that ends in ERROR, fails the run
+without a retry. Each order wait is one operation bounded by `--timeout`, and
+an order still pending at the deadline fails the run too. See
+[Secret ACLs and container consumers](scenario-schema.md#secret-acls-and-container-consumers)
+for the requests each ACL and consumer costs.
 
 Its quota pre-check reads the project's effective Barbican quotas and compares
-them with the plan's secrets, orders, and containers, counting one secret per
-order on top of the stored ones, since each order generates a secret. A denied
-quota read (HTTP 403) skips the pre-check with a warning; any other read
-failure, including an answer without a `quotas` object, aborts the run before
-anything is created. Barbican limits a secret by its
-`max_allowed_secret_in_bytes` setting, which it checks against the base64 text
-dizzy sends. The default of 20000 holds the shipped profiles' largest payload of
+them with the plan's secrets, orders, containers, and consumers, counting one
+secret per order on top of the stored ones, since each order generates a
+secret. Barbican has no quota for ACLs. A denied quota read (HTTP 403) skips
+the pre-check with a warning; any other read failure, including an answer
+without a `quotas` object, aborts the run before anything is created. Barbican
+limits a secret by its `max_allowed_secret_in_bytes` setting, which it checks
+against the base64 text dizzy sends. The default of 20000 holds the shipped profiles' largest payload of
 8192 bytes, 10924 characters once encoded, but a deployment still on the older
 default of 10000 refuses a payload above 7500 bytes with HTTP 413, which fails
 the store as `http_413` without a retry. The project user needs a role that
 Barbican's policy allows to create secrets, orders, and containers: `creator` or
 `admin` under the legacy policy, `member` once the secure-RBAC defaults are
-enforced. Without one, the first store fails as `http_403`.
+enforced. Without one, the first store fails as `http_403`. Setting an ACL and
+registering a consumer need no role beyond that one.
 
 `octavia apply` takes no service-specific flags: dizzy creates every object
 itself, and the scenario names the provider (`provider`, empty for the cloud's
@@ -243,20 +250,26 @@ Namespace-specific:
 | `--token-ratio <float>` | `keystone` | `0.3` | Probability per churn step of issuing a token as a live, assigned user or authenticating with a live application credential or trust; `0` disables all three |
 | `--lifecycle-ratio <float>` | `nova` | `0.3` | Probability per churn step of mutating a live server (stop/start, resize, or live-migrate); `0` disables |
 | `--lifecycle-ratio <float>` | `glance` | `0.3` | Probability per churn step of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, or metadata churn); `0` disables |
-| `--retrieve-ratio <float>` | `barbican` | `0.3` | Probability per churn step of reading back the payload of a live stored secret the plan marks for read-back and byte-comparing it; `0` disables |
+| `--retrieve-ratio <float>` | `barbican` | `0.3` | Probability per churn step of one read-back: the payload of a live stored secret the plan marks for read-back, byte-compared; the ACL of a live secret; or a live consumer in its container's list; `0` disables all three |
 | `--update-ratio <float>` | `octavia` | `0.3` | Probability per churn step of setting a live listener or member to `admin_state_up=false` and back to `true`; `0` disables |
 | `--privilege`, `--domain`, `--roles` | `keystone` | | As for `apply` |
 
-`barbican chaos` churns stored secrets and containers and never touches the
-plan's orders. A container is created only while the secrets it references are
-live, and a secret is not deleted while a live container references it. Before
-it creates anything, the command runs the quota pre-check of `barbican apply`
-against the plan's secrets and containers only; an abort there writes no run
-record. It reads back only the secrets the plan marks for read-back, each at
-most once per lifetime. A read-back that returns different bytes does not stop
-the churn: the run finishes, tears down unless `--no-cleanup` is set, and then
-exits non-zero. The run record's `error` names the count, e.g.
-`payload read-back mismatch (run <id>): 2 read-back(s) returned different bytes`.
+`barbican chaos` churns stored secrets, containers, ACLs and consumers and
+never touches the plan's orders. A container is created only while the secrets
+it references are live, and a secret is not deleted while a live container
+references it. An ACL is set only while its secret is live and a consumer
+registered only while its container is live, and neither a secret with a live
+ACL nor a container with a live consumer is deleted. Before it creates
+anything, the command runs the quota pre-check of `barbican apply` against the
+plan's secrets, containers and consumers only; an abort there writes no run
+record. It reads back a secret's payload only when the plan marks the secret
+for read-back, and may read back any ACL or consumer, each at most once per
+lifetime. A consumer's read-back checks only that the consumer is in its
+container's list. A read-back that returns data that differs from what was
+written does not stop the churn: the run finishes, tears down unless
+`--no-cleanup` is set, and then exits non-zero. The run record's `error`
+names the count, e.g.
+`read-back mismatch (run <id>): 2 read-back(s) returned data that differs from what was written`.
 The leak check finds a secret by its `dizzy_run` metadata, or, for a secret
 without any metadata, by its `creator_id` being the user of the command's
 token; with a token that names no user, it cannot see a stored secret whose
@@ -1037,7 +1050,11 @@ Discovery differs per service, and so does what `--run-id` alone can reach:
   user, leaves a secret without metadata and logs a warning; `--run` still
   deletes a stamp-failed one by id. A create Barbican commits after the
   cleanup listed the secrets is left for the next `barbican monitor` sweep or
-  a second `barbican cleanup --run-id`.
+  a second `barbican cleanup --run-id`. The cleanup deletes no ACL or
+  consumer on its own, with a record or without one: they go with their
+  secrets and containers, because Barbican deletes a secret's ACL and a
+  container's consumers when it deletes the secret or the container. The
+  `deleted <n> resource(s)` count leaves them out.
 - **octavia** — everything is found by the `dizzy:run=<id>` tag: load
   balancers, VIP networks, and subnets are discovered by it, with the run
   record's created list as a fallback. Load balancers are deleted first, with
