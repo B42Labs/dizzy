@@ -96,6 +96,37 @@ func TestSetupTelemetryServesOnce(t *testing.T) {
 	}
 }
 
+// TestSetupTelemetryMarksProgress shows that setupTelemetry wires the
+// listener's health tracker into the telemetry: a tracker that has stalled
+// turns healthy again on a recorded operation, which reaches it only through
+// the OnProgress hook.
+func TestSetupTelemetryMarksProgress(t *testing.T) {
+	opts := &globalOptions{listenAddress: "127.0.0.1:0", healthStallTimeout: 200 * time.Millisecond}
+	tel, err := setupTelemetry(context.Background(), opts, telemetry.Config{Service: "neutron"})
+	if err != nil {
+		t.Fatalf("setupTelemetry: %v", err)
+	}
+	t.Cleanup(func() { _ = opts.server.Close() })
+	t.Cleanup(func() { flushTelemetry(tel) })
+
+	// Wait for the stall rather than sleeping a fixed time.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if healthy, _ := opts.health().Check(); !healthy {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("health did not stall within 5s with a 200ms limit")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	tel.RecordOperation(context.Background(), "network", "create", time.Second, "timeout")
+	if healthy, idle := opts.health().Check(); !healthy {
+		t.Errorf("health after a recorded operation = (false, %s), want healthy", idle)
+	}
+}
+
 func TestSetupTelemetryListenError(t *testing.T) {
 	opts := &globalOptions{listenAddress: holdAddress(t), healthStallTimeout: 15 * time.Minute}
 	for _, call := range []string{"first", "second"} {

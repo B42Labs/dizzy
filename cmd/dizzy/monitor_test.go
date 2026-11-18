@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -248,6 +249,30 @@ func TestMonitorLoopStalledIterationIsUnhealthy(t *testing.T) {
 	}
 }
 
+// TestMonitorCommandsHandHealthToLoop keeps every monitor command wired to the
+// listener's health tracker: each sets cfg.health after its telemetry setup
+// and before it starts the loop. Without that, a monitor's planned waits
+// would count as stalls.
+func TestMonitorCommandsHandHealthToLoop(t *testing.T) {
+	for _, f := range []string{
+		"monitor.go", "cinder_monitor.go", "keystone_monitor.go", "nova_monitor.go",
+		"glance_monitor.go", "barbican_monitor.go", "octavia_monitor.go",
+	} {
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("reading %s: %v", f, err)
+		}
+		s := string(src)
+		setup := strings.Index(s, "setupTelemetry(ctx, opts,")
+		assign := strings.Index(s, "cfg.health = opts.health()")
+		loop := strings.Index(s, "runMonitorLoop(ctx, cfg,")
+		if setup < 0 || assign < 0 || loop < 0 || setup >= assign || assign >= loop {
+			t.Errorf("%s: want setupTelemetry, then cfg.health = opts.health(), then runMonitorLoop; offsets %d, %d, %d",
+				f, setup, assign, loop)
+		}
+	}
+}
+
 // checkingClock is a fakeClock that checks the health tracker at the end of
 // every sleep, the moment the planned wait is longest.
 type checkingClock struct {
@@ -268,11 +293,13 @@ func TestMonitorLoopWaitIsNotAStall(t *testing.T) {
 	health := serve.NewHealth(healthLimit, fc.Now)
 	clk := &checkingClock{fakeClock: fc, health: health}
 	cfg := monitorConfig{interval: 10 * healthLimit, iterations: 3, health: health}
-	var idleAtStart []time.Duration
+	var idleAtStart, idleInside []time.Duration
 	runOnce := func(ctx context.Context, iter int) bool {
 		_, idle := health.Check()
 		idleAtStart = append(idleAtStart, idle)
 		fc.advance(time.Minute)
+		_, idle = health.Check()
+		idleInside = append(idleInside, idle)
 		return true
 	}
 
@@ -287,10 +314,15 @@ func TestMonitorLoopWaitIsNotAStall(t *testing.T) {
 			t.Errorf("Check() at the end of sleep %d is unhealthy, want healthy", i+1)
 		}
 	}
-	// The end of a wait is progress, so every later iteration starts fresh.
-	for i, idle := range idleAtStart[1:] {
-		if idle != 0 {
-			t.Errorf("idle at the start of iteration %d = %s, want 0s", i+2, idle)
+	// The end of a wait is progress, so every later iteration starts fresh,
+	// and the wait is over: a minute into the iteration the tracker counts
+	// that minute again. A waiting flag left set would report 0s here.
+	for i := 1; i < len(idleAtStart); i++ {
+		if idleAtStart[i] != 0 {
+			t.Errorf("idle at the start of iteration %d = %s, want 0s", i+1, idleAtStart[i])
+		}
+		if idleInside[i] != time.Minute {
+			t.Errorf("idle a minute into iteration %d = %s, want 1m0s (the wait must have ended)", i+1, idleInside[i])
 		}
 	}
 }
