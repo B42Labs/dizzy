@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -88,12 +89,87 @@ func TestMixHelpListsSubcommands(t *testing.T) {
 
 func TestGlobalFlagsRegistered(t *testing.T) {
 	flags := newRootCmd().PersistentFlags()
-	for _, name := range []string{"os-cloud", "concurrency", "timeout", "seed", "log-level", "otel"} {
+	for _, name := range []string{"os-cloud", "concurrency", "timeout", "seed", "log-level", "otel", "listen-address", "health-stall-timeout"} {
 		t.Run(name, func(t *testing.T) {
 			if flags.Lookup(name) == nil {
 				t.Errorf("persistent flag %q not registered", name)
 			}
 		})
+	}
+
+	// The listener is off unless asked for, and the stall limit defaults to
+	// 15 minutes.
+	for name, want := range map[string]string{"listen-address": "", "health-stall-timeout": "15m0s"} {
+		if f := flags.Lookup(name); f != nil && f.DefValue != want {
+			t.Errorf("--%s default = %q, want %q", name, f.DefValue, want)
+		}
+	}
+}
+
+func TestValidateServing(t *testing.T) {
+	tests := []struct {
+		name    string
+		opts    *globalOptions
+		wantErr string
+	}{
+		{
+			name:    "negative stall timeout without a listener",
+			opts:    &globalOptions{timeout: time.Minute, healthStallTimeout: -time.Second},
+			wantErr: "--health-stall-timeout must not be negative",
+		},
+		{
+			name:    "negative stall timeout with a listener",
+			opts:    &globalOptions{listenAddress: ":0", timeout: time.Minute, healthStallTimeout: -time.Second},
+			wantErr: "--health-stall-timeout must not be negative",
+		},
+		{
+			name:    "stall timeout equal to the operation timeout",
+			opts:    &globalOptions{listenAddress: ":0", timeout: time.Minute, healthStallTimeout: time.Minute},
+			wantErr: "must be greater than --timeout",
+		},
+		{
+			name: "stall detection disabled",
+			opts: &globalOptions{listenAddress: ":0", timeout: time.Minute, healthStallTimeout: 0},
+		},
+		{
+			name: "stall timeout above the operation timeout",
+			opts: &globalOptions{listenAddress: ":0", timeout: time.Minute, healthStallTimeout: 61 * time.Second},
+		},
+		{
+			// Without a listener the stall timeout has no effect, so a short
+			// one is not an error.
+			name: "short stall timeout without a listener",
+			opts: &globalOptions{timeout: time.Minute, healthStallTimeout: time.Second},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.opts.validateServing()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Errorf("validateServing() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("validateServing() = %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestMonitorRejectsStallTimeoutNotAboveTimeout confirms the root command
+// validates the listener flags before a subcommand runs: a 30s stall limit
+// under the default 1m --timeout fails.
+func TestMonitorRejectsStallTimeoutNotAboveTimeout(t *testing.T) {
+	path := writeScenario(t, sampleScenarioYAML)
+	_, err := execRoot(t, "neutron", "monitor", "--scenario", path,
+		"--listen-address", "127.0.0.1:0", "--health-stall-timeout", "30s")
+	if err == nil {
+		t.Fatal("monitor with --health-stall-timeout below --timeout: expected an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "--health-stall-timeout") {
+		t.Errorf("error = %q, want it to mention --health-stall-timeout", err.Error())
 	}
 }
 
