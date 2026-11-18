@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -155,6 +156,36 @@ func TestCleanupDeletesKindsInDependencyOrder(t *testing.T) {
 	}
 	if prev != len(steps)-1 {
 		t.Errorf("cleanup ended at step %q, want it to reach %q: %v", steps[prev], steps[len(steps)-1], e)
+	}
+}
+
+// TestCleanupSkipsACLsAndConsumers confirms cleanup passes over the ACL and
+// consumer entries of a run record, although an ACL shares its secret's id:
+// Barbican deletes both with their secret and container, which cleanup
+// deletes, so neither gets a Delete of its own or counts as deleted.
+func TestCleanupSkipsACLsAndConsumers(t *testing.T) {
+	f := newFakeCleaner(sec("s1"), ctr("c1"))
+	recorded := []resource.Resource{
+		sec("s1"),
+		ctr("c1"),
+		{Kind: barbican.KindACL, Logical: "acl-0001", ID: "s1"},
+		{Kind: barbican.KindConsumer, Logical: "con-0001", Name: "dizzy-run0-con-0001", ID: "c1:dizzy-run0-con-0001"},
+	}
+	deleted, err := Cleanup(context.Background(), f, "run0", recorded, 4)
+	if err != nil {
+		t.Fatalf("Cleanup() = %v, want nil", err)
+	}
+	if deleted != 2 {
+		t.Errorf("deleted = %d, want 2 (the secret and the container)", deleted)
+	}
+	var deletes []string
+	for _, ev := range f.snapshot() {
+		if strings.HasPrefix(ev, "delete:") {
+			deletes = append(deletes, ev)
+		}
+	}
+	if want := []string{"delete:container/c1", "delete:secret/s1"}; !slices.Equal(deletes, want) {
+		t.Errorf("deletes = %v, want %v (no acl or consumer delete)", deletes, want)
 	}
 }
 

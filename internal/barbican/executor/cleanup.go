@@ -36,6 +36,13 @@ var _ Cleaner = (*barbican.Client)(nil)
 // belt-and-suspenders handle, so it never touches resources the tool did not
 // create and still reclaims one discovery missed.
 //
+// Secret ACLs and container consumers are not deleted one by one, and the
+// count leaves them out: Barbican deletes a secret's ACL with the secret and a
+// container's consumers with the container, so both go with the secrets and
+// containers this teardown deletes. Their record entries are of neither kind
+// recordedOfKind picks, so an ACL, which carries its secret's id, is never
+// deleted as a secret.
+//
 // The order listing also yields each discovered order's generated secret.
 // Deleting an order leaves that secret behind, and for a secret that was never
 // stamped (its order turned ACTIVE after the order wait gave up, or a retried

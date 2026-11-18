@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -28,17 +29,31 @@ import (
 // for a create and verb:<id> for a call on an existing resource, and answers
 // with the next error queued for that event in fail, succeeding once the queue
 // is empty. blockWait names an order id whose wait blocks until its context
-// ends, standing in for an order that never turns ACTIVE.
+// ends, standing in for an order that never turns ACTIVE. onSetACL, when set,
+// runs inside every SetACL call, standing in for an interrupt mid-stage.
 type fakeBarbican struct {
 	mu     sync.Mutex
 	events []string
 	fail   map[string][]error
 
 	blockWait string
+	onSetACL  func()
 
-	storeSeeds    map[string]int64    // secret logical name -> the seed the store was handed
-	reads         map[string]readCall // secret logical name -> the read-back's arguments
-	containerRefs map[string][]string // container logical name -> the stored secret ids it references
+	storeSeeds    map[string]int64             // secret logical name -> the seed the store was handed
+	reads         map[string]readCall          // secret logical name -> the read-back's arguments
+	containerRefs map[string][]string          // container logical name -> the stored secret ids it references
+	aclTargets    map[string]string            // acl logical name -> the secret id SetACL was handed
+	consumerCtrs  map[string]string            // consumer logical name -> the container id RegisterConsumer was handed
+	aclChecks     map[string]resource.Resource // acl logical name -> the resource VerifyACL was handed
+	consumerCalls []consumersCall              // every VerifyConsumers call, in call order
+}
+
+// consumersCall is the arguments one VerifyConsumers call was handed: the
+// container's id and the logical names of the wanted consumers, in order.
+type consumersCall struct {
+	container string
+	want      []string
+	exact     bool
 }
 
 // readCall is the arguments one RetrievePayload call was handed.
@@ -54,6 +69,9 @@ func newFakeBarbican() *fakeBarbican {
 		storeSeeds:    map[string]int64{},
 		reads:         map[string]readCall{},
 		containerRefs: map[string][]string{},
+		aclTargets:    map[string]string{},
+		consumerCtrs:  map[string]string{},
+		aclChecks:     map[string]resource.Resource{},
 	}
 }
 
@@ -97,6 +115,19 @@ func generatedRes(logical string) resource.Resource {
 
 func containerRes(logical string) resource.Resource {
 	return resource.Resource{Kind: barbican.KindContainer, Logical: logical, Name: "dizzy-run0-" + logical, ID: "container-" + logical}
+}
+
+// aclRes is the resource SetACL returns for an ACL on the stored secret with
+// logical name secret: it carries the secret's id and no name.
+func aclRes(logical, secret string) resource.Resource {
+	return resource.Resource{Kind: barbican.KindACL, Logical: logical, ID: storedRes(secret).ID}
+}
+
+// consumerRes is the resource RegisterConsumer returns for a consumer on the
+// container with logical name container.
+func consumerRes(logical, container string) resource.Resource {
+	name := "dizzy-run0-" + logical
+	return resource.Resource{Kind: barbican.KindConsumer, Logical: logical, Name: name, ID: containerRes(container).ID + ":" + name}
 }
 
 func (f *fakeBarbican) StoreSecret(_ context.Context, s plan.Secret, seed int64) (resource.Resource, error) {
@@ -156,6 +187,55 @@ func (f *fakeBarbican) RetrievePayload(_ context.Context, r resource.Resource, s
 	return f.call("retrieve:" + r.ID)
 }
 
+func (f *fakeBarbican) SetACL(_ context.Context, a plan.ACL, secret resource.Resource) (resource.Resource, error) {
+	if secret.ID == "" {
+		return resource.Resource{}, fmt.Errorf("acl %q targets secret %q that was not stored", a.Name, a.Secret)
+	}
+	f.mu.Lock()
+	f.aclTargets[a.Name] = secret.ID
+	hook := f.onSetACL
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	if err := f.call("acl:" + a.Name); err != nil {
+		return resource.Resource{}, err
+	}
+	return resource.Resource{Kind: barbican.KindACL, Logical: a.Name, ID: secret.ID}, nil
+}
+
+func (f *fakeBarbican) RegisterConsumer(_ context.Context, con plan.Consumer, container resource.Resource) (resource.Resource, error) {
+	if container.ID == "" {
+		return resource.Resource{}, fmt.Errorf("consumer %q targets container %q that was not created", con.Name, con.Container)
+	}
+	f.mu.Lock()
+	f.consumerCtrs[con.Name] = container.ID
+	f.mu.Unlock()
+	if err := f.call("consumer:" + con.Name); err != nil {
+		return resource.Resource{}, err
+	}
+	name := "dizzy-run0-" + con.Name
+	return resource.Resource{Kind: barbican.KindConsumer, Logical: con.Name, Name: name, ID: container.ID + ":" + name}, nil
+}
+
+func (f *fakeBarbican) VerifyACL(_ context.Context, a plan.ACL, r resource.Resource) error {
+	f.mu.Lock()
+	f.aclChecks[a.Name] = r
+	f.mu.Unlock()
+	return f.call("verifyacl:" + r.ID)
+}
+
+func (f *fakeBarbican) VerifyConsumers(_ context.Context, container resource.Resource, want []resource.Resource, exact bool) error {
+	logicals := make([]string, 0, len(want))
+	for _, w := range want {
+		logicals = append(logicals, w.Logical)
+	}
+	f.mu.Lock()
+	f.consumerCalls = append(f.consumerCalls, consumersCall{container: container.ID, want: logicals, exact: exact})
+	f.mu.Unlock()
+	return f.call("verifyconsumers:" + container.ID)
+}
+
 // indexOf returns the position of the first event equal to want, or -1.
 func indexOf(events []string, want string) int {
 	return slices.Index(events, want)
@@ -178,7 +258,8 @@ func count(events []string, want string) int {
 }
 
 // fullPlan builds a plan that exercises every stage: three stored secrets, two
-// of them read back, two key orders, and two containers.
+// of them read back, two key orders, two containers, two ACLs, and three
+// consumers spread over both containers.
 func fullPlan() *plan.Plan {
 	return &plan.Plan{
 		Scenario: "t",
@@ -193,8 +274,29 @@ func fullPlan() *plan.Plan {
 			{Name: "ctr-0001", Secrets: []string{"sec-0001", "sec-0003"}},
 			{Name: "ctr-0002", Secrets: []string{"sec-0002"}},
 		},
+		ACLs: []plan.ACL{
+			{Name: "acl-0001", Secret: "sec-0001", Users: []string{"u1", "u2"}},
+			{Name: "acl-0002", Secret: "sec-0003", Users: []string{"u3"}},
+		},
+		Consumers: []plan.Consumer{
+			{Name: "con-0001", Container: "ctr-0002"},
+			{Name: "con-0002", Container: "ctr-0001"},
+			{Name: "con-0003", Container: "ctr-0002"},
+		},
 	}
 }
+
+// basePlan is fullPlan without ACLs or consumers: the plan every stage of
+// today's apply runs on.
+func basePlan() *plan.Plan {
+	p := fullPlan()
+	p.ACLs, p.Consumers = nil, nil
+	return p
+}
+
+// newStagePrefixes are the event prefixes of the calls the ACL and consumer
+// stages make.
+var newStagePrefixes = []string{"acl:", "consumer:", "verifyacl:", "verifyconsumers:"}
 
 // policyDenied is a 403 without a quota in its body: a policy denial, which is
 // neither a quota rejection nor retryable.
@@ -220,7 +322,11 @@ func TestApplyStageOrdering(t *testing.T) {
 			"order:ord-0002", "wait:order-ord-0002", "stamp:gen-ord-0002",
 		},
 		{"container:ctr-0001", "container:ctr-0002"},
+		{"acl:acl-0001", "acl:acl-0002"},
+		{"consumer:con-0001", "consumer:con-0002", "consumer:con-0003"},
 		{"retrieve:secret-sec-0001", "retrieve:secret-sec-0003"},
+		{"verifyacl:secret-sec-0001", "verifyacl:secret-sec-0003"},
+		{"verifyconsumers:container-ctr-0001", "verifyconsumers:container-ctr-0002"},
 	}
 	var total int
 	prevLast := -1
@@ -338,9 +444,194 @@ func TestApplyCreatedOrder(t *testing.T) {
 		orderRes("ord-0001"), generatedRes("ord-0001"),
 		orderRes("ord-0002"), generatedRes("ord-0002"),
 		containerRes("ctr-0001"), containerRes("ctr-0002"),
+		aclRes("acl-0001", "sec-0001"), aclRes("acl-0002", "sec-0003"),
+		consumerRes("con-0001", "ctr-0002"), consumerRes("con-0002", "ctr-0001"), consumerRes("con-0003", "ctr-0002"),
 	}
 	if !slices.Equal(result.Created, want) {
 		t.Errorf("Created = %+v\nwant      %+v", result.Created, want)
+	}
+}
+
+// TestApplyWithoutACLsOrConsumers confirms a plan with neither kind drives none
+// of the four ACL and consumer seam calls and records the Created list apply
+// recorded before they existed.
+func TestApplyWithoutACLsOrConsumers(t *testing.T) {
+	f := newFakeBarbican()
+	p := basePlan()
+	result, err := Apply(context.Background(), f, p, 4, time.Second, p.Seed)
+	if err != nil {
+		t.Fatalf("Apply() = %v, want nil", err)
+	}
+	e := f.snapshot()
+	for _, prefix := range newStagePrefixes {
+		if i := indexOfPrefix(e, prefix); i >= 0 {
+			t.Errorf("%s ran for a plan without ACLs or consumers: %v", e[i], e)
+		}
+	}
+	want := []resource.Resource{
+		storedRes("sec-0001"), storedRes("sec-0002"), storedRes("sec-0003"),
+		orderRes("ord-0001"), generatedRes("ord-0001"),
+		orderRes("ord-0002"), generatedRes("ord-0002"),
+		containerRes("ctr-0001"), containerRes("ctr-0002"),
+	}
+	if !slices.Equal(result.Created, want) {
+		t.Errorf("Created = %+v\nwant      %+v", result.Created, want)
+	}
+}
+
+// TestApplyACLsAndConsumersTargetTheirParents confirms each ACL is set on the
+// secret stage 1 stored for it and read back with the resource stage 4
+// returned, and each consumer is registered on the container stage 3 created
+// for it.
+func TestApplyACLsAndConsumersTargetTheirParents(t *testing.T) {
+	f := newFakeBarbican()
+	p := fullPlan()
+	if _, err := Apply(context.Background(), f, p, 4, time.Second, p.Seed); err != nil {
+		t.Fatalf("Apply() = %v, want nil", err)
+	}
+	wantTargets := map[string]string{"acl-0001": "secret-sec-0001", "acl-0002": "secret-sec-0003"}
+	if !maps.Equal(f.aclTargets, wantTargets) {
+		t.Errorf("ACL targets = %v, want %v", f.aclTargets, wantTargets)
+	}
+	wantChecks := map[string]resource.Resource{
+		"acl-0001": aclRes("acl-0001", "sec-0001"),
+		"acl-0002": aclRes("acl-0002", "sec-0003"),
+	}
+	if !maps.Equal(f.aclChecks, wantChecks) {
+		t.Errorf("ACL read-backs = %v, want %v", f.aclChecks, wantChecks)
+	}
+	wantCtrs := map[string]string{"con-0001": "container-ctr-0002", "con-0002": "container-ctr-0001", "con-0003": "container-ctr-0002"}
+	if !maps.Equal(f.consumerCtrs, wantCtrs) {
+		t.Errorf("consumer containers = %v, want %v", f.consumerCtrs, wantCtrs)
+	}
+}
+
+// TestApplyVerifiesConsumersPerContainer confirms stage 8 reads back the
+// consumer list once per container that has consumers, in container order,
+// each call handed that container's consumers in plan order and exact true,
+// and that a container without a consumer gets no call.
+func TestApplyVerifiesConsumersPerContainer(t *testing.T) {
+	f := newFakeBarbican()
+	p := basePlan()
+	p.Containers = append(p.Containers, plan.Container{Name: "ctr-0003", Secrets: []string{"sec-0002"}})
+	p.Consumers = []plan.Consumer{
+		{Name: "con-0001", Container: "ctr-0003"},
+		{Name: "con-0002", Container: "ctr-0001"},
+		{Name: "con-0003", Container: "ctr-0003"},
+	}
+	if _, err := Apply(context.Background(), f, p, 1, time.Second, p.Seed); err != nil {
+		t.Fatalf("Apply() = %v, want nil", err)
+	}
+	want := []consumersCall{
+		{container: "container-ctr-0001", want: []string{"con-0002"}, exact: true},
+		{container: "container-ctr-0003", want: []string{"con-0001", "con-0003"}, exact: true},
+	}
+	if !reflect.DeepEqual(f.consumerCalls, want) {
+		t.Errorf("VerifyConsumers calls = %+v, want %+v (none for ctr-0002)", f.consumerCalls, want)
+	}
+}
+
+// TestApplySetACLRetriesTransient confirms an ACL write that fails twice with a
+// 503 is retried and the third attempt's ACL is recorded.
+func TestApplySetACLRetriesTransient(t *testing.T) {
+	f := newFakeBarbican()
+	unavailable := gophercloud.ErrUnexpectedResponseCode{Actual: 503}
+	f.failWith("acl:acl-0001", unavailable, unavailable)
+	p := fullPlan()
+	result, err := Apply(context.Background(), f, p, 4, time.Second, p.Seed)
+	if err != nil {
+		t.Fatalf("Apply() = %v, want nil", err)
+	}
+	if n := count(f.snapshot(), "acl:acl-0001"); n != 3 {
+		t.Errorf("SetACL of acl-0001 attempted %d times, want 3 (two 503s, then success)", n)
+	}
+	if !slices.Contains(result.Created, aclRes("acl-0001", "sec-0001")) {
+		t.Errorf("Created = %+v, want it to hold acl-0001", result.Created)
+	}
+}
+
+// TestApplyConsumerQuotaFailsFast confirms a consumer registration rejected by
+// a quota stops the run without a retry and without any read-back.
+func TestApplyConsumerQuotaFailsFast(t *testing.T) {
+	f := newFakeBarbican()
+	f.failWith("consumer:con-0002", fmt.Errorf("creating consumer %q: %w", "con-0002", barbican.ErrQuota))
+	p := fullPlan()
+	result, err := Apply(context.Background(), f, p, 1, time.Second, p.Seed)
+	if !errors.Is(err, barbican.ErrQuota) {
+		t.Fatalf("Apply() = %v, want barbican.ErrQuota", err)
+	}
+	e := f.snapshot()
+	if n := count(e, "consumer:con-0002"); n != 1 {
+		t.Errorf("the quota-rejected registration was attempted %d times, want 1", n)
+	}
+	for _, prefix := range []string{"retrieve:", "verifyacl:", "verifyconsumers:"} {
+		if i := indexOfPrefix(e, prefix); i >= 0 {
+			t.Errorf("%s ran after a quota rejection in stage 5: %v", e[i], e)
+		}
+	}
+	if !slices.Contains(result.Created, consumerRes("con-0001", "ctr-0002")) {
+		t.Errorf("Created = %+v, want it to hold the consumer registered before the rejection", result.Created)
+	}
+}
+
+// TestApplyCanceledDuringACLStage confirms an interrupt while the ACLs are set
+// returns context.Canceled and starts no later stage.
+func TestApplyCanceledDuringACLStage(t *testing.T) {
+	f := newFakeBarbican()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.onSetACL = cancel
+	p := fullPlan()
+	_, err := Apply(ctx, f, p, 4, time.Second, p.Seed)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Apply() = %v, want context.Canceled", err)
+	}
+	e := f.snapshot()
+	for _, prefix := range []string{"consumer:", "retrieve:", "verifyacl:", "verifyconsumers:"} {
+		if i := indexOfPrefix(e, prefix); i >= 0 {
+			t.Errorf("%s ran after the ACL stage was cancelled: %v", e[i], e)
+		}
+	}
+}
+
+// TestApplyACLMismatchFailsAfterOneAttempt confirms an ACL that reads back
+// other users fails the run after one attempt, with the ACL still recorded.
+func TestApplyACLMismatchFailsAfterOneAttempt(t *testing.T) {
+	f := newFakeBarbican()
+	f.failWith("verifyacl:secret-sec-0003",
+		fmt.Errorf("%w: acl %q reads back users [], want [u3]", barbican.ErrACLMismatch, "acl-0002"))
+	p := fullPlan()
+	result, err := Apply(context.Background(), f, p, 4, time.Second, p.Seed)
+	if !errors.Is(err, barbican.ErrACLMismatch) {
+		t.Fatalf("Apply() = %v, want barbican.ErrACLMismatch", err)
+	}
+	if n := count(f.snapshot(), "verifyacl:secret-sec-0003"); n != 1 {
+		t.Errorf("the mismatching ACL read-back was attempted %d times, want 1", n)
+	}
+	if !slices.Contains(result.Created, aclRes("acl-0002", "sec-0003")) {
+		t.Errorf("Created = %+v, want it to hold acl-0002", result.Created)
+	}
+}
+
+// TestApplyConsumerMismatchFailsAfterOneAttempt confirms a consumer list that
+// reads back wrong fails the run after one attempt, with the consumers still
+// recorded.
+func TestApplyConsumerMismatchFailsAfterOneAttempt(t *testing.T) {
+	f := newFakeBarbican()
+	f.failWith("verifyconsumers:container-ctr-0002",
+		fmt.Errorf("%w: container container-ctr-0002 lacks consumer %q", barbican.ErrConsumerMismatch, "dizzy-run0-con-0003"))
+	p := fullPlan()
+	result, err := Apply(context.Background(), f, p, 4, time.Second, p.Seed)
+	if !errors.Is(err, barbican.ErrConsumerMismatch) {
+		t.Fatalf("Apply() = %v, want barbican.ErrConsumerMismatch", err)
+	}
+	if n := count(f.snapshot(), "verifyconsumers:container-ctr-0002"); n != 1 {
+		t.Errorf("the mismatching consumer read-back was attempted %d times, want 1", n)
+	}
+	for _, r := range []resource.Resource{consumerRes("con-0001", "ctr-0002"), consumerRes("con-0002", "ctr-0001"), consumerRes("con-0003", "ctr-0002")} {
+		if !slices.Contains(result.Created, r) {
+			t.Errorf("Created = %+v, want it to hold %s", result.Created, r.Logical)
+		}
 	}
 }
 
@@ -427,7 +718,7 @@ func TestApplyQuotaFailsFast(t *testing.T) {
 		t.Fatalf("Apply() = %v, want barbican.ErrQuota", err)
 	}
 	e := f.snapshot()
-	for _, prefix := range []string{"order:", "wait:", "container:", "retrieve:"} {
+	for _, prefix := range append([]string{"order:", "wait:", "container:", "retrieve:"}, newStagePrefixes...) {
 		if i := indexOfPrefix(e, prefix); i >= 0 {
 			t.Errorf("%s ran after a quota rejection in stage 1: %v", e[i], e)
 		}
@@ -465,7 +756,7 @@ func TestApplyOrderFailureFailsRun(t *testing.T) {
 	if n := count(e, "wait:order-ord-0001"); n != 1 {
 		t.Errorf("the failed order was waited on %d times, want 1", n)
 	}
-	for _, prefix := range []string{"stamp:gen-ord-0001", "container:", "retrieve:"} {
+	for _, prefix := range append([]string{"stamp:gen-ord-0001", "container:", "retrieve:"}, newStagePrefixes...) {
 		if i := indexOfPrefix(e, prefix); i >= 0 {
 			t.Errorf("%s ran after the order failed: %v", e[i], e)
 		}
@@ -499,6 +790,11 @@ func TestApplyMismatchFailsAfterOneAttempt(t *testing.T) {
 	}
 	if n := count(f.snapshot(), "retrieve:secret-sec-0003"); n != 1 {
 		t.Errorf("the mismatching read-back was attempted %d times, want 1", n)
+	}
+	for _, prefix := range []string{"verifyacl:", "verifyconsumers:"} {
+		if i := indexOfPrefix(f.snapshot(), prefix); i >= 0 {
+			t.Errorf("%s ran after a payload mismatch in stage 6", prefix)
+		}
 	}
 }
 
