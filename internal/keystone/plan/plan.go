@@ -15,13 +15,14 @@ import (
 
 // Plan is the fully-expanded expected state for one Keystone run. Scenario and
 // Seed record the provenance that produced it; the slices enumerate every
-// domain, role, implied-role rule, project, user, role assignment, and token
-// issue. Domains, roles and implied-role rules are created in admin mode; in
-// domain-manager mode the domains and roles bind to the in-scope domain and
-// reused roles, and the rules are not created. User passwords are never in the
-// plan: each is derived deterministically from (seed, logical name) at apply
-// time. ImpliedRoles is omitted when empty, so a plan without rules encodes as
-// it did before they existed.
+// domain, role, implied-role rule, project, user, role assignment, token
+// issue, application credential and trust. Domains, roles and implied-role
+// rules are created in admin mode; in domain-manager mode the domains and roles
+// bind to the in-scope domain and reused roles, and the rules are not created.
+// User passwords and application credential secrets are never in the plan:
+// each is generated at apply time. ImpliedRoles, ApplicationCredentials and
+// Trusts are omitted when empty, so a plan without them encodes as it did
+// before they existed.
 type Plan struct {
 	Scenario     string        `json:"scenario"`
 	Seed         int64         `json:"seed"`
@@ -32,6 +33,9 @@ type Plan struct {
 	Users        []User        `json:"users"`
 	Assignments  []Assignment  `json:"assignments"`
 	Tokens       []TokenIssue  `json:"tokens"`
+
+	ApplicationCredentials []ApplicationCredential `json:"application_credentials,omitempty"`
+	Trusts                 []Trust                 `json:"trusts,omitempty"`
 }
 
 // Domain is an identity domain, referenced elsewhere by its logical name.
@@ -87,12 +91,40 @@ type TokenIssue struct {
 	Project string `json:"project"`
 }
 
+// ApplicationCredential is an application credential User creates for itself,
+// carrying the one role Role on the one project Project (all logical names).
+// It requires a matching project-scoped Assignment, since Keystone refuses to
+// authenticate with a credential whose owner no longer holds its role. Its
+// secret is generated at apply time and never in the plan.
+type ApplicationCredential struct {
+	Name    string `json:"name"`
+	User    string `json:"user"`
+	Project string `json:"project"`
+	Role    string `json:"role"`
+}
+
+// Trust is a trust the user Trustor creates, delegating its role Role on the
+// project Project to the user Trustee (all logical names). It requires a
+// matching project-scoped Assignment of the trustor, and the trustee is
+// another user of the plan. A trust has no cloud name; Name is its logical
+// handle only.
+type Trust struct {
+	Name    string `json:"name"`
+	Trustor string `json:"trustor"`
+	Trustee string `json:"trustee"`
+	Project string `json:"project"`
+	Role    string `json:"role"`
+}
+
 // Validate checks the plan graph for well-formedness: unique logical names per
 // kind, every domain/role/project/user reference resolving, every implied-role
 // rule linking two distinct known roles at most once, no duplicate (user,
-// target, role) grant, and every token issue naming an existing user and
-// project backed by a matching project-scoped assignment. It returns an error
-// naming the first offending resource.
+// target, role) grant, every token issue naming an existing user and project
+// backed by a matching project-scoped assignment, every application
+// credential and trust backed by the matching project-scoped assignment of its
+// owner, and every trust naming another known user as its trustee, at most
+// once per (trustor, trustee, project). It returns an error naming the first
+// offending resource.
 func (p *Plan) Validate() error {
 	domains, err := uniqueNames("domain", names(p.Domains, func(d Domain) string { return d.Name }))
 	if err != nil {
@@ -174,6 +206,46 @@ func (p *Plan) Validate() error {
 		}
 	}
 
+	return p.validateDelegations(users, grants)
+}
+
+// validateDelegations checks the application credentials and trusts against
+// the plan's users and its (user, project, role) grants: unique names per
+// kind, each backed by a project-scoped grant of its owner, and each trust
+// naming a known trustee other than its trustor, at most once per (trustor,
+// trustee, project), the uniqueness Keystone enforces for trusts without
+// expiry.
+func (p *Plan) validateDelegations(users map[string]string, grants map[string]bool) error {
+	if _, err := uniqueNames("application credential", names(p.ApplicationCredentials, func(ac ApplicationCredential) string { return ac.Name })); err != nil {
+		return err
+	}
+	if _, err := uniqueNames("trust", names(p.Trusts, func(t Trust) string { return t.Name })); err != nil {
+		return err
+	}
+
+	for _, ac := range p.ApplicationCredentials {
+		if ac.Project == "" || !grants[grantKey(ac.User, ac.Project, ac.Role)] {
+			return fmt.Errorf("application credential %q has no matching project-scoped assignment (user %q, project %q, role %q)", ac.Name, ac.User, ac.Project, ac.Role)
+		}
+	}
+
+	trusts := make(map[string]bool, len(p.Trusts))
+	for _, t := range p.Trusts {
+		if t.Project == "" || !grants[grantKey(t.Trustor, t.Project, t.Role)] {
+			return fmt.Errorf("trust %q has no matching project-scoped assignment (trustor %q, project %q, role %q)", t.Name, t.Trustor, t.Project, t.Role)
+		}
+		if _, ok := users[t.Trustee]; !ok {
+			return fmt.Errorf("trust %q references unknown trustee %q", t.Name, t.Trustee)
+		}
+		if t.Trustor == t.Trustee {
+			return fmt.Errorf("trust %q names %q as trustor and trustee", t.Name, t.Trustor)
+		}
+		key := t.Trustor + "\x00" + t.Trustee + "\x00" + t.Project
+		if trusts[key] {
+			return fmt.Errorf("duplicate trust (trustor %q, trustee %q, project %q)", t.Trustor, t.Trustee, t.Project)
+		}
+		trusts[key] = true
+	}
 	return nil
 }
 
@@ -215,8 +287,8 @@ func (p *Plan) FanUsers() int {
 // "keystone apply --dry-run" to preview a scenario without touching a cloud.
 // The users count includes the fan users, which a line of their own counts
 // again only when the plan has any, so the summary of a plan without fan users
-// is unchanged. The implied-role rules get a line only when the plan has any,
-// for the same reason.
+// is unchanged. The implied-role rules, the application credentials and the
+// trusts get a line only when the plan has any, for the same reason.
 func (p *Plan) Summary() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Plan for scenario %q (seed %d)\n", p.Scenario, p.Seed)
@@ -232,6 +304,12 @@ func (p *Plan) Summary() string {
 	}
 	fmt.Fprintf(&b, "  assignments:     %d (%d domain-scoped)\n", len(p.Assignments), p.DomainScopedAssignments())
 	fmt.Fprintf(&b, "  token issues:    %d\n", len(p.Tokens))
+	if n := len(p.ApplicationCredentials); n > 0 {
+		fmt.Fprintf(&b, "  app credentials: %d\n", n)
+	}
+	if n := len(p.Trusts); n > 0 {
+		fmt.Fprintf(&b, "  trusts:          %d\n", n)
+	}
 	return b.String()
 }
 
