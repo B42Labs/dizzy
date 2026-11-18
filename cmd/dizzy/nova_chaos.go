@@ -78,8 +78,8 @@ func newNovaChaosCmd(opts *globalOptions) *cobra.Command {
 				stop()
 			}()
 
-			tel, err := telemetry.Setup(ctx, telemetry.Config{
-				Enabled: opts.otel, Cloud: opts.cloudName(), Scenario: p.Scenario, Service: "nova",
+			tel, err := setupTelemetry(ctx, opts, telemetry.Config{
+				Cloud: opts.cloudName(), Scenario: p.Scenario, Service: "nova",
 			})
 			if err != nil {
 				return fmt.Errorf("setting up telemetry: %w", err)

@@ -78,8 +78,8 @@ func newOctaviaMonitorCmd(opts *globalOptions) *cobra.Command {
 				stop()
 			}()
 
-			tel, err := telemetry.Setup(ctx, telemetry.Config{
-				Enabled: opts.otel, Cloud: opts.cloudName(), Scenario: p.Scenario, Service: "octavia",
+			tel, err := setupTelemetry(ctx, opts, telemetry.Config{
+				Cloud: opts.cloudName(), Scenario: p.Scenario, Service: "octavia",
 			})
 			if err != nil {
 				return fmt.Errorf("setting up telemetry: %w", err)

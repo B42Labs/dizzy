@@ -88,8 +88,8 @@ func buildMixLane(ctx context.Context, opts *globalOptions, in mixLaneInput) (_ 
 		if telCloud == "" {
 			telCloud = opts.cloudName()
 		}
-		tel, err = telemetry.Setup(ctx, telemetry.Config{
-			Enabled: opts.otel, Cloud: telCloud, Scenario: in.scenario, Service: "mix", Persona: in.name,
+		tel, err = setupTelemetry(ctx, opts, telemetry.Config{
+			Cloud: telCloud, Scenario: in.scenario, Service: "mix", Persona: in.name,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("setting up telemetry for persona %q: %w", in.name, err)

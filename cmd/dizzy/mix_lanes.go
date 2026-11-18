@@ -93,8 +93,8 @@ func buildServiceLane(ctx context.Context, opts *globalOptions, in serviceLaneIn
 		if telCloud == "" {
 			telCloud = opts.cloudName()
 		}
-		tel, err = telemetry.Setup(ctx, telemetry.Config{
-			Enabled: opts.otel, Cloud: telCloud, Scenario: in.lane.Scenario(), Service: "mix", Lane: in.name,
+		tel, err = setupTelemetry(ctx, opts, telemetry.Config{
+			Cloud: telCloud, Scenario: in.lane.Scenario(), Service: "mix", Lane: in.name,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("setting up telemetry for lane %q: %w", in.name, err)
