@@ -289,6 +289,8 @@ func TestBarbicanApplyDryRunSummaryNoAPICall(t *testing.T) {
 		"  read-backs:      ",
 		"  orders:          5",
 		"  containers:      3 (",
+		"  acls:            3 (7 users)",
+		"  consumers:       3",
 	}
 	if len(lines) != len(wantPrefixes) {
 		t.Fatalf("summary has %d lines, want %d:\n%s", len(lines), len(wantPrefixes), out)

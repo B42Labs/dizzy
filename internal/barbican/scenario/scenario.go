@@ -1,8 +1,9 @@
 // Package scenario defines the human-authored YAML scenario format for Barbican
-// (the secret, order, and container counts, the payload-size range, the
-// read-back ratio, the container fan-in, the seed, and the optional chaos block
-// of the churn mode) and the deterministic generator that expands a scenario
-// plus its seed into a fully-enumerated plan.
+// (the secret, order, container, secret ACL, and container consumer counts, the
+// payload-size range, the read-back ratio, the container fan-in, the users per
+// ACL, the seed, and the optional chaos block of the churn mode) and the
+// deterministic generator that expands a scenario plus its seed into a
+// fully-enumerated plan.
 // The same scenario and seed always yield a byte-identical plan. Barbican gets
 // its own scenario schema rather than sharing another service's: the services
 // share no resources, and separate schemas keep yaml.UnmarshalStrict failing
@@ -40,13 +41,14 @@ type Scenario struct {
 // falls back to the command's default. Duration is intentionally not required
 // here (a flag may supply it); the merged "duration must be set" check lives in
 // the command. RetrieveRatio is the key-manager-specific knob: the per-step
-// probability of reading back the payload of a live stored secret and
-// byte-comparing it with the bytes it was stored with. It only picks how often a
+// probability of one read-back, either of the payload of a live stored secret
+// byte-compared with the bytes it was stored with, of the ACL of a live secret,
+// or of a live consumer in its container's list. It only picks how often a
 // read-back happens; distribution.retrieve_ratio still decides which secrets the
-// plan marks as read-back candidates. It is a pointer so an omitted key (nil)
-// falls back to the command's default while an explicit retrieve_ratio: 0
-// disables read-backs — the one knob where 0 reads as an on/off switch rather
-// than a degenerate value.
+// plan marks as payload read-back candidates, while every ACL and consumer is
+// one. It is a pointer so an omitted key (nil) falls back to the command's
+// default while an explicit retrieve_ratio: 0 disables all three read-backs —
+// the one knob where 0 reads as an on/off switch rather than a degenerate value.
 //
 // BucketWidth is the width of one time bucket of a run without an end, which
 // only --duration 0 selects; zero means unset, and a bounded run ignores it.
@@ -91,18 +93,22 @@ func (d *Duration) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
-// Resources holds the fixed counts of top-level resources to create: opaque
-// secrets stored with a payload, asynchronous key orders, and generic
-// containers grouping stored secrets.
+// Resources holds the fixed counts of resources to create: opaque secrets
+// stored with a payload, asynchronous key orders, generic containers grouping
+// stored secrets, read ACLs on stored secrets (at most one per secret), and
+// consumers registered on containers.
 type Resources struct {
 	Secrets    int `yaml:"secrets"`
 	Orders     int `yaml:"orders"`
 	Containers int `yaml:"containers"`
+	ACLs       int `yaml:"acls"`
+	Consumers  int `yaml:"consumers"`
 }
 
 // Distribution holds the per-secret range and ratio that shape each stored
-// secret's payload size and whether it is read back, and the per-container
-// range that sets how many stored secrets each container references.
+// secret's payload size and whether it is read back, the per-container range
+// that sets how many stored secrets each container references, and the per-ACL
+// range that sets how many users each ACL lists.
 type Distribution struct {
 	// PayloadBytes is the size drawn per stored secret for its synthetic
 	// payload, in bytes.
@@ -113,6 +119,9 @@ type Distribution struct {
 	// SecretsPerContainer is the reference count drawn per container. Each
 	// container references that many distinct stored secrets.
 	SecretsPerContainer Range `yaml:"secrets_per_container"`
+	// UsersPerACL is the user count drawn per ACL. Each ACL lists that many
+	// synthetic user ids.
+	UsersPerACL Range `yaml:"users_per_acl"`
 }
 
 // Range is an inclusive integer interval drawn from during generation.
@@ -151,6 +160,8 @@ func (s Scenario) Validate() error {
 		{"resources.secrets", s.Resources.Secrets},
 		{"resources.orders", s.Resources.Orders},
 		{"resources.containers", s.Resources.Containers},
+		{"resources.acls", s.Resources.ACLs},
+		{"resources.consumers", s.Resources.Consumers},
 	} {
 		if c.count < 0 {
 			return fmt.Errorf("%s must not be negative, got %d", c.key, c.count)
@@ -164,6 +175,9 @@ func (s Scenario) Validate() error {
 		return err
 	}
 	if err := validateRange("distribution.secrets_per_container", s.Distribution.SecretsPerContainer); err != nil {
+		return err
+	}
+	if err := validateRange("distribution.users_per_acl", s.Distribution.UsersPerACL); err != nil {
 		return err
 	}
 
@@ -181,6 +195,22 @@ func (s Scenario) Validate() error {
 	// references than the run stores.
 	if s.Resources.Containers > 0 && s.Distribution.SecretsPerContainer.Max > s.Resources.Secrets {
 		return fmt.Errorf("distribution.secrets_per_container.max (%d) exceeds resources.secrets (%d)", s.Distribution.SecretsPerContainer.Max, s.Resources.Secrets)
+	}
+
+	// A stored secret carries at most one ACL.
+	if s.Resources.ACLs > s.Resources.Secrets {
+		return fmt.Errorf("resources.acls (%d) exceeds resources.secrets (%d)", s.Resources.ACLs, s.Resources.Secrets)
+	}
+
+	// An ACL is written with a PUT that lists its users, and a PUT without users
+	// sets nothing, so every ACL lists at least one.
+	if s.Resources.ACLs > 0 && s.Distribution.UsersPerACL.Min < 1 {
+		return fmt.Errorf("distribution.users_per_acl.min must be at least 1 when resources.acls > 0, got %d", s.Distribution.UsersPerACL.Min)
+	}
+
+	// A consumer is registered on a container, so it needs at least one.
+	if s.Resources.Consumers > 0 && s.Resources.Containers == 0 {
+		return fmt.Errorf("resources.consumers is %d but resources.containers is 0", s.Resources.Consumers)
 	}
 
 	if err := s.Chaos.validate(); err != nil {
@@ -237,6 +267,10 @@ func (s *Scenario) Set(key, value string) error {
 		return setInt(&s.Resources.Orders, key, value)
 	case "resources.containers":
 		return setInt(&s.Resources.Containers, key, value)
+	case "resources.acls":
+		return setInt(&s.Resources.ACLs, key, value)
+	case "resources.consumers":
+		return setInt(&s.Resources.Consumers, key, value)
 	case "distribution.payload_bytes.min":
 		return setInt(&s.Distribution.PayloadBytes.Min, key, value)
 	case "distribution.payload_bytes.max":
@@ -247,6 +281,10 @@ func (s *Scenario) Set(key, value string) error {
 		return setInt(&s.Distribution.SecretsPerContainer.Min, key, value)
 	case "distribution.secrets_per_container.max":
 		return setInt(&s.Distribution.SecretsPerContainer.Max, key, value)
+	case "distribution.users_per_acl.min":
+		return setInt(&s.Distribution.UsersPerACL.Min, key, value)
+	case "distribution.users_per_acl.max":
+		return setInt(&s.Distribution.UsersPerACL.Max, key, value)
 	default:
 		return fmt.Errorf("unknown override key %q", key)
 	}

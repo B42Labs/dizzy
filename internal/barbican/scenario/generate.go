@@ -21,8 +21,16 @@ import (
 // Each order ord-%04d draws nothing. Each container ctr-%04d draws its reference
 // count and then, only when that count is positive, a permutation of the stored
 // secrets whose first count indices, sorted ascending, name the secrets it
-// references. Every slice is allocated non-nil, so an empty collection encodes
-// as [] rather than null.
+// references. Every slice up to here is allocated non-nil, so an empty
+// collection encodes as [] rather than null.
+//
+// ACLs and consumers are drawn after everything else, each only when its count
+// is positive, so a scenario that asks for neither yields the plan it yielded
+// before they existed and leaves both slices nil, which the plan omits from its
+// JSON. The ACLs draw one permutation of the stored secrets whose first count
+// indices, sorted ascending, name the secrets that carry an ACL; ACL acl-%04d
+// then draws its user count and that many 32-hex-character user ids. Each
+// consumer con-%04d draws the container it is registered on.
 func (s Scenario) Generate() (*plan.Plan, error) {
 	if err := s.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid scenario: %w", err)
@@ -65,6 +73,34 @@ func (s Scenario) Generate() (*plan.Plan, error) {
 			}
 		}
 		p.Containers = append(p.Containers, ct)
+	}
+
+	if n := s.Resources.ACLs; n > 0 {
+		// Validate caps resources.acls at the stored-secret count, so the
+		// permutation always holds at least n indices.
+		idx := rng.Perm(len(p.Secrets))[:n]
+		slices.Sort(idx)
+		p.ACLs = make([]plan.ACL, 0, n)
+		for i, j := range idx {
+			k := randRange(rng, s.Distribution.UsersPerACL)
+			users := make([]string, 0, k)
+			for range k {
+				users = append(users, fmt.Sprintf("%016x%016x", rng.Uint64(), rng.Uint64()))
+			}
+			p.ACLs = append(p.ACLs, plan.ACL{Name: fmt.Sprintf("acl-%04d", i+1), Secret: p.Secrets[j].Name, Users: users})
+		}
+	}
+
+	if n := s.Resources.Consumers; n > 0 {
+		// Validate refuses consumers without containers, so Intn's bound is
+		// positive.
+		p.Consumers = make([]plan.Consumer, 0, n)
+		for i := 0; i < n; i++ {
+			p.Consumers = append(p.Consumers, plan.Consumer{
+				Name:      fmt.Sprintf("con-%04d", i+1),
+				Container: p.Containers[rng.Intn(len(p.Containers))].Name,
+			})
+		}
 	}
 
 	if err := p.Validate(); err != nil {

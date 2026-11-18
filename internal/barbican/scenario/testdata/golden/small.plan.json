@@ -91,5 +91,46 @@
         "sec-0008"
       ]
     }
+  ],
+  "acls": [
+    {
+      "name": "acl-0001",
+      "secret": "sec-0004",
+      "users": [
+        "07c332b7e6da9721262c4e878f66df51",
+        "a71760a89ce01c9f49f43f304817e2e7",
+        "72ed481ce1231b1ceef2765f689d5317"
+      ]
+    },
+    {
+      "name": "acl-0002",
+      "secret": "sec-0008",
+      "users": [
+        "d96cc2d32a4b86b23a135a76422338e6",
+        "f1f660f72de596d6d1a4dca0295e46c3"
+      ]
+    },
+    {
+      "name": "acl-0003",
+      "secret": "sec-0010",
+      "users": [
+        "b9644af5f57115c28c9b42d83f510531",
+        "3d832a9fbae14a196fe81f66b372ae86"
+      ]
+    }
+  ],
+  "consumers": [
+    {
+      "name": "con-0001",
+      "container": "ctr-0001"
+    },
+    {
+      "name": "con-0002",
+      "container": "ctr-0003"
+    },
+    {
+      "name": "con-0003",
+      "container": "ctr-0002"
+    }
   ]
 }

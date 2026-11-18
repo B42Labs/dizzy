@@ -123,12 +123,46 @@ func TestProfilesGrowStrictly(t *testing.T) {
 		{"secrets", func(p *plan.Plan) int { return len(p.Secrets) }},
 		{"orders", func(p *plan.Plan) int { return len(p.Orders) }},
 		{"containers", func(p *plan.Plan) int { return len(p.Containers) }},
+		{"acls", func(p *plan.Plan) int { return len(p.ACLs) }},
+		{"consumers", func(p *plan.Plan) int { return len(p.Consumers) }},
 	} {
 		for i := 1; i < len(plans); i++ {
 			if got, prev := c.count(plans[i]), c.count(plans[i-1]); got <= prev {
 				t.Errorf("%s %s (%d) must exceed %s %s (%d)", profileNames[i], c.resource, got, profileNames[i-1], c.resource, prev)
 			}
 		}
+	}
+}
+
+// TestProfilesACLsAndConsumers pins the ACLs, the users they list, and the
+// consumers each shipped profile yields, the counts the scenario schema's
+// Profiles table documents.
+func TestProfilesACLsAndConsumers(t *testing.T) {
+	want := map[string]struct{ acls, users, consumers int }{
+		"small":  {3, 7, 3},
+		"medium": {10, 19, 10},
+		"large":  {25, 45, 25},
+	}
+	for _, name := range profileNames {
+		t.Run(name, func(t *testing.T) {
+			w, ok := want[name]
+			if !ok {
+				t.Fatalf("profile barbican/%s.yaml has no expected counts in this test", name)
+			}
+			p, err := readProfile(t, name).Generate()
+			if err != nil {
+				t.Fatalf("Generate() = %v, want nil", err)
+			}
+			if got := len(p.ACLs); got != w.acls {
+				t.Errorf("profile barbican/%s.yaml yields %d ACLs, want %d", name, got, w.acls)
+			}
+			if got := p.ACLUsers(); got != w.users {
+				t.Errorf("profile barbican/%s.yaml ACLs list %d users, want %d", name, got, w.users)
+			}
+			if got := len(p.Consumers); got != w.consumers {
+				t.Errorf("profile barbican/%s.yaml yields %d consumers, want %d", name, got, w.consumers)
+			}
+		})
 	}
 }
 

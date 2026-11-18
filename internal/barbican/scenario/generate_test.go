@@ -8,6 +8,8 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -212,11 +214,11 @@ func TestGenerateContainerReferences(t *testing.T) {
 // lies in the drawn range.
 func TestGenerateCountersAndBounds(t *testing.T) {
 	s := smallScenario()
-	s.Resources = Resources{Secrets: 25, Orders: 12, Containers: 7}
+	s.Resources = Resources{Secrets: 25, Orders: 12, Containers: 7, ACLs: 5, Consumers: 9}
 
 	p := generate(t, s)
-	if len(p.Secrets) != 25 || len(p.Orders) != 12 || len(p.Containers) != 7 {
-		t.Fatalf("counts = %d/%d/%d, want 25/12/7", len(p.Secrets), len(p.Orders), len(p.Containers))
+	if len(p.Secrets) != 25 || len(p.Orders) != 12 || len(p.Containers) != 7 || len(p.ACLs) != 5 || len(p.Consumers) != 9 {
+		t.Fatalf("counts = %d/%d/%d/%d/%d, want 25/12/7/5/9", len(p.Secrets), len(p.Orders), len(p.Containers), len(p.ACLs), len(p.Consumers))
 	}
 	r := s.Distribution.PayloadBytes
 	for i, sec := range p.Secrets {
@@ -235,6 +237,106 @@ func TestGenerateCountersAndBounds(t *testing.T) {
 	for i, ct := range p.Containers {
 		if want := fmt.Sprintf("ctr-%04d", i+1); ct.Name != want {
 			t.Errorf("container %d name = %q, want %q", i, ct.Name, want)
+		}
+	}
+	for i, a := range p.ACLs {
+		if want := fmt.Sprintf("acl-%04d", i+1); a.Name != want {
+			t.Errorf("acl %d name = %q, want %q", i, a.Name, want)
+		}
+	}
+	for i, con := range p.Consumers {
+		if want := fmt.Sprintf("con-%04d", i+1); con.Name != want {
+			t.Errorf("consumer %d name = %q, want %q", i, con.Name, want)
+		}
+	}
+}
+
+// TestGenerateSmallACLsAndConsumers pins the ACLs and consumers the small
+// fixture draws at seed 42. They are drawn after the containers in a fixed
+// order, so a generator that draws in another order yields other entries.
+func TestGenerateSmallACLsAndConsumers(t *testing.T) {
+	p := generate(t, smallScenario())
+
+	wantACLs := []plan.ACL{
+		{Name: "acl-0001", Secret: "sec-0004", Users: []string{
+			"07c332b7e6da9721262c4e878f66df51", "a71760a89ce01c9f49f43f304817e2e7", "72ed481ce1231b1ceef2765f689d5317",
+		}},
+		{Name: "acl-0002", Secret: "sec-0008", Users: []string{
+			"d96cc2d32a4b86b23a135a76422338e6", "f1f660f72de596d6d1a4dca0295e46c3",
+		}},
+		{Name: "acl-0003", Secret: "sec-0010", Users: []string{
+			"b9644af5f57115c28c9b42d83f510531", "3d832a9fbae14a196fe81f66b372ae86",
+		}},
+	}
+	if !reflect.DeepEqual(p.ACLs, wantACLs) {
+		t.Errorf("ACLs = %+v\nwant   %+v", p.ACLs, wantACLs)
+	}
+
+	wantConsumers := []plan.Consumer{
+		{Name: "con-0001", Container: "ctr-0001"},
+		{Name: "con-0002", Container: "ctr-0003"},
+		{Name: "con-0003", Container: "ctr-0002"},
+	}
+	if !reflect.DeepEqual(p.Consumers, wantConsumers) {
+		t.Errorf("Consumers = %+v\nwant        %+v", p.Consumers, wantConsumers)
+	}
+}
+
+// TestGenerateZeroACLsAndConsumers confirms a scenario asking for neither kind
+// draws nothing for them: its JSON carries neither key and equals the JSON of
+// the fixture's plan with both slices set to nil, so the secrets, orders, and
+// containers are those of a plan generated before the two kinds existed.
+func TestGenerateZeroACLsAndConsumers(t *testing.T) {
+	s := smallScenario()
+	s.Resources.ACLs, s.Resources.Consumers = 0, 0
+	got := marshal(t, generate(t, s))
+
+	for _, key := range []string{`"acls"`, `"consumers"`} {
+		if bytes.Contains(got, []byte(key)) {
+			t.Errorf("plan JSON carries %s without any:\n%s", key, got)
+		}
+	}
+
+	full := generate(t, smallScenario())
+	if len(full.ACLs) == 0 || len(full.Consumers) == 0 {
+		t.Fatalf("the fixture draws %d ACLs and %d consumers; the comparison needs both", len(full.ACLs), len(full.Consumers))
+	}
+	full.ACLs, full.Consumers = nil, nil
+	if want := marshal(t, full); !bytes.Equal(got, want) {
+		t.Errorf("plan without ACLs or consumers differs from the fixture's plan with both slices nil:\n%s\n---\n%s", got, want)
+	}
+}
+
+// hexUser is the shape of a synthetic user id: 32 lowercase hex characters.
+var hexUser = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// TestGenerateOneACLPerSecret confirms resources.acls equal to
+// resources.secrets puts one ACL on every stored secret, in secret order, each
+// listing a user count inside users_per_acl of distinct 32-hex-character ids.
+func TestGenerateOneACLPerSecret(t *testing.T) {
+	s := smallScenario()
+	s.Resources.ACLs = s.Resources.Secrets
+	s.Distribution.UsersPerACL = Range{Min: 2, Max: 5}
+
+	p := generate(t, s)
+	if len(p.ACLs) != len(p.Secrets) {
+		t.Fatalf("ACLs = %d, want one per stored secret (%d)", len(p.ACLs), len(p.Secrets))
+	}
+	r := s.Distribution.UsersPerACL
+	for i, a := range p.ACLs {
+		if want := fmt.Sprintf("acl-%04d", i+1); a.Name != want {
+			t.Errorf("acl %d name = %q, want %q", i, a.Name, want)
+		}
+		if want := p.Secrets[i].Name; a.Secret != want {
+			t.Errorf("acl %q is on %q, want %q (secret order)", a.Name, a.Secret, want)
+		}
+		if n := len(a.Users); n < r.Min || n > r.Max {
+			t.Errorf("acl %q lists %d users, want %d to %d", a.Name, n, r.Min, r.Max)
+		}
+		for _, u := range a.Users {
+			if !hexUser.MatchString(u) {
+				t.Errorf("acl %q user %q is not 32 hex characters", a.Name, u)
+			}
 		}
 	}
 }
