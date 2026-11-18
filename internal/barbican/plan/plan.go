@@ -1,10 +1,9 @@
 // Package plan defines the expanded, fully-enumerated set of Barbican resources
 // (stored secrets, key orders, generic containers, secret ACLs, and container
 // consumers): the expected-state source of truth produced deterministically
-// from a scenario plus a seed. Like
-// the other services' plans it is pure data: every collection is a slice (never
-// a map) so that encoding the plan to JSON yields byte-identical output for the
-// same input. A stored secret's payload is not part of the plan: its bytes are
+// from a scenario plus a seed. Like the other services' plans it is pure data:
+// every collection is a slice (never a map) so that encoding the plan to JSON
+// yields byte-identical output for the same input. A stored secret's payload is not part of the plan: its bytes are
 // derived from the plan seed and the secret's logical name, so the plan records
 // only the payload size, and a read-back can compare against the same bytes.
 package plan
