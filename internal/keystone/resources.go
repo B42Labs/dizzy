@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/applicationcredentials"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/domains"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/projects"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/roles"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/trusts"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/users"
 	"github.com/gophercloud/gophercloud/v2/pagination"
 
@@ -18,9 +20,13 @@ import (
 // error other than a 404. Domains and projects render enabled/disabled; users,
 // roles and implied-role rules have no status and render "" (shown as
 // "present" by the status table); an assignment exists when the grant is still
-// present. A 404 (or an absent assignment) is reported as ("", false, nil) so a
-// resource deleted out of band reads as gone rather than as a failure. The
-// status command drives this over a run's resources.
+// present. Application credentials and trusts have no status either and are
+// read with the run's own token. A 404 (or an absent assignment) is reported as
+// ("", false, nil) so a resource deleted out of band reads as gone rather than
+// as a failure. A 403 on an application credential or a trust is reported as
+// ("unknown", true, nil): only an admin or the owner may read either, so a
+// domain manager cannot tell, and status would otherwise fail on every one of
+// them. The status command drives this over a run's resources.
 func (c *Client) Observe(ctx context.Context, r resource.Resource) (status string, exists bool, err error) {
 	var (
 		st string
@@ -34,6 +40,8 @@ func (c *Client) Observe(ctx context.Context, r resource.Resource) (status strin
 	switch {
 	case IsNotFound(err):
 		return "", false, nil
+	case IsForbidden(err) && (r.Kind == KindApplicationCredential || r.Kind == KindTrust):
+		return "unknown", true, nil
 	case err != nil:
 		return "", false, err
 	default:
@@ -81,6 +89,20 @@ func (c *Client) observeOne(ctx context.Context, r resource.Resource) (string, b
 			return "", false, err
 		}
 		return "", ex, nil
+	case KindApplicationCredential:
+		userID, credentialID, err := parseApplicationCredentialID(r.ID)
+		if err != nil {
+			return "", false, err
+		}
+		if _, err := applicationcredentials.Get(ctx, c.gc, userID, credentialID).Extract(); err != nil {
+			return "", false, err
+		}
+		return "", true, nil
+	case KindTrust:
+		if _, err := trusts.Get(ctx, c.gc, r.ID).Extract(); err != nil {
+			return "", false, err
+		}
+		return "", true, nil
 	default:
 		return "", false, fmt.Errorf("observe not supported for kind %q", r.Kind)
 	}

@@ -27,18 +27,23 @@ import (
 	"github.com/B42Labs/dizzy/internal/telemetry"
 )
 
-// Keystone resource kinds. They double as the metrics "type" label; KindToken is
-// also recorded as a time-to-ready kind (the token-issue latency). Assignments,
-// implied-role rules and tokens carry no cloud name or tag — they live only in
-// the run record.
+// Keystone resource kinds. They double as the metrics "type" label; KindToken,
+// KindApplicationCredential and KindTrust are also recorded as time-to-ready
+// kinds (the token-issue and authentication latencies). Assignments,
+// implied-role rules, tokens and trusts carry no cloud name or tag — they live
+// only in the run record. An application credential carries a cloud name but
+// lives under its user, and both it and a trust go with their user when
+// Keystone deletes the user.
 const (
-	KindDomain      resource.Kind = "domain"
-	KindProject     resource.Kind = "project"
-	KindUser        resource.Kind = "user"
-	KindRole        resource.Kind = "role"
-	KindImpliedRole resource.Kind = "implied_role"
-	KindAssignment  resource.Kind = "role_assignment"
-	KindToken       resource.Kind = "token"
+	KindDomain                resource.Kind = "domain"
+	KindProject               resource.Kind = "project"
+	KindUser                  resource.Kind = "user"
+	KindRole                  resource.Kind = "role"
+	KindImpliedRole           resource.Kind = "implied_role"
+	KindAssignment            resource.Kind = "role_assignment"
+	KindToken                 resource.Kind = "token"
+	KindApplicationCredential resource.Kind = "application_credential"
+	KindTrust                 resource.Kind = "trust"
 )
 
 // namePrefix is the common prefix of every resource this tool creates. A run's
