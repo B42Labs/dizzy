@@ -2,9 +2,12 @@ package telemetry
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -326,6 +329,197 @@ func TestNilTelemetryIsNoOp(t *testing.T) {
 	tel.RecordIterationOperations(ctx, 1, 1, 0)
 	if err := tel.Shutdown(ctx); err != nil {
 		t.Errorf("Shutdown on nil telemetry = %v, want nil", err)
+	}
+
+	// A Telemetry built by NewWithProvider has no progress hook; recording
+	// on it must not call through a nil function.
+	built, _ := newTestTelemetry(t)
+	built.RecordOperation(ctx, "network", "create", time.Second, "")
+	built.RecordIteration(ctx, time.Second, true)
+}
+
+// gatherLabels gathers g and returns, per metric family name, the label set
+// of each of its series. A histogram's le bounds live inside the series, so
+// they are not among its labels.
+func gatherLabels(t *testing.T, g prometheus.Gatherer) map[string][]map[string]string {
+	t.Helper()
+	mfs, err := g.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	out := map[string][]map[string]string{}
+	for _, mf := range mfs {
+		for _, m := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			out[mf.GetName()] = append(out[mf.GetName()], labels)
+		}
+	}
+	return out
+}
+
+// setupPrometheus sets up a Telemetry with only the Prometheus reader on reg
+// and shuts it down when the test ends.
+func setupPrometheus(t *testing.T, reg prometheus.Registerer, cfg Config) *Telemetry {
+	t.Helper()
+	cfg.Registerer = reg
+	tel, err := Setup(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	if tel == nil {
+		t.Fatal("Setup with a Registerer returned nil")
+	}
+	t.Cleanup(func() { _ = tel.Shutdown(context.Background()) })
+	return tel
+}
+
+func TestSetupPrometheusOnly(t *testing.T) {
+	// Without Enabled no OTLP variable is read, so a bogus protocol that
+	// would fail newExporter does not matter.
+	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "bogus")
+	reg := prometheus.NewRegistry()
+	tel := setupPrometheus(t, reg, Config{Cloud: "c", Scenario: "s", Service: "neutron"})
+
+	ctx := context.Background()
+	tel.RecordOperation(ctx, "network", "create", 100*time.Millisecond, "")
+	tel.RecordOperation(ctx, "port", "delete", 50*time.Millisecond, "http_500")
+	tel.RecordTimeToReady(ctx, "network", 200*time.Millisecond, true)
+	tel.RecordIteration(ctx, 5*time.Second, true)
+	tel.RecordIterationOperations(ctx, 2, 1, 1)
+
+	families := gatherLabels(t, reg)
+	for _, name := range []string{
+		"dizzy_operation_duration_seconds",
+		"dizzy_operation_errors_total",
+		"dizzy_resource_time_to_ready_seconds",
+		"dizzy_iteration_duration_seconds",
+		"dizzy_iteration_operations_total",
+		"dizzy_iterations_total",
+		"target_info",
+	} {
+		if len(families[name]) == 0 {
+			t.Errorf("family %s not gathered", name)
+		}
+	}
+
+	wantKeys := []string{"cloud", "kind", "operation", "outcome", "scenario", "service"}
+	for _, labels := range families["dizzy_operation_duration_seconds"] {
+		var got []string
+		for k := range labels {
+			got = append(got, k)
+		}
+		slices.Sort(got)
+		if !slices.Equal(got, wantKeys) {
+			t.Errorf("operation duration labels = %v, want %v", got, wantKeys)
+		}
+		if labels["cloud"] != "c" || labels["scenario"] != "s" || labels["service"] != "neutron" {
+			t.Errorf("operation duration resource labels = %v, want cloud=c scenario=s service=neutron", labels)
+		}
+	}
+
+	errs := families["dizzy_operation_errors_total"]
+	if len(errs) != 1 || errs[0]["error_kind"] != "http_500" {
+		t.Errorf("operation errors series = %v, want one with error_kind=http_500", errs)
+	}
+
+	for name, series := range families {
+		if !strings.HasPrefix(name, "dizzy_") {
+			continue
+		}
+		for _, labels := range series {
+			for k := range labels {
+				if strings.HasPrefix(k, "otel_scope_") {
+					t.Errorf("%s carries scope label %s", name, k)
+				}
+			}
+		}
+	}
+}
+
+func TestSetupPrometheusOmitsEmptyResourceLabels(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	tel := setupPrometheus(t, reg, Config{Service: "mix", Persona: "ci"})
+	tel.RecordOperation(context.Background(), "server", "create", time.Second, "")
+
+	series := gatherLabels(t, reg)["dizzy_operation_duration_seconds"]
+	if len(series) == 0 {
+		t.Fatal("no operation duration series gathered")
+	}
+	for _, labels := range series {
+		if labels["service"] != "mix" || labels["persona"] != "ci" {
+			t.Errorf("labels = %v, want service=mix persona=ci", labels)
+		}
+		for _, absent := range []string{"cloud", "scenario", "lane"} {
+			if _, ok := labels[absent]; ok {
+				t.Errorf("labels = %v carry %s although it was not set", labels, absent)
+			}
+		}
+	}
+}
+
+func TestSetupPrometheusSharedRegistry(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	persona := setupPrometheus(t, reg, Config{Service: "mix", Persona: "ci"})
+	lane := setupPrometheus(t, reg, Config{Service: "mix", Lane: "cinder"})
+	persona.RecordOperation(context.Background(), "server", "create", time.Second, "")
+	lane.RecordOperation(context.Background(), "volume", "create", time.Second, "")
+
+	families := gatherLabels(t, reg)
+	var personas, lanes int
+	for _, labels := range families["dizzy_operation_duration_seconds"] {
+		if labels["persona"] == "ci" {
+			personas++
+		}
+		if labels["lane"] == "cinder" {
+			lanes++
+		}
+	}
+	if personas != 1 || lanes != 1 {
+		t.Errorf("operation duration series: %d with persona=ci and %d with lane=cinder, want 1 each; all: %v",
+			personas, lanes, families["dizzy_operation_duration_seconds"])
+	}
+	if got := len(families["target_info"]); got != 2 {
+		t.Errorf("target_info series = %d, want 2", got)
+	}
+}
+
+func TestSetupPrometheusShutdownStopsSeries(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	tel, err := Setup(context.Background(), Config{Service: "neutron", Registerer: reg})
+	if err != nil {
+		t.Fatalf("Setup: %v", err)
+	}
+	tel.RecordOperation(context.Background(), "network", "create", time.Second, "")
+	if len(gatherLabels(t, reg)["dizzy_operation_duration_seconds"]) == 0 {
+		t.Fatal("no operation duration series before Shutdown")
+	}
+
+	if err := tel.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	for name := range gatherLabels(t, reg) {
+		if strings.HasPrefix(name, "dizzy_") {
+			t.Errorf("family %s still gathered after Shutdown", name)
+		}
+	}
+}
+
+func TestOnProgressCalledForOperationsAndIterations(t *testing.T) {
+	var calls int
+	tel := setupPrometheus(t, prometheus.NewRegistry(), Config{
+		Service:    "neutron",
+		OnProgress: func() { calls++ },
+	})
+	ctx := context.Background()
+	tel.RecordOperation(ctx, "network", "create", time.Second, "timeout")
+	tel.RecordIteration(ctx, time.Second, false)
+	tel.RecordTimeToReady(ctx, "network", time.Second, true)
+	tel.RecordIterationOperations(ctx, 1, 0, 1)
+	if calls != 2 {
+		t.Errorf("OnProgress calls = %d, want 2 (one operation, one iteration)", calls)
 	}
 }
 

@@ -1,13 +1,15 @@
-// Package telemetry is the OpenTelemetry (OTLP push) metrics seam for the
-// tester. It wraps the OTEL Go SDK behind a small set of nil-safe recording
-// methods so a run with export disabled constructs nothing and behaves exactly
-// as before: a nil *Telemetry is the no-op, and every method returns early on
-// it. When enabled via Setup it builds an OTLP exporter configured entirely
-// from the standard OTEL_EXPORTER_OTLP_* environment variables and records the
-// documented per-operation, time-to-ready, and per-iteration instruments —
-// including the per-error-kind operation.errors counter — alongside the
-// in-memory metrics.Collector, which stays the source of truth for run records
-// and reports.
+// Package telemetry is the OpenTelemetry metrics seam for the tester. It wraps
+// the OTEL Go SDK behind a small set of nil-safe recording methods so a run
+// with every reader disabled constructs nothing and behaves exactly as before:
+// a nil *Telemetry is the no-op, and every method returns early on it. Setup
+// feeds one MeterProvider into up to two readers: an OTLP push exporter
+// configured entirely from the standard OTEL_EXPORTER_OTLP_* environment
+// variables (--otel), and a Prometheus reader that registers on the scrape
+// listener's registry (--listen-address). Both see the documented
+// per-operation, time-to-ready, and per-iteration instruments, including the
+// per-error-kind operation.errors counter, recorded alongside the in-memory
+// metrics.Collector, which stays the source of truth for run records and
+// reports.
 //
 // The exported resource additionally carries bounded identifying attributes —
 // cloud, scenario, and service (neutron | cinder | keystone | nova | glance |
@@ -32,10 +34,12 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -55,6 +59,12 @@ const meterName = "github.com/B42Labs/dizzy"
 // names the workload persona and Lane the background lane of a combined (mix)
 // run, which sets up one Telemetry per persona and per lane; each is omitted
 // when empty.
+//
+// Enabled turns on the OTLP push exporter. Registerer, when non-nil, adds a
+// Prometheus reader whose collector registers there; several Telemetry
+// values may share one registry, as the personas and lanes of a mix run do.
+// OnProgress, when non-nil, is called on every recorded operation and every
+// recorded iteration, which is what the health endpoint counts as progress.
 type Config struct {
 	Enabled  bool
 	Cloud    string
@@ -62,12 +72,21 @@ type Config struct {
 	Service  string
 	Persona  string
 	Lane     string
+
+	Registerer prometheus.Registerer
+	OnProgress func()
 }
+
+// resourceLabels are the resource attributes the Prometheus reader turns
+// into labels on every series, so a scrape carries the same identity the
+// OTLP path stores. Each is present only when buildResource set it.
+var resourceLabels = attribute.NewAllowKeysFilter("cloud", "scenario", "service", "persona", "lane")
 
 // Telemetry holds the constructed instruments and the provider shutdown hook.
 // A nil *Telemetry is the disabled no-op: every method is safe to call on it.
 type Telemetry struct {
 	shutdown func(context.Context) error
+	progress func()
 
 	operationDuration metric.Float64Histogram
 	operationErrors   metric.Int64Counter
@@ -77,22 +96,19 @@ type Telemetry struct {
 	iterations        metric.Int64Counter
 }
 
-// Setup returns the OTEL export seam. It returns (nil, nil) when export is
-// disabled, so callers thread a nil *Telemetry through the disabled path and
-// every recording method becomes a no-op. When enabled it builds an OTLP
-// exporter from the standard OTEL_EXPORTER_OTLP_* environment variables, wraps
-// it in a periodic reader (which honors OTEL_METRIC_EXPORT_INTERVAL/_TIMEOUT),
-// and constructs the instruments. Export errors from a down collector are
-// routed to a slog.Warn error handler so they degrade to warnings and never
-// break a run.
+// Setup returns the OTEL export seam. It returns (nil, nil) when neither
+// reader is requested (Enabled false and Registerer nil), so callers thread a
+// nil *Telemetry through the disabled path and every recording method becomes
+// a no-op. With Enabled it builds an OTLP exporter from the standard
+// OTEL_EXPORTER_OTLP_* environment variables and wraps it in a periodic
+// reader (which honors OTEL_METRIC_EXPORT_INTERVAL/_TIMEOUT); without it no
+// OTEL_EXPORTER_OTLP_* variable is read. With a Registerer it adds a
+// Prometheus reader registered there. Both readers share one MeterProvider
+// and the instruments built on it. Export and collection errors are routed to
+// a slog.Warn error handler so they degrade to warnings and never break a run.
 func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
-	if !cfg.Enabled {
+	if !cfg.Enabled && cfg.Registerer == nil {
 		return nil, nil
-	}
-
-	exp, err := newExporter(ctx)
-	if err != nil {
-		return nil, err
 	}
 
 	res, err := buildResource(cfg)
@@ -100,21 +116,42 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 		return nil, err
 	}
 
-	// A down or misconfigured collector must degrade to warnings, not crash the
-	// run: batched exports fail asynchronously and surface through this handler.
+	opts := []sdkmetric.Option{sdkmetric.WithResource(res)}
+	if cfg.Enabled {
+		exp, err := newExporter(ctx)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exp)))
+	}
+	if cfg.Registerer != nil {
+		// Scope labels (otel_scope_*) are off because the OTLP path into
+		// Prometheus or VictoriaMetrics does not produce them either.
+		exp, err := otelprom.New(
+			otelprom.WithRegisterer(cfg.Registerer),
+			otelprom.WithoutScopeInfo(),
+			otelprom.WithResourceAsConstantLabels(resourceLabels),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("creating prometheus exporter: %w", err)
+		}
+		opts = append(opts, sdkmetric.WithReader(exp))
+	}
+
+	// A down or misconfigured collector, or a failing scrape collection, must
+	// degrade to warnings, not crash the run: batched exports fail
+	// asynchronously and surface through this handler.
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
 		slog.Warn("opentelemetry metric export error", "error", err)
 	}))
 
-	mp := sdkmetric.NewMeterProvider(
-		sdkmetric.WithResource(res),
-		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exp)),
-	)
+	mp := sdkmetric.NewMeterProvider(opts...)
 	t, err := NewWithProvider(mp)
 	if err != nil {
 		return nil, err
 	}
 	t.shutdown = mp.Shutdown
+	t.progress = cfg.OnProgress
 	return t, nil
 }
 
@@ -230,11 +267,13 @@ func newExporter(ctx context.Context) (sdkmetric.Exporter, error) {
 // empty errKind is success, "timeout" is timeout, anything else is error. A
 // failed call additionally increments operation.errors with the verbatim
 // errKind as error.kind, preserving the per-error-kind breakdown that outcome
-// collapses; a successful call creates no operation.errors series.
+// collapses; a successful call creates no operation.errors series. Every
+// recorded call, failed or timed out included, counts as progress.
 func (t *Telemetry) RecordOperation(ctx context.Context, kind, op string, d time.Duration, errKind string) {
 	if t == nil {
 		return
 	}
+	t.markProgress()
 	t.operationDuration.Record(ctx, d.Seconds(), metric.WithAttributes(
 		attribute.String("kind", kind),
 		attribute.String("operation", op),
@@ -263,11 +302,13 @@ func (t *Telemetry) RecordTimeToReady(ctx context.Context, kind string, d time.D
 }
 
 // RecordIteration records one iteration's wall-clock duration and increments the
-// iterations counter, both tagged with the success/failure outcome.
+// iterations counter, both tagged with the success/failure outcome. A finished
+// iteration counts as progress.
 func (t *Telemetry) RecordIteration(ctx context.Context, d time.Duration, ok bool) {
 	if t == nil {
 		return
 	}
+	t.markProgress()
 	attrs := metric.WithAttributes(attribute.String("outcome", iterationOutcome(ok)))
 	t.iterationDuration.Record(ctx, d.Seconds(), attrs)
 	t.iterations.Add(ctx, 1, attrs)
@@ -282,6 +323,13 @@ func (t *Telemetry) RecordIterationOperations(ctx context.Context, attempted, su
 	t.iterationOps.Add(ctx, int64(attempted), metric.WithAttributes(attribute.String("result", "attempted")))
 	t.iterationOps.Add(ctx, int64(succeeded), metric.WithAttributes(attribute.String("result", "succeeded")))
 	t.iterationOps.Add(ctx, int64(failed), metric.WithAttributes(attribute.String("result", "failed")))
+}
+
+// markProgress calls the OnProgress hook, if Setup was given one.
+func (t *Telemetry) markProgress() {
+	if t.progress != nil {
+		t.progress()
+	}
 }
 
 // Shutdown flushes any buffered metrics and stops the provider. It is nil-safe,
