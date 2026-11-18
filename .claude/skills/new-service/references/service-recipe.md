@@ -123,7 +123,11 @@ anything the new service *adds* as "this issue adds", not as already present.
     Note any panel that hardcodes a `kind`/`operation` regex to verify. A
     command sets its telemetry up through `setupTelemetry`
     (`cmd/dizzy/telemetry.go`), never `telemetry.Setup` directly, so `--otel`
-    and `--listen-address` both reach it.
+    and `--listen-address` both reach it, and a monitor then sets
+    `cfg.health = opts.health()` before `runMonitorLoop`, so its waits between
+    iterations do not count as stalls. `TestTelemetrySetupHasOneCaller` counts
+    the `setupTelemetry` calls and `TestMonitorCommandsHandHealthToLoop` lists
+    the monitor files, so a new service updates both.
 
 13. **Docs, Makefile, README** — `docs/reference/{cli,scenario-schema,metrics,run-record}.md`
     and the relevant `docs/explanation/*` gain the new service; the README status
