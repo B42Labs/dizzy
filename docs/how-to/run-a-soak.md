@@ -121,9 +121,10 @@ $ dizzy octavia chaos --scenario scenarios/octavia/small.yaml \
 not-yet-resized volume to its planned target. `--token-ratio` is the probability
 of one of three authentications: issuing a scoped token as a live, assigned
 user, or authenticating with a live application credential or, as its
-trustee, with a live trust. `--retrieve-ratio` is the
-probability of reading back the payload of a live secret the plan marks for
-read-back and comparing it byte for byte with the payload stored.
+trustee, with a live trust. `--retrieve-ratio` is the probability of one of
+three read-backs: reading back the payload of a live secret the plan marks for
+read-back and comparing it byte for byte with the payload stored, reading back
+the users of a live ACL, or finding a live consumer in its container's list.
 `--update-ratio` is the probability of setting a live listener or member to
 `admin_state_up=false` and back to `true`, waiting after each change until its
 load balancer is ACTIVE again. Set any of them to `0` to disable.
@@ -133,10 +134,16 @@ assignment. Each is parented on the assignment node of the grant it carries,
 so the engine creates it only while that grant is live and deletes it before
 the grant. `--token-ratio 0` switches all three Keystone authentications off.
 
-A Barbican read-back that returns different bytes does not stop the churn. The
-run finishes and tears down as usual, then `barbican chaos` exits non-zero, and
-the run record's `error` names the count, e.g.
-`payload read-back mismatch (run <id>): 2 read-back(s) returned different bytes`.
+`barbican chaos` churns ACLs and consumers under their secret or container.
+Each ACL is parented on its secret and each consumer on its container, so the
+engine creates it only while that parent is live and deletes it before the
+parent. `--retrieve-ratio 0` switches all three Barbican read-backs off.
+
+A Barbican read-back that returns data that differs from what was written does
+not stop the churn. The run finishes and tears down as usual, then
+`barbican chaos` exits non-zero, and the run record's `error` names the
+count, e.g.
+`read-back mismatch (run <id>): 2 read-back(s) returned data that differs from what was written`.
 No other `chaos` command fails on an operation error. This one does because a
 mismatch means the key manager returned wrong data, which is a correctness
 failure rather than a latency one.

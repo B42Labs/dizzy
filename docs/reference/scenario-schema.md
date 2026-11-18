@@ -671,11 +671,14 @@ resources:
   secrets:    10                # opaque secrets stored with a payload
   orders:     5                 # AES-256 key orders, each generating one more secret
   containers: 3                 # generic containers referencing stored secrets
+  acls:       3                 # read ACLs, each on its own stored secret
+  consumers:  3                 # consumers, each registered on one container
 
 distribution:
   payload_bytes:         { min: 64, max: 8192 }   # synthetic payload per stored secret, in raw bytes
   retrieve_ratio:        0.5                      # fraction of stored secrets read back and byte-compared
   secrets_per_container: { min: 1, max: 3 }       # distinct stored secrets referenced per container
+  users_per_acl:         { min: 1, max: 3 }       # synthetic user ids listed per ACL
 
 chaos:                                 # `barbican chaos --scenario scenarios/barbican/small.yaml` runs as-is
   duration: 5m                         # total runtime; the only hard stop besides Ctrl-C
@@ -683,7 +686,7 @@ chaos:                                 # `barbican chaos --scenario scenarios/ba
   parallel: { max: 4 }                 # per-tick fan-out, drawn in [1, max]; capped by --concurrency
   churn_ratio: 0.5                     # create bias at steady state (0..1)
   target_fill: 0.8                     # fraction of the envelope kept populated (0..1)
-  retrieve_ratio: 0.3                  # probability per step of reading back a live secret marked for read-back
+  retrieve_ratio: 0.3                  # probability per step of one read-back: a marked secret's payload, an ACL, or a consumer
 ```
 
 Every secret is stored by dizzy with a **synthetic payload** of `payload_bytes`
@@ -698,9 +701,12 @@ stored secrets only, never the secret of an order.
 | `resources.secrets` | int | Opaque secrets to store, each with a synthetic payload |
 | `resources.orders` | int | AES-256 key orders to submit; each generates one more secret once ACTIVE |
 | `resources.containers` | int | Generic containers to create, each referencing stored secrets |
+| `resources.acls` | int | Read ACLs to set, each on its own stored secret; at most `resources.secrets`. See [Secret ACLs and container consumers](#secret-acls-and-container-consumers) |
+| `resources.consumers` | int | Consumers to register, each on one container; needs `containers > 0`. See [Secret ACLs and container consumers](#secret-acls-and-container-consumers) |
 | `distribution.payload_bytes` | range | Synthetic payload size drawn per stored secret, in raw bytes; `min >= 1` when `secrets > 0` |
 | `distribution.retrieve_ratio` | ratio | Fraction of stored secrets whose payload is read back and byte-compared with the bytes stored |
 | `distribution.secrets_per_container` | range | Distinct stored secrets drawn per container; `max <= resources.secrets` when `containers > 0` |
+| `distribution.users_per_acl` | range | Synthetic user ids drawn per ACL; `min >= 1` when `acls > 0` |
 
 The payload sizes, the read-back decisions, and the secrets each container
 references live **in the plan**, so the same scenario and seed store the same
@@ -709,15 +715,18 @@ are derived from the plan seed and the secret's logical name, so a run stores
 byte-identical data every time and a read-back compares against the same bytes.
 
 The two `retrieve_ratio` keys do different jobs. `distribution.retrieve_ratio`
-picks the read-back candidates: the plan marks each stored secret for read-back
-or not, and both `apply` and `chaos` read back only the marked ones.
-`chaos.retrieve_ratio` is the probability per churn step that `barbican chaos`
-reads back one live marked secret, and a secret is read back at most once per
-lifetime. It picks no candidates of its own, so with
-`distribution.retrieve_ratio: 0` a churn run reads nothing back.
-`chaos.retrieve_ratio: 0` or `--retrieve-ratio 0` turns the churn read-backs
-off. `apply` ignores the `chaos:` block, so it still reads back every marked
-secret.
+picks the payload read-back candidates: the plan marks each stored secret for
+read-back or not, and both `apply` and `chaos` read back only the payloads of
+the marked ones. It marks only secrets: every ACL and every consumer is a
+read-back candidate. `chaos.retrieve_ratio` is the probability per churn step
+that `barbican chaos` reads back one of three things: the payload of a live
+marked secret, a live ACL, or a live consumer. Each is read back at most once
+per lifetime. It picks no candidates of its own, so with
+`distribution.retrieve_ratio: 0` a churn run reads back no payload but still
+reads back ACLs and consumers. `chaos.retrieve_ratio: 0` or
+`--retrieve-ratio 0` turns all three churn read-backs off. `apply` ignores the
+`chaos:` block, so it still reads back every marked secret, every ACL and the
+consumers of every container that has any.
 
 The schema sets no payload cap of its own. Barbican's limit is its
 `max_allowed_secret_in_bytes` setting, checked against the base64 text, whose
@@ -725,22 +734,149 @@ default of 20000 admits up to 15000 raw bytes. The shipped profiles stay at
 8192, 10924 characters once encoded. A deployment still on the older default of
 10000 refuses a payload above 7500 bytes with HTTP 413.
 
+### Secret ACLs and container consumers
+
+`resources.acls` and `resources.consumers` ask for that many secret ACLs and
+container consumers. An ACL belongs to one stored secret and lists users that
+may read it. A consumer belongs to one container and records a name and a
+URL. Neither is an object of its own in Barbican: an ACL is addressed through
+its secret (`/v1/secrets/<id>/acl`) and a consumer through its container
+(`/v1/containers/<id>/consumers`).
+
+The generator draws both last, after the containers, so adding them to a
+scenario leaves the rest of its plan as it was. A count of `0` draws nothing,
+and a plan without either kind carries no `acls` or `consumers` key.
+
+- The ACLs come first, named `acl-0001`, `acl-0002` and so on. The generator
+  picks `resources.acls` of the stored secrets at random and sets one ACL on
+  each, in the secrets' plan order. An order's secret never gets one. Each ACL
+  draws a user count from `distribution.users_per_acl` and that many user
+  ids, 32 hex characters each, drawn from the seed and written into the plan.
+  Barbican's ACL validator accepts any string of up to 255 characters and
+  never asks Keystone, so the ids name no real user and a run needs no user
+  beyond its own.
+- The consumers come next, named `con-0001`, `con-0002` and so on. Each draws
+  its container uniformly, so a container can carry several consumers or
+  none.
+
+`apply --dry-run` prints an `acls:` and a `consumers:` line after the
+`containers:` line, each only when its count is above zero. For the `small`
+profile they read:
+
+```
+  acls:            3 (7 users)
+  consumers:       3
+```
+
+`--set resources.acls=<n>`, `--set resources.consumers=<n>`,
+`--set distribution.users_per_acl.min=<n>` and
+`--set distribution.users_per_acl.max=<n>` override the keys.
+
+A negative count or one above the limit fails like any other, e.g.
+`resources.acls must not be negative, got -1` or
+`resources.consumers exceeds the limit of 1000000, got 1000001`. Three more
+rules follow, checked in this order:
+
+- `resources.acls (11) exceeds resources.secrets (10)`, since a secret
+  carries one ACL
+- `distribution.users_per_acl.min must be at least 1 when resources.acls > 0, got 0`,
+  since an ACL written without users sets nothing
+- `resources.consumers is 2 but resources.containers is 0`
+
+The expansion ends with a check of the plan, which tests the ACLs and then
+the consumers after the containers and reports the first failure:
+
+- `acl has an empty name`
+- `duplicate acl name "<name>"`
+- `acl "<name>" references unknown secret "<s>"`, where an order's name does
+  not count as a secret
+- `secret "<s>" carries more than one acl`
+- `acl "<name>" lists no users`
+- `acl "<name>" has an empty user`
+- `acl "<name>" lists user "<u>" more than once`
+- `consumer has an empty name`
+- `duplicate consumer name "<name>"`
+- `consumer "<name>" references unknown container "<c>"`
+
+`apply` and `monitor` run eight stages: they store the secrets, submit the
+orders, create the containers, set the ACLs, register the consumers, and then
+read back the payloads, the ACLs and the consumers. An ACL is written with
+`PUT /v1/secrets/<id>/acl` and the body `{"read":{"users":[...]}}`. The body
+carries no `project-access` key, so Barbican sets it to `true` and the secret
+stays readable and deletable by its project. The read-back reads the ACL with
+`GET` and compares the users of its `read` entry with the plan's as a set, in
+any order. A consumer is registered with `POST /v1/containers/<id>/consumers`
+under the name `dizzy-<run>-con-NNNN` and the URL
+`https://dizzy.invalid/consumers/<name>`. `.invalid` is a reserved top-level
+domain, and nothing contacts the URL. The consumer read-back runs once per
+container that has consumers: it lists the container's consumers, 100 per
+page, and compares them by name and URL with the plan's consumers of that
+container. It is exact, so a missing and an extra consumer are both a
+mismatch.
+
+Each ACL costs `apply` two requests, the `PUT` and the `GET`, and each
+consumer one, the `POST`, plus one list request per 100 consumers of each
+container that has any. For `small` that adds 12 requests to an `apply` run
+or a `monitor` iteration.
+
+A read-back that differs from what was written is a mismatch of the same
+weight as a payload mismatch. It is never retried, fails `apply` and the
+`monitor` iteration, records `error.kind=mismatch`, and counts toward the
+non-zero exit of `barbican chaos`. The errors read:
+
+- `barbican: acl mismatch: acl "<name>" reads back users [...], want [...]`
+- `barbican: consumer mismatch: container <id> lacks consumer "<name>"`
+- `barbican: consumer mismatch: container <id> lists unexpected consumer "<name>"`
+
+`chaos` churns both kinds under their parent. It sets an ACL only while its
+secret is live and registers a consumer only while its container is live, and
+it never deletes a secret with a live ACL or a container with a live consumer.
+Each read-back is a mutation drawn with `chaos.retrieve_ratio`; see
+[The `chaos:` block](#the-chaos-block). A consumer's churn read-back checks
+only that the consumer is in its container's list, not the whole list, since
+other consumers of the container come and go meanwhile. The churn deletes an
+ACL with `DELETE /v1/secrets/<id>/acl` and a consumer with
+`DELETE /v1/containers/<id>/consumers`, with the name and URL in the body, and
+counts a 404 as deleted.
+
+The quota pre-check also compares the plan's consumers with Barbican's
+`consumers` quota, in `chaos` as in `apply`. Barbican has no quota for ACLs.
+Setting an ACL and registering a consumer need no role beyond the one that
+stores the secret and creates the container.
+
+The run record lists an ACL as kind `acl`, with a `logical` such as
+`acl-0001`, an empty `name` and its secret's id as `id`, since an ACL has no
+name or id of its own. It lists a consumer as kind `consumer`, with a
+`logical` such as `con-0001`, the `name` `dizzy-<run>-con-0001` and the id
+`<container id>:dizzy-<run>-con-0001`. `barbican status` shows an ACL as
+`present` when its `read` entry lists a user, and as `gone` when it lists
+none or its secret is gone. It shows a consumer as `present` when its
+container lists it, and as `gone` otherwise or when its container is gone.
+
+The teardown deletes neither kind itself. Barbican deletes a secret's ACL with
+the secret and a container's consumers with the container, and the teardown
+deletes the run's secrets and containers. The count of deleted resources
+leaves both kinds out. A bare `--run-id` reaches both, since it reaches the
+secrets and containers. The leak check and the `monitor` sweep are unchanged,
+since neither kind outlives its secret or container.
+
 ### Profiles
 
 Expanded counts at each profile's shipped seed, as `barbican apply --dry-run`
 prints them:
 
-| Profile | Secrets | Payload total | Read-backs | Orders | Containers | References | Chaos duration |
-|---|---|---|---|---|---|---|---|
-| `small` | 10 | 40565 bytes | 7 | 5 | 3 | 8 | 5m |
-| `medium` | 40 | 171992 bytes | 19 | 15 | 10 | 22 | 30m |
-| `large` | 100 | 435955 bytes | 48 | 40 | 25 | 48 | 1h |
+| Profile | Secrets | Payload total | Read-backs | Orders | Containers | References | ACLs | ACL users | Consumers | Chaos duration |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `small` | 10 | 40565 bytes | 7 | 5 | 3 | 8 | 3 | 7 | 3 | 5m |
+| `medium` | 40 | 171992 bytes | 19 | 15 | 10 | 22 | 10 | 19 | 10 | 30m |
+| `large` | 100 | 435955 bytes | 48 | 40 | 25 | 48 | 25 | 45 | 25 | 1h |
 
-Each order generates a secret on top of the stored ones, so the profiles need
-15, 55, and 140 secrets against the secrets quota. Barbican's project quotas
-default to unlimited (`-1`), so none of the profiles carries a quota risk there;
-on a project with lowered quotas the `apply` pre-check names the ones that
-block.
+All three set `users_per_acl` to `{ min: 1, max: 3 }`. Each order generates a
+secret on top of the stored ones, so the profiles need 15, 55, and 140 secrets
+against the secrets quota, and 3, 10, and 25 consumers against the consumers
+quota. Barbican's project quotas default to unlimited (`-1`), so none of the
+profiles carries a quota risk there; on a project with lowered quotas the
+`apply` pre-check names the ones that block.
 
 ## Octavia
 
@@ -1150,7 +1286,7 @@ chaos:                                # the block shipped by scenarios/neutron/m
 | `token_ratio` | ratio | keystone | Probability per step of issuing a token as a live, assigned user or authenticating with a live application credential or trust. `0` switches all three off |
 | `lifecycle_ratio` | ratio | nova | Probability per step of mutating a live server (stop/start, resize, or live-migrate) |
 | `lifecycle_ratio` | ratio | glance | Probability per step of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, or metadata churn) |
-| `retrieve_ratio` | ratio | barbican | Probability per step of reading back the payload of a live secret the plan marks for read-back and byte-comparing it |
+| `retrieve_ratio` | ratio | barbican | Probability per step of one read-back: the payload of a live secret the plan marks for read-back, byte-compared; the users of a live ACL; or a live consumer in its container's list. `0` switches all three off |
 | `update_ratio` | ratio | octavia | Probability per step of setting a live listener or member to `admin_state_up=false` and back to `true` |
 
 All twenty-four built-in profiles carry a `chaos:` block, so `chaos` runs any

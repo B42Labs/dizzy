@@ -31,7 +31,7 @@ same way.
 | `startedAt` | timestamp | RFC 3339 |
 | `finishedAt` | timestamp | RFC 3339 |
 | `created` | array | Every created resource; see below |
-| `error` | string | Present only when the run failed. A `barbican chaos` record that saw a read-back mismatch carries it too, e.g. `payload read-back mismatch (run <id>): 2 read-back(s) returned different bytes` |
+| `error` | string | Present only when the run failed. A `barbican chaos` record that saw a read-back mismatch carries it too, e.g. `read-back mismatch (run <id>): 2 read-back(s) returned data that differs from what was written` |
 | `metrics` | object | Aggregate metrics; see below |
 | `volumeType` | string | Cinder only; the resolved volume type, for provenance |
 | `chaos` | object | Churn runs only; see below. Absent on a `mix` record, whose personas and lanes carry their own |
@@ -84,16 +84,26 @@ in the list, and no teardown deletes it.
 
 On a `barbican` record the list holds the stored secrets in plan order, then
 each order followed by the secret Barbican generated for it, then the
-containers. An order and its generated secret share `logical` and `name`, e.g.
-`ord-0001` and `dizzy-a1b2c3d4-ord-0001`, and differ in `kind`, `order` for the
-one and `secret` for the other, and in `id`. A secret whose metadata stamp
-failed, stored or generated, is still listed. Without the record, cleanup finds
-such a secret by its `creator_id` when it runs as the user that created it, and
-a generated one also through its order's `secret_ref`. Run as another user,
+containers, then the ACLs, and then the consumers. An order and its generated
+secret share `logical` and `name`, e.g. `ord-0001` and
+`dizzy-a1b2c3d4-ord-0001`, and differ in `kind`, `order` for the one and
+`secret` for the other, and in `id`. A secret whose metadata stamp failed,
+stored or generated, is still listed. Without the record, cleanup finds such a
+secret by its `creator_id` when it runs as the user that created it, and a
+generated one also through its order's `secret_ref`. Run as another user,
 `cleanup --run` reaches a stamp-failed stored secret through this list alone.
 
-On a `barbican chaos` record the list holds the secrets and containers still
-live at the end of the run, and no orders.
+An ACL has no name or id of its own in Barbican, so its entry has kind `acl`,
+a `logical` such as `acl-0001`, an empty `name` and the id of its secret. A
+consumer's entry has kind `consumer`, a `logical` such as `con-0001`, the
+`name` `dizzy-<run>-con-0001` and the id
+`<container id>:dizzy-<run>-con-0001`, since Barbican addresses a consumer
+only under its container. An ACL or consumer whose read-back failed is listed
+too. `cleanup` deletes neither kind from the list: Barbican deletes both with
+their secret or container.
+
+On a `barbican chaos` record the list holds the secrets, containers, ACLs and
+consumers still live at the end of the run, and no orders.
 
 On an `octavia apply` record the list holds each VIP network followed by its
 subnet, in plan order, then the load balancers, then the listeners, pools,
@@ -151,8 +161,9 @@ service actually returns, or `http_other`. These are the same values the OTLP
 `error.kind` attribute carries — see [Metrics](metrics.md).
 A `keystone pressure` record adds `accepted`, for a `bad_token` request that
 a service answered with a 2xx. A `barbican` record adds `mismatch`, for a
-read-back that returned different bytes, and `order_error`, for an order that
-ended in ERROR. An `octavia` record, and a `mix` record whose `services` lists
+read-back of a payload, an ACL or a container's consumers that returned data
+that differs from what was written, and `order_error`, for an order that ended
+in ERROR. An `octavia` record, and a `mix` record whose `services` lists
 `octavia`, adds `provisioning_error`, for a load balancer that reached ERROR
 after a write.
 
@@ -164,7 +175,7 @@ Present only on a run record written by `chaos`.
 |---|---|---|
 | `creates` | int | Create operations issued |
 | `deletes` | int | Delete operations issued |
-| `mutates` | int | Cinder extends, Keystone token issues and authentications with an application credential or a trust, Nova server or Glance image lifecycle mutations, Barbican payload read-backs, or Octavia admin-state toggles; omitted when zero |
+| `mutates` | int | Cinder extends, Keystone token issues and authentications with an application credential or a trust, Nova server or Glance image lifecycle mutations, Barbican read-backs of a payload, an ACL or a consumer, or Octavia admin-state toggles; omitted when zero |
 | `cycles` | int | Completed create→delete cycles |
 | `popMin` | int | Minimum live population over the run |
 | `popMax` | int | Maximum live population |

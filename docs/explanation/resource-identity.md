@@ -134,8 +134,8 @@ start with `dizzy-a1b2c3d4-keystone-`. See [Combined runs](combined-runs.md).
 
 ## Where the stamp doesn't reach
 
-Three resource types cannot be discovered by their own identity, and all three
-are reclaimed from the **run record's created list**, by id:
+Three resource types that cannot be discovered by their own identity are
+reclaimed from the **run record's created list**, by id:
 
 - **Neutron address scopes.** Some Neutron releases return 404 when you try to
   tag one. Tagging them is therefore best-effort: a failure is logged, tolerated,
@@ -156,6 +156,17 @@ has no name at all. The record lists a credential under the id
 `<userID>:<credentialID>` and a trust under the trust's id, and cleanup passes
 over both entries, so its `deleted <n> resource(s)` count leaves them out. A
 bare `--run-id` reaches both, since it reaches the users.
+
+Barbican secret ACLs and container consumers are reclaimed through their
+secret or container, not by name or from the record. Barbican deletes a
+secret's ACL when it deletes the secret and a container's consumers when it
+deletes the container, and cleanup deletes the run's secrets and containers.
+An ACL has no name or id of its own. A consumer carries the name
+`dizzy-<runid>-con-NNNN`, but Barbican keeps it under its container. The
+record lists an ACL under its secret's id and a consumer under the id
+`<containerID>:dizzy-<runid>-con-NNNN`, and cleanup passes over both entries,
+so its `deleted <n> resource(s)` count leaves them out. A bare `--run-id`
+reaches both, since it reaches the secrets and containers.
 
 Barbican adds secrets that never got their metadata, because the stamp is a
 second call after the secret exists. Discovery never takes a secret on its name
