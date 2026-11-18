@@ -31,13 +31,25 @@ type retrieveCall struct {
 // The closure tests call it from a single goroutine, so it takes no lock.
 type recordingBarbican struct {
 	storeErr, stampErr, containerErr, retrieveErr, deleteErr error
+	aclErr, consumerErr, verifyACLErr, verifyConsumersErr    error
 
-	calls      []string // method names, in call order
-	storeSeeds []int64
-	stamped    []resource.Resource
-	stored     map[string]resource.Resource // the stored map CreateContainer last received
-	retrieves  []retrieveCall
-	deleted    []resource.Resource
+	calls          []string // method names, in call order
+	storeSeeds     []int64
+	stamped        []resource.Resource
+	stored         map[string]resource.Resource // the stored map CreateContainer last received
+	retrieves      []retrieveCall
+	deleted        []resource.Resource
+	aclSecrets     []resource.Resource // the secret each SetACL call targeted
+	consumerCtrs   []resource.Resource // the container each RegisterConsumer call targeted
+	aclChecks      []resource.Resource // the resource each VerifyACL call was handed
+	consumerChecks []consumersCall
+}
+
+// consumersCall is one recorded VerifyConsumers call.
+type consumersCall struct {
+	container resource.Resource
+	want      []resource.Resource
+	exact     bool
 }
 
 func (f *recordingBarbican) StoreSecret(_ context.Context, s barbicanplan.Secret, seed int64) (resource.Resource, error) {
@@ -68,6 +80,37 @@ func (f *recordingBarbican) RetrievePayload(_ context.Context, r resource.Resour
 	f.calls = append(f.calls, "RetrievePayload")
 	f.retrieves = append(f.retrieves, retrieveCall{res: r, seed: seed, n: n})
 	return f.retrieveErr
+}
+
+func (f *recordingBarbican) SetACL(_ context.Context, a barbicanplan.ACL, secret resource.Resource) (resource.Resource, error) {
+	f.calls = append(f.calls, "SetACL")
+	f.aclSecrets = append(f.aclSecrets, secret)
+	if f.aclErr != nil {
+		return resource.Resource{}, f.aclErr
+	}
+	return resource.Resource{Kind: barbican.KindACL, Logical: a.Name, ID: secret.ID}, nil
+}
+
+func (f *recordingBarbican) RegisterConsumer(_ context.Context, con barbicanplan.Consumer, container resource.Resource) (resource.Resource, error) {
+	f.calls = append(f.calls, "RegisterConsumer")
+	f.consumerCtrs = append(f.consumerCtrs, container)
+	if f.consumerErr != nil {
+		return resource.Resource{}, f.consumerErr
+	}
+	name := "dizzy-run0-" + con.Name
+	return resource.Resource{Kind: barbican.KindConsumer, Logical: con.Name, Name: name, ID: container.ID + ":" + name}, nil
+}
+
+func (f *recordingBarbican) VerifyACL(_ context.Context, _ barbicanplan.ACL, r resource.Resource) error {
+	f.calls = append(f.calls, "VerifyACL")
+	f.aclChecks = append(f.aclChecks, r)
+	return f.verifyACLErr
+}
+
+func (f *recordingBarbican) VerifyConsumers(_ context.Context, container resource.Resource, want []resource.Resource, exact bool) error {
+	f.calls = append(f.calls, "VerifyConsumers")
+	f.consumerChecks = append(f.consumerChecks, consumersCall{container: container, want: want, exact: exact})
+	return f.verifyConsumersErr
 }
 
 func (f *recordingBarbican) Delete(_ context.Context, r resource.Resource) error {
@@ -102,20 +145,22 @@ func mustBuildRecording(t *testing.T, f *recordingBarbican) []chaos.Node {
 	return nodes
 }
 
-// TestBuildShape confirms the graph is one node per stored secret and one per
-// container, secrets first in plan order and then containers, with no node for
-// the plan's order; that secrets are parentless and each container is parented
-// on its secrets in reference order; and that Mutate is set exactly on the
-// secrets the plan marks for read-back.
+// TestBuildShape confirms the graph is one node per stored secret, container,
+// ACL, and consumer, in that order and each in plan order, with no node for the
+// plan's order; that secrets are parentless, each container is parented on its
+// secrets in reference order, each ACL on its secret alone, and each consumer
+// on its container alone; and that Mutate is set exactly on the secrets the plan
+// marks for read-back and on every ACL and consumer.
 func TestBuildShape(t *testing.T) {
 	p := churnPlan()
 	nodes, err := Build(p, &recordingBarbican{}, p.Seed, time.Minute)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	// 3 secrets + 2 containers = 5. The order is not a node.
-	if len(nodes) != 5 {
-		t.Fatalf("built %d nodes, want 5 (secrets + containers; no order node)", len(nodes))
+	// 3 secrets + 2 containers + 2 ACLs + 3 consumers = 10. The order is not a
+	// node.
+	if len(nodes) != 10 {
+		t.Fatalf("built %d nodes, want 10 (secrets, containers, ACLs, consumers; no order node)", len(nodes))
 	}
 
 	var keys []string
@@ -128,9 +173,9 @@ func TestBuildShape(t *testing.T) {
 			t.Errorf("node %q has a gate, want none", n.Key)
 		}
 	}
-	wantKeys := []string{"sec-0001", "sec-0002", "sec-0003", "ctr-0001", "ctr-0002"}
+	wantKeys := []string{"sec-0001", "sec-0002", "sec-0003", "ctr-0001", "ctr-0002", "acl-0001", "acl-0002", "con-0001", "con-0002", "con-0003"}
 	if !slices.Equal(keys, wantKeys) {
-		t.Errorf("node keys = %v, want %v (secrets then containers, in plan order)", keys, wantKeys)
+		t.Errorf("node keys = %v, want %v (secrets, containers, ACLs, consumers, each in plan order)", keys, wantKeys)
 	}
 
 	mutable := 0
@@ -160,6 +205,19 @@ func TestBuildShape(t *testing.T) {
 		}
 		if n.Mutate != nil {
 			t.Errorf("container node %q is mutable, want no mutate", ct.Name)
+		}
+	}
+
+	for _, a := range p.ACLs {
+		n := nodeByKey(t, nodes, a.Name)
+		if n.Kind != barbican.KindACL || !slices.Equal(n.Parents, []string{a.Secret}) || n.Mutate == nil {
+			t.Errorf("ACL node %q kind=%q parents=%v mutable=%v, want acl parented on [%s] and mutable", a.Name, n.Kind, n.Parents, n.Mutate != nil, a.Secret)
+		}
+	}
+	for _, con := range p.Consumers {
+		n := nodeByKey(t, nodes, con.Name)
+		if n.Kind != barbican.KindConsumer || !slices.Equal(n.Parents, []string{con.Container}) || n.Mutate == nil {
+			t.Errorf("consumer node %q kind=%q parents=%v mutable=%v, want consumer parented on [%s] and mutable", con.Name, n.Kind, n.Parents, n.Mutate != nil, con.Container)
 		}
 	}
 
@@ -299,10 +357,10 @@ func TestContainerCreateResolvesSecretIDs(t *testing.T) {
 }
 
 // TestDeleteFoldsNotFound confirms a node's delete treats an already-gone (404)
-// resource as success and returns any other error, for a secret and a
-// container alike.
+// resource as success and returns any other error, for a secret, a container,
+// an ACL, and a consumer alike.
 func TestDeleteFoldsNotFound(t *testing.T) {
-	for _, key := range []string{"sec-0001", "ctr-0001"} {
+	for _, key := range []string{"sec-0001", "ctr-0001", "acl-0001", "con-0001"} {
 		t.Run(key, func(t *testing.T) {
 			res := resource.Resource{Logical: key, ID: "id-" + key}
 
@@ -355,6 +413,99 @@ func TestRetrieveMutateReadsBack(t *testing.T) {
 	})
 }
 
+// TestACLCreateResolvesSecretID confirms an ACL node's create sets the ACL on
+// the current instance of its secret, from the engine's parent ids.
+func TestACLCreateResolvesSecretID(t *testing.T) {
+	f := &recordingBarbican{}
+	node := nodeByKey(t, mustBuildRecording(t, f), "acl-0001")
+
+	res, err := node.Create(context.Background(), map[string]string{"sec-0002": "id-2"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	want := []resource.Resource{{Kind: barbican.KindSecret, Logical: "sec-0002", ID: "id-2"}}
+	if !reflect.DeepEqual(f.aclSecrets, want) {
+		t.Errorf("SetACL targets = %v, want %v", f.aclSecrets, want)
+	}
+	if res != (resource.Resource{Kind: barbican.KindACL, Logical: "acl-0001", ID: "id-2"}) {
+		t.Errorf("Create returned %+v, want the ACL under its secret's id", res)
+	}
+}
+
+// TestConsumerCreateResolvesContainerID confirms a consumer node's create
+// registers the consumer on the current instance of its container, from the
+// engine's parent ids.
+func TestConsumerCreateResolvesContainerID(t *testing.T) {
+	f := &recordingBarbican{}
+	node := nodeByKey(t, mustBuildRecording(t, f), "con-0002")
+
+	res, err := node.Create(context.Background(), map[string]string{"ctr-0002": "id-ctr-2"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	want := []resource.Resource{{Kind: barbican.KindContainer, Logical: "ctr-0002", ID: "id-ctr-2"}}
+	if !reflect.DeepEqual(f.consumerCtrs, want) {
+		t.Errorf("RegisterConsumer targets = %v, want %v", f.consumerCtrs, want)
+	}
+	if res.ID != "id-ctr-2:dizzy-run0-con-0002" {
+		t.Errorf("Create returned %+v, want the consumer registered on id-ctr-2", res)
+	}
+}
+
+// TestACLMutateReadsBack confirms an ACL's mutate reads that ACL back, and that
+// a mismatch is returned after one call, never retried.
+func TestACLMutateReadsBack(t *testing.T) {
+	res := resource.Resource{Kind: barbican.KindACL, Logical: "acl-0002", ID: "id-sec-0003"}
+
+	f := &recordingBarbican{}
+	if err := nodeByKey(t, mustBuildRecording(t, f), "acl-0002").Mutate(context.Background(), nil, res); err != nil {
+		t.Fatalf("Mutate: %v", err)
+	}
+	if want := []resource.Resource{res}; !reflect.DeepEqual(f.aclChecks, want) {
+		t.Errorf("VerifyACL calls = %v, want %v", f.aclChecks, want)
+	}
+
+	mismatch := fmt.Errorf("%w: x", barbican.ErrACLMismatch)
+	failing := &recordingBarbican{verifyACLErr: mismatch}
+	if err := nodeByKey(t, mustBuildRecording(t, failing), "acl-0002").Mutate(context.Background(), nil, res); !errors.Is(err, mismatch) {
+		t.Errorf("Mutate error = %v, want %v", err, mismatch)
+	}
+	if len(failing.aclChecks) != 1 {
+		t.Errorf("VerifyACL called %d times, want exactly 1 (a mismatch is never retried)", len(failing.aclChecks))
+	}
+}
+
+// TestConsumerMutateVerifiesPresence confirms a consumer's mutate checks the
+// current instance of its container for that consumer alone, without exact,
+// since other consumers of the container come and go meanwhile, and that a
+// mismatch is returned after one call, never retried.
+func TestConsumerMutateVerifiesPresence(t *testing.T) {
+	res := resource.Resource{Kind: barbican.KindConsumer, Logical: "con-0001", Name: "dizzy-run0-con-0001", ID: "id-ctr-now:dizzy-run0-con-0001"}
+	ids := map[string]string{"ctr-0001": "id-ctr-now"}
+
+	f := &recordingBarbican{}
+	if err := nodeByKey(t, mustBuildRecording(t, f), "con-0001").Mutate(context.Background(), ids, res); err != nil {
+		t.Fatalf("Mutate: %v", err)
+	}
+	want := []consumersCall{{
+		container: resource.Resource{Kind: barbican.KindContainer, Logical: "ctr-0001", ID: "id-ctr-now"},
+		want:      []resource.Resource{res},
+		exact:     false,
+	}}
+	if !reflect.DeepEqual(f.consumerChecks, want) {
+		t.Errorf("VerifyConsumers calls = %+v, want %+v", f.consumerChecks, want)
+	}
+
+	mismatch := fmt.Errorf("%w: x", barbican.ErrConsumerMismatch)
+	failing := &recordingBarbican{verifyConsumersErr: mismatch}
+	if err := nodeByKey(t, mustBuildRecording(t, failing), "con-0001").Mutate(context.Background(), ids, res); !errors.Is(err, mismatch) {
+		t.Errorf("Mutate error = %v, want %v", err, mismatch)
+	}
+	if len(failing.consumerChecks) != 1 {
+		t.Errorf("VerifyConsumers called %d times, want exactly 1 (a mismatch is never retried)", len(failing.consumerChecks))
+	}
+}
+
 func TestClassify(t *testing.T) {
 	tests := []struct {
 		name string
@@ -363,6 +514,8 @@ func TestClassify(t *testing.T) {
 	}{
 		{"nil", nil, ""},
 		{"mismatch", fmt.Errorf("%w: secret %q differs", barbican.ErrPayloadMismatch, "sec-0001"), "mismatch"},
+		{"acl mismatch", fmt.Errorf("%w: acl %q reads back users [], want [u1]", barbican.ErrACLMismatch, "acl-0001"), "mismatch"},
+		{"consumer mismatch", fmt.Errorf("%w: container c1 lacks consumer %q", barbican.ErrConsumerMismatch, "dizzy-run0-con-0001"), "mismatch"},
 		{"canceled", context.Canceled, "canceled"},
 		{"timeout", context.DeadlineExceeded, "timeout"},
 		{"quota", fmt.Errorf("creating secret %q: %w: %w", "sec-0001", barbican.ErrQuota, respErr(403)), "quota"},

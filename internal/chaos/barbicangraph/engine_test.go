@@ -23,23 +23,36 @@ type fakeBarbican struct {
 	nextID int
 
 	retrieve map[string]bool // logical -> the plan marks the secret for read-back
-	mismatch bool            // every read-back returns a wrapped ErrPayloadMismatch
+	mismatch bool            // every read-back returns a wrapped mismatch of its kind
 
 	liveSecret    map[string]bool     // secret id -> live
 	liveContainer map[string][]string // container id -> the secret ids it references
+	liveACL       map[string]bool     // secret id -> an ACL is set on it
+	liveConsumer  map[string]string   // consumer id -> the container id it is registered on
 	readBacks     map[string]int      // secret id -> read-backs of that instance
 	retrieveCalls int                 // total RetrievePayload calls
+
+	// calls per ACL and consumer operation
+	aclSets, aclVerifies, aclDeletes                int
+	consumerRegs, consumerVerifies, consumerDeletes int
 
 	// live counts and high-water marks
 	curS, maxS int
 	curC, maxC int
 
 	// invariant violations the graph must never cause
-	stampAbsent            bool // a stamp referenced a secret that was not live
-	containerOnAbsent      bool // a container create referenced a secret id that was not live
-	secretDeleteReferenced bool // a secret was deleted while a live container referenced it
-	readBackAbsent         bool // a read-back referenced a secret that was not live
-	readBackUnmarked       bool // a read-back referenced a secret the plan does not mark Retrieve
+	stampAbsent              bool // a stamp referenced a secret that was not live
+	containerOnAbsent        bool // a container create referenced a secret id that was not live
+	secretDeleteReferenced   bool // a secret was deleted while a live container referenced it
+	readBackAbsent           bool // a read-back referenced a secret that was not live
+	readBackUnmarked         bool // a read-back referenced a secret the plan does not mark Retrieve
+	aclOnAbsent              bool // an ACL was set on a secret that was not live
+	consumerOnAbsent         bool // a consumer was registered on a container that was not live
+	secretDeleteWithACL      bool // a secret was deleted while an ACL on it was live
+	containerDeleteConsumed  bool // a container was deleted while a consumer on it was live
+	aclReadBackAbsent        bool // an ACL read-back targeted an ACL that was not live
+	consumerReadBackAbsent   bool // a consumer read-back targeted a consumer that was not live on that container
+	consumerReadBackNotAlone bool // a consumer read-back was not for exactly itself, without exact
 }
 
 func newFakeBarbican(p *barbicanplan.Plan) *fakeBarbican {
@@ -51,6 +64,8 @@ func newFakeBarbican(p *barbicanplan.Plan) *fakeBarbican {
 		retrieve:      retrieve,
 		liveSecret:    make(map[string]bool),
 		liveContainer: make(map[string][]string),
+		liveACL:       make(map[string]bool),
+		liveConsumer:  make(map[string]string),
 		readBacks:     make(map[string]int),
 	}
 }
@@ -115,6 +130,61 @@ func (f *fakeBarbican) RetrievePayload(_ context.Context, r resource.Resource, _
 	return nil
 }
 
+func (f *fakeBarbican) SetACL(_ context.Context, a barbicanplan.ACL, secret resource.Resource) (resource.Resource, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.aclSets++
+	if !f.liveSecret[secret.ID] {
+		f.aclOnAbsent = true
+	}
+	f.liveACL[secret.ID] = true
+	return resource.Resource{Kind: barbican.KindACL, Logical: a.Name, ID: secret.ID}, nil
+}
+
+func (f *fakeBarbican) RegisterConsumer(_ context.Context, con barbicanplan.Consumer, container resource.Resource) (resource.Resource, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.consumerRegs++
+	if _, ok := f.liveContainer[container.ID]; !ok {
+		f.consumerOnAbsent = true
+	}
+	name := "dizzy-run0-" + con.Name
+	id := container.ID + ":" + name
+	f.liveConsumer[id] = container.ID
+	return resource.Resource{Kind: barbican.KindConsumer, Logical: con.Name, Name: name, ID: id}, nil
+}
+
+func (f *fakeBarbican) VerifyACL(_ context.Context, a barbicanplan.ACL, r resource.Resource) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.aclVerifies++
+	if !f.liveACL[r.ID] {
+		f.aclReadBackAbsent = true
+	}
+	if f.mismatch {
+		return fmt.Errorf("%w: acl %q reads back users [], want %v", barbican.ErrACLMismatch, a.Name, a.Users)
+	}
+	return nil
+}
+
+func (f *fakeBarbican) VerifyConsumers(_ context.Context, container resource.Resource, want []resource.Resource, exact bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.consumerVerifies++
+	if len(want) != 1 || exact {
+		f.consumerReadBackNotAlone = true
+	}
+	for _, w := range want {
+		if ctr, ok := f.liveConsumer[w.ID]; !ok || ctr != container.ID {
+			f.consumerReadBackAbsent = true
+		}
+	}
+	if f.mismatch {
+		return fmt.Errorf("%w: container %s lacks consumer %q", barbican.ErrConsumerMismatch, container.ID, want[0].Name)
+	}
+	return nil
+}
+
 func (f *fakeBarbican) Delete(_ context.Context, r resource.Resource) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -127,22 +197,37 @@ func (f *fakeBarbican) Delete(_ context.Context, r resource.Resource) error {
 				}
 			}
 		}
+		if f.liveACL[r.ID] {
+			f.secretDeleteWithACL = true
+		}
 		if f.liveSecret[r.ID] {
 			delete(f.liveSecret, r.ID)
 			f.curS--
 		}
 	case barbican.KindContainer:
+		for _, ctr := range f.liveConsumer {
+			if ctr == r.ID {
+				f.containerDeleteConsumed = true
+			}
+		}
 		if _, ok := f.liveContainer[r.ID]; ok {
 			delete(f.liveContainer, r.ID)
 			f.curC--
 		}
+	case barbican.KindACL:
+		f.aclDeletes++
+		delete(f.liveACL, r.ID)
+	case barbican.KindConsumer:
+		f.consumerDeletes++
+		delete(f.liveConsumer, r.ID)
 	}
 	return nil
 }
 
 // churnPlan is a plan with three stored secrets (two marked for read-back), one
-// key order the graph must ignore, and two containers that share a secret, so a
-// shared parent is held by more than one live container.
+// key order the graph must ignore, two containers that share a secret, so a
+// shared parent is held by more than one live container, an ACL on each of two
+// secrets, and three consumers, two of them on the same container.
 func churnPlan() *barbicanplan.Plan {
 	return &barbicanplan.Plan{
 		Scenario: "churn", Seed: 7,
@@ -155,6 +240,15 @@ func churnPlan() *barbicanplan.Plan {
 		Containers: []barbicanplan.Container{
 			{Name: "ctr-0001", Secrets: []string{"sec-0001", "sec-0002"}},
 			{Name: "ctr-0002", Secrets: []string{"sec-0003", "sec-0001"}},
+		},
+		ACLs: []barbicanplan.ACL{
+			{Name: "acl-0001", Secret: "sec-0002", Users: []string{"u1"}},
+			{Name: "acl-0002", Secret: "sec-0003", Users: []string{"u2", "u3"}},
+		},
+		Consumers: []barbicanplan.Consumer{
+			{Name: "con-0001", Container: "ctr-0001"},
+			{Name: "con-0002", Container: "ctr-0002"},
+			{Name: "con-0003", Container: "ctr-0001"},
 		},
 	}
 }
@@ -202,7 +296,12 @@ func mustBuild(t *testing.T, p *barbicanplan.Plan, c Barbican) []chaos.Node {
 // live, no secret was deleted while a live container referenced it, every
 // read-back targeted a live secret the plan marks for read-back, no secret
 // instance was read back more than once, and the live secrets and containers
-// stayed within the plan envelope.
+// stayed within the plan envelope. For the ACLs and consumers it checks that no
+// ACL was set on an absent secret, no consumer registered on an absent
+// container, no secret deleted while its ACL was live, no container deleted
+// while a consumer of it was live, and that every ACL and consumer read-back
+// targeted a live one, a consumer's for itself alone and not exact; and that
+// both kinds were created, read back, and deleted.
 func TestRunLifecycleInvariants(t *testing.T) {
 	p := churnPlan()
 	f := newFakeBarbican(p)
@@ -246,10 +345,39 @@ func TestRunLifecycleInvariants(t *testing.T) {
 	if f.maxC > len(p.Containers) {
 		t.Errorf("live containers peaked at %d, exceeding the envelope %d", f.maxC, len(p.Containers))
 	}
+
+	for _, v := range []struct {
+		violated bool
+		what     string
+	}{
+		{f.aclOnAbsent, "an ACL was set on a secret that was not live"},
+		{f.consumerOnAbsent, "a consumer was registered on a container that was not live"},
+		{f.secretDeleteWithACL, "a secret was deleted while its ACL was live"},
+		{f.containerDeleteConsumed, "a container was deleted while a consumer of it was live"},
+		{f.aclReadBackAbsent, "an ACL read-back targeted an ACL that was not live"},
+		{f.consumerReadBackAbsent, "a consumer read-back targeted a consumer that was not live on that container"},
+		{f.consumerReadBackNotAlone, "a consumer read-back was not for itself alone without exact"},
+	} {
+		if v.violated {
+			t.Error(v.what)
+		}
+	}
+	for _, c := range []struct {
+		n    int
+		what string
+	}{
+		{f.aclSets, "ACL sets"}, {f.aclVerifies, "ACL read-backs"}, {f.aclDeletes, "ACL deletes"},
+		{f.consumerRegs, "consumer registrations"}, {f.consumerVerifies, "consumer read-backs"}, {f.consumerDeletes, "consumer deletes"},
+	} {
+		if c.n == 0 {
+			t.Errorf("no %s happened; the run does not exercise them", c.what)
+		}
+	}
 }
 
-// TestRunRetrieveRatioZeroNeverReadsBack confirms retrieve_ratio 0 reads no
-// payload back, even though the plan marks secrets for read-back.
+// TestRunRetrieveRatioZeroNeverReadsBack confirms retrieve_ratio 0 reads
+// nothing back: no payload, although the plan marks secrets for read-back, and
+// no ACL or consumer.
 func TestRunRetrieveRatioZeroNeverReadsBack(t *testing.T) {
 	p := churnPlan()
 	f := newFakeBarbican(p)
@@ -266,13 +394,20 @@ func TestRunRetrieveRatioZeroNeverReadsBack(t *testing.T) {
 	if f.retrieveCalls != 0 {
 		t.Errorf("RetrievePayload calls = %d, want 0 at retrieve_ratio 0", f.retrieveCalls)
 	}
+	if f.aclVerifies != 0 || f.consumerVerifies != 0 {
+		t.Errorf("VerifyACL calls = %d, VerifyConsumers calls = %d, want 0 at retrieve_ratio 0", f.aclVerifies, f.consumerVerifies)
+	}
+	if f.aclSets == 0 || f.consumerRegs == 0 {
+		t.Errorf("ACL sets = %d, consumer registrations = %d; the run must still churn both kinds", f.aclSets, f.consumerRegs)
+	}
 }
 
 // TestRunMismatchIsAFailedOutcome confirms a read-back that returns different
-// bytes is a failed operation the engine tolerates, not a stop: the run keeps
-// creating and deleting after the first read-back, returns no error, and the
-// per-bucket error breakdown labels the failure mismatch, the value the chaos
-// command counts to exit non-zero.
+// data (here every payload, ACL, and consumer read-back) is a failed operation
+// the engine tolerates, not a stop: the run keeps creating and deleting after
+// the first read-back, returns no error, and the per-bucket error breakdown
+// labels the failures mismatch, the value the chaos command counts to exit
+// non-zero.
 func TestRunMismatchIsAFailedOutcome(t *testing.T) {
 	p := churnPlan()
 	f := newFakeBarbican(p)
@@ -305,15 +440,22 @@ func TestRunMismatchIsAFailedOutcome(t *testing.T) {
 	}
 
 	sawMismatch := false
+	mismatches := 0
 	for _, b := range r.Buckets {
 		for _, e := range b.Errors {
 			if e.Kind == barbican.ErrKindMismatch {
 				sawMismatch = true
+				mismatches += e.Count
 			}
 		}
 	}
 	if !sawMismatch {
 		t.Errorf("no bucket recorded a %q error; buckets = %+v", barbican.ErrKindMismatch, r.Buckets)
+	}
+	// Every mutation is a read-back, and every read-back mismatches, so each
+	// one, whatever its kind, is labeled mismatch.
+	if mismatches != r.Mutates {
+		t.Errorf("buckets label %d errors %q, want one per mutation (%d)", mismatches, barbican.ErrKindMismatch, r.Mutates)
 	}
 }
 
