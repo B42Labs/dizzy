@@ -147,6 +147,16 @@ are reclaimed from the **run record's created list**, by id:
   record it goes with its roles, since Keystone deletes a role's implied-role
   rules when it deletes the role.
 
+Keystone application credentials and trusts are reclaimed through their users,
+not by name or from the record. Keystone deletes a user's application
+credentials, and every trust the user is trustor or trustee of, when it
+deletes the user, and cleanup deletes the run's users. A credential carries the
+name `dizzy-<runid>-appcred-NNNN`, but Keystone keeps it under its user; a trust
+has no name at all. The record lists a credential under the id
+`<userID>:<credentialID>` and a trust under the trust's id, and cleanup passes
+over both entries, so its `deleted <n> resource(s)` count leaves them out. A
+bare `--run-id` reaches both, since it reaches the users.
+
 Barbican adds secrets that never got their metadata, because the stamp is a
 second call after the secret exists. Discovery never takes a secret on its name
 alone: it confirms one by its `dizzy_run` metadata, as the `secret_ref` of an

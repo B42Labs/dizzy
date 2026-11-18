@@ -58,7 +58,13 @@ right lifecycle without a line of Cinder-specific lifecycle code: a snapshot onl
 exists while its volume does, a volume with live snapshots is never deleted, and
 snapshots naturally churn faster than the volumes under them. Keystone's domains
 and roles form a stable scaffold, provisioned once; projects, users, and
-assignments churn inside it. Barbican's stored secrets have no parents; a
+assignments churn inside it. Application credentials and trusts churn under
+their assignment: a credential is parented on its user, its project and the
+assignment node of its grant, a trust on its trustor, its trustee, its project
+and the assignment node of the trustor's grant. So neither lives without the
+grant Keystone needs to authenticate with it, and an assignment with a live
+credential or trust under it is never deleted. Barbican's stored secrets have
+no parents; a
 generic container is parented on the secrets it references. So a container is
 created only while its secrets are live, and a secret a live container
 references is never deleted. Barbican's orders take no part in the churn.
@@ -181,21 +187,28 @@ schedule stays the same.
 
 Create and delete change the population. Some interesting operations don't.
 
-Cinder's **extend**, Keystone's **token issue**, Nova's **server lifecycle**,
+Cinder's **extend**, Keystone's **authentications**, Nova's **server lifecycle**,
 Glance's **image lifecycle**, Barbican's **payload read-back**, and Octavia's
 **admin-state toggle** are modeled as *mutations*: with probability
 `resize_ratio` (or `token_ratio`, `lifecycle_ratio`, `retrieve_ratio`, or
 `update_ratio`), a churn step mutates an existing resource instead of changing
 the population. A volume is extended to its
 plan's target; a user with a live project assignment authenticates for a scoped
-token; a live server is stop/started, resized-and-confirmed, or live-migrated, in
-that fixed precedence; a live image is metadata-churned, shared with a member
+token, or dizzy authenticates with a live application credential or, as its
+trustee, with a live trust; a live server is stop/started,
+resized-and-confirmed, or live-migrated, in that fixed precedence; a live
+image is metadata-churned, shared with a member
 added/accepted/removed, deactivated-and-reactivated, and flipped to community and
 public visibility, in that fixed precedence. A live secret the plan marks for
 read-back has its payload read back and compared byte for byte with the bytes it
 was stored with. A live listener or member is set to `admin_state_up=false` and
 back to `true`, and each change waits until its load balancer is `ACTIVE`
 again.
+
+Keystone's mutation covers three authentications: the token issue and the
+authentications with an application credential and with a trust.
+`token_ratio` draws among the live candidates of all three, and
+`token_ratio: 0` switches all three off.
 
 Because mutations leave the population untouched, the controller's economics
 above are unaffected. They still count against the per-tick fan-out, since they
@@ -208,9 +221,10 @@ returns different bytes: the run still goes on to its end and tears down, but
 failure, not a latency one.
 
 Each resource *instance* is mutated at most once per lifetime — a volume is
-extended to its planned target and not further, a grant issues one token, a
-server runs its planned lifecycle once, an image runs its planned lifecycle once,
-a secret is read back once, a listener or member is disabled and re-enabled
+extended to its planned target and not further, a grant issues one token, an
+application credential or trust is used to authenticate once, a server runs
+its planned lifecycle once, an image runs its planned lifecycle once, a secret is
+read back once, a listener or member is disabled and re-enabled
 once — and is re-armed when it is deleted and recreated.
 For Cinder this is what keeps a week-long soak's gigabyte consumption inside the
 envelope that the quota pre-check validated (the sum of planned final sizes),

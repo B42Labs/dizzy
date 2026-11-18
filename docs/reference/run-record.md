@@ -60,6 +60,18 @@ and then every lane's, lane by lane, each lane with the resources it created
 before its engine started (the Keystone lane's domains, roles and implied-role
 rules) first. An empty run writes `"created": []`.
 
+On a `keystone apply` or `keystone monitor` record the application
+credentials follow the role assignments, and the trusts follow the
+credentials. A credential's entry has kind `application_credential`, a
+`logical` such as `appcred-0001`, the `name` `dizzy-<run>-appcred-0001` and
+the id `<user id>:<credential id>`, since Keystone addresses a credential only
+under its user. A trust has no cloud name, so its entry has kind `trust`, a
+`logical` such as `trust-0001`, an empty `name` and the trust's id. A
+credential or trust that was created but failed to authenticate is listed
+too. On a `keystone chaos` record the list holds those still live at the end
+of the run. `cleanup` deletes neither kind from the list: Keystone deletes
+both with their users.
+
 On a `keystone pressure` record the list also holds, after the provisioned
 resources, the grants of the cloud's `reader` role to the pool users that a
 run with a positive `probe` weight or with the propagation probe makes before
@@ -152,7 +164,7 @@ Present only on a run record written by `chaos`.
 |---|---|---|
 | `creates` | int | Create operations issued |
 | `deletes` | int | Delete operations issued |
-| `mutates` | int | Cinder extends, Keystone token issues, Nova server or Glance image lifecycle mutations, Barbican payload read-backs, or Octavia admin-state toggles; omitted when zero |
+| `mutates` | int | Cinder extends, Keystone token issues and authentications with an application credential or a trust, Nova server or Glance image lifecycle mutations, Barbican payload read-backs, or Octavia admin-state toggles; omitted when zero |
 | `cycles` | int | Completed create→delete cycles |
 | `popMin` | int | Minimum live population over the run |
 | `popMax` | int | Maximum live population |

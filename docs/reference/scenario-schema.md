@@ -171,6 +171,8 @@ resources:
   roles:    2     # admin-only; ignored (existing roles reused) in domain-manager mode
   projects: 5
   users:    10
+  application_credentials: 2   # see "Application credentials and trusts"
+  trusts:                  2
 
 distribution:
   projects_per_domain:            { min: 1, max: 3 }
@@ -191,6 +193,8 @@ pressure:          # read only by `keystone pressure`; see "The pressure: block"
 | `resources.projects` | int | Projects |
 | `resources.users` | int | Users |
 | `resources.implied_roles` | list | Implied-role rules, each a `prior` role and the roles it `implies`, by logical name. Admin-only; see [Implied roles](#implied-roles) |
+| `resources.application_credentials` | int | Application credentials, each created by a user on one of its project-scoped grants and then authenticated with. Both tiers; see [Application credentials and trusts](#application-credentials-and-trusts) |
+| `resources.trusts` | int | Trusts, each from a user on one of its project-scoped grants to another user of the plan, and then authenticated with as that user. Both tiers; needs at least 2 users; see [Application credentials and trusts](#application-credentials-and-trusts) |
 | `distribution.projects_per_domain` | range | Clustering granularity of the round-robin deal of projects across domains — **not** a per-domain cap |
 | `distribution.assignments_per_user` | range | `(user, target, role)` grants drawn per user |
 | `distribution.domain_scoped_assignment_ratio` | ratio | Fraction of grants targeting the domain rather than a project |
@@ -224,8 +228,11 @@ and holds one grant on that many distinct projects, drawn uniformly from the
 projects of every domain, with a role drawn uniformly from the plan's roles
 for each grant. Keystone allows a grant on a project of another domain, so the
 rule that keeps a regular user's grants in its own domain does not apply to a
-fan user. The fan users are drawn after everything else, so adding them to a
-scenario leaves the rest of its plan as it was.
+fan user. The fan users are drawn after everything but the
+[application credentials and trusts](#application-credentials-and-trusts),
+so adding them to a scenario leaves the rest of its plan as it was. Those two
+draw from the fan users' grants as well, so adding fan users changes which
+credentials and trusts a plan with them holds.
 
 A fan user never issues a plan token, and in `keystone pressure` it is never a
 pool user or a churn user: `effective` lists its grants with a token of its
@@ -315,6 +322,95 @@ in turn: its `implies` list, its `prior`, and then each entry of its
 - `resources.implied_roles[0].implies[0] lets "role-0001" imply itself`
 - `resources.implied_roles[1].implies[0] repeats the rule "role-0001" implies "role-0002"`,
   for a pair that an earlier rule or entry already declared
+
+### Application credentials and trusts
+
+`resources.application_credentials` and `resources.trusts` ask for that many
+application credentials and trusts. Each one carries one role on one project,
+the role and project of a project-scoped grant of the plan. A credential
+belongs to the grant's user. A trust belongs to the grant's user, its
+trustor, and delegates the role to another user of the plan, its trustee.
+
+The generator draws both last, after the fan users, so adding them to a
+scenario leaves the rest of its plan as it was. A count of `0` draws nothing.
+Both draw from the plan's project-scoped grants in plan order, the fan users'
+grants included:
+
+- The application credentials come first, named `appcred-0001`,
+  `appcred-0002` and so on. Each draws one grant uniformly and takes its
+  user, project and role.
+- The trusts come next, named `trust-0001`, `trust-0002` and so on. Each
+  draws one grant uniformly, whose user is the trustor, and then the trustee
+  uniformly over the plan's other users. Keystone refuses a trust that
+  repeats the trustor, trustee, project, impersonation and expiry of another,
+  and every trust dizzy creates has the same impersonation and expiry, so a
+  draw whose (trustor, trustee, project) an earlier trust already has is
+  skipped, not redrawn. A plan can therefore hold fewer trusts than
+  `resources.trusts`, and their names stay contiguous.
+
+`apply --dry-run` prints an `app credentials:` and a `trusts:` line after the
+`token issues:` line, each only when the plan has any.
+`--set resources.application_credentials=<n>` and
+`--set resources.trusts=<n>` override the keys.
+
+A negative count or one above the limit fails like any other, e.g.
+`resources.application_credentials must not be negative, got -1` or
+`resources.trusts exceeds the limit of 1000000, got 1000001`. A trust needs
+two users, fan users counted, so with `resources.trusts` above `0` and a
+single user validation also reports
+`resources.trusts needs at least 2 users, a trustor and a trustee, got 1`.
+
+A positive count also needs a project-scoped grant to draw from. Without
+one, for example with `distribution.domain_scoped_assignment_ratio: 1` and
+no fan users, the generator reports the first that applies:
+
+- `resources.application_credentials is 2 but the plan has no project-scoped assignment to create one on`
+- `resources.trusts is 2 but the plan has no project-scoped assignment to create one on`
+
+Keystone's default policy lets only a credential's own user create it and
+only the trustor create a trust. dizzy therefore creates both kinds as their
+owners, in admin mode and in domain-manager mode alike: it logs in with the
+owner's password for a token scoped to the project of the credential or
+trust, and sends the create with that token. In domain-manager mode the role
+is one of the reused roles. Each credential's secret is a random value
+generated before the create and held only in memory, like the passwords, so
+neither the plan nor the run record holds it. A trust is created with
+impersonation, as Heat creates its trusts, and without expiry or use limit.
+
+`apply` and `monitor` create the credentials after the token issues and then
+the trusts, each stage up to `--concurrency` at a time, and authenticate with
+every one they create. A credential or trust that fails to authenticate fails
+`apply`, or the `monitor` iteration. Each credential costs three requests:
+the owner's token, the create, and an authentication with the credential's id
+and secret. Each trust costs three: the trustor's token, the create, and a
+login of the trustee scoped to the trust, so two of the three are password
+logins.
+
+`chaos` and the `keystone` lane of a mix run churn both kinds. A create of
+either costs two requests, the owner's token and the create, and so does a
+delete, the owner's token and the delete. An authentication costs one and is
+drawn with `token_ratio`; see [The `chaos:` block](#the-chaos-block). The
+churn keeps each credential and trust on a live grant: a credential lives
+only while its user, its project and its grant do, and a trust only while its
+trustor, its trustee, its project and the trustor's grant do. Keystone
+deletes a user's application credentials on a project when it revokes the
+user's role there, and keeps a trust whose trustor lost the delegated role
+but refuses to issue a token with it.
+
+The run record lists a credential as kind `application_credential`, with the
+cloud name `dizzy-<run>-appcred-0001` and the id
+`<user id>:<credential id>`, and a trust as kind `trust`, with an empty name
+and the trust's id. `keystone status` shows either as `present` or `gone`,
+and as `unknown` when Keystone answers the read with a 403, as it does for a
+domain manager, who may not read another user's credential or trust.
+
+The teardown deletes neither kind itself. Keystone deletes a user's
+application credentials, and every trust the user is trustor or trustee of,
+when it deletes the user, and the teardown deletes the run's users with a
+record or without one. The count of deleted resources leaves both kinds out.
+The leak check is unchanged, since neither kind can outlive its users.
+
+`keystone pressure` creates neither kind, whatever the two keys say.
 
 ### A fan for C5C3/cobaltcore#1459
 
@@ -409,11 +505,11 @@ what it records of a stage whose grants outlast the run.
 
 Expanded counts at each profile's shipped seed:
 
-| Profile | Domains | Roles | Projects | Users | Assignments | Token issues | Chaos duration | Pressure |
-|---|---|---|---|---|---|---|---|---|
-| `small` | 1 | 2 | 5 | 10 | 21 | 3 | 5m | 5m, 8 workers, 20 tokens |
-| `medium` | 2 | 3 | 20 | 50 | 90 | 25 | 30m | 30m, 32 workers, 200 tokens |
-| `large` | 3 | 4 | 50 | 150 | 296 | 78 | 1h | 1h, 128 workers, 1000 tokens |
+| Profile | Domains | Roles | Projects | Users | Assignments | Token issues | Application credentials | Trusts | Chaos duration | Pressure |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `small` | 1 | 2 | 5 | 10 | 21 | 3 | 2 | 2 | 5m | 5m, 8 workers, 20 tokens |
+| `medium` | 2 | 3 | 20 | 50 | 90 | 25 | 10 | 10 | 30m | 30m, 32 workers, 200 tokens |
+| `large` | 3 | 4 | 50 | 150 | 296 | 78 | 30 | 30 | 1h | 1h, 128 workers, 1000 tokens |
 
 `small` keeps a single domain so it stays runnable in domain-manager mode.
 `medium` and `large` declare more than one domain and are therefore admin-only.
@@ -1051,7 +1147,7 @@ chaos:                                # the block shipped by scenarios/neutron/m
 | `target_fill` | ratio | all but mix | Fraction of the envelope kept populated |
 | `bucket_width` | duration | all | Width of one time bucket of a run with `--duration 0`, at least `1m`. `0` or omitted falls back to `1h`; a bounded run ignores it |
 | `resize_ratio` | ratio | cinder | Probability per step of extending a live volume to its planned target |
-| `token_ratio` | ratio | keystone | Probability per step of issuing a token as a live, assigned user |
+| `token_ratio` | ratio | keystone | Probability per step of issuing a token as a live, assigned user or authenticating with a live application credential or trust. `0` switches all three off |
 | `lifecycle_ratio` | ratio | nova | Probability per step of mutating a live server (stop/start, resize, or live-migrate) |
 | `lifecycle_ratio` | ratio | glance | Probability per step of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, or metadata churn) |
 | `retrieve_ratio` | ratio | barbican | Probability per step of reading back the payload of a live secret the plan marks for read-back and byte-comparing it |

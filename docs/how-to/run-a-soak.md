@@ -119,12 +119,19 @@ $ dizzy octavia chaos --scenario scenarios/octavia/small.yaml \
 
 `--resize-ratio` is the probability per churn step of extending a live,
 not-yet-resized volume to its planned target. `--token-ratio` is the probability
-of issuing a scoped token as a live, assigned user. `--retrieve-ratio` is the
+of one of three authentications: issuing a scoped token as a live, assigned
+user, or authenticating with a live application credential or, as its
+trustee, with a live trust. `--retrieve-ratio` is the
 probability of reading back the payload of a live secret the plan marks for
 read-back and comparing it byte for byte with the payload stored.
 `--update-ratio` is the probability of setting a live listener or member to
 `admin_state_up=false` and back to `true`, waiting after each change until its
 load balancer is ACTIVE again. Set any of them to `0` to disable.
+
+`keystone chaos` churns application credentials and trusts under their
+assignment. Each is parented on the assignment node of the grant it carries,
+so the engine creates it only while that grant is live and deletes it before
+the grant. `--token-ratio 0` switches all three Keystone authentications off.
 
 A Barbican read-back that returns different bytes does not stop the churn. The
 run finishes and tears down as usual, then `barbican chaos` exits non-zero, and
