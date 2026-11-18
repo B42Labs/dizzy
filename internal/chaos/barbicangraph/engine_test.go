@@ -22,8 +22,9 @@ type fakeBarbican struct {
 	mu     sync.Mutex
 	nextID int
 
-	retrieve map[string]bool // logical -> the plan marks the secret for read-back
-	mismatch bool            // every read-back returns a wrapped mismatch of its kind
+	retrieve         map[string]bool // logical -> the plan marks the secret for read-back
+	mismatch         bool            // every read-back returns a wrapped mismatch of its kind
+	notFoundOnDelete bool            // an ACL or consumer delete removes it and answers 404
 
 	liveSecret    map[string]bool     // secret id -> live
 	liveContainer map[string][]string // container id -> the secret ids it references
@@ -217,9 +218,15 @@ func (f *fakeBarbican) Delete(_ context.Context, r resource.Resource) error {
 	case barbican.KindACL:
 		f.aclDeletes++
 		delete(f.liveACL, r.ID)
+		if f.notFoundOnDelete {
+			return respErr(404)
+		}
 	case barbican.KindConsumer:
 		f.consumerDeletes++
 		delete(f.liveConsumer, r.ID)
+		if f.notFoundOnDelete {
+			return respErr(404)
+		}
 	}
 	return nil
 }
@@ -291,87 +298,153 @@ func mustBuild(t *testing.T, p *barbicanplan.Plan, c Barbican) []chaos.Node {
 	return nodes
 }
 
-// TestRunLifecycleInvariants drives the full churn graph and checks the
+// TestRunLifecycleInvariants drives the churn graph and checks the
 // key-manager lifecycle invariants: no container grouped a secret that was not
 // live, no secret was deleted while a live container referenced it, every
-// read-back targeted a live secret the plan marks for read-back, no secret
-// instance was read back more than once, and the live secrets and containers
-// stayed within the plan envelope. For the ACLs and consumers it checks that no
-// ACL was set on an absent secret, no consumer registered on an absent
-// container, no secret deleted while its ACL was live, no container deleted
-// while a consumer of it was live, and that every ACL and consumer read-back
-// targeted a live one, a consumer's for itself alone and not exact; and that
-// both kinds were created, read back, and deleted.
+// payload read-back targeted a live secret the plan marks for read-back, no
+// secret instance was read back more than once, and the live secrets and
+// containers stayed within the plan envelope. It runs once on the secrets and
+// containers alone, so the payload read-backs keep the share of the mutations
+// they had before ACLs and consumers existed, and once with both kinds. For
+// the ACLs and consumers it checks that no ACL was set on an absent secret, no
+// consumer registered on an absent container, no secret deleted while its ACL
+// was live, no container deleted while a consumer of it was live, and that
+// every ACL and consumer read-back targeted a live one, a consumer's for itself
+// alone and not exact; and that the engine created, read back, and deleted
+// both kinds.
 func TestRunLifecycleInvariants(t *testing.T) {
+	payloadOnly := churnPlan()
+	payloadOnly.ACLs, payloadOnly.Consumers = nil, nil
+
+	for _, tc := range []struct {
+		name  string
+		p     *barbicanplan.Plan
+		kinds bool
+	}{
+		{"secrets and containers", payloadOnly, false},
+		{"with acls and consumers", churnPlan(), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := tc.p
+			f := newFakeBarbican(p)
+
+			r, err := chaos.Run(context.Background(), mustBuild(t, p, f), p.Seed, barbicanCfg(0.5), newFakeClock())
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if r.Creates == 0 {
+				t.Fatal("no creates were scheduled; the test exercises nothing")
+			}
+			if r.Mutates == 0 {
+				t.Fatal("no read-backs were scheduled; the test exercises nothing")
+			}
+
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if f.retrieveCalls == 0 {
+				t.Fatal("no payload read-back happened; the payload read-back invariants check nothing")
+			}
+			if f.stampAbsent {
+				t.Error("a stamp referenced a secret that was not live")
+			}
+			if f.containerOnAbsent {
+				t.Error("a container create referenced a secret id that was not live")
+			}
+			if f.secretDeleteReferenced {
+				t.Error("a secret was deleted while a live container referenced it")
+			}
+			if f.readBackAbsent {
+				t.Error("a read-back referenced a secret that was not live")
+			}
+			if f.readBackUnmarked {
+				t.Error("a read-back referenced a secret the plan does not mark Retrieve")
+			}
+			for id, n := range f.readBacks {
+				if n > 1 {
+					t.Errorf("secret instance %s read back %d times, want at most once per lifetime", id, n)
+				}
+			}
+			if f.maxS > len(p.Secrets) {
+				t.Errorf("live secrets peaked at %d, exceeding the envelope %d", f.maxS, len(p.Secrets))
+			}
+			if f.maxC > len(p.Containers) {
+				t.Errorf("live containers peaked at %d, exceeding the envelope %d", f.maxC, len(p.Containers))
+			}
+
+			for _, v := range []struct {
+				violated bool
+				what     string
+			}{
+				{f.aclOnAbsent, "an ACL was set on a secret that was not live"},
+				{f.consumerOnAbsent, "a consumer was registered on a container that was not live"},
+				{f.secretDeleteWithACL, "a secret was deleted while its ACL was live"},
+				{f.containerDeleteConsumed, "a container was deleted while a consumer of it was live"},
+				{f.aclReadBackAbsent, "an ACL read-back targeted an ACL that was not live"},
+				{f.consumerReadBackAbsent, "a consumer read-back targeted a consumer that was not live on that container"},
+				{f.consumerReadBackNotAlone, "a consumer read-back was not for itself alone without exact"},
+			} {
+				if v.violated {
+					t.Error(v.what)
+				}
+			}
+			if !tc.kinds {
+				return
+			}
+
+			for _, c := range []struct {
+				n    int
+				what string
+			}{
+				{f.aclSets, "ACL sets"}, {f.aclVerifies, "ACL read-backs"}, {f.aclDeletes, "ACL deletes"},
+				{f.consumerRegs, "consumer registrations"}, {f.consumerVerifies, "consumer read-backs"}, {f.consumerDeletes, "consumer deletes"},
+			} {
+				if c.n == 0 {
+					t.Errorf("no %s happened; the run does not exercise them", c.what)
+				}
+			}
+			decided := make(map[string]bool)
+			for _, d := range r.Decisions {
+				decided[string(d.Kind)+" "+d.Action] = true
+			}
+			for _, kind := range []resource.Kind{barbican.KindACL, barbican.KindConsumer} {
+				for _, action := range []string{"create", "mutate", "delete"} {
+					if !decided[string(kind)+" "+action] {
+						t.Errorf("the run's decisions hold no %s of an %s", action, kind)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestRunDeleteNotFoundCountsAsDeleted confirms the engine counts an ACL or
+// consumer delete that Barbican answers with 404, because the ACL or consumer
+// is already gone, as a succeeded delete: no bucket records a failure or an
+// error for it.
+func TestRunDeleteNotFoundCountsAsDeleted(t *testing.T) {
 	p := churnPlan()
 	f := newFakeBarbican(p)
+	f.notFoundOnDelete = true
 
 	r, err := chaos.Run(context.Background(), mustBuild(t, p, f), p.Seed, barbicanCfg(0.5), newFakeClock())
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if r.Creates == 0 {
-		t.Fatal("no creates were scheduled; the test exercises nothing")
-	}
-	if r.Mutates == 0 {
-		t.Fatal("no read-backs were scheduled; the test exercises nothing")
-	}
-
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.stampAbsent {
-		t.Error("a stamp referenced a secret that was not live")
+	aclDeletes, consumerDeletes := f.aclDeletes, f.consumerDeletes
+	f.mu.Unlock()
+	if aclDeletes == 0 || consumerDeletes == 0 {
+		t.Fatalf("ACL deletes = %d, consumer deletes = %d; the test needs both", aclDeletes, consumerDeletes)
 	}
-	if f.containerOnAbsent {
-		t.Error("a container create referenced a secret id that was not live")
-	}
-	if f.secretDeleteReferenced {
-		t.Error("a secret was deleted while a live container referenced it")
-	}
-	if f.readBackAbsent {
-		t.Error("a read-back referenced a secret that was not live")
-	}
-	if f.readBackUnmarked {
-		t.Error("a read-back referenced a secret the plan does not mark Retrieve")
-	}
-	for id, n := range f.readBacks {
-		if n > 1 {
-			t.Errorf("secret instance %s read back %d times, want at most once per lifetime", id, n)
+	var failed int
+	for _, b := range r.Buckets {
+		failed += b.Stats.Failed
+		for _, e := range b.Errors {
+			t.Errorf("bucket at %s records error %q x%d, want none for a delete answered with 404", b.Start, e.Kind, e.Count)
 		}
 	}
-	if f.maxS > len(p.Secrets) {
-		t.Errorf("live secrets peaked at %d, exceeding the envelope %d", f.maxS, len(p.Secrets))
-	}
-	if f.maxC > len(p.Containers) {
-		t.Errorf("live containers peaked at %d, exceeding the envelope %d", f.maxC, len(p.Containers))
-	}
-
-	for _, v := range []struct {
-		violated bool
-		what     string
-	}{
-		{f.aclOnAbsent, "an ACL was set on a secret that was not live"},
-		{f.consumerOnAbsent, "a consumer was registered on a container that was not live"},
-		{f.secretDeleteWithACL, "a secret was deleted while its ACL was live"},
-		{f.containerDeleteConsumed, "a container was deleted while a consumer of it was live"},
-		{f.aclReadBackAbsent, "an ACL read-back targeted an ACL that was not live"},
-		{f.consumerReadBackAbsent, "a consumer read-back targeted a consumer that was not live on that container"},
-		{f.consumerReadBackNotAlone, "a consumer read-back was not for itself alone without exact"},
-	} {
-		if v.violated {
-			t.Error(v.what)
-		}
-	}
-	for _, c := range []struct {
-		n    int
-		what string
-	}{
-		{f.aclSets, "ACL sets"}, {f.aclVerifies, "ACL read-backs"}, {f.aclDeletes, "ACL deletes"},
-		{f.consumerRegs, "consumer registrations"}, {f.consumerVerifies, "consumer read-backs"}, {f.consumerDeletes, "consumer deletes"},
-	} {
-		if c.n == 0 {
-			t.Errorf("no %s happened; the run does not exercise them", c.what)
-		}
+	if failed != 0 {
+		t.Errorf("buckets record %d failed operations, want 0", failed)
 	}
 }
 
