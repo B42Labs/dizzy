@@ -10,7 +10,7 @@ resources reach, and cleans up after itself. It covers seven services today:
 |---|---|---|
 | `dizzy neutron` | Networking | Address scopes, subnet pools, networks, subnets, routers, router interfaces, security groups + rules, ports, floating IPs |
 | `dizzy cinder` | Block storage | Volume create, extend (resize), snapshot |
-| `dizzy keystone` | Identity | Domains, roles, implied-role rules, projects, users, role assignments, scoped token issue |
+| `dizzy keystone` | Identity | Domains, roles, implied-role rules, projects, users, role assignments, scoped token issue, application credentials and trusts, each created as its owner and authenticated |
 | `dizzy nova` | Compute | Server boot (image / volume), stop/start (soft / hard), resize + confirm, live migration, volume & port attach/detach, multi-network, user data |
 | `dizzy glance` | Image | Image create + synthetic data upload, metadata/property churn, visibility transitions (private / shared / community / public), member add/accept/remove, deactivate/reactivate, delete |
 | `dizzy barbican` | Key manager | Secret store with a synthetic payload and metadata stamp, AES-256 key orders polled to ACTIVE, generic containers, byte-compared payload read-back |

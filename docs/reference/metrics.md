@@ -279,8 +279,8 @@ Every value set is bounded.
 
 | Attribute | Values |
 |---|---|
-| `kind` | **neutron:** `address-scope`, `subnet-pool`, `network`, `subnet`, `router`, `router-interface`, `security-group`, `security-group-rule`, `port`, `floating-ip` — **cinder:** `volume`, `snapshot` — **keystone:** `domain`, `project`, `user`, `role`, `implied_role` (an implied-role rule), `role_assignment`, `token`, and for `keystone pressure` also `probe`, `bad_token` and `propagation` (a request to Nova, Neutron, Cinder or Glance) and, on `dizzy.resource.time_to_ready` only, `revocation` (the propagation delay) — **nova:** `server`, `network`, `subnet`, `port`, `volume`, `server_group` (only the `mix` Gardener persona creates server groups) — **glance:** `image`; **barbican:** `secret` (a stored secret and the secret an order generates alike), `order`, `container` — **octavia:** `loadbalancer`, `listener`, `pool`, `member`, `healthmonitor`, `network`, `subnet`; the `mix` Gardener persona records `loadbalancer`, `listener`, `pool`, `member` and `healthmonitor` when Octavia is opted in with `services: [octavia]`, plus `port` and `subnet` samples of operation `list` from the address lookups of its member and load balancer creates |
-| `operation` | `create`, `delete`, `get`, `list`, `tag`, `attach`, `detach`, `extend` (cinder resize), `update` (keystone domain disable-before-delete; glance property churn; barbican secret metadata stamp; octavia listener and member admin-state toggle), `validate`, `revoke` (keystone token validation and revocation; `keystone pressure` only), `stop`, `start`, `reboot`, `resize`, `confirm-resize`, `live-migrate`, `cold-migrate` (nova server lifecycle; `cold-migrate` only for the `mix` Legacy persona), `upload`, `visibility`, `deactivate`, `reactivate`, `member-add`, `member-accept`, `member-remove` (glance image lifecycle), `download` (barbican payload read-back), `nova`, `neutron`, `cinder`, `glance` (the service a `probe`, `bad_token` or `propagation` request went to; `keystone pressure` only) |
+| `kind` | **neutron:** `address-scope`, `subnet-pool`, `network`, `subnet`, `router`, `router-interface`, `security-group`, `security-group-rule`, `port`, `floating-ip` — **cinder:** `volume`, `snapshot` — **keystone:** `domain`, `project`, `user`, `role`, `implied_role` (an implied-role rule), `role_assignment`, `token`, `application_credential`, `trust`, and for `keystone pressure` also `probe`, `bad_token` and `propagation` (a request to Nova, Neutron, Cinder or Glance) and, on `dizzy.resource.time_to_ready` only, `revocation` (the propagation delay) — **nova:** `server`, `network`, `subnet`, `port`, `volume`, `server_group` (only the `mix` Gardener persona creates server groups) — **glance:** `image`; **barbican:** `secret` (a stored secret and the secret an order generates alike), `order`, `container` — **octavia:** `loadbalancer`, `listener`, `pool`, `member`, `healthmonitor`, `network`, `subnet`; the `mix` Gardener persona records `loadbalancer`, `listener`, `pool`, `member` and `healthmonitor` when Octavia is opted in with `services: [octavia]`, plus `port` and `subnet` samples of operation `list` from the address lookups of its member and load balancer creates |
+| `operation` | `create`, `delete`, `get`, `list`, `tag`, `attach`, `detach`, `extend` (cinder resize), `update` (keystone domain disable-before-delete; glance property churn; barbican secret metadata stamp; octavia listener and member admin-state toggle), `validate`, `revoke` (keystone token validation and revocation; `keystone pressure` only), `authenticate` (keystone authentication with an application credential or a trust), `stop`, `start`, `reboot`, `resize`, `confirm-resize`, `live-migrate`, `cold-migrate` (nova server lifecycle; `cold-migrate` only for the `mix` Legacy persona), `upload`, `visibility`, `deactivate`, `reactivate`, `member-add`, `member-accept`, `member-remove` (glance image lifecycle), `download` (barbican payload read-back), `nova`, `neutron`, `cinder`, `glance` (the service a `probe`, `bad_token` or `propagation` request went to; `keystone pressure` only) |
 | `outcome` | `success`, `error`, `timeout` for an operation; `success`, `timeout` for time-to-ready, where `timeout` under `kind=revocation` is a propagation probe that reached its ceiling; `success`, `failure` for an iteration |
 | `result` | `attempted`, `succeeded`, `failed` |
 | `error.kind` | `quota`, `timeout`, `canceled`, `other`, `http_<status>` for the statuses the service returns, `http_other` for the rest, `accepted` for a `bad_token` request that a service answered with a 2xx, `mismatch` for a barbican read-back that returned different bytes, `order_error` for a barbican order that ended in ERROR, `provisioning_error` for an octavia load balancer that reached ERROR |
@@ -294,14 +294,29 @@ at all — its absence is the steady state, not a missing metric.
 
 Keystone creates and deletes are synchronous, so `resource.time_to_ready` is
 largely unused there. One exception is **token-issue latency**, recorded with
-`kind=token` in addition to the `token`/`create` operation histogram; the
-other is the propagation delay of `keystone pressure`, below.
+`kind=token` in addition to the `token`/`create` operation histogram. The
+others are the authentication latency of application credentials and trusts
+and the propagation delay of `keystone pressure`, both below.
 `keystone pressure` adds two operations under `kind=token`, `validate` and
 `revoke`, which record no time-to-ready; its pool issues record as
 `token`/`create` like any token issue, the three listings of its `effective`
 operation as `role_assignment`/`list` and `project`/`list`, and the `reader`
 grants of its pool users and the grants of its stages as
 `role_assignment`/`create` like any grant.
+
+Application credentials and trusts record their creates as
+`application_credential`/`create` and `trust`/`create`, and the deletes of
+the churn as `application_credential`/`delete` and `trust`/`delete`. Each
+authentication with a credential or a trust records as
+`application_credential`/`authenticate` or `trust`/`authenticate`, and with
+the same duration on `dizzy.resource.time_to_ready` under
+`kind=application_credential` or `kind=trust`, where a failed one records
+`outcome=timeout`, as a failed token issue does. dizzy creates and deletes
+both kinds as their owners, with a token it first issues to the owning user.
+Each such owner token records as `token`/`create` and under `kind=token` on
+`dizzy.resource.time_to_ready`, like any token issue, so the `token` counts
+of a run with either kind include these owner tokens beside the plan's token
+issues.
 
 Each request of a `probe` or `bad_token` draw and each poll of the
 propagation probe records on `dizzy.operation.duration` and, when it fails,

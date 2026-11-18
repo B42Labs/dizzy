@@ -240,7 +240,7 @@ Namespace-specific:
 | `--external-network <name>` | `neutron` | auto-detect | As for `apply` |
 | `--volume-type <name>` | `cinder` | cloud default | As for `apply` |
 | `--resize-ratio <float>` | `cinder` | `0.3` | Probability per churn step of extending a live, not-yet-resized volume to its planned target; `0` disables |
-| `--token-ratio <float>` | `keystone` | `0.3` | Probability per churn step of issuing a token as a live, assigned user; `0` disables |
+| `--token-ratio <float>` | `keystone` | `0.3` | Probability per churn step of issuing a token as a live, assigned user or authenticating with a live application credential or trust; `0` disables all three |
 | `--lifecycle-ratio <float>` | `nova` | `0.3` | Probability per churn step of mutating a live server (stop/start, resize, or live-migrate); `0` disables |
 | `--lifecycle-ratio <float>` | `glance` | `0.3` | Probability per churn step of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, or metadata churn); `0` disables |
 | `--retrieve-ratio <float>` | `barbican` | `0.3` | Probability per churn step of reading back the payload of a live stored secret the plan marks for read-back and byte-comparing it; `0` disables |
@@ -996,7 +996,11 @@ Discovery differs per service, and so does what `--run-id` alone can reach:
   handle. Implied-role rules have no name; they are deleted by id from the
   run record, after the projects and before the roles. Without a record they
   go with their roles, because Keystone deletes a role's implied-role rules
-  when it deletes the role.
+  when it deletes the role. The cleanup deletes no application credential or
+  trust on its own, with a record or without one: they go with their users,
+  because Keystone deletes a user's application credentials and every trust
+  the user is trustor or trustee of when it deletes the user. The
+  `deleted <n> resource(s)` count leaves them out.
 - **nova** — servers and data volumes are found by their `dizzy:run=<id>`
   metadata; the companion networks, subnets, and ports by the `dizzy:run=<id>`
   tag. Servers are deleted first (so their attachments release), then ports,

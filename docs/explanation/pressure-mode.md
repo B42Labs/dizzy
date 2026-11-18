@@ -238,7 +238,8 @@ listing. See
 and a scenario for C5C3/cobaltcore#1459.
 
 The fan users are extra users, not pool users given more grants. They are
-drawn after everything else in the plan, so a scenario with fan users keeps
+drawn after the regular users, their grants and the token issues, so a
+scenario with fan users keeps
 the regular users, their grants and with them the token pool it had without
 them, and the other operations go to the same users either way. A fan user
 holds a token of its own outside the pool, which no `revoke` or `issue` takes

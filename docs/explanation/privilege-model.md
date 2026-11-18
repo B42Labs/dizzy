@@ -87,10 +87,12 @@ with `rules=<n>`.
 
 ## Why token issue is an operation
 
-The seven Keystone operations are: create domain, create user, create project,
-create role, create implied-role rule, assign role, and **issue token**.
+The Keystone operations are: create domain, create user, create project,
+create role, create implied-role rule, assign role, **issue token**, create
+application credential, authenticate with an application credential, create
+trust, and authenticate with a trust.
 
-The last is different in kind. It authenticates *as a created user* and obtains a
+Token issue differs in kind. It authenticates *as a created user* and obtains a
 project-scoped token — the tool's first operation that acts as a principal it
 created rather than as the operator. That makes it an end-to-end consistency
 check as much as a latency measurement: it can only succeed if the whole
@@ -100,8 +102,45 @@ skipped.
 
 Keystone's creates and deletes are synchronous — the resource is usable when the
 call returns — so there is no status polling and no time-to-ready stage. Token
-issue is the one exception: its latency is recorded on `time_to_ready` with
-`kind=token`, because there is nothing else meaningful to record there.
+issue and the two authentications are the exceptions: their latencies are
+recorded on `time_to_ready` with `kind=token`, `kind=application_credential`
+and `kind=trust`, because there is nothing else meaningful to record there.
+
+## Acting as a created user
+
+The operator's token cannot create an application credential or a trust, in
+either tier. Keystone's default policy lets only the owner create an
+application credential and only the trustor create a trust. Deleting or
+reading either is open only to an admin or the owner.
+
+So dizzy acts as the user it created, in admin mode and domain-manager mode
+alike. It obtains a project-scoped token of that user with the random
+password dizzy generated for the user and holds in memory for the run, and
+sends the create with that token. The token is scoped to the project of the
+grant the credential or trust carries; for a trust it is the trustor's token.
+A churn delete of either takes the same path, with a token of the owner or,
+for a trust, the trustor.
+
+`apply` and `monitor` follow each create with an authentication, the
+read-back that proves the delegation works; `chaos` authenticates as a
+mutation drawn with `token_ratio`. dizzy authenticates with the application
+credential's id and the secret it generated for the credential, and with a
+trust as its trustee, using the trustee's password and the trust as the
+token's scope. A failed authentication fails `apply` and a `monitor`
+iteration.
+
+Acting as a user adds a token request to every create and delete of either
+kind. Each application credential costs `apply` three requests: the owner
+token, the create and the authentication. Each trust costs three as well, two
+of them password authentications: the owner token as trustor and the
+authentication as trustee. A churn delete of either costs two, the owner token
+and the delete. Every owner token is recorded as a `token`/`create` sample
+and a `kind=token` time-to-ready sample.
+
+`keystone status` reads both kinds back with the operator's token. An admin
+may read them. A domain manager may not read another user's credential or
+trust, so Keystone answers 403, and in a domain manager's run `status` shows
+each of them as `unknown` instead of failing.
 
 ## Failing open, failing fast
 
@@ -169,6 +208,12 @@ deleted, again **only in admin mode**.
 An implied-role rule carries no name prefix, since it has no name. The teardown
 deletes the rules the run record lists, and without a record they go with their
 roles: Keystone deletes a role's implied-role rules when it deletes the role.
+
+Application credentials and trusts get no delete of their own in either tier.
+Keystone deletes a user's application credentials, and every trust the user is
+trustor or trustee of, when it deletes the user, so both kinds go with the
+run's users. The `deleted <n> resource(s)` count leaves them out, and the leak
+check counts neither, since neither can outlive its users.
 
 The disable-before-delete is a Keystone requirement — it refuses to delete an
 enabled domain — which is why an `update` operation appears in a Keystone run's
