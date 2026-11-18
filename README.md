@@ -97,6 +97,7 @@ matches what you are doing right now.
 - [Monitor a cloud continuously](docs/how-to/monitor-a-cloud.md)
 - [Run a churn soak with `chaos`](docs/how-to/run-a-soak.md)
 - [Export metrics to OpenTelemetry](docs/how-to/export-to-otel.md)
+- [Serve Prometheus metrics and a health check](docs/how-to/serve-prometheus-metrics.md)
 - [Run against a Cobalt Core dev stack](docs/how-to/run-against-devstack-c5c3.md)
 - [Deal with the quota pre-check](docs/how-to/raise-quotas.md)
 
