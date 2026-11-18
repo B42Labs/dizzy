@@ -1,16 +1,19 @@
-// Package executor turns a Barbican plan into real secrets, key orders, and
-// generic containers and checks that what it stored comes back intact. It runs
-// four strictly ordered stages: store each secret with its synthetic payload and
-// stamp the run identity onto it, submit each key order and wait for Barbican to
-// generate its key before stamping the generated secret, group the stored
-// secrets into containers, then read back the payloads the plan selects and
-// byte-compare each with the bytes it was stored with. Independent work within a
-// stage runs concurrently up to a configurable limit; transient failures are
-// retried with exponential backoff, quota errors fail fast, and every operation
-// has its own timeout. A payload mismatch or an order that ends in ERROR is
-// never retried, so either fails the run, as a failed token issue fails a
-// Keystone run. The created resources and the timing the Barbican wrappers
-// record are the hand-off surface a later run record and cleanup consume.
+// Package executor turns a Barbican plan into real secrets, key orders, generic
+// containers, secret ACLs, and container consumers and checks that what it
+// wrote comes back intact. It runs eight strictly ordered stages: store each
+// secret with its synthetic payload and stamp the run identity onto it, submit
+// each key order and wait for Barbican to generate its key before stamping the
+// generated secret, group the stored secrets into containers, set each ACL on
+// its secret, register each consumer on its container, then read back the
+// payloads the plan selects and byte-compare each with the bytes it was stored
+// with, read back each ACL's users, and read back the consumer list of each
+// container that has consumers. Independent work within a stage runs
+// concurrently up to a configurable limit; transient failures are retried with
+// exponential backoff, quota errors fail fast, and every operation has its own
+// timeout. A mismatch of any read-back or an order that ends in ERROR is never
+// retried, so either fails the run, as a failed token issue fails a Keystone
+// run. The created resources and the timing the Barbican wrappers record are
+// the hand-off surface a later run record and cleanup consume.
 package executor
 
 import (
@@ -30,16 +33,16 @@ import (
 // retryBaseDelay, retryMaxDelay, and maxAttempts bound the per-operation retry
 // of transient errors. They duplicate the other executors' policy rather than
 // sharing it: each package's WithRetry hardcodes its own service's classifiers,
-// and this one uses the barbican classifiers, under which a payload mismatch and
-// a failed order are never retried.
+// and this one uses the barbican classifiers, under which a read-back mismatch
+// and a failed order are never retried.
 const (
 	retryBaseDelay = 250 * time.Millisecond
 	retryMaxDelay  = 5 * time.Second
 	maxAttempts    = 5
 )
 
-// Barbican is the store, order, group, and read-back surface the executor
-// drives. It is the single ports-and-adapters seam to the cloud:
+// Barbican is the store, order, group, ACL, consumer, and read-back surface the
+// executor drives. It is the single ports-and-adapters seam to the cloud:
 // *barbican.Client satisfies it in production and a fake satisfies it in tests.
 type Barbican interface {
 	StoreSecret(ctx context.Context, s plan.Secret, seed int64) (resource.Resource, error)
@@ -47,7 +50,11 @@ type Barbican interface {
 	CreateOrder(ctx context.Context, o plan.Order) (resource.Resource, error)
 	WaitForOrder(ctx context.Context, r resource.Resource) (resource.Resource, error)
 	CreateContainer(ctx context.Context, ct plan.Container, stored map[string]resource.Resource) (resource.Resource, error)
+	SetACL(ctx context.Context, a plan.ACL, secret resource.Resource) (resource.Resource, error)
+	RegisterConsumer(ctx context.Context, con plan.Consumer, container resource.Resource) (resource.Resource, error)
 	RetrievePayload(ctx context.Context, r resource.Resource, seed int64, n int) error
+	VerifyACL(ctx context.Context, a plan.ACL, r resource.Resource) error
+	VerifyConsumers(ctx context.Context, container resource.Resource, want []resource.Resource, exact bool) error
 }
 
 // The production *barbican.Client must satisfy the seam.
@@ -55,21 +62,23 @@ var _ Barbican = (*barbican.Client)(nil)
 
 // Result is the outcome of an apply: every resource that was created, in stage
 // order. The stored secrets come first in plan order, then each order followed
-// by the secret Barbican generated for it, then the containers. Read-backs
-// create no resource and never appear here.
+// by the secret Barbican generated for it, then the containers, the ACLs (each
+// under its secret's id), and the consumers. Read-backs create no resource and
+// never appear here.
 type Result struct {
 	Created []resource.Resource
 }
 
 // Apply stores the plan's secrets, submits its key orders, creates its
-// containers, and reads back the payloads it marks for retrieval, in four
-// strictly ordered stages. Within a stage independent work runs concurrently up
-// to concurrency, each operation retried on transient errors and bounded by
-// opTimeout. seed threads the plan seed into the per-secret payload derivation,
-// so a store and its read-back use the same bytes and two runs of the same plan
-// store byte-identical payloads. The first quota error, or any non-retryable
-// error, stops the run and is returned along with the resources created so far;
-// ctx cancellation returns ctx.Err().
+// containers, sets its ACLs, registers its consumers, and reads back the
+// payloads it marks for retrieval, every ACL, and the consumer list of every
+// container with consumers, in eight strictly ordered stages. Within a stage
+// independent work runs concurrently up to concurrency, each operation retried
+// on transient errors and bounded by opTimeout. seed threads the plan seed into
+// the per-secret payload derivation, so a store and its read-back use the same
+// bytes and two runs of the same plan store byte-identical payloads. The first
+// quota error, or any non-retryable error, stops the run and is returned along
+// with the resources created so far; ctx cancellation returns ctx.Err().
 func Apply(ctx context.Context, c Barbican, p *plan.Plan, concurrency int, opTimeout time.Duration, seed int64) (*Result, error) {
 	e := &applier{c: c, opTimeout: opTimeout, seed: seed}
 	result := &Result{}
@@ -100,16 +109,41 @@ func Apply(ctx context.Context, c Barbican, p *plan.Plan, concurrency int, opTim
 		return result, err
 	}
 
-	// Stage 3: group the stored secrets into containers.
+	// Stage 3: group the stored secrets into containers. The created containers
+	// are indexed by logical name for the consumers and their read-backs.
 	ctrRes, err := runStage(ctx, p.Containers, concurrency, func(ctx context.Context, ct plan.Container) (resource.Resource, error) {
 		return e.createContainer(ctx, ct, stored)
 	})
 	result.Created = appendCreated(result.Created, ctrRes)
+	created := make(map[string]resource.Resource, len(p.Containers))
+	for i, r := range ctrRes {
+		if r.ID != "" {
+			created[p.Containers[i].Name] = r
+		}
+	}
 	if err != nil {
 		return result, err
 	}
 
-	// Stage 4: read back the payloads the plan selects and byte-compare each with
+	// Stage 4: set each ACL on the secret it names.
+	aclRes, err := runStage(ctx, p.ACLs, concurrency, func(ctx context.Context, a plan.ACL) (resource.Resource, error) {
+		return e.setACL(ctx, a, stored[a.Secret])
+	})
+	result.Created = appendCreated(result.Created, aclRes)
+	if err != nil {
+		return result, err
+	}
+
+	// Stage 5: register each consumer on the container it names.
+	conRes, err := runStage(ctx, p.Consumers, concurrency, func(ctx context.Context, con plan.Consumer) (resource.Resource, error) {
+		return e.registerConsumer(ctx, con, created[con.Container])
+	})
+	result.Created = appendCreated(result.Created, conRes)
+	if err != nil {
+		return result, err
+	}
+
+	// Stage 6: read back the payloads the plan selects and byte-compare each with
 	// the bytes it was stored with.
 	toRead := make([]plan.Secret, 0)
 	for _, s := range p.Secrets {
@@ -128,7 +162,57 @@ func Apply(ctx context.Context, c Barbican, p *plan.Plan, concurrency int, opTim
 		return result, err
 	}
 
+	// Stage 7: read back each ACL's users and compare them with the plan's.
+	aclChecks := make([]aclCheck, len(p.ACLs))
+	for i, a := range p.ACLs {
+		aclChecks[i] = aclCheck{acl: a, res: aclRes[i]}
+	}
+	_, err = runStage(ctx, aclChecks, concurrency, func(ctx context.Context, ac aclCheck) (struct{}, error) {
+		return struct{}{}, WithRetry(ctx, e.opTimeout, func(ctx context.Context) error {
+			return e.c.VerifyACL(ctx, ac.acl, ac.res)
+		})
+	})
+	if err != nil {
+		return result, err
+	}
+
+	// Stage 8: read back the consumer list of each container that has consumers,
+	// in container order, and compare it exactly with the consumers registered on
+	// it, in plan order.
+	byContainer := make(map[string][]resource.Resource, len(p.Containers))
+	for i, con := range p.Consumers {
+		byContainer[con.Container] = append(byContainer[con.Container], conRes[i])
+	}
+	var consumerChecks []consumerCheck
+	for _, ct := range p.Containers {
+		if want, ok := byContainer[ct.Name]; ok {
+			consumerChecks = append(consumerChecks, consumerCheck{container: created[ct.Name], want: want})
+		}
+	}
+	_, err = runStage(ctx, consumerChecks, concurrency, func(ctx context.Context, cc consumerCheck) (struct{}, error) {
+		return struct{}{}, WithRetry(ctx, e.opTimeout, func(ctx context.Context) error {
+			return e.c.VerifyConsumers(ctx, cc.container, cc.want, true)
+		})
+	})
+	if err != nil {
+		return result, err
+	}
+
 	return result, nil
+}
+
+// aclCheck is one stage-7 work item: an ACL of the plan and the resource stage 4
+// created for it.
+type aclCheck struct {
+	acl plan.ACL
+	res resource.Resource
+}
+
+// consumerCheck is one stage-8 work item: a container and the consumers stage 5
+// registered on it, in plan order.
+type consumerCheck struct {
+	container resource.Resource
+	want      []resource.Resource
 }
 
 // applier carries the apply-wide configuration shared by the stage helpers.
@@ -206,6 +290,35 @@ func (e *applier) createContainer(ctx context.Context, ct plan.Container, stored
 	var res resource.Resource
 	if err := withCreate(ctx, e.opTimeout, func(ctx context.Context) (resource.Resource, error) {
 		return e.c.CreateContainer(ctx, ct, stored)
+	}, &res); err != nil {
+		return resource.Resource{}, err
+	}
+	logCreated(res)
+	return res, nil
+}
+
+// setACL sets an ACL (retrying transient errors) on secret, the stored secret
+// stage 1 indexed under the ACL's secret. The PUT replaces the secret's read
+// ACL, so a retry is safe.
+func (e *applier) setACL(ctx context.Context, a plan.ACL, secret resource.Resource) (resource.Resource, error) {
+	var res resource.Resource
+	if err := withCreate(ctx, e.opTimeout, func(ctx context.Context) (resource.Resource, error) {
+		return e.c.SetACL(ctx, a, secret)
+	}, &res); err != nil {
+		return resource.Resource{}, err
+	}
+	logCreated(res)
+	return res, nil
+}
+
+// registerConsumer registers a consumer (retrying transient errors) on
+// container, the container stage 3 indexed under the consumer's container.
+// Barbican updates an existing consumer of the same container, name, and URL
+// in place, so a retry is safe.
+func (e *applier) registerConsumer(ctx context.Context, con plan.Consumer, container resource.Resource) (resource.Resource, error) {
+	var res resource.Resource
+	if err := withCreate(ctx, e.opTimeout, func(ctx context.Context) (resource.Resource, error) {
+		return e.c.RegisterConsumer(ctx, con, container)
 	}, &res); err != nil {
 		return resource.Resource{}, err
 	}
@@ -359,7 +472,7 @@ dispatch:
 // WithRetry runs fn, bounding each attempt with opTimeout, and retries transient
 // errors with exponential backoff up to maxAttempts. It returns immediately on
 // success, on a quota error (so the run fails fast), or on any non-retryable
-// error, which includes a payload mismatch and a failed order. Backoff sleeps
+// error, which includes a read-back mismatch and a failed order. Backoff sleeps
 // honor the parent context. It is exported, as the other executors' WithRetry
 // is, so a caller outside the apply path can drive Barbican calls through the
 // same transient/quota backoff policy.
