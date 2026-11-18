@@ -13,10 +13,16 @@ import (
 //
 // A nil *Health is the disabled tracker: Mark and SetWaiting do nothing and
 // Check always reports healthy.
+//
+// Times are kept as offsets from a base reading taken at construction, so
+// with time.Now the idle time comes from the monotonic clock and a step of the
+// wall clock (an NTP correction, a resumed VM) neither fakes a stall nor
+// hides one.
 type Health struct {
 	stallAfter time.Duration
 	now        func() time.Time
-	last       atomic.Int64 // unix nanoseconds of the last progress
+	base       time.Time
+	last       atomic.Int64 // nanoseconds from base to the last progress
 	waiting    atomic.Bool
 }
 
@@ -25,17 +31,18 @@ type Health struct {
 // so a process that never records anything stalls stallAfter after it
 // started. A stallAfter of 0 disables stall detection.
 func NewHealth(stallAfter time.Duration, now func() time.Time) *Health {
-	h := &Health{stallAfter: stallAfter, now: now}
-	h.last.Store(now().UnixNano())
-	return h
+	return &Health{stallAfter: stallAfter, now: now, base: now()}
 }
+
+// sinceBase returns how far now is past the base reading.
+func (h *Health) sinceBase() time.Duration { return h.now().Sub(h.base) }
 
 // Mark records that progress happened now.
 func (h *Health) Mark() {
 	if h == nil {
 		return
 	}
-	h.last.Store(h.now().UnixNano())
+	h.last.Store(int64(h.sinceBase()))
 }
 
 // SetWaiting announces the start (true) or the end (false) of a planned
@@ -61,6 +68,6 @@ func (h *Health) Check() (healthy bool, idle time.Duration) {
 	if h == nil || h.stallAfter == 0 || h.waiting.Load() {
 		return true, 0
 	}
-	idle = h.now().Sub(time.Unix(0, h.last.Load()))
+	idle = h.sinceBase() - time.Duration(h.last.Load())
 	return idle < h.stallAfter, idle
 }
