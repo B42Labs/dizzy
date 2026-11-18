@@ -195,5 +195,35 @@
       "user": "user-0010",
       "project": "proj-0005"
     }
+  ],
+  "application_credentials": [
+    {
+      "name": "appcred-0001",
+      "user": "user-0002",
+      "project": "proj-0005",
+      "role": "role-0001"
+    },
+    {
+      "name": "appcred-0002",
+      "user": "user-0001",
+      "project": "proj-0003",
+      "role": "role-0002"
+    }
+  ],
+  "trusts": [
+    {
+      "name": "trust-0001",
+      "trustor": "user-0008",
+      "trustee": "user-0001",
+      "project": "proj-0002",
+      "role": "role-0001"
+    },
+    {
+      "name": "trust-0002",
+      "trustor": "user-0001",
+      "trustee": "user-0004",
+      "project": "proj-0003",
+      "role": "role-0002"
+    }
   ]
 }

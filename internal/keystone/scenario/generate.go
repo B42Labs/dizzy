@@ -43,6 +43,19 @@ import (
 //     shuffle is undone after each fan user, so every fan user draws from the
 //     plan order. Fan users live in the first domain and issue no plan token:
 //     they are appended after the token draws.
+//  8. application credentials (appcred-%04d) — only when
+//     resources.application_credentials > 0: per credential, draw one of the
+//     plan's project-scoped assignments (fan users' grants included, in plan
+//     order) uniformly; the credential belongs to its user and carries its
+//     project and role.
+//  9. trusts (trust-%04d) — only when resources.trusts > 0: per trust, draw a
+//     project-scoped assignment uniformly as in step 8, whose user is the
+//     trustor, then the trustee uniformly over the other users. A draw whose
+//     (trustor, trustee, project) an earlier trust already has is skipped, not
+//     redrawn, and the names stay contiguous.
+//
+// Steps 8 and 9 come last and draw nothing at a zero count, so a plan without
+// them is byte-identical to one generated before they existed.
 func (s Scenario) Generate() (*plan.Plan, error) {
 	if err := s.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid scenario: %w", err)
@@ -195,10 +208,76 @@ func (s Scenario) Generate() (*plan.Plan, error) {
 		}
 	}
 
+	if err := s.drawDelegations(rng, p); err != nil {
+		return nil, err
+	}
+
 	if err := p.Validate(); err != nil {
 		return nil, fmt.Errorf("generated plan failed validation: %w", err)
 	}
 	return p, nil
+}
+
+// drawDelegations draws the plan's application credentials and then its
+// trusts, steps 8 and 9 of Generate, over the plan's project-scoped
+// assignments in plan order. Each step draws nothing at a zero count, and a
+// positive count without a project-scoped assignment is an error naming its
+// key.
+func (s Scenario) drawDelegations(rng *rand.Rand, p *plan.Plan) error {
+	nCreds, nTrusts := s.Resources.ApplicationCredentials, s.Resources.Trusts
+	if nCreds == 0 && nTrusts == 0 {
+		return nil
+	}
+	var scoped []plan.Assignment
+	for _, a := range p.Assignments {
+		if a.Project != "" {
+			scoped = append(scoped, a)
+		}
+	}
+
+	if nCreds > 0 {
+		if len(scoped) == 0 {
+			return fmt.Errorf("resources.application_credentials is %d but the plan has no project-scoped assignment to create one on", nCreds)
+		}
+		p.ApplicationCredentials = make([]plan.ApplicationCredential, 0, nCreds)
+		for i := 0; i < nCreds; i++ {
+			a := scoped[rng.Intn(len(scoped))]
+			p.ApplicationCredentials = append(p.ApplicationCredentials, plan.ApplicationCredential{
+				Name: fmt.Sprintf("appcred-%04d", i+1), User: a.User, Project: a.Project, Role: a.Role,
+			})
+		}
+	}
+
+	if nTrusts > 0 {
+		if len(scoped) == 0 {
+			return fmt.Errorf("resources.trusts is %d but the plan has no project-scoped assignment to create one on", nTrusts)
+		}
+		userIndex := make(map[string]int, len(p.Users))
+		for i, u := range p.Users {
+			userIndex[u.Name] = i
+		}
+		seen := make(map[string]bool, nTrusts)
+		for i := 0; i < nTrusts; i++ {
+			a := scoped[rng.Intn(len(scoped))]
+			// Uniform over the users other than the trustor: draw among one
+			// fewer and step over the trustor's own index.
+			j := rng.Intn(len(p.Users) - 1)
+			if j >= userIndex[a.User] {
+				j++
+			}
+			trustee := p.Users[j].Name
+			key := a.User + "\x00" + trustee + "\x00" + a.Project
+			if seen[key] {
+				continue // Keystone holds one such trust per triple; skipped, not redrawn
+			}
+			seen[key] = true
+			p.Trusts = append(p.Trusts, plan.Trust{
+				Name:    fmt.Sprintf("trust-%04d", len(p.Trusts)+1),
+				Trustor: a.User, Trustee: trustee, Project: a.Project, Role: a.Role,
+			})
+		}
+	}
+	return nil
 }
 
 // randRange returns a uniformly random integer in the inclusive interval
