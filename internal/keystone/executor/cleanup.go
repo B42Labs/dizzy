@@ -39,7 +39,11 @@ var _ Cleaner = (*keystone.Client)(nil)
 // additionally discovered from each surviving user's live grants. Implied-role
 // rules have no name or tag and are deleted from the record only: a sweep
 // without a record reaches them through their roles, since Keystone deletes a
-// role's rules when it deletes the role. Keystone refuses to delete an enabled
+// role's rules when it deletes the role. Application credentials and trusts are
+// deleted with their users: Keystone deletes a user's application credentials
+// and every trust the user is trustor or trustee of when it deletes the user,
+// so their recorded entries match no kind picked here and the count leaves
+// them out. Keystone refuses to delete an enabled
 // domain, so each domain is disabled before it is deleted (a cascade removes
 // its remaining contents). An already-gone resource (a 404) counts as success,
 // so running Cleanup twice is a no-op; each mutating op is bounded by
