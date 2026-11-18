@@ -24,10 +24,12 @@ func smallScenario() Scenario {
 		Name: "small",
 		Seed: 42,
 		Resources: Resources{
-			Domains:  1,
-			Roles:    2,
-			Projects: 5,
-			Users:    10,
+			Domains:                1,
+			Roles:                  2,
+			Projects:               5,
+			Users:                  10,
+			ApplicationCredentials: 2,
+			Trusts:                 2,
 		},
 		Distribution: Distribution{
 			ProjectsPerDomain:           Range{Min: 1, Max: 3},
@@ -73,8 +75,16 @@ func TestValidate(t *testing.T) {
 		{name: "negative projects", mutate: func(s *Scenario) { s.Resources.Projects = -1 }, wantErr: true},
 		{name: "domains zero with users rejected", mutate: func(s *Scenario) { s.Resources.Domains = 0 }, wantErr: true},
 		{
-			name:   "domains zero allowed with no projects or users",
-			mutate: func(s *Scenario) { s.Resources.Domains = 0; s.Resources.Projects = 0; s.Resources.Users = 0 },
+			// Without users there is no owner for an application credential
+			// and no trustor or trustee for a trust, so both counts go too.
+			name: "domains zero allowed with no projects or users",
+			mutate: func(s *Scenario) {
+				s.Resources.Domains = 0
+				s.Resources.Projects = 0
+				s.Resources.Users = 0
+				s.Resources.ApplicationCredentials = 0
+				s.Resources.Trusts = 0
+			},
 		},
 		{name: "roles zero with assignments rejected", mutate: func(s *Scenario) { s.Resources.Roles = 0 }, wantErr: true},
 		{
@@ -192,6 +202,45 @@ func TestValidate(t *testing.T) {
 			},
 			wantMsg: "resources.users (10) × distribution.assignments_per_user.max (3) + distribution.fan_users (1) × distribution.fan_assignments.max (1000000) = 1000030 exceeds the total assignment limit of 1000000",
 		},
+		{
+			name:    "negative application credentials",
+			mutate:  func(s *Scenario) { s.Resources.ApplicationCredentials = -1 },
+			wantMsg: "resources.application_credentials must not be negative, got -1",
+		},
+		{
+			name:    "application credentials above the limit",
+			mutate:  func(s *Scenario) { s.Resources.ApplicationCredentials = maxCount + 1 },
+			wantMsg: "resources.application_credentials exceeds the limit of 1000000, got 1000001",
+		},
+		{
+			name:    "negative trusts",
+			mutate:  func(s *Scenario) { s.Resources.Trusts = -1 },
+			wantMsg: "resources.trusts must not be negative, got -1",
+		},
+		{
+			name:    "trusts above the limit",
+			mutate:  func(s *Scenario) { s.Resources.Trusts = maxCount + 1 },
+			wantMsg: "resources.trusts exceeds the limit of 1000000, got 1000001",
+		},
+		{
+			name:    "trusts with a single user",
+			mutate:  func(s *Scenario) { s.Resources.Users = 1; s.Resources.Trusts = 1 },
+			wantMsg: "resources.trusts needs at least 2 users, a trustor and a trustee, got 1",
+		},
+		{
+			name:   "a single user without trusts",
+			mutate: func(s *Scenario) { s.Resources.Users = 1; s.Resources.Trusts = 0 },
+		},
+		{
+			// A fan user counts as the second user a trust needs.
+			name: "trusts with a single user and a fan user",
+			mutate: func(s *Scenario) {
+				s.Resources.Users = 1
+				s.Resources.Trusts = 1
+				s.Distribution.FanUsers = 1
+				s.Distribution.FanAssignments = Range{Min: 1, Max: 1}
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -226,6 +275,8 @@ func TestSet(t *testing.T) {
 		{"resources.roles", "4", func(s Scenario) bool { return s.Resources.Roles == 4 }},
 		{"resources.projects", "9", func(s Scenario) bool { return s.Resources.Projects == 9 }},
 		{"resources.users", "11", func(s Scenario) bool { return s.Resources.Users == 11 }},
+		{"resources.application_credentials", "3", func(s Scenario) bool { return s.Resources.ApplicationCredentials == 3 }},
+		{"resources.trusts", "3", func(s Scenario) bool { return s.Resources.Trusts == 3 }},
 		{"distribution.projects_per_domain.min", "2", func(s Scenario) bool { return s.Distribution.ProjectsPerDomain.Min == 2 }},
 		{"distribution.projects_per_domain.max", "6", func(s Scenario) bool { return s.Distribution.ProjectsPerDomain.Max == 6 }},
 		{"distribution.assignments_per_user.min", "1", func(s Scenario) bool { return s.Distribution.AssignmentsPerUser.Min == 1 }},
@@ -373,6 +424,8 @@ func TestSetErrors(t *testing.T) {
 	}{
 		{"unknown key", "resources.nope", "1"},
 		{"non-integer projects", "resources.projects", "many"},
+		{"non-integer application credentials", "resources.application_credentials", "many"},
+		{"non-integer trusts", "resources.trusts", "many"},
 		{"non-number ratio", "distribution.domain_scoped_assignment_ratio", "half"},
 	}
 	for _, tc := range tests {
@@ -766,6 +819,50 @@ distribution:
 
 	if _, err := Parse([]byte("name: ir\nresources:\n  implied_roles:\n    - { prior: role-0001, implied: [role-0002] }\n")); err == nil {
 		t.Error("Parse of an implied-role rule with an unknown key: expected an error, got nil")
+	}
+}
+
+// TestParseDelegations confirms the application_credentials and trusts keys
+// of the resources block parse into their counts and validate, and that the
+// --set overrides of both keys replace the parsed counts.
+func TestParseDelegations(t *testing.T) {
+	yaml := `name: d
+seed: 1
+resources:
+  domains: 1
+  roles: 1
+  projects: 2
+  users: 3
+  application_credentials: 2
+  trusts: 2
+distribution:
+  projects_per_domain: { min: 1, max: 2 }
+  assignments_per_user: { min: 1, max: 1 }
+`
+	s, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := s.Resources.ApplicationCredentials; got != 2 {
+		t.Errorf("application_credentials = %d, want 2", got)
+	}
+	if got := s.Resources.Trusts; got != 2 {
+		t.Errorf("trusts = %d, want 2", got)
+	}
+	if err := s.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil", err)
+	}
+
+	for _, key := range []string{"resources.application_credentials", "resources.trusts"} {
+		if err := s.Set(key, "3"); err != nil {
+			t.Fatalf("Set(%q, \"3\") = %v", key, err)
+		}
+	}
+	if got := s.Resources.ApplicationCredentials; got != 3 {
+		t.Errorf("application_credentials after --set = %d, want 3", got)
+	}
+	if got := s.Resources.Trusts; got != 3 {
+		t.Errorf("trusts after --set = %d, want 3", got)
 	}
 }
 

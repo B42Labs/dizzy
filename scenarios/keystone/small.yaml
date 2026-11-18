@@ -6,6 +6,8 @@ resources:
   roles:    2                  # admin-only; ignored (existing roles reused) in domain-manager mode
   projects: 5
   users:    10
+  application_credentials: 2   # each created by a user on one of its project grants, then authenticated with
+  trusts:                  2   # each from a user on one of its project grants to another user, then authenticated with
 
 distribution:
   projects_per_domain:            { min: 1, max: 3 }   # round-robin deal granularity, not a hard cap
@@ -20,6 +22,7 @@ chaos:                                 # `keystone chaos --scenario scenarios/ke
   churn_ratio: 0.5                     # create bias at steady state (0..1)
   target_fill: 0.8                     # fraction of the envelope kept populated (0..1)
   token_ratio: 0.3                     # probability per tick of issuing a token as a live, assigned user
+                                       # or authenticating with a live application credential or trust
 
 pressure:                              # `keystone pressure --scenario scenarios/keystone/small.yaml` runs as-is
   duration: 5m                         # total runtime; the only hard stop besides Ctrl-C

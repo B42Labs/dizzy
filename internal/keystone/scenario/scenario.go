@@ -166,13 +166,18 @@ func (d *Duration) UnmarshalYAML(unmarshal func(interface{}) error) error {
 // implied-role rules between the created roles. Domains, roles and the rules
 // are admin-only knobs: in domain-manager mode domains are forced to the single
 // in-scope domain, roles are ignored (existing roles reused) and no rule is
-// created.
+// created. ApplicationCredentials and Trusts count the application
+// credentials and trusts the created users create on their project-scoped
+// grants, in either mode.
 type Resources struct {
 	Domains      int           `yaml:"domains"`
 	Roles        int           `yaml:"roles"`
 	Projects     int           `yaml:"projects"`
 	Users        int           `yaml:"users"`
 	ImpliedRoles []ImpliedRole `yaml:"implied_roles"`
+
+	ApplicationCredentials int `yaml:"application_credentials"`
+	Trusts                 int `yaml:"trusts"`
 }
 
 // ImpliedRole declares that a grant of the role Prior also gives its holder
@@ -248,6 +253,8 @@ func (s Scenario) Validate() error {
 		{"resources.roles", s.Resources.Roles},
 		{"resources.projects", s.Resources.Projects},
 		{"resources.users", s.Resources.Users},
+		{"resources.application_credentials", s.Resources.ApplicationCredentials},
+		{"resources.trusts", s.Resources.Trusts},
 		{"distribution.fan_users", s.Distribution.FanUsers},
 	} {
 		if c.n < 0 {
@@ -307,6 +314,11 @@ func (s Scenario) Validate() error {
 	if fanUsers && s.Distribution.FanAssignments.Max > s.Resources.Projects {
 		return fmt.Errorf("distribution.fan_assignments.max (%d) exceeds resources.projects (%d); a fan user holds one grant per distinct project",
 			s.Distribution.FanAssignments.Max, s.Resources.Projects)
+	}
+	// A trust delegates from one user to another, so it needs two users, fan
+	// users counted.
+	if users := s.Resources.Users + s.Distribution.FanUsers; s.Resources.Trusts > 0 && users < 2 {
+		return fmt.Errorf("resources.trusts needs at least 2 users, a trustor and a trustee, got %d", users)
 	}
 
 	// The assignment slice grows to users × assignments_per_user.max plus
@@ -564,6 +576,10 @@ func (s *Scenario) Set(key, value string) error {
 		return setInt(&s.Resources.Projects, key, value)
 	case "resources.users":
 		return setInt(&s.Resources.Users, key, value)
+	case "resources.application_credentials":
+		return setInt(&s.Resources.ApplicationCredentials, key, value)
+	case "resources.trusts":
+		return setInt(&s.Resources.Trusts, key, value)
 	case "distribution.projects_per_domain.min":
 		return setInt(&s.Distribution.ProjectsPerDomain.Min, key, value)
 	case "distribution.projects_per_domain.max":

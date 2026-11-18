@@ -187,10 +187,15 @@ func TestGenerateRatioZeroNoDomainScoped(t *testing.T) {
 // TestGenerateProjectlessDomainFallsBackToDomainScoped confirms that when a
 // user's domain has no projects, its grants fall back to domain-scoped rather
 // than referencing a foreign project. With one domain and zero projects, every
-// grant must be domain-scoped.
+// grant must be domain-scoped. Such a plan has no grant to create an
+// application credential or a trust on, so both counts are zero here;
+// TestGenerateDelegationsWithoutProjectScopedAssignment covers the error a
+// positive count meets.
 func TestGenerateProjectlessDomainFallsBackToDomainScoped(t *testing.T) {
 	s := smallScenario()
 	s.Resources.Projects = 0
+	s.Resources.ApplicationCredentials = 0
+	s.Resources.Trusts = 0
 	s.Distribution.DomainScopedAssignmentRatio = 0 // force the project-scoped path
 
 	p, err := s.Generate()
@@ -404,5 +409,218 @@ func TestGenerateImpliedRolesDrawNothing(t *testing.T) {
 	}
 	if !bytes.Equal(marshal(t, p), want) {
 		t.Error("an implied-role rule changed the rest of the generated plan")
+	}
+}
+
+// TestGenerateDelegations pins steps 8 and 9 of the generator on the small
+// fixture: its two application credentials and two trusts are exactly the
+// entries the draw order yields at seed 42, named contiguously from 0001.
+func TestGenerateDelegations(t *testing.T) {
+	p, err := smallScenario().Generate()
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	wantCreds := []plan.ApplicationCredential{
+		{Name: "appcred-0001", User: "user-0002", Project: "proj-0005", Role: "role-0001"},
+		{Name: "appcred-0002", User: "user-0001", Project: "proj-0003", Role: "role-0002"},
+	}
+	if !reflect.DeepEqual(p.ApplicationCredentials, wantCreds) {
+		t.Errorf("ApplicationCredentials = %+v, want %+v", p.ApplicationCredentials, wantCreds)
+	}
+	wantTrusts := []plan.Trust{
+		{Name: "trust-0001", Trustor: "user-0008", Trustee: "user-0001", Project: "proj-0002", Role: "role-0001"},
+		{Name: "trust-0002", Trustor: "user-0001", Trustee: "user-0004", Project: "proj-0003", Role: "role-0002"},
+	}
+	if !reflect.DeepEqual(p.Trusts, wantTrusts) {
+		t.Errorf("Trusts = %+v, want %+v", p.Trusts, wantTrusts)
+	}
+}
+
+// TestGenerateDelegationsZeroLeavesPlanUnchanged confirms steps 8 and 9 draw
+// nothing at a zero count and come after every other step: the small fixture
+// with both counts at 0 marshals without the application_credentials and
+// trusts keys, byte for byte as the fixture's own plan with both slices set
+// aside.
+func TestGenerateDelegationsZeroLeavesPlanUnchanged(t *testing.T) {
+	s := smallScenario()
+	s.Resources.ApplicationCredentials = 0
+	s.Resources.Trusts = 0
+	p, err := s.Generate()
+	if err != nil {
+		t.Fatalf("Generate() with both counts 0: %v", err)
+	}
+	got := marshal(t, p)
+	for _, key := range []string{`"application_credentials"`, `"trusts"`} {
+		if bytes.Contains(got, []byte(key)) {
+			t.Errorf("the plan JSON of a scenario with both counts 0 has the key %s", key)
+		}
+	}
+
+	fixture, err := smallScenario().Generate()
+	if err != nil {
+		t.Fatalf("Generate() of the fixture: %v", err)
+	}
+	if len(fixture.ApplicationCredentials) == 0 || len(fixture.Trusts) == 0 {
+		t.Fatalf("the fixture plan has %d application credentials and %d trusts, want both drawn",
+			len(fixture.ApplicationCredentials), len(fixture.Trusts))
+	}
+	fixture.ApplicationCredentials = nil
+	fixture.Trusts = nil
+	if want := marshal(t, fixture); !bytes.Equal(got, want) {
+		t.Errorf("the plan with both counts 0 differs from the fixture's plan without them:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestGenerateDelegationsWithoutProjectScopedAssignment confirms a positive
+// count of either kind fails Generate with the message naming its key when
+// every grant of the plan is domain-scoped, so there is no project-scoped
+// assignment to create one on.
+func TestGenerateDelegationsWithoutProjectScopedAssignment(t *testing.T) {
+	tests := []struct {
+		name    string
+		creds   int
+		trusts  int
+		wantMsg string
+	}{
+		{
+			name:    "application credentials",
+			creds:   2,
+			wantMsg: "resources.application_credentials is 2 but the plan has no project-scoped assignment to create one on",
+		},
+		{
+			name:    "trusts",
+			trusts:  2,
+			wantMsg: "resources.trusts is 2 but the plan has no project-scoped assignment to create one on",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := smallScenario()
+			s.Distribution.DomainScopedAssignmentRatio = 1
+			s.Resources.ApplicationCredentials = tc.creds
+			s.Resources.Trusts = tc.trusts
+			p, err := s.Generate()
+			if err == nil || err.Error() != tc.wantMsg {
+				t.Fatalf("Generate() = %v, want %q", err, tc.wantMsg)
+			}
+			if p != nil {
+				t.Errorf("Generate() returned a plan alongside the error: %+v", p)
+			}
+		})
+	}
+}
+
+// TestGenerateTrustsSkipDuplicates confirms step 9 skips a draw whose
+// (trustor, trustee, project) an earlier trust already has rather than
+// redrawing it: two users holding one grant each on the one project allow two
+// distinct trusts, so ten draws yield at most two, named contiguously in
+// order, each delegating to the other user.
+func TestGenerateTrustsSkipDuplicates(t *testing.T) {
+	s := smallScenario()
+	s.Resources.Domains = 1
+	s.Resources.Roles = 1
+	s.Resources.Projects = 1
+	s.Resources.Users = 2
+	s.Resources.ApplicationCredentials = 0
+	s.Resources.Trusts = 10
+	s.Distribution.AssignmentsPerUser = Range{Min: 1, Max: 1}
+	s.Distribution.DomainScopedAssignmentRatio = 0
+
+	p, err := s.Generate()
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	if len(p.Trusts) > 2 {
+		t.Fatalf("trusts = %d, want at most 2 distinct (trustor, trustee, project): %+v", len(p.Trusts), p.Trusts)
+	}
+	var names []string
+	seen := make(map[string]bool, len(p.Trusts))
+	for _, tr := range p.Trusts {
+		names = append(names, tr.Name)
+		key := tr.Trustor + "\x00" + tr.Trustee + "\x00" + tr.Project
+		if seen[key] {
+			t.Errorf("trust %q repeats (trustor %q, trustee %q, project %q)", tr.Name, tr.Trustor, tr.Trustee, tr.Project)
+		}
+		seen[key] = true
+		if tr.Trustor == tr.Trustee {
+			t.Errorf("trust %q names %q as trustor and trustee", tr.Name, tr.Trustor)
+		}
+		if tr.Project != "proj-0001" || tr.Role != "role-0001" {
+			t.Errorf("trust %q is on project %q with role %q, want proj-0001 and role-0001", tr.Name, tr.Project, tr.Role)
+		}
+	}
+	if want := []string{"trust-0001", "trust-0002"}; !reflect.DeepEqual(names, want) {
+		t.Errorf("trust names = %v, want %v", names, want)
+	}
+	if len(p.ApplicationCredentials) != 0 {
+		t.Errorf("application credentials = %d, want 0", len(p.ApplicationCredentials))
+	}
+}
+
+// TestGenerateTrustNamesContiguousAfterSkip confirms a trust kept after a
+// skipped draw takes the next name rather than its draw's: at seed 1 the
+// second draw repeats the first (two draws yield one trust) and the third is
+// kept, as trust-0002, not trust-0003.
+func TestGenerateTrustNamesContiguousAfterSkip(t *testing.T) {
+	gen := func(trusts int) []plan.Trust {
+		t.Helper()
+		s := smallScenario()
+		s.Seed = 1
+		s.Resources.Domains, s.Resources.Roles, s.Resources.Projects, s.Resources.Users = 1, 1, 1, 2
+		s.Resources.ApplicationCredentials = 0
+		s.Resources.Trusts = trusts
+		s.Distribution.AssignmentsPerUser = Range{Min: 1, Max: 1}
+		s.Distribution.DomainScopedAssignmentRatio = 0
+		p, err := s.Generate()
+		if err != nil {
+			t.Fatalf("Generate(trusts=%d): %v", trusts, err)
+		}
+		return p.Trusts
+	}
+	if got := gen(2); len(got) != 1 {
+		t.Fatalf("two draws yield %d trusts (%+v), want 1: the fixture needs the second draw to repeat the first", len(got), got)
+	}
+	got := gen(3)
+	var names []string
+	for _, tr := range got {
+		names = append(names, tr.Name)
+	}
+	if want := []string{"trust-0001", "trust-0002"}; !reflect.DeepEqual(names, want) {
+		t.Errorf("trust names = %v, want %v", names, want)
+	}
+	if len(got) == 2 && got[0].Trustor == got[1].Trustor {
+		t.Errorf("trusts %+v share a trustor, want the third draw to delegate the other way", got)
+	}
+}
+
+// TestGenerateDelegationsDrawFanGrants confirms steps 8 and 9 draw from the fan
+// users' grants too, and that two fan users are the two users a trust needs:
+// with no regular user, every application credential belongs to a fan user and
+// every trust delegates from one fan user to the other.
+func TestGenerateDelegationsDrawFanGrants(t *testing.T) {
+	s := smallScenario()
+	s.Resources.Users = 0
+	s.Distribution.FanUsers = 2
+	s.Distribution.FanAssignments = Range{Min: 1, Max: 1}
+
+	p, err := s.Generate()
+	if err != nil {
+		t.Fatalf("Generate(): %v", err)
+	}
+	if len(p.ApplicationCredentials) != 2 {
+		t.Errorf("application credentials = %d, want 2", len(p.ApplicationCredentials))
+	}
+	for _, ac := range p.ApplicationCredentials {
+		if !strings.HasPrefix(ac.User, "fan-") {
+			t.Errorf("application credential %q belongs to %q, want a fan user", ac.Name, ac.User)
+		}
+	}
+	if len(p.Trusts) == 0 {
+		t.Fatal("no trust drawn from the fan users' grants")
+	}
+	for _, tr := range p.Trusts {
+		if !strings.HasPrefix(tr.Trustor, "fan-") || !strings.HasPrefix(tr.Trustee, "fan-") || tr.Trustor == tr.Trustee {
+			t.Errorf("trust %q delegates from %q to %q, want one fan user to the other", tr.Name, tr.Trustor, tr.Trustee)
+		}
 	}
 }

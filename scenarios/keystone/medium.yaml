@@ -6,6 +6,8 @@ resources:
   roles:    3                  # admin-only; ignored in domain-manager mode
   projects: 20
   users:    50
+  application_credentials: 10  # each created by a user on one of its project grants, then authenticated with
+  trusts:                  10  # each from a user on one of its project grants to another user, then authenticated with
 
 distribution:
   projects_per_domain:            { min: 1, max: 5 }
@@ -19,7 +21,7 @@ chaos:
   parallel: { max: 4 }
   churn_ratio: 0.5
   target_fill: 0.8
-  token_ratio: 0.3
+  token_ratio: 0.3                     # issue a token, or authenticate with an application credential or trust
 
 pressure:
   duration: 30m

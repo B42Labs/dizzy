@@ -137,6 +137,44 @@ func TestProfilesHaveNoFanUsers(t *testing.T) {
 	}
 }
 
+// TestProfilesGenerateDelegations asserts every shipped Keystone profile asks
+// for application credentials and trusts at the counts of its row in the
+// scenario schema's profile table, and that its plan yields every one of them,
+// no trust lost to a skipped duplicate.
+func TestProfilesGenerateDelegations(t *testing.T) {
+	want := map[string]struct{ creds, trusts int }{
+		"small":  {creds: 2, trusts: 2},
+		"medium": {creds: 10, trusts: 10},
+		"large":  {creds: 30, trusts: 30},
+	}
+	for _, name := range profileNames {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			w, ok := want[name]
+			if !ok {
+				t.Fatalf("profile keystone/%s.yaml has no expected delegation counts in this test", name)
+			}
+			s := readProfile(t, name)
+			if got := s.Resources.ApplicationCredentials; got != w.creds {
+				t.Errorf("profile keystone/%s.yaml resources.application_credentials = %d, want %d", name, got, w.creds)
+			}
+			if got := s.Resources.Trusts; got != w.trusts {
+				t.Errorf("profile keystone/%s.yaml resources.trusts = %d, want %d", name, got, w.trusts)
+			}
+			p, err := s.Generate()
+			if err != nil {
+				t.Fatalf("Generate() = %v, want nil", err)
+			}
+			if got := len(p.ApplicationCredentials); got != w.creds {
+				t.Errorf("profile keystone/%s.yaml plan has %d application credentials, want %d", name, got, w.creds)
+			}
+			if got := len(p.Trusts); got != w.trusts {
+				t.Errorf("profile keystone/%s.yaml plan has %d trusts, want %d", name, got, w.trusts)
+			}
+		})
+	}
+}
+
 // TestSmallProfileSingleDomain asserts the small profile keeps a single domain,
 // so it stays runnable in domain-manager mode (which requires domains <= 1).
 func TestSmallProfileSingleDomain(t *testing.T) {
