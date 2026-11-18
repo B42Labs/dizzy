@@ -1,9 +1,11 @@
 // Package executor turns a Keystone plan into real domains, roles, implied-role
-// rules, projects, users, role assignments, and issued tokens. It runs strictly
-// ordered stages — bind the roots (create domains, roles and the rules between
-// the roles in admin mode; map onto the in-scope domain and reused roles in
-// domain-manager mode), create projects and users
-// concurrently, grant role assignments, then issue tokens — with independent
+// rules, projects, users, role assignments, issued tokens, application
+// credentials and trusts. It runs strictly ordered stages — bind the roots
+// (create domains, roles and the rules between the roles in admin mode; map
+// onto the in-scope domain and reused roles in domain-manager mode), create
+// projects and users concurrently, grant role assignments, issue tokens, then
+// create and authenticate with the application credentials and then the
+// trusts, each as the created user that owns it — with independent
 // work within a stage run concurrently up to a configurable limit, transient
 // failures retried with exponential backoff, a 403 policy denial failing fast
 // (the privilege backstop), and per-operation timeouts. Keystone creates are
@@ -52,6 +54,27 @@ type Keystone interface {
 // The production *keystone.Client must satisfy the seam.
 var _ Keystone = (*keystone.Client)(nil)
 
+// Delegations is the surface Apply drives as the created users after the
+// token issues: it creates each application credential and trust as its owner
+// and authenticates with it. It sits beside Keystone rather than in it, so a
+// caller that only provisions (keystone pressure) needs none of it.
+type Delegations interface {
+	CreateApplicationCredential(ctx context.Context, ac plan.ApplicationCredential, userID, userDomainID, password, projectID, roleID, secret string) (resource.Resource, error)
+	AuthenticateApplicationCredential(ctx context.Context, ac plan.ApplicationCredential, res resource.Resource, secret string) error
+	CreateTrust(ctx context.Context, t plan.Trust, trustorID, trustorDomainID, trustorPassword, trusteeID, projectID, roleID string) (resource.Resource, error)
+	AuthenticateTrust(ctx context.Context, t plan.Trust, res resource.Resource, trusteeDomainID, trusteePassword string) error
+}
+
+// ApplyKeystone is the whole surface Apply drives: the provisioning seam and
+// the delegations.
+type ApplyKeystone interface {
+	Keystone
+	Delegations
+}
+
+// The production *keystone.Client must satisfy the apply seam.
+var _ ApplyKeystone = (*keystone.Client)(nil)
+
 // Bindings maps a plan's logical domain and role names to their cloud ids: the
 // created roots in admin mode, the in-scope domain and reused roles in
 // domain-manager mode.
@@ -62,8 +85,10 @@ type Bindings struct {
 
 // Result is the outcome of an apply: every resource that was created, in
 // dependency order (roots, which are the domains, roles and implied-role
-// rules, then projects and users, then assignments). Tokens create no resource
-// and never appear here.
+// rules, then projects and users, then assignments, then application
+// credentials, then trusts). Tokens create no resource and never appear here.
+// A credential or trust that was created but failed to authenticate is listed
+// too.
 type Result struct {
 	Created []resource.Resource
 }
@@ -246,14 +271,16 @@ func Provision(ctx context.Context, c Keystone, p *plan.Plan, tier keystone.Tier
 }
 
 // Apply binds the plan's roots, creates its projects and users concurrently,
-// grants its role assignments (Provision), and then issues its tokens, in
+// grants its role assignments (Provision), issues its tokens, then creates and
+// authenticates with its application credentials and then its trusts, in
 // strictly ordered stages. Within a stage independent work runs concurrently up
 // to concurrency, each operation retried on transient errors and bounded by
 // opTimeout. A 403 policy denial, or any non-retryable error, stops the run and
-// is returned along with the resources created so far; ctx cancellation returns
-// ctx.Err(). tier and res select admin (create roots) or domain-manager (bind
-// roots) mode.
-func Apply(ctx context.Context, c Keystone, p *plan.Plan, tier keystone.Tier, res keystone.Resolution, concurrency int, opTimeout time.Duration) (*Result, error) {
+// is returned along with the resources created so far; a failed stage skips
+// every later one; ctx cancellation returns ctx.Err(). tier and res select
+// admin (create roots) or domain-manager (bind roots) mode; the credentials and
+// trusts are created as their owners in either.
+func Apply(ctx context.Context, c ApplyKeystone, p *plan.Plan, tier keystone.Tier, res keystone.Resolution, concurrency int, opTimeout time.Duration) (*Result, error) {
 	prov, err := Provision(ctx, c, p, tier, res, concurrency, opTimeout)
 	result := &Result{Created: prov.Created}
 	if err != nil {
@@ -273,7 +300,86 @@ func Apply(ctx context.Context, c Keystone, p *plan.Plan, tier keystone.Tier, re
 		return result, err
 	}
 
+	// Stage 5: create each application credential as its owner and
+	// authenticate with it. Each secret is generated here (single-threaded),
+	// held in memory only, and never persisted.
+	creds := make([]credential, len(p.ApplicationCredentials))
+	for i, ac := range p.ApplicationCredentials {
+		secret, err := keystone.RandomPassword()
+		if err != nil {
+			return result, fmt.Errorf("generating secret for application credential %q: %w", ac.Name, err)
+		}
+		creds[i] = credential{ac: ac, secret: secret}
+	}
+	credRes, err := runStage(ctx, creds, concurrency, func(ctx context.Context, cr credential) (resource.Resource, error) {
+		return e.applicationCredential(ctx, c, cr, prov, userDomain)
+	})
+	result.Created = appendCreated(result.Created, credRes)
+	if err != nil {
+		return result, err
+	}
+
+	// Stage 6: create each trust as its trustor and authenticate with it as
+	// its trustee.
+	trustRes, err := runStage(ctx, p.Trusts, concurrency, func(ctx context.Context, t plan.Trust) (resource.Resource, error) {
+		return e.trust(ctx, c, t, prov, userDomain)
+	})
+	result.Created = appendCreated(result.Created, trustRes)
+	if err != nil {
+		return result, err
+	}
+
 	return result, nil
+}
+
+// credential is one stage-5 item: an application credential and the secret
+// it is created and authenticated with.
+type credential struct {
+	ac     plan.ApplicationCredential
+	secret string
+}
+
+// applicationCredential creates cr's credential as its owner through the
+// retry policy, then authenticates with it through the retry policy. When the
+// create succeeded and the authentication failed it returns the created
+// resource with the error, so the caller records what exists.
+func (e *applier) applicationCredential(ctx context.Context, c Delegations, cr credential, prov *Provisioned, userDomain map[string]string) (resource.Resource, error) {
+	ac := cr.ac
+	res, err := e.create(ctx, func(ctx context.Context) (resource.Resource, error) {
+		return c.CreateApplicationCredential(ctx, ac, prov.IDs[ac.User], userDomain[ac.User], prov.Passwords[ac.User],
+			prov.IDs[ac.Project], prov.Bindings.Roles[ac.Role], cr.secret)
+	})
+	if err != nil {
+		return resource.Resource{}, err
+	}
+	if err := WithRetry(ctx, e.opTimeout, func(ctx context.Context) error {
+		return c.AuthenticateApplicationCredential(ctx, ac, res, cr.secret)
+	}); err != nil {
+		return res, err
+	}
+	slog.Info("authenticated application credential", "credential", ac.Name, "user", ac.User, "project", ac.Project)
+	return res, nil
+}
+
+// trust creates t as its trustor through the retry policy, then authenticates
+// with it as its trustee through the retry policy. When the create succeeded
+// and the authentication failed it returns the created resource with the
+// error, so the caller records what exists.
+func (e *applier) trust(ctx context.Context, c Delegations, t plan.Trust, prov *Provisioned, userDomain map[string]string) (resource.Resource, error) {
+	res, err := e.create(ctx, func(ctx context.Context) (resource.Resource, error) {
+		return c.CreateTrust(ctx, t, prov.IDs[t.Trustor], userDomain[t.Trustor], prov.Passwords[t.Trustor],
+			prov.IDs[t.Trustee], prov.IDs[t.Project], prov.Bindings.Roles[t.Role])
+	})
+	if err != nil {
+		return resource.Resource{}, err
+	}
+	if err := WithRetry(ctx, e.opTimeout, func(ctx context.Context) error {
+		return c.AuthenticateTrust(ctx, t, res, userDomain[t.Trustee], prov.Passwords[t.Trustee])
+	}); err != nil {
+		return res, err
+	}
+	slog.Info("authenticated trust", "trust", t.Name, "trustor", t.Trustor, "trustee", t.Trustee, "project", t.Project)
+	return res, nil
 }
 
 // userDomains maps each user's logical name to its domain's cloud id under b,
