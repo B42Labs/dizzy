@@ -124,8 +124,10 @@ and **consumers**. Barbican has no quota for ACLs, so they are not counted.
 The secrets include one per order on top of the stored ones, since every order
 that turns ACTIVE generates a secret that counts against the same quota: the
 `small` profile's 10 secrets and 5 orders need 15 secrets. The pre-check of
-`barbican chaos` counts the consumers too. A negative limit, which is
-Barbican's default for every quota, means unlimited and never blocks.
+`barbican chaos` counts the secrets, containers and consumers only, without the
+orders or the secrets they generate, so `small` needs 10 secrets there. A
+negative limit, which is Barbican's default for every quota, means unlimited
+and never blocks.
 Like Cinder's, the check compares the plan with the limit, not with what the
 project has left.
 

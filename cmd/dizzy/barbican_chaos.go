@@ -109,9 +109,9 @@ func newBarbicanChaosCmd(opts *globalOptions) *cobra.Command {
 
 			// The envelope is the population's worst case, so quota is pre-checked
 			// against the secrets, containers, and consumers the churn can hold at
-			// once; the orders it never creates are left out. The pre-check runs before the
-			// collector exists and before any write, so an oversized plan leaves
-			// nothing in the cloud and no run record.
+			// once; the orders it never creates are left out. The pre-check runs
+			// before the collector exists and before any write, so an oversized plan
+			// leaves nothing in the cloud and no run record.
 			if err := barbican.PrecheckQuota(ctx, kv, barbicanChurnEnvelope(p)); err != nil {
 				return err
 			}
@@ -286,8 +286,8 @@ func mergeBarbicanChaosConfig(cmd *cobra.Command, opts *globalOptions, s barbica
 // barbicanChurnEnvelope returns the part of p the churn populates, for the
 // quota pre-check: a shallow copy with Orders set to nil, so the check sizes the
 // secrets, containers, and consumers the graph churns and never the orders (or
-// their generated secrets) it ignores. p itself is left untouched, since the graph
-// and the run record still read it.
+// their generated secrets) it ignores. p itself is left untouched, since the
+// graph and the run record still read it.
 func barbicanChurnEnvelope(p *barbicanplan.Plan) *barbicanplan.Plan {
 	env := *p
 	env.Orders = nil

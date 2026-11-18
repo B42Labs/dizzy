@@ -164,14 +164,15 @@ secret. Barbican has no quota for ACLs. A denied quota read (HTTP 403) skips
 the pre-check with a warning; any other read failure, including an answer
 without a `quotas` object, aborts the run before anything is created. Barbican
 limits a secret by its `max_allowed_secret_in_bytes` setting, which it checks
-against the base64 text dizzy sends. The default of 20000 holds the shipped profiles' largest payload of
-8192 bytes, 10924 characters once encoded, but a deployment still on the older
-default of 10000 refuses a payload above 7500 bytes with HTTP 413, which fails
-the store as `http_413` without a retry. The project user needs a role that
-Barbican's policy allows to create secrets, orders, and containers: `creator` or
-`admin` under the legacy policy, `member` once the secure-RBAC defaults are
-enforced. Without one, the first store fails as `http_403`. Setting an ACL and
-registering a consumer need no role beyond that one.
+against the base64 text dizzy sends. The default of 20000 holds the shipped
+profiles' largest payload of 8192 bytes, 10924 characters once encoded, but a
+deployment still on the older default of 10000 refuses a payload above 7500
+bytes with HTTP 413, which fails the store as `http_413` without a retry. The
+project user needs a role that Barbican's policy allows to create secrets,
+orders, and containers: `creator` or `admin` under the legacy policy, `member`
+once the secure-RBAC defaults are enforced. Without one, the first store fails
+as `http_403`. Setting an ACL and registering a consumer need no role beyond
+that one.
 
 `octavia apply` takes no service-specific flags: dizzy creates every object
 itself, and the scenario names the provider (`provider`, empty for the cloud's
