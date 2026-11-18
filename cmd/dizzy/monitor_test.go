@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/B42Labs/dizzy/internal/neutron"
+	"github.com/B42Labs/dizzy/internal/serve"
 )
 
 // fakeClock is a virtual clock for the loop tests: Sleep advances time instantly
@@ -206,6 +207,91 @@ func TestMonitorLoopContinuousStopsOnCancel(t *testing.T) {
 	// clock's Sleep observes the cancelled context even with a zero delay.
 	if iterations != 3 {
 		t.Errorf("iterations = %d, want 3 (continuous loop stops promptly on cancel)", iterations)
+	}
+}
+
+// healthLimit is the stall limit of the loop's health tests.
+const healthLimit = 10 * time.Minute
+
+func TestMonitorLoopMarksHealthAfterIteration(t *testing.T) {
+	clk := &fakeClock{now: time.Unix(0, 0)}
+	health := serve.NewHealth(healthLimit, clk.Now)
+	cfg := monitorConfig{iterations: 1, health: health}
+	runOnce := func(ctx context.Context, iter int) bool {
+		clk.advance(2 * healthLimit) // a long iteration that records nothing
+		return false                 // and fails, e.g. on authentication
+	}
+
+	runMonitorLoop(context.Background(), cfg, clk, runOnce)
+
+	// A finished iteration is progress, failed or not.
+	if healthy, idle := health.Check(); !healthy || idle != 0 {
+		t.Errorf("Check() after the iteration = (%v, %s), want (true, 0s)", healthy, idle)
+	}
+}
+
+func TestMonitorLoopStalledIterationIsUnhealthy(t *testing.T) {
+	clk := &fakeClock{now: time.Unix(0, 0)}
+	health := serve.NewHealth(healthLimit, clk.Now)
+	cfg := monitorConfig{iterations: 1, health: health}
+	var healthy bool
+	runOnce := func(ctx context.Context, iter int) bool {
+		clk.advance(healthLimit) // stuck for the whole limit, recording nothing
+		healthy, _ = health.Check()
+		return true
+	}
+
+	runMonitorLoop(context.Background(), cfg, clk, runOnce)
+
+	if healthy {
+		t.Error("Check() inside an iteration stuck for the whole limit is healthy, want unhealthy")
+	}
+}
+
+// checkingClock is a fakeClock that checks the health tracker at the end of
+// every sleep, the moment the planned wait is longest.
+type checkingClock struct {
+	*fakeClock
+	health *serve.Health
+	seen   []bool
+}
+
+func (c *checkingClock) Sleep(ctx context.Context, d time.Duration) error {
+	err := c.fakeClock.Sleep(ctx, d)
+	healthy, _ := c.health.Check()
+	c.seen = append(c.seen, healthy)
+	return err
+}
+
+func TestMonitorLoopWaitIsNotAStall(t *testing.T) {
+	fc := &fakeClock{now: time.Unix(0, 0)}
+	health := serve.NewHealth(healthLimit, fc.Now)
+	clk := &checkingClock{fakeClock: fc, health: health}
+	cfg := monitorConfig{interval: 10 * healthLimit, iterations: 3, health: health}
+	var idleAtStart []time.Duration
+	runOnce := func(ctx context.Context, iter int) bool {
+		_, idle := health.Check()
+		idleAtStart = append(idleAtStart, idle)
+		fc.advance(time.Minute)
+		return true
+	}
+
+	runMonitorLoop(context.Background(), cfg, clk, runOnce)
+
+	// Two sleeps of almost ten limits each, healthy throughout.
+	if len(clk.seen) != 2 {
+		t.Fatalf("sleeps checked = %d, want 2", len(clk.seen))
+	}
+	for i, healthy := range clk.seen {
+		if !healthy {
+			t.Errorf("Check() at the end of sleep %d is unhealthy, want healthy", i+1)
+		}
+	}
+	// The end of a wait is progress, so every later iteration starts fresh.
+	for i, idle := range idleAtStart[1:] {
+		if idle != 0 {
+			t.Errorf("idle at the start of iteration %d = %s, want 0s", i+2, idle)
+		}
 	}
 }
 

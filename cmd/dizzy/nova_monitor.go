@@ -67,6 +67,7 @@ func newNovaMonitorCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("setting up telemetry: %w", err)
 			}
 			defer flushTelemetry(tel)
+			cfg.health = opts.health()
 
 			// One startup stack resolves the image/flavors and runs the pre-checks so
 			// a misconfiguration fails fast; each iteration authenticates its own

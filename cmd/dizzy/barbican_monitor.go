@@ -78,6 +78,7 @@ func newBarbicanMonitorCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("setting up telemetry: %w", err)
 			}
 			defer flushTelemetry(tel)
+			cfg.health = opts.health()
 
 			// One startup client pre-checks quota so an oversized plan or an
 			// unreadable quota fails fast; each iteration authenticates its own

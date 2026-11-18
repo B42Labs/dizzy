@@ -71,6 +71,7 @@ func newGlanceMonitorCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("setting up telemetry: %w", err)
 			}
 			defer flushTelemetry(tel)
+			cfg.health = opts.health()
 
 			// One startup client fails fast on a misconfiguration; each iteration
 			// authenticates its own client (see the runOnce closure) so a multi-day

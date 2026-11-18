@@ -19,6 +19,7 @@ import (
 	"github.com/B42Labs/dizzy/internal/plan"
 	"github.com/B42Labs/dizzy/internal/resource"
 	"github.com/B42Labs/dizzy/internal/run"
+	"github.com/B42Labs/dizzy/internal/serve"
 	"github.com/B42Labs/dizzy/internal/telemetry"
 )
 
@@ -69,6 +70,9 @@ func newMonitorCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("setting up telemetry: %w", err)
 			}
 			defer flushTelemetry(tel)
+			// The loop marks finished iterations and planned waits on the
+			// listener's health tracker; nil without --listen-address.
+			cfg.health = opts.health()
 
 			// One startup client resolves the external network and pre-checks quota
 			// so a misconfiguration fails fast; each iteration authenticates its own
@@ -118,11 +122,14 @@ func newMonitorCmd(opts *globalOptions) *cobra.Command {
 	return cmd
 }
 
-// monitorConfig holds the loop's pacing knobs, validated before any cloud call.
+// monitorConfig holds the loop's pacing knobs, validated before any cloud call,
+// and the listener's health tracker (nil without --listen-address), which the
+// loop tells about finished iterations and planned waits.
 type monitorConfig struct {
 	interval   time.Duration
 	errorWait  time.Duration
 	iterations int
+	health     *serve.Health
 }
 
 // validate rejects a negative interval and negative counts before the loop
@@ -153,6 +160,11 @@ func (c monitorConfig) validate() error {
 // iterations == 0 runs forever; a cancelled context ends the loop between or
 // during iterations. It is a pure function of the injected clock and runOnce, so
 // pacing and shutdown are tested on a fake clock without a cloud.
+//
+// Every finished iteration, failed ones included, marks progress on
+// cfg.health, and the sleep between two iterations is a planned wait that
+// never counts as a stall: an iteration that fails before its first API call
+// records no operation, yet the loop is still alive.
 func runMonitorLoop(ctx context.Context, cfg monitorConfig, clk chaos.Clock, runOnce func(ctx context.Context, iter int) bool) (iterations, failures int) {
 	for i := 1; cfg.iterations == 0 || i <= cfg.iterations; i++ {
 		if ctx.Err() != nil {
@@ -160,6 +172,7 @@ func runMonitorLoop(ctx context.Context, cfg monitorConfig, clk chaos.Clock, run
 		}
 		start := clk.Now()
 		ok := runOnce(ctx, i)
+		cfg.health.Mark()
 		iterations++
 		if !ok {
 			failures++
@@ -186,7 +199,10 @@ func runMonitorLoop(ctx context.Context, cfg monitorConfig, clk chaos.Clock, run
 				delay = minFailureBackoff
 			}
 		}
-		if err := clk.Sleep(ctx, delay); err != nil {
+		cfg.health.SetWaiting(true)
+		err := clk.Sleep(ctx, delay)
+		cfg.health.SetWaiting(false)
+		if err != nil {
 			break
 		}
 	}

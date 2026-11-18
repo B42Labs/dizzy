@@ -85,6 +85,7 @@ func newOctaviaMonitorCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("setting up telemetry: %w", err)
 			}
 			defer flushTelemetry(tel)
+			cfg.health = opts.health()
 
 			// One startup stack checks the project scope and pre-checks quota so a
 			// misconfiguration fails fast; each iteration authenticates its own
