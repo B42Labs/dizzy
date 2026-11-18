@@ -47,7 +47,8 @@ anything the new service *adds* as "this issue adds", not as already present.
 1. **CLI namespace** — a sibling of the existing `cmd/dizzy/<service>*.go`
    command files, wired into the root command and the global flags
    (`--os-cloud`, `--concurrency`, `--timeout`, `--seed`, `--otel`,
-   `--log-level`). One file per verb, following the `glance_*.go` layout.
+   `--listen-address`, `--health-stall-timeout`, `--log-level`). One file per
+   verb, following the `glance_*.go` layout.
 
 2. **Client constructor** — `internal/config/config.go` gains
    `New<Service>Client` (gophercloud v2 `openstack.New<Service>V<n>`), next to
@@ -119,7 +120,10 @@ anything the new service *adds* as "this issue adds", not as already present.
     label values flow through the existing histograms and the errors-by-kind
     counter with **no schema change**; the `service=<name>` resource attribute
     keeps the OTEL series separable and Grafana's `service` variable picks it up.
-    Note any panel that hardcodes a `kind`/`operation` regex to verify.
+    Note any panel that hardcodes a `kind`/`operation` regex to verify. A
+    command sets its telemetry up through `setupTelemetry`
+    (`cmd/dizzy/telemetry.go`), never `telemetry.Setup` directly, so `--otel`
+    and `--listen-address` both reach it.
 
 13. **Docs, Makefile, README** — `docs/reference/{cli,scenario-schema,metrics,run-record}.md`
     and the relevant `docs/explanation/*` gain the new service; the README status

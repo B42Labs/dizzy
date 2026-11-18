@@ -74,6 +74,10 @@ See [Export metrics to OpenTelemetry](export-to-otel.md). If you do want the
 per-iteration records anyway, pass `--keep-run-records` and clean up after
 yourself.
 
+A monitor can instead, or as well, serve its metrics for a Prometheus scrape
+and a liveness probe with `--listen-address`; see
+[Serve Prometheus metrics and a health check](serve-prometheus-metrics.md).
+
 ## Change what is measured
 
 The plan is expanded **once at startup** and reused by every iteration, so every

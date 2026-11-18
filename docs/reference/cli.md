@@ -36,6 +36,8 @@ Accepted by every command.
 | `--seed <int>` | — | Override the scenario's RNG seed |
 | `--log-level <level>` | `info` | `debug`, `info`, `warn`, or `error` |
 | `--otel` | off | Export metrics via OpenTelemetry OTLP |
+| `--listen-address <host:port>` | off | Serve Prometheus metrics on `/metrics` and a health check on `/healthz` |
+| `--health-stall-timeout <duration>` | `15m` | With `--listen-address`: `/healthz` turns unhealthy after this long without progress; `0` disables the check |
 | `--version` / `-v` | — | Print the version and exit |
 
 `--otel` is the *only* thing that enables export. The standard
@@ -43,6 +45,15 @@ Accepted by every command.
 switch it on, so a globally exported `OTEL_EXPORTER_OTLP_ENDPOINT` does not
 change the behavior of a command run without `--otel`. See
 [Metrics](metrics.md).
+
+Without `--listen-address` no listener opens. With it, `apply`, `chaos`,
+`pressure` and `monitor` serve `/metrics` and `/healthz` at that address, e.g.
+`--listen-address :9464`; every other verb accepts the flag and opens no
+listener. The listener and `--otel` are independent of each other.
+`--health-stall-timeout` must be greater than `--timeout`, since an operation
+is recorded when it returns. `0` disables the check, and `/healthz` then
+always answers 200. See
+[Prometheus scrape endpoint](metrics.md#prometheus-scrape-endpoint).
 
 Progress output from `apply`, `chaos`, `pressure`, and `cleanup` goes to stderr
 at `info` level, so `--log-level warn` silences it while keeping warnings and

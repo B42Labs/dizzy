@@ -16,8 +16,10 @@ then the only trace of the refusal. A 409 or 400 that dizzy does not confirm
 keeps its `http_409` or `http_400`.
 
 These measurements have two sinks. The in-memory collector is the source of
-truth for run records and `report`. With `--otel`, the same seam also feeds an
-OpenTelemetry exporter.
+truth for run records and `report`. With `--otel` or `--listen-address`, the
+same seam also feeds the OpenTelemetry instruments: `--otel` pushes them to an
+OTLP exporter, and `--listen-address` serves them on a
+[Prometheus scrape endpoint](#prometheus-scrape-endpoint).
 
 The collector keeps no individual sample. It adds each one to counters and a
 fixed-size latency histogram per resource kind, so its memory does not grow with
@@ -409,3 +411,88 @@ sum(rate(dizzy_iterations_total{outcome="success"}[1h]))
 
 For a ready-to-run local backend and provisioned Grafana dashboards, see
 [Export metrics to OpenTelemetry](../how-to/export-to-otel.md).
+
+## Prometheus scrape endpoint
+
+`--listen-address <host:port>` serves the instruments above in the Prometheus
+text exposition format on `/metrics`, for a Prometheus server to scrape. A
+second reader on the OpenTelemetry MeterProvider that `--otel` pushes from
+feeds it, so the endpoint and the OTLP export read the same instruments. The
+two are independent: a command runs with either, both, or neither.
+
+The listener starts only in the verbs that record metrics: `apply`, `chaos`
+(`mix chaos` included), `keystone pressure` and `monitor`. `generate`,
+`status`, `report`, `cleanup`, `verify` and `list-networks` accept the flag
+and open no listener, as they accept `--otel`. It starts once per process,
+before the command authenticates against the cloud, and dizzy then logs
+`serving metrics and health` with `address` and `stallTimeout`. An address
+that cannot be bound fails the command, e.g.
+`setting up telemetry: listening on :9464: listen tcp :9464: bind: address already in use`.
+The listener serves until the process exits, so the series stay scrapeable
+through the teardown after the first SIGTERM. Every path other than `/metrics`
+and `/healthz` answers 404.
+
+The families carry the names that [Prometheus naming](#prometheus-naming) gives
+the OTLP path, so the [query cookbook](#query-cookbook-promql) works unchanged
+against the endpoint.
+
+| Family | Instrument |
+|---|---|
+| `dizzy_operation_duration_seconds` (`_bucket`, `_sum`, `_count`) | `dizzy.operation.duration` |
+| `dizzy_operation_errors_total` | `dizzy.operation.errors` |
+| `dizzy_resource_time_to_ready_seconds` (`_bucket`, `_sum`, `_count`) | `dizzy.resource.time_to_ready` |
+| `dizzy_iteration_duration_seconds` (`_bucket`, `_sum`, `_count`) | `dizzy.iteration.duration` |
+| `dizzy_iteration_operations_total` | `dizzy.iteration.operations` |
+| `dizzy_iterations_total` | `dizzy.iterations` |
+| `target_info` | None; one series per resource |
+
+Every series carries its instrument's attributes as the labels `kind`,
+`operation`, `outcome`, `result` and `error_kind`, the dot of `error.kind`
+turned into an underscore. It also carries the
+[resource attributes](#resource-attributes) `cloud`, `scenario`, `service`,
+`persona` and `lane` as labels, each only when its value is set, so `persona`
+appears only on a series of a `mix` persona and `lane` only on one of a `mix`
+lane. `target_info` carries the whole resource: `service_name="dizzy"`,
+`service_version`, `cloud`, `scenario`, `service`, `persona` or `lane`, and the
+`telemetry_sdk_*` attributes. No series carries an `otel_scope_*` label, and
+the endpoint serves no Go runtime or process metrics, no `go_*` and no
+`process_*` family.
+
+One endpoint carries every persona and every lane of a `mix chaos` run, and
+the `persona` and `lane` labels tell their series apart.
+
+A series appears with its first sample. As on the OTLP path,
+`dizzy_operation_errors_total` is therefore absent on a healthy run.
+
+## Health endpoint
+
+`/healthz` on the same listener reports whether the run still makes progress.
+It is healthy while the last recorded operation, successful, failed or timed
+out alike, or the last finished iteration is younger than
+`--health-stall-timeout` (default `15m`). The clock starts when the listener
+starts. The planned wait between two `monitor` iterations never counts as a
+stall: the rest of `--interval`, the `--error-wait` pause and the 5 s backoff
+after a failure.
+
+| State | Status | Body |
+|---|---|---|
+| Healthy | `200` | `ok` |
+| Stalled | `503` | `stalled: no operation or iteration finished for <idle> (limit <limit>)` |
+
+Both bodies are `text/plain`, and both durations are rounded to the second,
+e.g. `stalled: no operation or iteration finished for 16m2s (limit 15m0s)`. A
+stalled answer also logs the warning `health check failing` with `idle` and
+`limit`.
+
+`--health-stall-timeout 0` disables the check, and `/healthz` then always
+answers 200. Before any command runs, dizzy checks the flag. A negative value
+fails with `--health-stall-timeout must not be negative, got <value>`. With
+`--listen-address` set and a non-zero stall timeout, the stall timeout must be
+greater than `--timeout`, because an operation is recorded when it returns,
+which can take the whole `--timeout`; otherwise the command fails with
+`--health-stall-timeout (<v>) must be greater than --timeout (<v>), or 0 to disable the check`.
+
+The listener speaks plain HTTP, with no TLS and no authentication; the bind
+address limits who reaches it. For choosing the stall timeout and wiring the
+endpoint into a liveness probe, see
+[Serve Prometheus metrics and a health check](../how-to/serve-prometheus-metrics.md).
