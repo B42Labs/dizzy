@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
 	"github.com/B42Labs/dizzy/internal/resource"
 	"github.com/B42Labs/dizzy/internal/run"
+	"github.com/B42Labs/dizzy/scenarios"
 )
 
 // sampleKeystoneScenarioYAML is a small but complete Keystone scenario used by
@@ -267,6 +269,80 @@ func TestKeystoneApplyDryRunSummaryNoAPICall(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("summary missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// TestKeystoneApplyDryRunSummaryDelegations confirms apply --dry-run prints
+// "  app credentials: <n>" and "  trusts:          <n>" after the token issues
+// line for a scenario that asks for both kinds: the sample scenario with both
+// counts set through --set, and each shipped profile (2 and 2 for small, 10
+// and 10 for medium, 30 and 30 for large). A scenario that asks for neither
+// prints neither line.
+func TestKeystoneApplyDryRunSummaryDelegations(t *testing.T) {
+	t.Setenv("OS_CLOUD", "")
+	t.Setenv("OS_CLIENT_CONFIG_FILE", "/nonexistent/clouds.yaml")
+
+	tests := []struct {
+		name    string
+		profile string // a shipped scenarios/keystone profile; empty for the sample scenario
+		set     []string
+		creds   int // 0 means the line must be absent
+		trusts  int
+	}{
+		{name: "sample with both set", set: []string{"resources.application_credentials=3", "resources.trusts=2"}, creds: 3, trusts: 2},
+		{name: "sample with neither"},
+		{name: "small profile", profile: "small", creds: 2, trusts: 2},
+		{name: "medium profile", profile: "medium", creds: 10, trusts: 10},
+		{name: "large profile", profile: "large", creds: 30, trusts: 30},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := sampleKeystoneScenarioYAML
+			if tc.profile != "" {
+				data, err := scenarios.Files.ReadFile("keystone/" + tc.profile + ".yaml")
+				if err != nil {
+					t.Fatalf("reading shipped profile %s.yaml: %v", tc.profile, err)
+				}
+				body = string(data)
+			}
+			args := []string{"keystone", "apply", "--dry-run", "--scenario", writeScenario(t, body)}
+			for _, kv := range tc.set {
+				args = append(args, "--set", kv)
+			}
+
+			out, err := execRoot(t, args...)
+			if err != nil {
+				t.Fatalf("apply --dry-run: %v", err)
+			}
+			tokens := strings.Index(out, "  token issues:")
+			if tokens < 0 {
+				t.Fatalf("summary has no token issues line:\n%s", out)
+			}
+			after := tokens
+			for _, line := range []struct {
+				label, text string
+				n           int
+			}{
+				{"app credentials", fmt.Sprintf("\n  app credentials: %d\n", tc.creds), tc.creds},
+				{"trusts", fmt.Sprintf("\n  trusts:          %d\n", tc.trusts), tc.trusts},
+			} {
+				if line.n == 0 {
+					if strings.Contains(out, line.label+":") {
+						t.Errorf("summary has a %s line for a scenario that asks for none:\n%s", line.label, out)
+					}
+					continue
+				}
+				i := strings.Index(out, line.text)
+				if i < 0 {
+					t.Errorf("summary missing %q:\n%s", strings.Trim(line.text, "\n"), out)
+					continue
+				}
+				if i < after {
+					t.Errorf("summary prints %q before the lines it follows:\n%s", strings.Trim(line.text, "\n"), out)
+				}
+				after = i
+			}
+		})
 	}
 }
 

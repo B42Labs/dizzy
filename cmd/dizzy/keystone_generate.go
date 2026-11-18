@@ -46,6 +46,7 @@ func newKeystoneGenerateCmd(opts *globalOptions) *cobra.Command {
 			slog.Info("generated plan", "scenario", p.Scenario, "seed", p.Seed,
 				"domains", len(p.Domains), "roles", len(p.Roles), "projects", len(p.Projects),
 				"users", len(p.Users), "assignments", len(p.Assignments), "tokens", len(p.Tokens),
+				"applicationCredentials", len(p.ApplicationCredentials), "trusts", len(p.Trusts),
 				"destination", dest)
 			return nil
 		},

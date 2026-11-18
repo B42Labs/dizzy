@@ -31,9 +31,11 @@ const defaultChaosTokenRatio = 0.3
 
 // newKeystoneChaosCmd builds "keystone chaos": a random churn/soak run that,
 // for a configured duration or until it is stopped (--duration 0), continuously
-// creates and deletes projects, users, and role assignments within the stable
-// domain/role scaffold, and occasionally issues a scoped token as a live,
-// assigned user. It authenticates, runs the privilege pre-check, provisions the
+// creates and deletes projects, users, role assignments, application
+// credentials and trusts within the stable domain/role scaffold, and
+// occasionally issues a scoped token as a live, assigned user or authenticates
+// with a live application credential or trust. It authenticates, runs the
+// privilege pre-check, provisions the
 // scaffold once, runs the churn, rewrites its run record every
 // chaosCheckpointInterval while it runs, records the run, and — whether it
 // completed or was interrupted, unless --no-cleanup — tears the resources down
@@ -51,7 +53,7 @@ func newKeystoneChaosCmd(opts *globalOptions) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "chaos",
-		Short: "Run continuous randomized project/user/assignment churn within a scenario envelope",
+		Short: "Run continuous randomized project/user/assignment/app credential/trust churn within a scenario envelope",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			s, p, err := buildKeystonePlanFromFlags(cmd, opts, scenarioPath, sets)
 			if err != nil {
@@ -173,7 +175,7 @@ func newKeystoneChaosCmd(opts *globalOptions) *cobra.Command {
 	flags.IntVar(&f.maxParallel, "max-parallel", 0, "maximum concurrent in-flight churn operations (default: --concurrency)")
 	flags.Float64Var(&f.churnRatio, "churn-ratio", defaultChaosChurnRatio, "create bias at steady state, between 0 and 1")
 	flags.Float64Var(&f.targetFill, "target-fill", defaultChaosTargetFill, "fraction of the envelope to keep populated on average, between 0 and 1")
-	flags.Float64Var(&tokenRatio, "token-ratio", defaultChaosTokenRatio, "probability per churn step of issuing a token as a live, assigned user, between 0 and 1")
+	flags.Float64Var(&tokenRatio, "token-ratio", defaultChaosTokenRatio, "probability per churn step of issuing a token as a live, assigned user or authenticating with a live application credential or trust, between 0 and 1")
 	flags.BoolVar(&noCleanup, "no-cleanup", false, "leave the identity resources in place — at the end of the run or on interrupt — instead of tearing them down by name prefix")
 	priv.register(flags)
 	// MarkFlagRequired only fails for an unknown flag; "scenario" was just added.
