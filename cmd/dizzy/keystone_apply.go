@@ -25,10 +25,13 @@ import (
 // scenario into a plan and prints a summary without making any API calls.
 // Without --dry-run it authenticates, runs the read-only privilege pre-check
 // (which replaces the quota pre-check Neutron/Cinder run), creates domains,
-// roles, implied-role rules, projects, users, assigns roles, and issues
-// tokens, then prints the collected timing metrics. On Ctrl-C / SIGTERM the run
+// roles, implied-role rules, projects, users, assigns roles, issues tokens,
+// and creates application credentials and trusts as their owners and
+// authenticates with each, then prints the collected timing metrics. On
+// Ctrl-C / SIGTERM the run
 // record is written and the partial topology is torn down (assignments, users,
-// projects, then implied-role rules, roles and domains); --keep-on-abort leaves
+// projects, then implied-role rules, roles and domains; application
+// credentials and trusts go with their users); --keep-on-abort leaves
 // it in place with the cleanup hint; a second signal aborts hard.
 func newKeystoneApplyCmd(opts *globalOptions) *cobra.Command {
 	var (
@@ -41,7 +44,7 @@ func newKeystoneApplyCmd(opts *globalOptions) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "apply",
-		Short: "Create domains, roles, projects, users, assign roles, issue tokens, and record a run",
+		Short: "Create domains, roles, projects, users, assign roles, issue tokens, create app credentials and trusts, and record a run",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, p, err := buildKeystonePlanFromFlags(cmd, opts, scenarioPath, sets)
 			if err != nil {
@@ -100,6 +103,7 @@ func newKeystoneApplyCmd(opts *globalOptions) *cobra.Command {
 			slog.Info("applying plan", "run", runID, "scenario", p.Scenario, "tier", tier,
 				"domains", len(p.Domains), "roles", len(p.Roles), "projects", len(p.Projects),
 				"users", len(p.Users), "assignments", len(p.Assignments), "tokens", len(p.Tokens),
+				"applicationCredentials", len(p.ApplicationCredentials), "trusts", len(p.Trusts),
 				"concurrency", opts.concurrency)
 
 			start := time.Now()
