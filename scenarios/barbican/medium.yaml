@@ -7,11 +7,14 @@ resources:
   secrets:    40
   orders:     15
   containers: 10
+  acls:       10                # read ACLs, each on its own stored secret
+  consumers:  10                # consumers, each registered on one container
 
 distribution:
   payload_bytes:         { min: 64, max: 8192 }
   retrieve_ratio:        0.5
   secrets_per_container: { min: 1, max: 3 }
+  users_per_acl:         { min: 1, max: 3 }       # synthetic user ids listed per ACL
 
 chaos:                                 # `barbican chaos --scenario scenarios/barbican/medium.yaml` runs as-is
   duration: 30m
@@ -19,7 +22,7 @@ chaos:                                 # `barbican chaos --scenario scenarios/ba
   parallel: { max: 4 }
   churn_ratio: 0.5
   target_fill: 0.8
-  retrieve_ratio: 0.3
+  retrieve_ratio: 0.3                  # probability per step of one read-back: a marked secret's payload, an ACL, or a consumer
 
 # Barbican's project quotas default to unlimited (-1), so this profile carries
 # no quota risk there. The payload range encodes to at most 10924 base64

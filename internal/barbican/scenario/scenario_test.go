@@ -22,11 +22,14 @@ func smallScenario() Scenario {
 			Secrets:    10,
 			Orders:     5,
 			Containers: 3,
+			ACLs:       3,
+			Consumers:  3,
 		},
 		Distribution: Distribution{
 			PayloadBytes:        Range{Min: 64, Max: 8192},
 			RetrieveRatio:       0.5,
 			SecretsPerContainer: Range{Min: 1, Max: 3},
+			UsersPerACL:         Range{Min: 1, Max: 3},
 		},
 		Chaos: &Chaos{
 			Duration:      Duration(5 * time.Minute),
@@ -50,10 +53,13 @@ resources:
   secrets: 10
   orders: 5
   containers: 3
+  acls: 3
+  consumers: 3
 distribution:
   payload_bytes: { min: 64, max: 8192 }
   retrieve_ratio: 0.5
   secrets_per_container: { min: 1, max: 3 }
+  users_per_acl: { min: 1, max: 3 }
 chaos:
   duration: 5m
   interval: { min: 200ms, max: 3s }
@@ -186,8 +192,12 @@ func TestValidate(t *testing.T) {
 		{name: "orders above limit", mutate: func(s *Scenario) { s.Resources.Orders = 1_000_001 }, wantErr: "resources.orders exceeds the limit of 1000000, got 1000001"},
 		{name: "negative containers", mutate: func(s *Scenario) { s.Resources.Containers = -1 }, wantErr: "resources.containers must not be negative, got -1"},
 		{name: "containers above limit", mutate: func(s *Scenario) { s.Resources.Containers = 1_000_001 }, wantErr: "resources.containers exceeds the limit of 1000000, got 1000001"},
+		{name: "negative acls", mutate: func(s *Scenario) { s.Resources.ACLs = -1 }, wantErr: "resources.acls must not be negative, got -1"},
+		{name: "acls above limit", mutate: func(s *Scenario) { s.Resources.ACLs = 1_000_001 }, wantErr: "resources.acls exceeds the limit of 1000000, got 1000001"},
+		{name: "negative consumers", mutate: func(s *Scenario) { s.Resources.Consumers = -1 }, wantErr: "resources.consumers must not be negative, got -1"},
+		{name: "consumers above limit", mutate: func(s *Scenario) { s.Resources.Consumers = 1_000_001 }, wantErr: "resources.consumers exceeds the limit of 1000000, got 1000001"},
 		{name: "counts at the limit", mutate: func(s *Scenario) {
-			s.Resources = Resources{Secrets: maxCount, Orders: maxCount, Containers: maxCount}
+			s.Resources = Resources{Secrets: maxCount, Orders: maxCount, Containers: maxCount, ACLs: maxCount, Consumers: maxCount}
 		}},
 
 		{
@@ -214,6 +224,16 @@ func TestValidate(t *testing.T) {
 			name:    "negative secrets per container min",
 			mutate:  func(s *Scenario) { s.Distribution.SecretsPerContainer.Min = -1 },
 			wantErr: "distribution.secrets_per_container.min must not be negative, got -1",
+		},
+		{
+			name:    "users per acl min above max",
+			mutate:  func(s *Scenario) { s.Distribution.UsersPerACL = Range{Min: 3, Max: 1} },
+			wantErr: "distribution.users_per_acl.min (3) must not exceed distribution.users_per_acl.max (1)",
+		},
+		{
+			name:    "users per acl max above limit",
+			mutate:  func(s *Scenario) { s.Distribution.UsersPerACL.Max = 1_000_001 },
+			wantErr: "distribution.users_per_acl.max (1000001) exceeds the limit of 1000000",
 		},
 
 		{name: "retrieve ratio below zero", mutate: func(s *Scenario) { s.Distribution.RetrieveRatio = -0.1 }, wantErr: "distribution.retrieve_ratio must be between 0 and 1, got -0.1"},
@@ -247,6 +267,51 @@ func TestValidate(t *testing.T) {
 			mutate: func(s *Scenario) {
 				s.Resources.Secrets = 2
 				s.Resources.Containers = 0
+				s.Resources.ACLs = 0
+				s.Resources.Consumers = 0
+			},
+		},
+
+		{
+			name: "acls above secrets",
+			mutate: func(s *Scenario) {
+				s.Resources.Secrets = 10
+				s.Resources.ACLs = 11
+			},
+			wantErr: "resources.acls (11) exceeds resources.secrets (10)",
+		},
+		{
+			name:   "acls equal to secrets",
+			mutate: func(s *Scenario) { s.Resources.ACLs = s.Resources.Secrets },
+		},
+		{
+			name: "acls without users per acl",
+			mutate: func(s *Scenario) {
+				s.Resources.ACLs = 1
+				s.Distribution.UsersPerACL = Range{}
+			},
+			wantErr: "distribution.users_per_acl.min must be at least 1 when resources.acls > 0, got 0",
+		},
+		{
+			name: "no acls without users per acl",
+			mutate: func(s *Scenario) {
+				s.Resources.ACLs = 0
+				s.Distribution.UsersPerACL = Range{}
+			},
+		},
+		{
+			name: "consumers without containers",
+			mutate: func(s *Scenario) {
+				s.Resources.Consumers = 2
+				s.Resources.Containers = 0
+			},
+			wantErr: "resources.consumers is 2 but resources.containers is 0",
+		},
+		{
+			name: "no consumers without containers",
+			mutate: func(s *Scenario) {
+				s.Resources.Consumers = 0
+				s.Resources.Containers = 0
 			},
 		},
 
@@ -276,8 +341,8 @@ func TestValidate(t *testing.T) {
 	}
 }
 
-// TestSet asserts each of the nine documented override keys parses into its
-// field.
+// TestSet asserts each of the thirteen documented override keys parses into
+// its field.
 func TestSet(t *testing.T) {
 	keys := []struct {
 		key   string
@@ -293,6 +358,10 @@ func TestSet(t *testing.T) {
 		{"distribution.retrieve_ratio", "0.25", func(s Scenario) bool { return s.Distribution.RetrieveRatio == 0.25 }},
 		{"distribution.secrets_per_container.min", "2", func(s Scenario) bool { return s.Distribution.SecretsPerContainer.Min == 2 }},
 		{"distribution.secrets_per_container.max", "5", func(s Scenario) bool { return s.Distribution.SecretsPerContainer.Max == 5 }},
+		{"resources.acls", "4", func(s Scenario) bool { return s.Resources.ACLs == 4 }},
+		{"resources.consumers", "5", func(s Scenario) bool { return s.Resources.Consumers == 5 }},
+		{"distribution.users_per_acl.min", "2", func(s Scenario) bool { return s.Distribution.UsersPerACL.Min == 2 }},
+		{"distribution.users_per_acl.max", "4", func(s Scenario) bool { return s.Distribution.UsersPerACL.Max == 4 }},
 	}
 	for _, k := range keys {
 		t.Run(k.key, func(t *testing.T) {
@@ -318,6 +387,8 @@ func TestSetErrors(t *testing.T) {
 	}{
 		{"unknown key", "resources.images", "1", `unknown override key "resources.images"`},
 		{"non-integer count", "resources.secrets", "x", `override resources.secrets: "x" is not an integer`},
+		{"non-integer acl count", "resources.acls", "x", `override resources.acls: "x" is not an integer`},
+		{"non-integer users per acl", "distribution.users_per_acl.max", "x", `override distribution.users_per_acl.max: "x" is not an integer`},
 		{"non-integer seed", "seed", "x", `override seed: "x" is not an integer`},
 		{"non-number ratio", "distribution.retrieve_ratio", "half", `override distribution.retrieve_ratio: "half" is not a number`},
 	}
