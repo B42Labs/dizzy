@@ -125,15 +125,27 @@ func TestValidateServing(t *testing.T) {
 		{
 			name:    "stall timeout equal to the operation timeout",
 			opts:    &globalOptions{listenAddress: ":0", timeout: time.Minute, healthStallTimeout: time.Minute},
-			wantErr: "must be greater than --timeout",
+			wantErr: "must be greater than twice --timeout",
+		},
+		{
+			// A wait of a whole --timeout and the call after it can leave
+			// that long without progress.
+			name:    "stall timeout above the operation timeout but not above twice it",
+			opts:    &globalOptions{listenAddress: ":0", timeout: time.Minute, healthStallTimeout: 61 * time.Second},
+			wantErr: "must be greater than twice --timeout",
+		},
+		{
+			name:    "stall timeout equal to twice the operation timeout",
+			opts:    &globalOptions{listenAddress: ":0", timeout: time.Minute, healthStallTimeout: 2 * time.Minute},
+			wantErr: "must be greater than twice --timeout",
 		},
 		{
 			name: "stall detection disabled",
 			opts: &globalOptions{listenAddress: ":0", timeout: time.Minute, healthStallTimeout: 0},
 		},
 		{
-			name: "stall timeout above the operation timeout",
-			opts: &globalOptions{listenAddress: ":0", timeout: time.Minute, healthStallTimeout: 61 * time.Second},
+			name: "stall timeout above twice the operation timeout",
+			opts: &globalOptions{listenAddress: ":0", timeout: time.Minute, healthStallTimeout: 121 * time.Second},
 		},
 		{
 			// Without a listener the stall timeout has no effect, so a short

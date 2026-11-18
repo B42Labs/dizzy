@@ -42,15 +42,17 @@ func (o *globalOptions) cloudName() string {
 
 // validateServing rejects listener settings that cannot work, before any
 // command runs. A negative stall timeout is always an error. With a listener
-// and stall detection on, the stall timeout must exceed --timeout: an
-// operation is recorded when it returns, which can take the whole --timeout,
-// so a shorter limit would fail the health check on a merely slow call.
+// and stall detection on, the stall timeout must exceed twice --timeout: a
+// readiness or deletion wait records nothing until it ends, and it can last
+// the whole --timeout, and the call after it is recorded only when it
+// returns, which can take another --timeout. A shorter limit would fail the
+// health check on a cloud that is merely slow.
 func (o *globalOptions) validateServing() error {
 	if o.healthStallTimeout < 0 {
 		return fmt.Errorf("--health-stall-timeout must not be negative, got %s", o.healthStallTimeout)
 	}
-	if o.listenAddress != "" && o.healthStallTimeout != 0 && o.healthStallTimeout <= o.timeout {
-		return fmt.Errorf("--health-stall-timeout (%s) must be greater than --timeout (%s), or 0 to disable the check",
+	if o.listenAddress != "" && o.healthStallTimeout != 0 && o.healthStallTimeout <= 2*o.timeout {
+		return fmt.Errorf("--health-stall-timeout (%s) must be greater than twice --timeout (%s), or 0 to disable the check",
 			o.healthStallTimeout, o.timeout)
 	}
 	return nil

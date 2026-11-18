@@ -50,9 +50,10 @@ Without `--listen-address` no listener opens. With it, `apply`, `chaos`,
 `pressure` and `monitor` serve `/metrics` and `/healthz` at that address, e.g.
 `--listen-address :9464`; every other verb accepts the flag and opens no
 listener. The listener and `--otel` are independent of each other.
-`--health-stall-timeout` must be greater than `--timeout`, since an operation
-is recorded when it returns. `0` disables the check, and `/healthz` then
-always answers 200. See
+`--health-stall-timeout` must be greater than twice `--timeout`, since a
+readiness wait can last a whole `--timeout` and the call after it is recorded
+only when it returns. `0` disables the check, and `/healthz` then always
+answers 200. See
 [Prometheus scrape endpoint](metrics.md#prometheus-scrape-endpoint).
 
 Progress output from `apply`, `chaos`, `pressure`, and `cleanup` goes to stderr
