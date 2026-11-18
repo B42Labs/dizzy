@@ -70,6 +70,7 @@ func newCinderMonitorCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("setting up telemetry: %w", err)
 			}
 			defer flushTelemetry(tel)
+			cfg.health = opts.health()
 
 			// One startup client resolves the volume type and pre-checks quota so a
 			// misconfiguration fails fast; each iteration authenticates its own

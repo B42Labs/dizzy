@@ -66,6 +66,7 @@ func newKeystoneMonitorCmd(opts *globalOptions) *cobra.Command {
 				return fmt.Errorf("setting up telemetry: %w", err)
 			}
 			defer flushTelemetry(tel)
+			cfg.health = opts.health()
 
 			// One startup client runs the read-only privilege pre-check and, in
 			// domain-manager mode, resolves the in-scope domain and reused roles, so
