@@ -26,8 +26,10 @@ import (
 // Without --dry-run it authenticates against the cloud, stores each secret with
 // its synthetic payload and stamps the run identity onto it, submits each key
 // order and waits for its generated secret, groups the stored secrets into
-// containers, reads back the payloads the plan selects and byte-compares them,
-// and prints the collected timing metrics. The cloud client is constructed only
+// containers, sets the plan's read ACLs on stored secrets and registers its
+// consumers on containers, reads back the payloads the plan selects and
+// byte-compares them, reads back every ACL and the consumer list of every
+// container with consumers, and prints the collected timing metrics. The cloud client is constructed only
 // on the non-dry-run path, after the early return, so --dry-run never reaches a
 // cloud. Before anything is created, the project's Barbican quotas are checked
 // against the plan: an oversized plan aborts with an itemized message and no run
@@ -46,7 +48,7 @@ func newBarbicanApplyCmd(opts *globalOptions) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "apply",
-		Short: "Store secrets, order keys, group them into containers, read payloads back, and record a run",
+		Short: "Store secrets, order keys, group them into containers, set ACLs and consumers, read all back, and record a run",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, p, err := buildBarbicanPlanFromFlags(cmd, opts, scenarioPath, sets)
 			if err != nil {
@@ -104,6 +106,7 @@ func newBarbicanApplyCmd(opts *globalOptions) *cobra.Command {
 
 			slog.Info("applying plan", "run", runID, "scenario", p.Scenario,
 				"secrets", len(p.Secrets), "orders", len(p.Orders), "containers", len(p.Containers),
+				"acls", len(p.ACLs), "consumers", len(p.Consumers),
 				"payloadBytes", p.TotalPayloadBytes(), "readBacks", p.Retrieves(), "concurrency", opts.concurrency)
 
 			start := time.Now()
@@ -183,7 +186,8 @@ func newBarbicanApplyCmd(opts *globalOptions) *cobra.Command {
 // hard abort during it, still leaves a record to reclaim from; teardown runs on
 // a context.WithoutCancel of ctx (the signal context is already cancelled) with
 // each op bounded by opTimeout, deleting containers, orders, and secrets by
-// identity via barbicanexec.Cleanup. The partial Created list is unioned with
+// identity via barbicanexec.Cleanup; the ACLs and consumers go with their
+// secrets and containers. The partial Created list is unioned with
 // the identity listing, so a stored secret whose metadata stamp never landed is
 // still reclaimed. Every return is a non-nil error naming the run id, so the
 // command exits non-zero.

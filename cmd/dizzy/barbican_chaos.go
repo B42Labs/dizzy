@@ -25,8 +25,9 @@ import (
 	"github.com/B42Labs/dizzy/internal/telemetry"
 )
 
-// defaultChaosRetrieveRatio is the built-in per-step probability of reading
-// back the payload of a live stored secret the plan marks for read-back, used
+// defaultChaosRetrieveRatio is the built-in per-step probability of one
+// read-back (the payload of a live stored secret the plan marks for read-back,
+// the ACL of a live secret, or a live consumer in its container's list), used
 // when neither the scenario chaos block nor the --retrieve-ratio flag supplies
 // one. The temporal defaults it joins live in chaos.go, shared with the other
 // chaos commands.
@@ -35,18 +36,20 @@ const defaultChaosRetrieveRatio = 0.3
 // newBarbicanChaosCmd builds "barbican chaos": a random churn/soak run that, for
 // a configured duration or until it is stopped (--duration 0), continuously
 // stores and deletes secrets (each with its synthetic payload and run identity
-// stamp) and groups and ungroups them in generic containers, and occasionally
-// reads a live secret's payload back and byte-compares it, bounded by the
-// scenario as the spatial envelope. Key orders are not churned. It
-// authenticates, pre-checks quota against the secrets and containers the churn
-// populates, runs the churn, rewrites its run record every
+// stamp), groups and ungroups them in generic containers, sets and deletes
+// read ACLs on them, and registers and deletes consumers on the containers, and
+// occasionally reads one back: a live secret's payload, byte-compared, an ACL's
+// users, or a consumer in its container's list, bounded by the scenario as the
+// spatial envelope. Key orders are not churned. It authenticates, pre-checks
+// quota against the secrets, containers, and consumers the churn populates,
+// runs the churn, rewrites its run record every
 // chaosCheckpointInterval while it runs, records the run, and — whether it
 // completed or was interrupted, unless --no-cleanup — tears the secrets and
-// containers down by identity and reports any leak. A read-back that returned
-// different bytes does not stop the churn, but once the teardown has run the
-// command exits non-zero naming the mismatch count, since a mismatch is a
-// correctness failure rather than a latency one. It mirrors "glance chaos" with
-// the key-manager-specific --retrieve-ratio.
+// containers down by identity (the ACLs and consumers go with them) and reports
+// any leak. A read-back that returned different data does not stop the churn,
+// but once the teardown has run the command exits non-zero naming the mismatch
+// count, since a mismatch is a correctness failure rather than a latency one.
+// It mirrors "glance chaos" with the key-manager-specific --retrieve-ratio.
 func newBarbicanChaosCmd(opts *globalOptions) *cobra.Command {
 	var (
 		scenarioPath  string
@@ -58,8 +61,8 @@ func newBarbicanChaosCmd(opts *globalOptions) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "chaos",
-		Short: "Run continuous randomized secret/container churn with payload read-backs within a scenario envelope",
-		Long: "Run continuous randomized secret/container churn with payload read-backs within a scenario envelope.\n\n" +
+		Short: "Run continuous randomized secret/container/ACL/consumer churn with read-backs within a scenario envelope",
+		Long: "Run continuous randomized secret/container/ACL/consumer churn with read-backs within a scenario envelope.\n\n" +
 			"Run only one dizzy process per project: a concurrent monitor's always-on pre-flight sweep reclaims " +
 			"every dizzy-named secret and container in the project, so this run's secrets and containers would be torn down mid-flight.",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -105,8 +108,8 @@ func newBarbicanChaosCmd(opts *globalOptions) *cobra.Command {
 			}
 
 			// The envelope is the population's worst case, so quota is pre-checked
-			// against the secrets and containers the churn can hold at once; the
-			// orders it never creates are left out. The pre-check runs before the
+			// against the secrets, containers, and consumers the churn can hold at
+			// once; the orders it never creates are left out. The pre-check runs before the
 			// collector exists and before any write, so an oversized plan leaves
 			// nothing in the cloud and no run record.
 			if err := barbican.PrecheckQuota(ctx, kv, barbicanChurnEnvelope(p)); err != nil {
@@ -126,6 +129,7 @@ func newBarbicanChaosCmd(opts *globalOptions) *cobra.Command {
 
 			slog.Info("starting churn run", "run", runID, "scenario", p.Scenario,
 				"secrets", len(p.Secrets), "containers", len(p.Containers),
+				"acls", len(p.ACLs), "consumers", len(p.Consumers),
 				"duration", chaosDurationLabel(cfg), "minInterval", cfg.MinInterval, "maxInterval", cfg.MaxInterval,
 				"maxParallel", cfg.MaxParallel, "retrieveRatio", cfg.ResizeRatio, "concurrency", cfg.Concurrency)
 
@@ -196,7 +200,7 @@ func newBarbicanChaosCmd(opts *globalOptions) *cobra.Command {
 	flags.IntVar(&f.maxParallel, "max-parallel", 0, "maximum concurrent in-flight churn operations (default: --concurrency)")
 	flags.Float64Var(&f.churnRatio, "churn-ratio", defaultChaosChurnRatio, "create bias at steady state, between 0 and 1")
 	flags.Float64Var(&f.targetFill, "target-fill", defaultChaosTargetFill, "fraction of the envelope to keep populated on average, between 0 and 1")
-	flags.Float64Var(&retrieveRatio, "retrieve-ratio", defaultChaosRetrieveRatio, "probability per churn step of reading back the payload of a live stored secret the plan marks for read-back and byte-comparing it, between 0 and 1")
+	flags.Float64Var(&retrieveRatio, "retrieve-ratio", defaultChaosRetrieveRatio, "probability per churn step of one read-back, between 0 and 1: the payload of a live stored secret the plan marks for read-back, byte-compared, the users of a live secret's ACL, or a live consumer in its container's consumer list; 0 disables all three")
 	flags.BoolVar(&noCleanup, "no-cleanup", false, "leave the secrets and containers in place — at the end of the run or on interrupt — instead of tearing them down by identity")
 	// MarkFlagRequired only fails for an unknown flag; "scenario" was just added.
 	_ = cmd.MarkFlagRequired("scenario")
@@ -281,8 +285,8 @@ func mergeBarbicanChaosConfig(cmd *cobra.Command, opts *globalOptions, s barbica
 
 // barbicanChurnEnvelope returns the part of p the churn populates, for the
 // quota pre-check: a shallow copy with Orders set to nil, so the check sizes the
-// secrets and containers the graph churns and never the orders (or their
-// generated secrets) it ignores. p itself is left untouched, since the graph
+// secrets, containers, and consumers the graph churns and never the orders (or
+// their generated secrets) it ignores. p itself is left untouched, since the graph
 // and the run record still read it.
 func barbicanChurnEnvelope(p *barbicanplan.Plan) *barbicanplan.Plan {
 	env := *p
@@ -290,11 +294,12 @@ func barbicanChurnEnvelope(p *barbicanplan.Plan) *barbicanplan.Plan {
 	return &env
 }
 
-// barbicanMismatchError returns the error a churn run that read back different
-// bytes than it stored exits with, or nil when no read-back mismatched. It sums
-// the mismatch entries of the run's metrics error breakdown, which the client
-// labels barbican.ErrKindMismatch, so the count is the number of read-backs that
-// failed the byte comparison.
+// barbicanMismatchError returns the error a churn run that read back data
+// differing from what it wrote exits with, or nil when no read-back mismatched.
+// It sums the mismatch entries of the run's metrics error breakdown, which the
+// client labels barbican.ErrKindMismatch for a payload, an ACL, and a consumer
+// read-back alike, so the count is the number of read-backs of all three kinds
+// that failed their comparison.
 func barbicanMismatchError(runID string, agg metrics.Aggregate) error {
 	var n int
 	for _, e := range agg.Errors {
@@ -305,7 +310,7 @@ func barbicanMismatchError(runID string, agg metrics.Aggregate) error {
 	if n == 0 {
 		return nil
 	}
-	return fmt.Errorf("payload read-back mismatch (run %s): %d read-back(s) returned different bytes", runID, n)
+	return fmt.Errorf("read-back mismatch (run %s): %d read-back(s) returned data that differs from what was written", runID, n)
 }
 
 // finishBarbicanChurn applies the teardown policy. Unless --no-cleanup is set,
