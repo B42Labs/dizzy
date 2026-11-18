@@ -362,7 +362,7 @@ func TestContainerCreateResolvesSecretIDs(t *testing.T) {
 func TestDeleteFoldsNotFound(t *testing.T) {
 	for _, key := range []string{"sec-0001", "ctr-0001", "acl-0001", "con-0001"} {
 		t.Run(key, func(t *testing.T) {
-			res := resource.Resource{Logical: key, ID: "id-" + key}
+			res := resource.Resource{Kind: nodeByKey(t, mustBuildRecording(t, &recordingBarbican{}), key).Kind, Logical: key, ID: "id-" + key}
 
 			gone := &recordingBarbican{deleteErr: respErr(404)}
 			if err := nodeByKey(t, mustBuildRecording(t, gone), key).Delete(context.Background(), nil, res); err != nil {
