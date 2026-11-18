@@ -488,9 +488,11 @@ stalled answer also logs the warning `health check failing` with `idle` and
 answers 200. Before any command runs, dizzy checks the flag. A negative value
 fails with `--health-stall-timeout must not be negative, got <value>`. With
 `--listen-address` set and a non-zero stall timeout, the stall timeout must be
-greater than `--timeout`, because an operation is recorded when it returns,
-which can take the whole `--timeout`; otherwise the command fails with
-`--health-stall-timeout (<v>) must be greater than --timeout (<v>), or 0 to disable the check`.
+greater than twice `--timeout`; otherwise the command fails with
+`--health-stall-timeout (<v>) must be greater than twice --timeout (<v>), or 0 to disable the check`.
+A readiness or deletion wait records nothing until it ends and can last the
+whole `--timeout`, and the call after it is recorded only when it returns,
+which can take another `--timeout`.
 
 The listener speaks plain HTTP, with no TLS and no authentication; the bind
 address limits who reaches it. For choosing the stall timeout and wiring the

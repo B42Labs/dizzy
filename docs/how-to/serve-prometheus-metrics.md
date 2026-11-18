@@ -104,13 +104,15 @@ so Prometheus still scrapes the series while the iteration tears down.
 last recorded operation, successful, failed or timed out alike, or the last
 finished iteration is younger than that.
 
-Keep it greater than `--timeout`. An operation is recorded when it returns,
-which can take the whole `--timeout`, so dizzy refuses a value that is not
-greater than `--timeout` before the command runs:
+Keep it greater than twice `--timeout`. A wait for a resource to become ready
+or to go away records nothing until it ends and can last the whole
+`--timeout`, and the call after it is recorded only when it returns, which can
+take another `--timeout`. dizzy refuses a value that is not greater than twice
+`--timeout` before the command runs:
 
 ```console
-$ dizzy neutron monitor --scenario scenarios/neutron/small.yaml --listen-address :9464 --health-stall-timeout 30s
-error: --health-stall-timeout (30s) must be greater than --timeout (1m0s), or 0 to disable the check
+$ dizzy neutron monitor --scenario scenarios/neutron/small.yaml --listen-address :9464 --health-stall-timeout 2m
+error: --health-stall-timeout (2m0s) must be greater than twice --timeout (1m0s), or 0 to disable the check
 ```
 
 For `chaos`, keep it greater than `--max-interval` too, the longest random gap
