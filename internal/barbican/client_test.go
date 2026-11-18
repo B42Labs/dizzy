@@ -3,6 +3,7 @@ package barbican
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -172,6 +173,8 @@ func TestErrKind(t *testing.T) {
 	}{
 		{"nil", nil, ""},
 		{"payload mismatch", fmt.Errorf("%w: secret %q differs", ErrPayloadMismatch, "sec-0001"), "mismatch"},
+		{"acl mismatch", fmt.Errorf("%w: acl %q differs", ErrACLMismatch, "acl-0001"), "mismatch"},
+		{"consumer mismatch", fmt.Errorf("%w: container c1 lacks consumer %q", ErrConsumerMismatch, "con"), "mismatch"},
 		{"order failed", fmt.Errorf("%w: order o1: boom (status 500)", ErrOrderFailed), "order_error"},
 		{"quota 403", respErr(403, "Creation not allowed because a quota has been reached"), "quota"},
 		{"wrapped quota 403", wrapCreate(KindSecret, "sec-0001", respErr(403, "quota reached")), "quota"},
@@ -239,6 +242,8 @@ func TestIsRetryable(t *testing.T) {
 		{"quota 403", respErr(403, "Creation not allowed because a quota has been reached"), false},
 		{"policy 403", respErr(403, "Forbidden: policy does not allow this"), false},
 		{"payload mismatch", fmt.Errorf("%w: secret %q differs", ErrPayloadMismatch, "sec-0001"), false},
+		{"acl mismatch", fmt.Errorf("%w: acl %q differs", ErrACLMismatch, "acl-0001"), false},
+		{"consumer mismatch", fmt.Errorf("%w: container c1 lacks consumer %q", ErrConsumerMismatch, "con"), false},
 		{"order failed", fmt.Errorf("%w: order o1: boom (status 500)", ErrOrderFailed), false},
 		{"500", respErr(500, "boom"), true},
 		{"502", respErr(502, "bad gateway"), true},
@@ -253,6 +258,30 @@ func TestIsRetryable(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := IsRetryable(tc.err); got != tc.want {
 				t.Errorf("IsRetryable(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIsMismatch confirms IsMismatch reports each of the three read-back
+// mismatches, wrapped or not, and nothing else.
+func TestIsMismatch(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"payload", fmt.Errorf("%w: x", ErrPayloadMismatch), true},
+		{"acl", fmt.Errorf("%w: x", ErrACLMismatch), true},
+		{"consumer", fmt.Errorf("%w: x", ErrConsumerMismatch), true},
+		{"wrapped acl", fmt.Errorf("verifying: %w", fmt.Errorf("%w: x", ErrACLMismatch)), true},
+		{"order failed", fmt.Errorf("%w: x", ErrOrderFailed), false},
+		{"500", respErr(500, "boom"), false},
+		{"nil", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsMismatch(tc.err); got != tc.want {
+				t.Errorf("IsMismatch(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}
@@ -410,13 +439,27 @@ func TestTimedRecordsOneSampleAndOperation(t *testing.T) {
 }
 
 // TestDeleteRoutesByKind confirms Delete sends DELETE to the collection of each
-// kind, records the call under that kind, and refuses an unknown kind without a
-// request.
+// kind, an ACL's to its secret and a consumer's to its container's consumers
+// with its name and URL in the body, records the call under that kind, and
+// refuses an unknown kind and a malformed consumer id without a request.
 func TestDeleteRoutesByKind(t *testing.T) {
 	var got []string
+	var consumerBody map[string]string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = append(got, r.Method+" "+r.URL.Path)
-		w.WriteHeader(http.StatusNoContent)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/acl"):
+			// Barbican answers an ACL delete with 200, the only code gophercloud
+			// accepts for it.
+			w.WriteHeader(http.StatusOK)
+		case strings.HasSuffix(r.URL.Path, "/consumers"):
+			if err := json.NewDecoder(r.Body).Decode(&consumerBody); err != nil {
+				t.Errorf("decoding consumer delete body: %v", err)
+			}
+			writeJSON(w, http.StatusOK, `{"container_ref":"https://kv/v1/containers/c1"}`)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
 	}))
 	defer ts.Close()
 	c, m := testClient(ts)
@@ -425,17 +468,26 @@ func TestDeleteRoutesByKind(t *testing.T) {
 		{Kind: KindSecret, ID: "s1"},
 		{Kind: KindOrder, ID: "o1"},
 		{Kind: KindContainer, ID: "c1"},
+		{Kind: KindACL, ID: "s1"},
+		{Kind: KindConsumer, ID: "c1:dizzy-run0-con-0001"},
 	} {
 		if err := c.Delete(context.Background(), r); err != nil {
 			t.Fatalf("Delete(%s): %v", r.Kind, err)
 		}
 	}
-	want := []string{"DELETE /v1/secrets/s1", "DELETE /v1/orders/o1", "DELETE /v1/containers/c1"}
+	want := []string{
+		"DELETE /v1/secrets/s1", "DELETE /v1/orders/o1", "DELETE /v1/containers/c1",
+		"DELETE /v1/secrets/s1/acl", "DELETE /v1/containers/c1/consumers",
+	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Errorf("requests = %v, want %v", got, want)
 	}
+	wantBody := map[string]string{"name": "dizzy-run0-con-0001", "URL": "https://dizzy.invalid/consumers/dizzy-run0-con-0001"}
+	if fmt.Sprint(consumerBody) != fmt.Sprint(wantBody) {
+		t.Errorf("consumer delete body = %v, want %v", consumerBody, wantBody)
+	}
 	agg := m.Aggregate(time.Second)
-	for _, kind := range []string{"secret", "order", "container"} {
+	for _, kind := range []string{"secret", "order", "container", "acl", "consumer"} {
 		if st := statsOf(agg, kind); st.Attempted != 1 || st.Succeeded != 1 {
 			t.Errorf("%s samples = %+v, want 1 succeeded", kind, st)
 		}
@@ -446,14 +498,19 @@ func TestDeleteRoutesByKind(t *testing.T) {
 	if err == nil || err.Error() != `unknown barbican resource kind "x"` {
 		t.Errorf("Delete(kind x) = %v, want unknown barbican resource kind %q", err, "x")
 	}
+	err = c.Delete(context.Background(), resource.Resource{Kind: KindConsumer, ID: "no-colon"})
+	if want := `malformed consumer id "no-colon"`; err == nil || err.Error() != want {
+		t.Errorf("Delete(malformed consumer) = %v, want %q", err, want)
+	}
 	if len(got) != 0 {
-		t.Errorf("Delete(kind x) sent %v, want no request", got)
+		t.Errorf("refused deletes sent %v, want no request", got)
 	}
 }
 
 // TestObserve confirms Observe reads each kind's status from its own
 // collection, reports a 404 as gone rather than as an error, and surfaces any
-// other failure.
+// other failure. An ACL exists only while its read entry lists a user, and a
+// consumer only while its container lists it.
 func TestObserve(t *testing.T) {
 	for _, tc := range []struct {
 		kind resource.Kind
@@ -504,6 +561,74 @@ func TestObserve(t *testing.T) {
 		status, exists, err := c.Observe(context.Background(), resource.Resource{Kind: KindOrder, ID: "id1"})
 		if status != "" || exists || !gophercloud.ResponseCodeIs(err, 500) {
 			t.Errorf("Observe = (%q, %v, %v), want (\"\", false, a 500)", status, exists, err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name       string
+		r          resource.Resource
+		path       string
+		status     int
+		body       string
+		wantExists bool
+		wantErr    bool
+	}{
+		{"acl lists a user", resource.Resource{Kind: KindACL, ID: "s1"}, "/v1/secrets/s1/acl",
+			http.StatusOK, `{"read":{"users":["u1"],"project-access":true}}`, true, false},
+		{"acl lists none", resource.Resource{Kind: KindACL, ID: "s1"}, "/v1/secrets/s1/acl",
+			http.StatusOK, `{"read":{"project-access":true}}`, false, false},
+		{"acl 404 is gone", resource.Resource{Kind: KindACL, ID: "s1"}, "/v1/secrets/s1/acl",
+			http.StatusNotFound, `{"code":404}`, false, false},
+		{"acl 500 is an error", resource.Resource{Kind: KindACL, ID: "s1"}, "/v1/secrets/s1/acl",
+			http.StatusInternalServerError, `{"code":500}`, false, true},
+		{"consumer listed", resource.Resource{Kind: KindConsumer, ID: "c1:dizzy-run0-con-0001"}, "/v1/containers/c1/consumers",
+			http.StatusOK, consumerPage("", listedConsumer("con-0002"), listedConsumer("con-0001")), true, false},
+		{"consumer not listed", resource.Resource{Kind: KindConsumer, ID: "c1:dizzy-run0-con-0001"}, "/v1/containers/c1/consumers",
+			http.StatusOK, consumerPage("", listedConsumer("con-0002")), false, false},
+		{"consumer 404 is gone", resource.Resource{Kind: KindConsumer, ID: "c1:dizzy-run0-con-0001"}, "/v1/containers/c1/consumers",
+			http.StatusNotFound, `{"code":404}`, false, false},
+		{"consumer 500 is an error", resource.Resource{Kind: KindConsumer, ID: "c1:dizzy-run0-con-0001"}, "/v1/containers/c1/consumers",
+			http.StatusInternalServerError, `{"code":500}`, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != tc.path {
+					t.Errorf("request %s %s, want GET %s", r.Method, r.URL.Path, tc.path)
+				}
+				writeJSON(w, tc.status, tc.body)
+			}))
+			defer ts.Close()
+			c, m := testClient(ts)
+
+			status, exists, err := c.Observe(context.Background(), tc.r)
+			if tc.wantErr {
+				if status != "" || exists || !gophercloud.ResponseCodeIs(err, tc.status) {
+					t.Errorf("Observe = (%q, %v, %v), want (\"\", false, a %d)", status, exists, err, tc.status)
+				}
+				return
+			}
+			if status != "" || exists != tc.wantExists || err != nil {
+				t.Errorf("Observe = (%q, %v, %v), want (\"\", %v, nil)", status, exists, err, tc.wantExists)
+			}
+			if st := statsOf(m.Aggregate(time.Second), string(tc.r.Kind)); st.Attempted != 1 {
+				t.Errorf("%s samples = %+v, want 1", tc.r.Kind, st)
+			}
+		})
+	}
+
+	t.Run("malformed consumer id", func(t *testing.T) {
+		var requests int
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+		}))
+		defer ts.Close()
+		c, _ := testClient(ts)
+		_, _, err := c.Observe(context.Background(), resource.Resource{Kind: KindConsumer, ID: "no-colon"})
+		if want := `malformed consumer id "no-colon"`; err == nil || err.Error() != want {
+			t.Errorf("Observe(malformed consumer) error = %v, want %q", err, want)
+		}
+		if requests != 0 {
+			t.Errorf("requests = %d, want 0", requests)
 		}
 	})
 

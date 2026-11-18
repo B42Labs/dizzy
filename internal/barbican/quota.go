@@ -21,11 +21,12 @@ import (
 // quotaSet is the part of Barbican's quota answer the pre-check reads. Each
 // limit is a pointer so a key the answer leaves out (or sets to null) is told
 // apart from a limit of 0 and left unchecked. A negative limit means unlimited,
-// which is Barbican's default for every quota.
+// which is Barbican's default for every quota. Barbican has no quota for ACLs.
 type quotaSet struct {
 	Secrets    *int `json:"secrets"`
 	Orders     *int `json:"orders"`
 	Containers *int `json:"containers"`
+	Consumers  *int `json:"consumers"`
 }
 
 // needs is the count of each quota-bounded resource a plan creates. Every
@@ -35,6 +36,7 @@ type needs struct {
 	secrets    int
 	orders     int
 	containers int
+	consumers  int
 }
 
 // planNeeds counts the quota-bounded resources a plan will create.
@@ -43,18 +45,19 @@ func planNeeds(p *barbicanplan.Plan) needs {
 		secrets:    len(p.Secrets) + len(p.Orders),
 		orders:     len(p.Orders),
 		containers: len(p.Containers),
+		consumers:  len(p.Consumers),
 	}
 }
 
 // PrecheckQuota reads the project's Barbican quotas and returns an itemized
-// error if the plan would exceed the secrets, orders, or containers quota,
-// before any resource is created. GET /v1/quotas answers the token project's
-// effective quotas, so no project id is derived. gophercloud has no binding for
-// it, so it is a raw GET, and it is not recorded in the metrics. A denied read
-// (a 403) logs a warning and returns nil, leaving the executor's quota fast-fail
-// as the backstop. Any other read failure, including an answer that is not JSON
-// or carries no quotas object, is returned so the plan aborts before creating
-// anything rather than hitting the real quota wall mid-apply.
+// error if the plan would exceed the secrets, orders, containers, or consumers
+// quota, before any resource is created. GET /v1/quotas answers the token
+// project's effective quotas, so no project id is derived. gophercloud has no
+// binding for it, so it is a raw GET, and it is not recorded in the metrics. A
+// denied read (a 403) logs a warning and returns nil, leaving the executor's
+// quota fast-fail as the backstop. Any other read failure, including an answer
+// that is not JSON or carries no quotas object, is returned so the plan aborts
+// before creating anything rather than hitting the real quota wall mid-apply.
 func PrecheckQuota(ctx context.Context, kv *gophercloud.ServiceClient, p *barbicanplan.Plan) error {
 	var body struct {
 		Quotas *quotaSet `json:"quotas"`
@@ -88,6 +91,7 @@ func checkQuota(need needs, q quotaSet) error {
 	check("secrets", need.secrets, q.Secrets)
 	check("orders", need.orders, q.Orders)
 	check("containers", need.containers, q.Containers)
+	check("consumers", need.consumers, q.Consumers)
 
 	if len(over) == 0 {
 		return nil

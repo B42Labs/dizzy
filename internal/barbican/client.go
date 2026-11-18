@@ -4,8 +4,9 @@
 // payload is derived through internal/payload from the plan seed and the
 // secret's logical name, submits AES-256 key orders and polls each until
 // Barbican has generated its key, groups stored secrets into generic
-// containers, and reads stored payloads back to byte-compare them with the
-// bytes it stored. Every created resource gets a deterministic
+// containers, sets read ACLs on stored secrets, registers consumers on
+// containers, and reads stored payloads, ACLs, and consumer lists back to
+// compare them with what it wrote. Every created resource gets a deterministic
 // dizzy-<id>-<logical> name (an order carries it as meta.name, which Barbican
 // also gives the secret it generates). Barbican has no tags and no server-side
 // prefix filter, so a run's resources are discovered client side by that name
@@ -32,6 +33,7 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
+	"github.com/gophercloud/gophercloud/v2/openstack/keymanager/v1/acls"
 	"github.com/gophercloud/gophercloud/v2/openstack/keymanager/v1/containers"
 	"github.com/gophercloud/gophercloud/v2/openstack/keymanager/v1/orders"
 	"github.com/gophercloud/gophercloud/v2/openstack/keymanager/v1/secrets"
@@ -44,11 +46,15 @@ import (
 // Barbican resource kinds. They double as the metrics "type" label; KindSecret
 // is also the value written under dizzy_type, and KindOrder the time-to-ready
 // kind of the order wait. A stored secret and an order's generated secret are
-// both KindSecret.
+// both KindSecret. An ACL and a consumer are no objects of their own in
+// Barbican: an ACL is addressed through its secret and a consumer through its
+// container, and Barbican removes both with their secret or container.
 const (
 	KindSecret    resource.Kind = "secret"
 	KindOrder     resource.Kind = "order"
 	KindContainer resource.Kind = "container"
+	KindACL       resource.Kind = "acl"
+	KindConsumer  resource.Kind = "consumer"
 )
 
 // Barbican order status strings the order wait branches on. An order is ready
@@ -94,10 +100,26 @@ var ErrQuota = errors.New("barbican: quota exceeded")
 // retryable: the stored data is wrong, not the call.
 var ErrPayloadMismatch = errors.New("barbican: payload mismatch")
 
-// ErrKindMismatch is the error-kind label an ErrPayloadMismatch carries in the
-// metrics error breakdown and the churn engine's per-bucket errors. It is
-// exported so the churn classifier and the chaos command's mismatch count name
-// the one value errKind records, rather than each repeating the literal.
+// ErrACLMismatch is the sentinel an ACL read-back wraps when the users the
+// secret's read ACL lists differ from the users dizzy set. It is never
+// retryable, like ErrPayloadMismatch.
+var ErrACLMismatch = errors.New("barbican: acl mismatch")
+
+// ErrConsumerMismatch is the sentinel a consumer read-back wraps when a
+// container's consumer list lacks a consumer dizzy registered or, for an exact
+// check, lists one it did not. It is never retryable, like ErrPayloadMismatch.
+var ErrConsumerMismatch = errors.New("barbican: consumer mismatch")
+
+// IsMismatch reports whether err is a read-back that returned data differing
+// from what was written: a payload, an ACL, or a consumer list.
+func IsMismatch(err error) bool {
+	return errors.Is(err, ErrPayloadMismatch) || errors.Is(err, ErrACLMismatch) || errors.Is(err, ErrConsumerMismatch)
+}
+
+// ErrKindMismatch is the error-kind label every mismatch (IsMismatch) carries
+// in the metrics error breakdown and the churn engine's per-bucket errors. It
+// is exported so the churn classifier and the chaos command's mismatch count
+// name the one value errKind records, rather than each repeating the literal.
 const ErrKindMismatch = "mismatch"
 
 // ErrOrderFailed is the sentinel the order wait wraps when an order ended in
@@ -274,13 +296,13 @@ func httpStatus(err error) int {
 
 // errKind classifies an error into a stable, low-cardinality label for the
 // metrics error breakdown. It returns the empty string for a nil error. A
-// read-back that returned different bytes is mismatch and an order that ended
-// in ERROR is order_error, so neither reads as other.
+// read-back that returned different data is mismatch and an order that ended in
+// ERROR is order_error, so neither reads as other.
 func errKind(err error) string {
 	switch {
 	case err == nil:
 		return ""
-	case errors.Is(err, ErrPayloadMismatch):
+	case IsMismatch(err):
 		return ErrKindMismatch
 	case errors.Is(err, ErrOrderFailed):
 		return "order_error"
@@ -307,10 +329,10 @@ func errKind(err error) string {
 }
 
 // IsRetryable reports whether err is a transient failure worth retrying: a 5xx,
-// a 429 rate-limit, or a 409 conflict that is not a quota rejection. A payload
-// mismatch and a failed order are never retryable.
+// a 429 rate-limit, or a 409 conflict that is not a quota rejection. A mismatch
+// of any read-back and a failed order are never retryable.
 func IsRetryable(err error) bool {
-	if err == nil || isQuota(err) || errors.Is(err, ErrPayloadMismatch) || errors.Is(err, ErrOrderFailed) {
+	if err == nil || isQuota(err) || IsMismatch(err) || errors.Is(err, ErrOrderFailed) {
 		return false
 	}
 	for _, code := range []int{500, 502, 503, 504, 429, 409} {
@@ -348,10 +370,13 @@ func isQuota(err error) bool {
 	return strings.Contains(strings.ToLower(string(code.Body)), "quota")
 }
 
-// Delete removes a secret, order, or container by id, switching on its kind and
-// recording the call under that kind. A 404 surfaces to the caller, which treats
-// an already-gone resource as success to keep cleanup idempotent. An unknown
-// kind is refused without a request.
+// Delete removes a secret, order, container, secret ACL, or consumer by id,
+// switching on its kind and recording the call under that kind. An ACL is
+// deleted through the secret whose id it carries, and a consumer through the
+// container its <containerID>:<name> id names, with its name and URL in the
+// body. A 404 surfaces to the caller, which treats an already-gone resource as
+// success to keep cleanup idempotent. An unknown kind and a malformed consumer
+// id are refused without a request.
 func (c *Client) Delete(ctx context.Context, r resource.Resource) error {
 	var del func(context.Context) error
 	switch r.Kind {
@@ -361,55 +386,96 @@ func (c *Client) Delete(ctx context.Context, r resource.Resource) error {
 		del = func(ctx context.Context) error { return orders.Delete(ctx, c.kv, r.ID).ExtractErr() }
 	case KindContainer:
 		del = func(ctx context.Context) error { return containers.Delete(ctx, c.kv, r.ID).ExtractErr() }
+	case KindACL:
+		del = func(ctx context.Context) error { return acls.DeleteSecretACL(ctx, c.kv, r.ID).ExtractErr() }
+	case KindConsumer:
+		containerID, name, err := parseConsumerID(r.ID)
+		if err != nil {
+			return err
+		}
+		opts := containers.DeleteConsumerOpts{Name: name, URL: consumerURL(name)}
+		del = func(ctx context.Context) error { return containers.DeleteConsumer(ctx, c.kv, containerID, opts).Err }
 	default:
 		return fmt.Errorf("unknown barbican resource kind %q", r.Kind)
 	}
 	return c.timed(ctx, r.Kind, "delete", del)
 }
 
-// Observe re-queries the live state of a created secret, order, or container,
-// recording the call under its kind. It returns the resource's status (ACTIVE,
-// PENDING, or ERROR), whether it still exists, and any error other than a 404.
-// A 404 is reported as ("", false, nil) so a resource deleted out of band reads
-// as gone rather than as a failure. The status command drives this over a run's
-// resources.
+// Observe re-queries the live state of a created secret, order, container,
+// secret ACL, or consumer, recording the call under its kind. It returns the
+// resource's status (ACTIVE, PENDING, or ERROR), whether it still exists, and
+// any error other than a 404. An ACL and a consumer carry no status. An ACL is
+// read as acl/get and exists only while the secret's read ACL lists a user,
+// since a secret without an ACL still answers one without users. A consumer is
+// looked up in its container's consumer list, read as consumer/list. A 404 is
+// reported as ("", false, nil) so a resource deleted out of band, or whose
+// secret or container was, reads as gone rather than as a failure. The status
+// command drives this over a run's resources. An unknown kind and a malformed
+// consumer id are refused without a request.
 func (c *Client) Observe(ctx context.Context, r resource.Resource) (status string, exists bool, err error) {
-	var get func(context.Context) (string, error)
+	op := "get"
+	var get func(context.Context) (string, bool, error)
 	switch r.Kind {
 	case KindSecret:
-		get = func(ctx context.Context) (string, error) {
+		get = func(ctx context.Context) (string, bool, error) {
 			s, err := secrets.Get(ctx, c.kv, r.ID).Extract()
 			if err != nil {
-				return "", err
+				return "", false, err
 			}
-			return s.Status, nil
+			return s.Status, true, nil
 		}
 	case KindOrder:
-		get = func(ctx context.Context) (string, error) {
+		get = func(ctx context.Context) (string, bool, error) {
 			o, err := orders.Get(ctx, c.kv, r.ID).Extract()
 			if err != nil {
-				return "", err
+				return "", false, err
 			}
-			return o.Status, nil
+			return o.Status, true, nil
 		}
 	case KindContainer:
-		get = func(ctx context.Context) (string, error) {
+		get = func(ctx context.Context) (string, bool, error) {
 			ct, err := containers.Get(ctx, c.kv, r.ID).Extract()
 			if err != nil {
-				return "", err
+				return "", false, err
 			}
-			return ct.Status, nil
+			return ct.Status, true, nil
+		}
+	case KindACL:
+		get = func(ctx context.Context) (string, bool, error) {
+			users, err := c.aclUsers(ctx, r.ID)
+			if err != nil {
+				return "", false, err
+			}
+			return "", len(users) > 0, nil
+		}
+	case KindConsumer:
+		containerID, name, parseErr := parseConsumerID(r.ID)
+		if parseErr != nil {
+			return "", false, parseErr
+		}
+		op = "list"
+		get = func(ctx context.Context) (string, bool, error) {
+			listed, err := c.listConsumers(ctx, containerID)
+			if err != nil {
+				return "", false, err
+			}
+			for _, con := range listed {
+				if con.Name == name {
+					return "", true, nil
+				}
+			}
+			return "", false, nil
 		}
 	default:
 		return "", false, fmt.Errorf("unknown barbican resource kind %q", r.Kind)
 	}
 
-	err = c.timed(ctx, r.Kind, "get", func(ctx context.Context) error {
-		s, getErr := get(ctx)
+	err = c.timed(ctx, r.Kind, op, func(ctx context.Context) error {
+		s, ok, getErr := get(ctx)
 		if getErr != nil {
 			return getErr
 		}
-		status = s
+		status, exists = s, ok
 		return nil
 	})
 	switch {
@@ -418,6 +484,6 @@ func (c *Client) Observe(ctx context.Context, r resource.Resource) (status strin
 	case err != nil:
 		return "", false, err
 	default:
-		return status, true, nil
+		return status, exists, nil
 	}
 }

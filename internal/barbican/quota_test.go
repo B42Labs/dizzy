@@ -12,8 +12,8 @@ import (
 )
 
 // quotaPlan builds a plan with the given resource counts; only the counts
-// matter to the quota pre-check.
-func quotaPlan(secrets, orders, containers int) *barbicanplan.Plan {
+// matter to the quota pre-check. The consumers sit on the first container.
+func quotaPlan(secrets, orders, containers, consumers int) *barbicanplan.Plan {
 	p := &barbicanplan.Plan{Scenario: "quota", Seed: 42}
 	for i := range secrets {
 		p.Secrets = append(p.Secrets, barbicanplan.Secret{Name: fmt.Sprintf("sec-%04d", i+1), PayloadBytes: 64})
@@ -24,6 +24,9 @@ func quotaPlan(secrets, orders, containers int) *barbicanplan.Plan {
 	for i := range containers {
 		p.Containers = append(p.Containers, barbicanplan.Container{Name: fmt.Sprintf("ctr-%04d", i+1), Secrets: []string{}})
 	}
+	for i := range consumers {
+		p.Consumers = append(p.Consumers, barbicanplan.Consumer{Name: fmt.Sprintf("con-%04d", i+1), Container: "ctr-0001"})
+	}
 	return p
 }
 
@@ -31,14 +34,15 @@ func quotaPlan(secrets, orders, containers int) *barbicanplan.Plan {
 func limit(n int) *int { return &n }
 
 func TestPlanNeedsCountsGeneratedSecrets(t *testing.T) {
-	got := planNeeds(quotaPlan(10, 5, 3))
-	if want := (needs{secrets: 15, orders: 5, containers: 3}); got != want {
+	got := planNeeds(quotaPlan(10, 5, 3, 4))
+	if want := (needs{secrets: 15, orders: 5, containers: 3, consumers: 4}); got != want {
 		t.Errorf("planNeeds = %+v, want %+v (every order generates a secret)", got, want)
 	}
 }
 
 func TestCheckQuota(t *testing.T) {
-	small := planNeeds(quotaPlan(10, 5, 3))
+	small := planNeeds(quotaPlan(10, 5, 3, 0))
+	consumers := planNeeds(quotaPlan(10, 5, 3, 3))
 	for _, tc := range []struct {
 		name string
 		need needs
@@ -54,7 +58,11 @@ func TestCheckQuota(t *testing.T) {
 		{"absent secrets key unchecked", small, quotaSet{Orders: limit(5), Containers: limit(3)}, ""},
 		{"absent keys leave the rest checked", small, quotaSet{Orders: limit(4)},
 			"plan exceeds project quota; raise these quotas before applying: orders need 5, quota 4"},
-		{"empty plan against zero quotas", planNeeds(quotaPlan(0, 0, 0)), quotaSet{Secrets: limit(0), Orders: limit(0), Containers: limit(0)}, ""},
+		{"empty plan against zero quotas", planNeeds(quotaPlan(0, 0, 0, 0)), quotaSet{Secrets: limit(0), Orders: limit(0), Containers: limit(0), Consumers: limit(0)}, ""},
+		{"consumers over", consumers, quotaSet{Consumers: limit(2)},
+			"plan exceeds project quota; raise these quotas before applying: consumers need 3, quota 2"},
+		{"consumers unlimited", consumers, quotaSet{Consumers: limit(-1)}, ""},
+		{"absent consumers key unchecked", consumers, quotaSet{Secrets: limit(-1), Orders: limit(-1), Containers: limit(-1)}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := checkQuota(tc.need, tc.q)
@@ -85,6 +93,9 @@ func TestPrecheckQuota(t *testing.T) {
 		{"over quota", http.StatusOK,
 			`{"quotas":{"secrets":12,"orders":-1,"containers":-1}}`,
 			"plan exceeds project quota; raise these quotas before applying: secrets need 15, quota 12", false},
+		{"consumers over quota", http.StatusOK,
+			`{"quotas":{"secrets":-1,"orders":-1,"containers":-1,"consumers":2,"cas":-1}}`,
+			"plan exceeds project quota; raise these quotas before applying: consumers need 3, quota 2", false},
 		{"null limit unchecked", http.StatusOK,
 			`{"quotas":{"secrets":null,"orders":5,"containers":3}}`, "", false},
 		{"403 skips", http.StatusForbidden,
@@ -105,7 +116,7 @@ func TestPrecheckQuota(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			err := PrecheckQuota(context.Background(), testKV(ts), quotaPlan(10, 5, 3))
+			err := PrecheckQuota(context.Background(), testKV(ts), quotaPlan(10, 5, 3, 3))
 			switch {
 			case tc.wantErr == "" && err != nil:
 				t.Errorf("PrecheckQuota = %v, want nil", err)
