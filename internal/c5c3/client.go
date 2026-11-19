@@ -25,10 +25,12 @@ package c5c3
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
@@ -165,6 +167,18 @@ type Client struct {
 	// pollMax; tests shorten them.
 	pollInitial time.Duration
 	pollMax     time.Duration
+
+	// keystoneURL and keystoneTLS replace the auth_url and the TLS
+	// configuration of every delivered document a Keystone check logs in
+	// with, each when SetKeystoneEndpoint set it. Both are empty after New,
+	// which leaves the documents as delivered.
+	keystoneURL string
+	keystoneTLS *tls.Config
+
+	// passwordRejections counts the 401 answers to password logins. Once it
+	// reaches maxPasswordRejections, the client sends no further password
+	// login, so a run cannot lock its user out of Keystone.
+	passwordRejections atomic.Int64
 }
 
 // New returns a Client that creates, lists and prechecks orders in namespace
