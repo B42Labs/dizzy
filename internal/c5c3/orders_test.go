@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -17,6 +20,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/B42Labs/dizzy/internal/c5c3/plan"
+	"github.com/B42Labs/dizzy/internal/metrics"
 	"github.com/B42Labs/dizzy/internal/resource"
 )
 
@@ -183,6 +187,77 @@ func TestCreateOrderFailure(t *testing.T) {
 	}
 	if got := errorCount(m.Aggregate(time.Second), "http_403"); got != 1 {
 		t.Errorf("http_403 samples = %d, want 1", got)
+	}
+}
+
+// TestCreateOrderAlreadyExists confirms a create answered with 409
+// AlreadyExists, as the retry of a create whose answer was lost is, reads the
+// order back: one this run made for the same kind is returned as created and
+// logged as such, after a failed create sample and a successful get sample,
+// while an order of another run or another kind returns the 409, and a failed
+// read returns its own error.
+func TestCreateOrderAlreadyExists(t *testing.T) {
+	user := orderRef(KindUser, "user")
+	for _, tc := range []struct {
+		name    string
+		labels  map[string]any
+		failGet error
+		check   func(error) bool
+		adopted bool
+	}{
+		{"this run's order", map[string]any{labelRun: testRun, labelType: "keystone_user"}, nil,
+			func(err error) bool { return err == nil }, true},
+		{"another run's order", map[string]any{labelRun: "run9", labelType: "keystone_user"}, nil,
+			func(err error) bool { return apierrors.IsAlreadyExists(err) && strings.Contains(err.Error(), "run9") }, false},
+		{"another kind's labels", map[string]any{labelRun: testRun, labelType: "keystone_project"}, nil,
+			func(err error) bool { return apierrors.IsAlreadyExists(err) }, false},
+		{"no labels", nil, nil,
+			func(err error) bool { return apierrors.IsAlreadyExists(err) }, false},
+		{"read fails", map[string]any{labelRun: testRun, labelType: "keystone_user"}, internalError(),
+			func(err error) bool {
+				return apierrors.IsInternalError(err) && IsRetryable(err) && strings.Contains(err.Error(), "exists")
+			}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLog(t)
+			c, dyn, m := testClient()
+			seed(t, dyn, KindUser, labelled(KindUser, user.Name, tc.labels))
+			if tc.failGet != nil {
+				failVerb(dyn, "get", "keystoneusers", tc.failGet)
+			}
+
+			r, err := c.CreateOrder(context.Background(), testPlan().Orders[0])
+			if !tc.check(err) {
+				t.Fatalf("CreateOrder = %+v, %v", r, err)
+			}
+			if tc.adopted {
+				if r != user {
+					t.Errorf("CreateOrder = %+v, want %+v", r, user)
+				}
+				if !strings.Contains(logs.String(), "already existed") || !strings.Contains(logs.String(), "id="+user.ID) {
+					t.Errorf("log %q does not say the order already existed", logs.String())
+				}
+			} else if r != (resource.Resource{}) {
+				t.Errorf("CreateOrder = %+v, want no resource", r)
+			}
+			if got := countActions(dyn, "create", "keystoneusers"); got != 1 {
+				t.Errorf("creates = %d, want 1", got)
+			}
+			if got := countActions(dyn, "get", "keystoneusers"); got != 1 {
+				t.Errorf("gets = %d, want 1: the order is read back once", got)
+			}
+			agg := m.Aggregate(time.Second)
+			wantFailed := 1
+			if tc.failGet != nil {
+				wantFailed = 2
+			}
+			if st := statsOf(agg, KindUser); st.Attempted != 2 || st.Failed != wantFailed {
+				t.Errorf("samples = %+v, want a create and a get with %d failed", st, wantFailed)
+			}
+			if got := errorCount(agg, "http_409"); got != 1 {
+				t.Errorf("http_409 samples = %d, want 1: the create", got)
+			}
+		})
 	}
 }
 
@@ -391,7 +466,8 @@ func TestWaitReadyKeepsPollingUntilDeadline(t *testing.T) {
 		{"stale observedGeneration", withStatus(orderObject(r, 2), 1, nil, cond("Ready", "True", "AllReady"))},
 	}
 	for _, reason := range []string{"WaitingForServiceAccounts", "ServiceAccountsFailed", "NoRoleOnProject", "UserNotFound",
-		"ProjectNotFound", "ServiceAccountError", "DeliveryError", "BackupNotSynced", "ProbingForCollision"} {
+		"ProjectNotFound", "ServiceAccountError", "DeliveryError", "BackupNotSynced", "ProbingForCollision",
+		"CredentialFailed", "WaitingForAdminCredential", "WaitingForUser", "WaitingForProject", "AuthenticationFailed"} {
 		cases = append(cases, struct {
 			name string
 			obj  *unstructured.Unstructured
@@ -827,11 +903,56 @@ func TestWaitRotated(t *testing.T) {
 			t.Fatalf("WaitRotated = %v, %v, want the credential ac-new", got, err)
 		}
 	})
-	t.Run("deadline", func(t *testing.T) {
+	t.Run("status generation ahead of the delivery", func(t *testing.T) {
+		// Upstream raises status.passwordGeneration once Keystone has applied
+		// the new password and rewrites the Secret only once ESO has pushed it,
+		// reporting DeliveryReady=False/BackupNotSynced until then. The old
+		// password in the Secret is no mismatch before the order is ready.
 		c, dyn, _ := testClient()
+		seed(t, dyn, KindSecret, userSecret("pw-one", "6"))
+		rotated := map[string]any{"passwordGeneration": int64(2)}
+		delivering := withStatus(orderObject(user, 2), 2, rotated, cond("UserReady", "True", "UserProvisioned"),
+			cond("DeliveryReady", "False", "BackupNotSynced"), cond("Ready", "False", "NotAllReady"))
+		delivered := withStatus(orderObject(user, 2), 2, rotated, cond("UserReady", "True", "UserProvisioned"),
+			cond("DeliveryReady", "True", "SecretDelivered"), cond("Ready", "True", "AllReady"))
+		gets := 0
+		dyn.PrependReactor("get", "keystoneusers", func(k8stesting.Action) (bool, runtime.Object, error) {
+			if gets++; gets == 1 {
+				return true, delivering.DeepCopy(), nil
+			}
+			if gets == 2 {
+				// The operator writes the new password, then reports the order ready.
+				replace(t, dyn, KindSecret, userSecret("pw-two", "7"))
+			}
+			return true, delivered.DeepCopy(), nil
+		})
+
+		got, err := c.WaitRotated(shortWait(t, 5*time.Second), user, 2, Credential{Password: "pw-one"})
+		if err != nil {
+			t.Fatalf("WaitRotated = %v, want the new credential once the order is ready", err)
+		}
+		if got.Password != "pw-two" || got.ResourceVersion != "7" {
+			t.Errorf("WaitRotated = %v with password %q, want the new credential", got, got.Password)
+		}
+		if gets != 2 {
+			t.Errorf("order gets = %d, want 2", gets)
+		}
+		if got := countActions(dyn, "get", "secrets"); got != 1 {
+			t.Errorf("secret gets = %d, want 1: none while the order is not ready", got)
+		}
+	})
+	t.Run("deadline", func(t *testing.T) {
+		c, dyn, _, reader := telemetryTestClient(t)
 		seed(t, dyn, KindUser, readyObject(user, map[string]any{"passwordGeneration": int64(1)}))
 		if _, err := c.WaitRotated(shortWait(t, 50*time.Millisecond), user, 2, Credential{}); err != context.DeadlineExceeded {
 			t.Fatalf("WaitRotated = %v, want context.DeadlineExceeded", err)
+		}
+		if got := countOf(metricPoints(t, reader, "dizzy.operation.duration"),
+			map[string]string{"kind": "keystone_user", "operation": "rotate", "outcome": "timeout"}); got != 1 {
+			t.Errorf("rotate timeouts = %d, want 1", got)
+		}
+		if got := operationCount(t, reader, KindUser, "rotate"); got != 1 {
+			t.Errorf("rotate samples = %d, want 1", got)
 		}
 	})
 	t.Run("project", func(t *testing.T) {
@@ -843,6 +964,147 @@ func TestWaitRotated(t *testing.T) {
 			t.Errorf("requests = %d, want 0", got)
 		}
 	})
+}
+
+// TestWaitRotatedSecretRead confirms how the wait for a rotation reads the
+// Secret once the order is ready at the generation: a retryable failure and a
+// 404 are recorded as failed secret gets and polled through until a read
+// returns the new credential; a Secret still missing at the deadline while
+// the order stays ready is a mismatch, but not once the order has stopped
+// reading ready; any other failure, and a Secret that does not parse, ends the
+// wait at once.
+func TestWaitRotatedSecretRead(t *testing.T) {
+	user := orderRef(KindUser, "user")
+	ready := readyAt(user, 2, map[string]any{"passwordGeneration": int64(2)})
+	rotated := userSecret("pw-two", "7")
+	missing := notFound("secrets", userSecretName)
+	for _, tc := range []struct {
+		name    string
+		orders  []any
+		secrets []any
+		check   func(error) bool
+		// gets is the number of secret gets, failed the number of them that
+		// failed, and -1 any number.
+		gets, failed int
+		// rotate is the error kind of the rotate sample, empty for a success.
+		rotate string
+		// getMismatch is the number of secret gets recorded as a mismatch.
+		getMismatch int64
+	}{
+		{"500 polled through", []any{ready}, []any{internalError(), rotated},
+			func(err error) bool { return err == nil }, 2, 1, "", 0},
+		{"connection reset polled through", []any{ready}, []any{connError(syscall.ECONNRESET), rotated},
+			func(err error) bool { return err == nil }, 2, 1, "", 0},
+		{"404 polled through", []any{ready}, []any{missing, missing, rotated},
+			func(err error) bool { return err == nil }, 3, 2, "", 0},
+		{"missing at the deadline", []any{ready}, []any{missing},
+			func(err error) bool {
+				return errors.Is(err, ErrMismatch) && errors.Is(err, context.DeadlineExceeded) && strings.Contains(err.Error(), userSecretName)
+			}, -1, -1, "mismatch", 0},
+		{"missing, then the order not ready", []any{ready, pendingObject(user, "BackupNotSynced")}, []any{missing},
+			func(err error) bool { return err == context.DeadlineExceeded }, 1, 1, "timeout", 0},
+		{"403 ends the wait", []any{ready}, []any{forbidden("secrets", userSecretName)},
+			func(err error) bool { return apierrors.IsForbidden(err) && !errors.Is(err, ErrMismatch) }, 1, 1, "http_403", 0},
+		{"unparseable ends the wait", []any{ready},
+			[]any{secretObject(userSecretName, "7", map[string]string{keyCloudsYAML: userDocument("pw-two")})},
+			func(err error) bool { return errors.Is(err, ErrMismatch) && !errors.Is(err, context.DeadlineExceeded) }, 1, 1, "mismatch", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, dyn, m, reader := telemetryTestClient(t)
+			script(t, dyn, "keystoneusers", tc.orders...)
+			script(t, dyn, "secrets", tc.secrets...)
+
+			got, err := c.WaitRotated(shortWait(t, 200*time.Millisecond), user, 2, Credential{Password: "pw-one"})
+			if !tc.check(err) {
+				t.Fatalf("WaitRotated = %v", err)
+			}
+			if err == nil && (got.Password != "pw-two" || got.Order != user) {
+				t.Errorf("WaitRotated = %v with password %q, want the new credential of %s", got, got.Password, user.ID)
+			}
+			gets := countActions(dyn, "get", "secrets")
+			if tc.gets >= 0 && gets != tc.gets {
+				t.Errorf("secret gets = %d, want %d", gets, tc.gets)
+			}
+			st := statsOf(m.Aggregate(time.Second), KindSecret)
+			if st.Attempted != gets || (tc.failed >= 0 && st.Failed != tc.failed) {
+				t.Errorf("secret samples = %+v, want one per get (%d) with %d failed", st, gets, tc.failed)
+			}
+			if tc.rotate == "" {
+				if got := countOf(metricPoints(t, reader, "dizzy.operation.duration"),
+					map[string]string{"kind": "keystone_user", "operation": "rotate", "outcome": "success"}); got != 1 {
+					t.Errorf("successful rotates = %d, want 1", got)
+				}
+			} else if got := operationErrors(t, reader, KindUser, "rotate", tc.rotate); got != 1 {
+				t.Errorf("rotate %s errors = %d, want 1", tc.rotate, got)
+			}
+			if got := operationCount(t, reader, KindUser, "rotate"); got != 1 {
+				t.Errorf("rotate samples = %d, want 1", got)
+			}
+			if got := operationErrors(t, reader, KindSecret, "get", "mismatch"); got != tc.getMismatch {
+				t.Errorf("secret get mismatches = %d, want %d: a polled-through read is no mismatch", got, tc.getMismatch)
+			}
+		})
+	}
+}
+
+// TestMethodsAddressTheID confirms the methods that take an order address it
+// through the namespace and name of its id, not through its Name and not
+// through the client's namespace: a client built for another namespace reads,
+// patches, waits on and deletes dizzy-orders/<name> and its Secret for a
+// resource whose Name differs.
+func TestMethodsAddressTheID(t *testing.T) {
+	dyn := newFakeDynamic()
+	c := New(dyn, "other", testRun, metrics.NewCollector())
+	c.pollInitial, c.pollMax = time.Millisecond, 2*time.Millisecond
+	ref := orderRef(KindUser, "user")
+	r := resource.Resource{Kind: KindUser, Logical: "user", Name: "not-the-name", ID: ref.ID}
+	obj := readyObject(ref, map[string]any{"passwordGeneration": int64(1)})
+	obj.Object["spec"] = map[string]any{"passwordGeneration": int64(1)}
+	seed(t, dyn, KindUser, obj)
+	seed(t, dyn, KindSecret, userSecret(testPassword, "1"))
+	ctx := shortWait(t, 5*time.Second)
+
+	if _, err := c.Status(ctx, r); err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if state, exists, err := c.Observe(ctx, r); err != nil || !exists || state != "Ready" {
+		t.Fatalf("Observe = (%q, %v, %v), want the ready order", state, exists, err)
+	}
+	if err := c.WaitReady(ctx, r); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+	if _, err := c.RaiseGeneration(ctx, r); err != nil {
+		t.Fatalf("RaiseGeneration: %v", err)
+	}
+	if _, err := c.ReadCredential(ctx, r); err != nil {
+		t.Fatalf("ReadCredential: %v", err)
+	}
+	if err := c.Delete(ctx, r); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := c.WaitGone(ctx, r); err != nil {
+		t.Fatalf("WaitGone: %v", err)
+	}
+
+	want := map[string]string{"keystoneusers": ref.Name, "secrets": userSecretName}
+	verbs := map[string]bool{}
+	for _, a := range dyn.Actions() {
+		verbs[a.GetVerb()] = true
+		named, ok := a.(interface{ GetName() string })
+		if !ok {
+			t.Errorf("%s of %s carries no name", a.GetVerb(), a.GetResource().Resource)
+			continue
+		}
+		res := a.GetResource().Resource
+		if a.GetNamespace() != testNamespace || named.GetName() != want[res] {
+			t.Errorf("%s of %s %s/%s, want %s/%s", a.GetVerb(), res, a.GetNamespace(), named.GetName(), testNamespace, want[res])
+		}
+	}
+	for _, verb := range []string{"get", "patch", "delete"} {
+		if !verbs[verb] {
+			t.Errorf("no %s was sent", verb)
+		}
+	}
 }
 
 // readyAt returns the order r addresses ready at metadata.generation
@@ -1034,4 +1296,37 @@ func TestObserve(t *testing.T) {
 			t.Errorf("Observe = (%v, %v), want (false, the 500)", exists, err)
 		}
 	})
+}
+
+// TestObserveRequestTimeout confirms SetRequestTimeout bounds Observe's GET,
+// which c5c3 status sends with no other bound: a GET the API server never
+// answers ends with the deadline error after about the timeout, as one get
+// sample of error kind timeout, though the caller's context allows ten
+// seconds.
+func TestObserveRequestTimeout(t *testing.T) {
+	const timeout = 200 * time.Millisecond
+	release := make(chan struct{})
+	var gets atomic.Int32
+	c, m := kubeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gets.Add(1)
+		wedge(r, release)
+	})
+	t.Cleanup(func() { close(release) })
+	c.SetRequestTimeout(timeout)
+
+	start := time.Now()
+	state, exists, err := c.Observe(shortWait(t, 10*time.Second), orderRef(KindRoleAssignment, "role"))
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) || exists || state != "" {
+		t.Fatalf("Observe = (%q, %v, %v), want an error wrapping context.DeadlineExceeded", state, exists, err)
+	}
+	if elapsed > timeout+2*time.Second {
+		t.Errorf("Observe took %v, want about the %v request timeout", elapsed, timeout)
+	}
+	if got := gets.Load(); got != 1 {
+		t.Errorf("GETs = %d, want 1", got)
+	}
+	if got := errorCount(m.Aggregate(time.Second), "timeout"); got != 1 {
+		t.Errorf("timeout samples = %d, want 1", got)
+	}
 }

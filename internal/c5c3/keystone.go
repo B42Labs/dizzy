@@ -53,9 +53,9 @@ func (c *Client) SetKeystoneEndpoint(authURL string, tlsConfig *tls.Config) {
 // delivered: unscoped for a user, whose document names no project, and scoped
 // by Keystone to the credential's project for an application credential. With
 // a non-empty wantProject the token's project name must equal it, otherwise
-// the result wraps ErrMismatch. A 401 is classified against the order the
-// credential belongs to (see classify). It records one authenticate sample of
-// kind over the login.
+// the result wraps ErrMismatch. A 401, and a 404 to an application credential
+// login, is classified against the order the credential belongs to (see
+// classify). It records one authenticate sample of kind over the login.
 func (c *Client) Authenticate(ctx context.Context, kind resource.Kind, cred Credential, wantProject string) error {
 	l, err := c.prepareLogin(cred, nil)
 	if err != nil {
@@ -78,14 +78,16 @@ func (c *Client) Authenticate(ctx context.Context, kind resource.Kind, cred Cred
 
 // VerifyRole logs in once with the document cred delivers, scoped to the
 // project projectName in the domain domainName, and checks that the token
-// carries the role named role. A token without it wraps ErrMismatch, and a 401
-// is classified against the order the credential belongs to (see classify).
-// It records one validate sample of kind keystone_role_assignment over the
-// login. An empty project or domain name is refused without a request: the
+// carries the role named role. A token without it wraps ErrMismatch, and a
+// 401, or a 404 to an application credential login, is classified against the
+// order the credential belongs to (see classify). It records one validate
+// sample of kind keystone_role_assignment over the login. An empty project or
+// domain name is refused without a request, as a failed validate sample: the
 // scope would fall back to the domain.
 func (c *Client) VerifyRole(ctx context.Context, cred Credential, projectName, domainName, role string) error {
 	scope, err := projectScope(projectName, domainName)
 	if err != nil {
+		c.record(ctx, KindRoleAssignment, "validate", 0, err)
 		return err
 	}
 	l, err := c.prepareLogin(cred, scope)
@@ -111,19 +113,27 @@ func (c *Client) VerifyRole(ctx context.Context, cred Credential, projectName, d
 // client's poll intervals, until a token's catalog lists a service of type
 // serviceType named serviceName with a public endpoint whose URL is
 // endpointURL. Keystone's catalog cache can lag the order turning ready, which
-// is why it polls. A retryable failure is polled through; a 401 ends the poll
-// classified against the order the credential belongs to (see classify), and
-// any other failure ends it as it is. It records one validate sample of kind
-// keystone_catalog_entry over the whole poll.
+// is why it polls. A retryable failure is polled through; a 401, or a 404 to
+// an application credential login, ends the poll classified against the order
+// the credential belongs to (see classify), and any other failure ends it as
+// it is. It records one validate sample of kind keystone_catalog_entry over
+// the whole poll.
 //
 // At the context's deadline it returns ErrMismatch, wrapping the deadline,
-// when the last login issued a token whose catalog lacked the entry. When the
-// last login failed with a retryable error instead, that error is returned, and
-// when no login completed at all, the deadline is: an outage is never a
-// mismatch. An empty project or domain name is refused without a request.
+// only when the last login completed with a token whose catalog lacked the
+// entry. Otherwise it returns the error of the latest login that failed with a
+// retryable error after the last token, and the deadline itself when there is
+// none, as when the deadline cut short the only login after a token without
+// the entry: an outage is never a mismatch, and an earlier token without the
+// entry does not make one. So that the deadline cuts short only a login that
+// hangs, not one that was merely under way, the poll sends no login in the
+// last tenth of the time the context left it at the start, nor while less than
+// twice its longest completed login is left. An empty project or domain name
+// is refused without a request, as a failed validate sample.
 func (c *Client) VerifyCatalog(ctx context.Context, cred Credential, projectName, domainName, serviceType, serviceName, endpointURL string) error {
 	scope, err := projectScope(projectName, domainName)
 	if err != nil {
+		c.record(ctx, KindCatalogEntry, "validate", 0, err)
 		return err
 	}
 	l, err := c.prepareLogin(cred, scope)
@@ -133,40 +143,63 @@ func (c *Client) VerifyCatalog(ctx context.Context, cred Credential, projectName
 	}
 
 	start := time.Now()
+	deadline, hasDeadline := ctx.Deadline()
 	var (
-		// issued is true once a login issued a token.
-		issued bool
-		// lastErr is the retryable error of the last login that completed, nil
-		// when that login issued a token.
+		// lacking is true when the last login completed with a token whose
+		// catalog lacked the entry.
+		lacking bool
+		// lastErr is the retryable error of the latest login that failed with
+		// one, nil when a later login issued a token.
 		lastErr error
+		// reserve is the time before the deadline in which no login is sent,
+		// and longest the longest a completed login has taken.
+		reserve, longest time.Duration
 	)
+	if hasDeadline {
+		reserve = time.Until(deadline) / 10
+	}
 	err = c.poll(ctx, func(ctx context.Context) (bool, error) {
+		if hasDeadline && time.Until(deadline) < max(reserve, 2*longest) {
+			// Too close to the deadline for a login to complete: the last
+			// login sent decides, and poll returns ctx.Err() at the deadline.
+			return false, nil
+		}
+		begin := time.Now()
 		before := c.readDelivery(ctx, cred)
 		result, err := c.sendLogin(ctx, l)
+		if ctx.Err() == nil {
+			longest = max(longest, time.Since(begin))
+		}
 		switch {
 		case err == nil:
 		case ctx.Err() != nil:
 			// The context's end cut the login short, which says nothing about
-			// the catalog; poll returns ctx.Err().
+			// the catalog: no earlier token decides the result, and poll
+			// returns ctx.Err().
+			lacking = false
 			return false, nil
 		case IsRetryable(err):
-			lastErr = err
+			lacking, lastErr = false, err
 			return false, nil
 		default:
 			return false, c.classify(ctx, cred, before, err)
 		}
-		issued, lastErr = true, nil
+		lacking, lastErr = false, nil
 		catalog, err := result.ExtractServiceCatalog()
 		if err != nil {
 			return false, fmt.Errorf("reading the catalog of the token issued with %v: %w", cred, err)
 		}
-		return listsEndpoint(catalog, serviceType, serviceName, endpointURL), nil
+		if listsEndpoint(catalog, serviceType, serviceName, endpointURL) {
+			return true, nil
+		}
+		lacking = true
+		return false, nil
 	})
 	if errors.Is(err, context.DeadlineExceeded) {
 		switch {
 		case lastErr != nil:
 			err = fmt.Errorf("the last login before the deadline failed: %w", lastErr)
-		case issued:
+		case lacking:
 			err = fmt.Errorf("%w: no token scoped to project %q listed a %s service %q with the public endpoint %s: %w",
 				ErrMismatch, projectName, serviceType, serviceName, endpointURL, err)
 		}
@@ -225,11 +258,22 @@ func (l loginRequest) secretValues() []string {
 
 // prepareLogin parses the document cred delivers into the options of one
 // login. clouds.Parse reads the document as the only clouds.yaml and its one
-// entry as the cloud, so no clouds.yaml or secure.yaml from disk or from the
-// environment takes part. The endpoint override of SetKeystoneEndpoint
-// replaces the document's auth_url and TLS configuration, a non-nil scope
-// replaces the scope the document implies, and re-authentication is off, so
-// one login is one token request.
+// entry as the cloud, so no clouds.yaml or secure.yaml file from disk or named
+// by the environment takes part, and OS_CLOUD and OS_CLIENT_CONFIG_FILE have
+// no effect; a clouds-public.yaml would take part only for an entry naming a
+// profile, which no delivered document does. Other environment variables still
+// apply to each login. clouds.Parse computes the TLS configuration from
+// OS_CACERT, OS_CERT and OS_KEY as well as from the document: an exported
+// OS_CACERT changes whom a login trusts unless SetKeystoneEndpoint gave a TLS
+// configuration, and a file one of them names that cannot be read, or an
+// OS_CERT without an OS_KEY, fails every login, with an override or without.
+// It also reads OS_REGION_NAME and OS_INTERFACE, into endpoint options no
+// login uses.
+//
+// The endpoint override of SetKeystoneEndpoint replaces the document's
+// auth_url and the TLS configuration, a non-nil scope replaces the scope the
+// document implies, and re-authentication is off, so one login is one token
+// request.
 //
 // A document gophercloud cannot decode wraps ErrMismatch without the
 // decoder's text, which can quote a value of the document; any other parse
@@ -329,9 +373,9 @@ func redact(err error, secrets ...string) error {
 	return &redactedError{err: err, text: text}
 }
 
-// delivery is what the 401 classification reads of the order a credential
-// belongs to: the order's status and the resourceVersion of the Secret beside
-// it, or the error of the read that failed.
+// delivery is what the classification of a rejected login reads of the order
+// a credential belongs to: the order's status and the resourceVersion of the
+// Secret beside it, or the error of the read that failed.
 type delivery struct {
 	status          OrderStatus
 	resourceVersion string
@@ -340,8 +384,8 @@ type delivery struct {
 
 // readDelivery reads the status of cred's order, one get sample of its kind,
 // and the Secret beside it, one get sample of kind secret. A failed read is
-// kept in the result rather than returned: it only stops a 401 from being
-// called a mismatch.
+// kept in the result rather than returned: it only stops a rejected login
+// from being called a mismatch.
 func (c *Client) readDelivery(ctx context.Context, cred Credential) delivery {
 	st, err := c.Status(ctx, cred.Order)
 	if err != nil {
@@ -371,20 +415,28 @@ func (c *Client) secretVersion(ctx context.Context, order resource.Resource) (st
 }
 
 // classify decides what err, the failure of a login with cred, means, given
-// before, what readDelivery read just before the login. Anything but a 401 is
-// returned as it is: a 5xx, a timeout or a connection error is an outage,
-// which the caller may retry, never a mismatch.
+// before, what readDelivery read just before the login. It classifies the
+// answers Keystone rejects a credential with: a 401 to any login, and a 404 to
+// an application credential login, which is how Keystone answers an
+// application credential id it does not know. Anything else is returned as it
+// is: a 5xx, a timeout or a connection error is an outage, which the caller
+// may retry, never a mismatch, and a 404 to a password login is no rejection
+// of the password.
 //
-// A 401 reads the order and its Secret again. It wraps ErrMismatch when the
-// credential was valid by the order's own account throughout the login: for
-// a user, the order was ready before and after and the Secret stayed at the
-// credential's resourceVersion; for an application credential, the order's
-// credentialID or previousCredentialID named the credential's id before and
-// after. Otherwise the login raced a change, such as a rotation, and the 401
-// is returned as it is, with error kind http_401. So is a 401 around which a
-// read failed, since it cannot be classified.
+// A rejection reads the order and its Secret again. It wraps ErrMismatch when
+// the credential was valid by the order's own account throughout the login:
+// for a user, the order was ready before and after and the Secret stayed at
+// the credential's resourceVersion; for an application credential, the
+// order's credentialID or previousCredentialID named the credential's id
+// before and after. Otherwise the login raced a change, such as a rotation,
+// and the answer is returned as it is, with error kind http_401 or http_404.
+// So is a rejection around which a read failed, since it cannot be
+// classified.
 func (c *Client) classify(ctx context.Context, cred Credential, before delivery, err error) error {
-	if httpStatus(err) != http.StatusUnauthorized {
+	status := httpStatus(err)
+	rejected := status == http.StatusUnauthorized ||
+		status == http.StatusNotFound && cred.Order.Kind == KindApplicationCredential
+	if !rejected {
 		return err
 	}
 	after := c.readDelivery(ctx, cred)
@@ -393,8 +445,8 @@ func (c *Client) classify(ctx context.Context, cred Credential, before delivery,
 		readErr = after.err
 	}
 	if readErr != nil {
-		return fmt.Errorf("%w; order %s could not be read around the login, so the 401 is not taken for a mismatch: %v",
-			err, cred.Order.ID, readErr)
+		return fmt.Errorf("%w; order %s could not be read around the login, so the %d is not taken for a mismatch: %v",
+			err, cred.Order.ID, status, readErr)
 	}
 	switch cred.Order.Kind {
 	case KindUser:
@@ -407,12 +459,13 @@ func (c *Client) classify(ctx context.Context, cred Credential, before delivery,
 	case KindApplicationCredential:
 		id := cred.ApplicationCredentialID
 		if namesCredential(before.status, id) && namesCredential(after.status, id) {
-			return fmt.Errorf("%w: Keystone rejected application credential %s, which order %s named before and after the login: %w",
-				ErrMismatch, id, cred.Order.ID, err)
+			return fmt.Errorf("%w: Keystone rejected application credential %s with a %d, "+
+				"and order %s named it before and after the login: %w",
+				ErrMismatch, id, status, cred.Order.ID, err)
 		}
 	}
-	return fmt.Errorf("%w; order %s or its secret changed around the login, so the 401 is not taken for a mismatch",
-		err, cred.Order.ID)
+	return fmt.Errorf("%w; order %s or its secret changed around the login, so the %d is not taken for a mismatch",
+		err, cred.Order.ID, status)
 }
 
 // namesCredential reports whether st names the application credential id as

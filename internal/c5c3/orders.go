@@ -3,12 +3,14 @@ package c5c3
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -232,6 +234,14 @@ func nestedString(u *unstructured.Unstructured, fields ...string) (string, error
 // and public endpoint of a catalog entry, and the referenced orders and the
 // plan's grace period of an application credential. An unknown kind, and a
 // client without a plan, are refused without a request.
+//
+// A create whose answer was lost, such as to a reset connection, can have
+// created the order, and its retry then meets a 409 AlreadyExists. On that
+// 409 the order is read back as one get sample of o's kind, and an order whose
+// dizzy/run label is the client's run id and whose dizzy/type label is o's
+// kind is returned as created. An order of another run or kind returns the
+// 409 wrapped. A failed read returns its own error wrapped, so a retryable
+// failure lets the create be retried and the order be read again.
 func (c *Client) CreateOrder(ctx context.Context, o plan.Order) (resource.Resource, error) {
 	kind := resource.Kind(o.Kind)
 	k, ok := lookupKind(kind)
@@ -261,15 +271,49 @@ func (c *Client) CreateOrder(ctx context.Context, o plan.Order) (resource.Resour
 		_, err := c.dyn.Resource(k.gvr()).Namespace(c.namespace).Create(ctx, obj, metav1.CreateOptions{})
 		return err
 	})
+	r := resource.Resource{Kind: kind, Logical: o.Name, Name: name, ID: orderID(c.namespace, name)}
+	if apierrors.IsAlreadyExists(err) {
+		return c.adoptExisting(ctx, k, r, err)
+	}
 	if err != nil {
 		// A create whose answer was lost can still have created the order. Its
 		// labels keep it discoverable at cleanup; the id lets an operator find it.
 		slog.Warn("create failed; an order with this name may exist in the namespace",
-			"id", orderID(c.namespace, name), "error", err)
+			"id", r.ID, "error", err)
 		return resource.Resource{}, fmt.Errorf("creating %s order %q: %w", kind, o.Name, err)
 	}
-	r := resource.Resource{Kind: kind, Logical: o.Name, Name: name, ID: orderID(c.namespace, name)}
 	slog.Info("created resource", "kind", r.Kind, "logical", r.Logical, "id", r.ID)
+	return r, nil
+}
+
+// adoptExisting decides a 409 AlreadyExists, exists, to the create of r: it
+// reads the order r names as one get sample of its kind and returns r when the
+// order carries the client's run id and r's kind in its labels, which makes it
+// the order an earlier attempt of the same create made. Any other order
+// returns exists wrapped, and a failed read its own error wrapped.
+func (c *Client) adoptExisting(ctx context.Context, k orderKind, r resource.Resource, exists error) (resource.Resource, error) {
+	var labels map[string]string
+	err := c.timed(ctx, r.Kind, "get", func(ctx context.Context) error {
+		u, err := c.dyn.Resource(k.gvr()).Namespace(c.namespace).Get(ctx, r.Name, metav1.GetOptions{})
+		if err == nil {
+			labels = u.GetLabels()
+		}
+		return err
+	})
+	if err != nil {
+		slog.Warn("create answered that the order exists, and reading it failed; it may be this run's order",
+			"id", r.ID, "error", err)
+		return resource.Resource{}, fmt.Errorf("creating %s order %q answered that it exists, and reading order %s failed: %w",
+			r.Kind, r.Logical, r.ID, err)
+	}
+	if labels[labelRun] != c.runID || labels[labelType] != string(r.Kind) {
+		slog.Warn("create failed; an order of this name exists and is not this run's",
+			"id", r.ID, "run", labels[labelRun], "type", labels[labelType])
+		return resource.Resource{}, fmt.Errorf("creating %s order %q: order %s exists with labels %s=%q and %s=%q: %w",
+			r.Kind, r.Logical, r.ID, labelRun, labels[labelRun], labelType, labels[labelType], exists)
+	}
+	slog.Info("order already existed with this run's labels; taking it as created",
+		"kind", r.Kind, "logical", r.Logical, "id", r.ID)
 	return r, nil
 }
 
@@ -502,13 +546,25 @@ func (c *Client) RaiseGeneration(ctx context.Context, r resource.Resource) (int6
 }
 
 // WaitRotated polls the user or application credential order r addresses
-// until it is ready with a status generation of at least generation, then
-// reads its delivered Secret and returns the credential. It returns
-// ErrMismatch when the Secret still carries previous's password, for a user,
-// or previous's application credential id, for a credential order. It records
-// one rotate sample of the order's kind over the whole wait. A 404 ends the
-// wait with an error wrapping it, and the context's end with ctx.Err(). Any
-// other kind is refused without a request.
+// until it is ready with a status generation of at least generation, and from
+// then on reads its delivered Secret in the same poll, one get sample of kind
+// secret after the order's get, until a read returns the credential. It
+// returns ErrMismatch when that Secret still carries previous's password, for
+// a user, or previous's application credential id, for a credential order, and
+// when it does not parse. It records one rotate sample of the order's kind
+// over the whole wait. Any other kind, and an order whose name lacks the
+// dizzyorder- prefix, are refused without a request.
+//
+// The wait is not retried as a whole, so a failed read of the Secret ends it
+// only where a later poll cannot help. A retryable error is recorded as a
+// failed get and polled through, and so is a 404: the operator rewrites the
+// delivered Secret in place and writes a deleted one again on the event, so a
+// ready order's missing Secret is a moment the operator repairs, not yet a
+// broken delivery. When the last poll before the deadline still read the order
+// ready and the Secret missing, the wait returns ErrMismatch wrapping the
+// deadline; any other end at the deadline returns ctx.Err(), so an outage
+// never reads as a mismatch. Any other failed read of the Secret ends the wait
+// with its error wrapped, and a 404 of the order with an error wrapping it.
 func (c *Client) WaitRotated(ctx context.Context, r resource.Resource, generation int64, previous Credential) (Credential, error) {
 	t, err := parseTarget(r)
 	if err != nil {
@@ -517,23 +573,79 @@ func (c *Client) WaitRotated(ctx context.Context, r resource.Resource, generatio
 	if generationField(t.kind) == "" {
 		return Credential{}, fmt.Errorf("order %s is a %s order, which does not rotate", r.ID, t.kind)
 	}
+	s, err := resolveSecret(r)
+	if err != nil {
+		return Credential{}, err
+	}
 
 	start := time.Now()
-	var cred Credential
-	err = c.waitOrder(ctx, t, fmt.Sprintf("for generation %d", generation), func(s orderState) (bool, error) {
-		return s.status.Ready && s.status.Generation >= generation, nil
+	var (
+		cred Credential
+		// missing is true when the last poll read the order ready at the
+		// generation and the Secret beside it answered 404.
+		missing bool
+	)
+	what := fmt.Sprintf("for generation %d", generation)
+	err = c.poll(ctx, func(ctx context.Context) (bool, error) {
+		missing = false
+		st, d, read, err := c.readPoll(ctx, t, what)
+		if !read {
+			return false, err
+		}
+		c.record(ctx, t.kind, "get", d, nil)
+		if !st.status.Ready || st.status.Generation < generation {
+			return false, nil
+		}
+		got, read, gone, err := c.pollSecret(ctx, s)
+		if !read {
+			missing = gone
+			return false, err
+		}
+		got.Order = r
+		if err := checkRotated(t, got, previous, generation); err != nil {
+			return false, err
+		}
+		cred = got
+		return true, nil
 	})
-	if err == nil {
-		cred, err = c.ReadCredential(ctx, r)
-	}
-	if err == nil {
-		err = checkRotated(t, cred, previous, generation)
+	if missing && errors.Is(err, context.DeadlineExceeded) {
+		err = fmt.Errorf("%w: secret %s of order %s is missing while the order is ready at generation %d: %w",
+			ErrMismatch, s.id(), r.ID, generation, err)
 	}
 	c.record(ctx, t.kind, "rotate", time.Since(start), err)
 	if err != nil {
 		return Credential{}, err
 	}
 	return cred, nil
+}
+
+// pollSecret reads the Secret s once as one poll of WaitRotated, one get
+// sample of kind secret. It returns the credential and read true when the
+// Secret was read and parses. A 404, and a failure that is retryable or that
+// the context's end cut short, is recorded as a failed get and returned as not
+// read with no error, gone true for the 404, so the wait polls on. A Secret
+// that does not parse returns ErrMismatch, and any other failure its error
+// wrapped; both are recorded on the sample.
+func (c *Client) pollSecret(ctx context.Context, s secretRef) (cred Credential, read, gone bool, err error) {
+	u, d, err := c.getSecret(ctx, s)
+	switch {
+	case IsNotFound(err):
+		c.record(ctx, KindSecret, "get", d, err)
+		return Credential{}, false, true, nil
+	case err != nil && (ctx.Err() != nil || IsRetryable(err)):
+		c.record(ctx, KindSecret, "get", d, err)
+		return Credential{}, false, false, nil
+	case err != nil:
+		err = fmt.Errorf("reading secret %s: %w", s.id(), err)
+		c.record(ctx, KindSecret, "get", d, err)
+		return Credential{}, false, false, err
+	}
+	cred, err = parseCredential(s, u)
+	c.record(ctx, KindSecret, "get", d, err)
+	if err != nil {
+		return Credential{}, false, false, err
+	}
+	return cred, true, false, nil
 }
 
 // checkRotated returns ErrMismatch when cred, read after the order reached
@@ -646,14 +758,17 @@ func (c *Client) list(ctx context.Context, kind resource.Kind, selector string) 
 // returns its state for the status table: Ready for a ready order, otherwise
 // the reason of its first condition with status False, otherwise Pending. A
 // 404 is reported as ("", false, nil), so an order deleted out of band reads
-// as gone rather than as a failure. A malformed id and an unknown kind are
-// refused without a request.
+// as gone rather than as a failure. The GET runs under the request timeout of
+// SetRequestTimeout. A malformed id and an unknown kind are refused without a
+// request.
 func (c *Client) Observe(ctx context.Context, r resource.Resource) (status string, exists bool, err error) {
 	t, err := parseTarget(r)
 	if err != nil {
 		return "", false, err
 	}
-	s, d, err := c.getOrder(ctx, t)
+	getCtx, cancel := c.requestContext(ctx)
+	s, d, err := c.getOrder(getCtx, t)
+	cancel()
 	c.record(ctx, t.kind, "get", d, err)
 	switch {
 	case IsNotFound(err):

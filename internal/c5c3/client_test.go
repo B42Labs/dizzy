@@ -9,6 +9,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"slices"
@@ -28,7 +30,9 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/B42Labs/dizzy/internal/c5c3/plan"
@@ -598,6 +602,11 @@ func TestIsRetryable(t *testing.T) {
 		{"connection reset", connError(syscall.ECONNRESET), true},
 		{"unexpected EOF", &url.Error{Op: "Get", URL: "https://k8s.invalid/apis", Err: io.ErrUnexpectedEOF}, true},
 		{"wrapped unexpected EOF", fmt.Errorf("reading: %w", io.ErrUnexpectedEOF), true},
+		{"EOF", &url.Error{Op: "Get", URL: "https://k8s.invalid/apis", Err: io.EOF}, true},
+		{"http2 GOAWAY", &url.Error{Op: "Get", URL: "https://k8s.invalid/apis",
+			Err: fmt.Errorf("reading the answer: %w", errors.New("http2: server sent GOAWAY and closed the connection"))}, true},
+		{"kubernetes 501", kubeStatus(501), false},
+		{"keystone 505", keystoneStatus(505), false},
 		{"timeout", context.DeadlineExceeded, false},
 		{"canceled", context.Canceled, false},
 		{"other", errors.New("boom"), false},
@@ -706,12 +715,19 @@ func TestPrecheck(t *testing.T) {
 	}
 }
 
+// bareStatus builds a Kubernetes API error of code and reason whose message
+// names neither a resource nor a namespace, so a test that finds them in an
+// error's text finds what the client wrote.
+func bareStatus(code int32, reason metav1.StatusReason) error {
+	return &apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: code, Reason: reason, Message: "denied"}}
+}
+
 // TestPrecheckKindNotServed confirms a 404 to the keystoneusers list, the
 // answer of a cluster without the operator's CRDs, returns ErrKindNotServed
 // naming the resource, wraps the 404, and stops the check.
 func TestPrecheckKindNotServed(t *testing.T) {
 	c, dyn, m := testClient()
-	failVerb(dyn, "list", "keystoneusers", notFound("keystoneusers", ""))
+	failVerb(dyn, "list", "keystoneusers", bareStatus(404, metav1.StatusReasonNotFound))
 
 	err := c.Precheck(context.Background())
 	if !errors.Is(err, ErrKindNotServed) {
@@ -735,7 +751,7 @@ func TestPrecheckKindNotServed(t *testing.T) {
 // the resource and the namespace, and wraps the 403.
 func TestPrecheckForbidden(t *testing.T) {
 	c, dyn, _ := testClient()
-	failVerb(dyn, "list", "keystoneprojects", forbidden("keystoneprojects", ""))
+	failVerb(dyn, "list", "keystoneprojects", bareStatus(403, metav1.StatusReasonForbidden))
 
 	err := c.Precheck(context.Background())
 	if !errors.Is(err, ErrForbidden) {
@@ -767,6 +783,99 @@ func TestPrecheckOtherError(t *testing.T) {
 	if !strings.Contains(err.Error(), "keystonecatalogentries.c5c3.io") {
 		t.Errorf("Precheck error %q does not name the resource", err)
 	}
+}
+
+// kubeServer starts an httptest API server that answers every request with
+// handler, closed when the test ends, and returns a Client for testRun in
+// testNamespace that reaches it through a real dynamic client, which honors a
+// request's context where the fake does not. Client-side rate limiting is off,
+// so a request's duration is the server's.
+func kubeServer(t *testing.T, handler http.HandlerFunc) (*Client, *metrics.Collector) {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	dyn, err := dynamic.NewForConfig(&rest.Config{Host: srv.URL, QPS: -1})
+	if err != nil {
+		t.Fatalf("dynamic.NewForConfig: %v", err)
+	}
+	m := metrics.NewCollector()
+	return New(dyn, testNamespace, testRun, m), m
+}
+
+// writeKube answers a Kubernetes API request with status and the JSON body.
+func writeKube(w http.ResponseWriter, status int, body string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, body)
+}
+
+// emptyList is the answer to a list of any order kind that finds nothing.
+const emptyList = `{"apiVersion":"c5c3.io/v1alpha1","kind":"List","metadata":{"resourceVersion":"1"},"items":[]}`
+
+// wedge blocks r until its client gives up on it or release is closed.
+func wedge(r *http.Request, release <-chan struct{}) {
+	select {
+	case <-r.Context().Done():
+	case <-release:
+	}
+}
+
+// TestPrecheckRequestTimeout confirms SetRequestTimeout bounds each of
+// Precheck's lists on its own rather than the check as a whole: five lists of
+// about 100ms each outlast the 300ms timeout together and still pass, while
+// one list that outlives the timeout fails the check with the deadline error
+// after about the timeout, though the caller's context allows ten seconds.
+func TestPrecheckRequestTimeout(t *testing.T) {
+	const timeout = 300 * time.Millisecond
+	t.Run("each list within the timeout", func(t *testing.T) {
+		c, _ := kubeServer(t, func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-time.After(100 * time.Millisecond):
+			case <-r.Context().Done():
+				return
+			}
+			writeKube(w, http.StatusOK, emptyList)
+		})
+		c.SetRequestTimeout(timeout)
+
+		start := time.Now()
+		if err := c.Precheck(context.Background()); err != nil {
+			t.Fatalf("Precheck: %v", err)
+		}
+		// The lists together outlast the timeout, so a single bound over the
+		// whole check would have failed it.
+		if elapsed := time.Since(start); elapsed <= timeout {
+			t.Errorf("Precheck took %v, want longer than the %v request timeout", elapsed, timeout)
+		}
+	})
+	t.Run("one list over the timeout", func(t *testing.T) {
+		release := make(chan struct{})
+		c, m := kubeServer(t, func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/keystoneprojects") {
+				wedge(r, release)
+				return
+			}
+			writeKube(w, http.StatusOK, emptyList)
+		})
+		t.Cleanup(func() { close(release) })
+		c.SetRequestTimeout(timeout)
+
+		start := time.Now()
+		err := c.Precheck(shortWait(t, 10*time.Second))
+		elapsed := time.Since(start)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Precheck = %v, want an error wrapping context.DeadlineExceeded", err)
+		}
+		if !strings.Contains(err.Error(), "keystoneprojects.c5c3.io") {
+			t.Errorf("Precheck error %q does not name the resource", err)
+		}
+		if elapsed > timeout+2*time.Second {
+			t.Errorf("Precheck took %v, want about the %v request timeout", elapsed, timeout)
+		}
+		if got := errorCount(m.Aggregate(time.Second), "timeout"); got != 1 {
+			t.Errorf("timeout samples = %d, want 1", got)
+		}
+	})
 }
 
 // keys returns the sorted attribute keys of every point.
@@ -958,16 +1067,19 @@ func userSecret(password, rv string) *unstructured.Unstructured {
 	})
 }
 
-// userDocument is a delivered user clouds.yaml with password.
+// userDocument is a delivered user clouds.yaml with password, in the shape the
+// upstream order guide shows, its quoted entry name and endpoint_type
+// included.
 func userDocument(password string) string {
 	return `clouds:
-  admin:
+  "admin":
     auth:
       auth_url: "http://controlplane-keystone.openstack.svc:5000/v3"
       username: "dizzyorder-run0-user"
       password: "` + password + `"
       user_domain_name: "Default"
     region_name: "RegionOne"
+    endpoint_type: internal
     identity_api_version: 3
 `
 }

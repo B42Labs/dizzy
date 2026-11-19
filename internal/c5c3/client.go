@@ -13,9 +13,10 @@
 // A user and an application credential order each deliver a Secret
 // <order name>-credentials beside the order, with a clouds.yaml key and the
 // credential's own keys. The client reads those Secrets through the same
-// dynamic client, edits and deletes them for the repair check, and never
-// touches a Secret that is not named after a dizzy order. The Keystone checks
-// log in with the delivered credentials to verify the orders.
+// dynamic client and edits and deletes them for the repair check. It reads no
+// Secret that is not named after a dizzy order, and edits and deletes only the
+// Secrets of its own run's orders. The Keystone checks log in with the
+// delivered credentials to verify the orders.
 //
 // Each call is timed through a metrics.Collector and, when enabled, mirrored
 // into OTEL. A wait for the operator polls with a GET whose interval starts at
@@ -175,6 +176,10 @@ type Client struct {
 	keystoneURL string
 	keystoneTLS *tls.Config
 
+	// requestTimeout bounds each request of Precheck and Observe on its own,
+	// when SetRequestTimeout set it above zero. It is zero after New.
+	requestTimeout time.Duration
+
 	// passwordRejections counts the 401 answers to password logins. Once it
 	// reaches maxPasswordRejections, the client sends no further password
 	// login, so a run cannot lock its user out of Keystone.
@@ -207,6 +212,29 @@ func (c *Client) SetTelemetry(t *telemetry.Telemetry) {
 // status and cleanup address existing orders and never create one.
 func (c *Client) SetPlan(p *plan.Plan) {
 	c.plan = p
+}
+
+// SetRequestTimeout bounds each request of Precheck and Observe on its own:
+// each of Precheck's five lists, and Observe's GET, runs under its own
+// context.WithTimeout(d). These two are what the commands send outside the
+// executor, which bounds the calls it makes itself. A bound per request,
+// not per check, keeps five slow lists from failing a check whose every list
+// answered in time, while a wedged API server still cannot hang the command.
+// A d of zero (the default after New) adds no bound, leaving each request to
+// the caller's context. Call it before the first request; it is not safe to
+// call while one runs.
+func (c *Client) SetRequestTimeout(d time.Duration) {
+	c.requestTimeout = d
+}
+
+// requestContext returns ctx bounded by the request timeout SetRequestTimeout
+// set, or ctx unchanged when none is set. The caller must call the returned
+// cancel function once its request is done.
+func (c *Client) requestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.requestTimeout > 0 {
+		return context.WithTimeout(ctx, c.requestTimeout)
+	}
+	return ctx, func() {}
 }
 
 // resourceName builds the deterministic Kubernetes name for a logical plan
@@ -464,7 +492,8 @@ func IsNotFound(err error) bool {
 
 // Precheck lists each of the five order kinds in the namespace with a limit of
 // 1, each as one list sample of its kind, so a command stops before it creates
-// anything when the cluster or its rights cannot carry a run. A 404 returns
+// anything when the cluster or its rights cannot carry a run. Each list runs
+// under the request timeout of SetRequestTimeout on its own. A 404 returns
 // ErrKindNotServed naming the resource, because the operator's CRDs are
 // missing; a 403 returns ErrForbidden naming the resource and the namespace.
 // Both wrap the original error. Any other error is returned wrapped, and the
@@ -472,6 +501,8 @@ func IsNotFound(err error) bool {
 func (c *Client) Precheck(ctx context.Context) error {
 	for _, k := range orderKinds {
 		err := c.timed(ctx, k.kind, "list", func(ctx context.Context) error {
+			ctx, cancel := c.requestContext(ctx)
+			defer cancel()
 			_, err := c.dyn.Resource(k.gvr()).Namespace(c.namespace).List(ctx, metav1.ListOptions{Limit: 1})
 			return err
 		})
