@@ -9,10 +9,16 @@
 // must also be an io.Closer whose rewind waits for the transport's Close. A
 // request whose 401 is its own outcome, such as authenticating as another user,
 // must go through a copy of the client whose ProviderClient has no ReauthFunc.
+//
+// NewKubeClient builds the Kubernetes dynamic client the c5c3 namespace orders
+// through, from a kubeconfig or the pod's service account, and
+// IdentityEndpoint reads a clouds.yaml entry's Keystone URL and TLS settings
+// without authenticating.
 package config
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 
 	"github.com/gophercloud/gophercloud/v2"
@@ -47,6 +53,22 @@ func newProvider(ctx context.Context, cloudName string) (*gophercloud.ProviderCl
 	}
 
 	return provider, endpointOptions, nil
+}
+
+// IdentityEndpoint returns the auth_url and the TLS configuration of the
+// clouds.yaml entry cloudName. It authenticates nothing: the c5c3 namespace
+// logs in with the credentials an order delivers and takes only where Keystone
+// answers, and how to trust it, from the entry. An entry without auth_url is an
+// error.
+func IdentityEndpoint(cloudName string) (authURL string, tlsConfig *tls.Config, err error) {
+	authOptions, _, tlsConfig, err := clouds.Parse(clouds.WithCloudName(cloudName))
+	if err != nil {
+		return "", nil, fmt.Errorf("parsing clouds.yaml: %w", err)
+	}
+	if authOptions.IdentityEndpoint == "" {
+		return "", nil, fmt.Errorf("clouds.yaml entry %q has no auth_url", cloudName)
+	}
+	return authOptions.IdentityEndpoint, tlsConfig, nil
 }
 
 // NewNetworkClient authenticates against the cloud described in clouds.yaml and

@@ -672,3 +672,53 @@ func TestUnreachableKeystoneFailsProviderCreation(t *testing.T) {
 		t.Errorf("error = %v, want it to wrap the dial error", err)
 	}
 }
+
+// TestIdentityEndpoint asserts the entry's auth_url and TLS settings come back
+// without a request to Keystone.
+func TestIdentityEndpoint(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	writeCloudsWith(t, "verify: false\n", credentialAuth(srv.URL+"/v3"))
+
+	authURL, tlsConfig, err := IdentityEndpoint("fake")
+	if err != nil {
+		t.Fatalf("IdentityEndpoint: %v", err)
+	}
+	if authURL != srv.URL+"/v3" {
+		t.Errorf("auth URL = %q, want %q", authURL, srv.URL+"/v3")
+	}
+	if tlsConfig == nil || !tlsConfig.InsecureSkipVerify {
+		t.Errorf("TLS config = %+v, want verification off as the entry says", tlsConfig)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Errorf("IdentityEndpoint sent %d request(s) to Keystone, want 0", n)
+	}
+}
+
+func TestIdentityEndpointWithoutAuthURL(t *testing.T) {
+	writeClouds(t, "username: u\npassword: p\n")
+
+	authURL, _, err := IdentityEndpoint("fake")
+	if err == nil {
+		t.Fatalf("IdentityEndpoint = %q, want an error", authURL)
+	}
+	if want := `clouds.yaml entry "fake" has no auth_url`; err.Error() != want {
+		t.Errorf("error = %q, want %q", err, want)
+	}
+}
+
+func TestIdentityEndpointMissingCloud(t *testing.T) {
+	writeClouds(t, credentialAuth("https://keystone.invalid/v3"))
+
+	authURL, _, err := IdentityEndpoint("other")
+	if err == nil {
+		t.Fatalf("IdentityEndpoint = %q, want an error", authURL)
+	}
+	if !strings.HasPrefix(err.Error(), "parsing clouds.yaml: ") || !strings.Contains(err.Error(), `"other"`) {
+		t.Errorf("error = %q, want a clouds.yaml parse error naming the cloud", err)
+	}
+}
