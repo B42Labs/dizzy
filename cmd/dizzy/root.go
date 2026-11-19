@@ -97,7 +97,10 @@ func newRootCmd() *cobra.Command {
 			"Nova server fleets, Glance image lifecycles, Barbican secret\n" +
 			"lifecycles, and Octavia load balancer lifecycles, records how long\n" +
 			"every operation takes, and tracks the states the resources reach.\n\n" +
-			"dizzy mix runs several workload personas side by side in one churn run.",
+			"dizzy mix runs several workload personas side by side in one churn run.\n\n" +
+			"dizzy c5c3 orders Keystone resources from Cobalt Core's c5c3-operator\n" +
+			"through the Kubernetes API and checks in Keystone what the operator\n" +
+			"made of them.",
 		// Version is set from the main package's build-time variable, so
 		// "dizzy --version" prints the release tag (or "dev" for local builds).
 		Version:       version,
@@ -128,7 +131,7 @@ func newRootCmd() *cobra.Command {
 	flags.StringVar(&opts.listenAddress, "listen-address", "", "serve Prometheus metrics on /metrics and a health check on /healthz at this address, e.g. :9464 (default: no listener)")
 	flags.DurationVar(&opts.healthStallTimeout, "health-stall-timeout", 15*time.Minute, "with --listen-address: /healthz turns unhealthy when no operation or iteration finished for this long; 0 disables the check")
 
-	cmd.AddCommand(newNeutronCmd(opts), newCinderCmd(opts), newKeystoneCmd(opts), newNovaCmd(opts), newGlanceCmd(opts), newBarbicanCmd(opts), newOctaviaCmd(opts), newMixCmd(opts))
+	cmd.AddCommand(newNeutronCmd(opts), newCinderCmd(opts), newKeystoneCmd(opts), newNovaCmd(opts), newGlanceCmd(opts), newBarbicanCmd(opts), newOctaviaCmd(opts), newMixCmd(opts), newC5C3Cmd(opts))
 
 	return cmd
 }

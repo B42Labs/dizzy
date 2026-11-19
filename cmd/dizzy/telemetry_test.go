@@ -159,7 +159,7 @@ func TestMonitorFailsOnBusyListenAddress(t *testing.T) {
 
 // TestTelemetrySetupHasOneCaller keeps every command on setupTelemetry, so
 // --otel and --listen-address reach all of them: telemetry.Setup is called
-// only from telemetry.go, and the 24 commands that record metrics call the
+// only from telemetry.go, and the 26 commands that record metrics call the
 // helper.
 func TestTelemetrySetupHasOneCaller(t *testing.T) {
 	files, err := filepath.Glob("*.go")
@@ -180,7 +180,7 @@ func TestTelemetrySetupHasOneCaller(t *testing.T) {
 		}
 		helperCalls += strings.Count(string(src), "setupTelemetry(")
 	}
-	if helperCalls != 24 {
-		t.Errorf("setupTelemetry calls outside telemetry.go = %d, want 24", helperCalls)
+	if helperCalls != 26 {
+		t.Errorf("setupTelemetry calls outside telemetry.go = %d, want 26", helperCalls)
 	}
 }
