@@ -504,8 +504,8 @@ var fullCleanup = []string{
 	"list:keystone_catalog_entry:run0",
 	"list:keystone_project:run0",
 	"list:keystone_user:run0",
+	"status:user", "waitsettled:user",
 	"lookup:appcred", "lookup:user",
-	"waitsettled:user",
 	"delete:appcred", "waitgone:appcred", "gone:appcred",
 	"delete:role", "waitgone:role", "gone:role",
 	"delete:catalog", "waitgone:catalog", "gone:catalog",
@@ -787,27 +787,149 @@ func TestCleanupWaitsForPasswordRotation(t *testing.T) {
 			t.Fatalf("Cleanup() = %d, %v, want 2, nil (the user order was already gone)", deleted, err)
 		}
 		e := f.snapshot()
-		index(t, e, "waitsettled:user")
-		noneWithPrefix(t, e, "status:", "reject:user")
+		index(t, e, "status:user")
+		noneWithPrefix(t, e, "waitsettled:", "reject:user")
 		if strings.Contains(logs.String(), unsettled) {
 			t.Errorf("a gone user order was logged as unsettled:\n%s", logs)
 		}
 	})
+
+	t.Run("a user order that goes during the wait counts as settled", func(t *testing.T) {
+		logs := captureLogs(t)
+		f := newFakeCleaner(fiveOrders...)
+		user := f.order("user")
+		user.specGen = 2
+		f.on("waitsettled:user", func(context.Context) error {
+			f.update("removed:user", func() { user.gone, user.secret = true, false })
+			return nil
+		})
+
+		deleted, err := runCleanup(f, nil)
+		if err != nil || deleted != 5 {
+			t.Fatalf("Cleanup() = %d, %v, want 5, nil", deleted, err)
+		}
+		index(t, f.snapshot(), "removed:user")
+		if strings.Contains(logs.String(), unsettled) {
+			t.Errorf("a user order gone during the wait was logged as unsettled:\n%s", logs)
+		}
+	})
 }
 
-// TestCleanupSkipsSettleWithoutCredential confirms the wait for a user
-// order's generation only runs when there is an application credential order
-// to delete: a user order that never got provisioned has a spec generation of
-// 1 and a status generation of 0, and waiting on it would only run into
-// readyTimeout.
-func TestCleanupSkipsSettleWithoutCredential(t *testing.T) {
-	f := newFakeCleaner("user", "project")
-	f.order("user").gen = 0
-	deleted, err := runCleanup(f, nil)
-	if err != nil || deleted != 2 {
-		t.Fatalf("Cleanup() = %d, %v, want 2, nil", deleted, err)
-	}
-	noneWithPrefix(t, f.snapshot(), "waitsettled:")
+// settleAfterQuiet holds the wait for user's password generation for a
+// moment, marking early:<prefix> when a call whose event starts with prefix is
+// recorded meanwhile, and then lets the status catch up with the spec, which
+// it records as caught-up:<logical>.
+func settleAfterQuiet(f *fakeCleaner, user *fakeOrder, prefix string) {
+	logical := user.res.Logical
+	f.on("waitsettled:"+logical, func(ctx context.Context) error {
+		quiet, stop := context.WithTimeout(ctx, 50*time.Millisecond)
+		defer stop()
+		if f.waitFor(quiet, func(e []string) bool { return countPrefix(e, prefix) > 0 }) == nil {
+			f.mark("early:" + prefix)
+		}
+		f.update("caught-up:"+logical, func() { user.gen = user.specGen })
+		return nil
+	})
+}
+
+// TestCleanupSettlesEachProvisionedUser confirms step 2 decides for each user
+// order on its own whether to wait for its password generation: a user whose
+// status generation is 0 was never provisioned and is not waited on, and a
+// provisioned user whose spec generation is ahead is waited on, whether or not
+// an application credential order is among the run's orders. It also confirms
+// the Secrets are read only once the wait is over.
+func TestCleanupSettlesEachProvisionedUser(t *testing.T) {
+	const (
+		unsettled = "did not settle"
+		skipped   = "never provisioned"
+	)
+
+	t.Run("a never provisioned user is not waited on beside a credential order", func(t *testing.T) {
+		logs := captureLogs(t)
+		f := newFakeCleaner(fiveOrders...)
+		user := f.order("user")
+		user.gen, user.secret = 0, false
+
+		deleted, err := runCleanup(f, nil)
+		if err != nil || deleted != 5 {
+			t.Fatalf("Cleanup() = %d, %v, want 5, nil", deleted, err)
+		}
+		e := f.snapshot()
+		index(t, e, "status:user")
+		noneWithPrefix(t, e, "waitsettled:")
+		out := logs.String()
+		if !strings.Contains(out, skipped) || !strings.Contains(out, `"id":"`+idOf("user")+`"`) {
+			t.Errorf("log lacks the skipped wait for the user order:\n%s", out)
+		}
+		if strings.Contains(out, unsettled) {
+			t.Errorf("a never provisioned user order was logged as unsettled:\n%s", out)
+		}
+	})
+
+	t.Run("a provisioned user mid-rotation is waited on without a credential order", func(t *testing.T) {
+		f := newFakeCleaner("user", "project")
+		user := f.order("user")
+		user.specGen = 2
+		settleAfterQuiet(f, user, "delete:")
+
+		deleted, err := runCleanup(f, nil)
+		if err != nil || deleted != 2 {
+			t.Fatalf("Cleanup() = %d, %v, want 2, nil", deleted, err)
+		}
+		e := f.snapshot()
+		noneWithPrefix(t, e, "early:")
+		if caught, del := index(t, e, "caught-up:user"), index(t, e, "delete:project"); del < caught {
+			t.Errorf("delete:project at %d comes before the status caught up at %d: %v", del, caught, e)
+		}
+	})
+
+	t.Run("the secrets are read once the wait is over", func(t *testing.T) {
+		f := newFakeCleaner(fiveOrders...)
+		user := f.order("user")
+		user.specGen = 2
+		settleAfterQuiet(f, user, "lookup:")
+
+		deleted, err := runCleanup(f, nil)
+		if err != nil || deleted != 5 {
+			t.Fatalf("Cleanup() = %d, %v, want 5, nil", deleted, err)
+		}
+		e := f.snapshot()
+		noneWithPrefix(t, e, "early:")
+		caught := index(t, e, "caught-up:user")
+		for _, l := range []string{"appcred", "user"} {
+			if i := index(t, e, "lookup:"+l); i < caught {
+				t.Errorf("lookup:%s at %d comes before the user's password generation settled at %d: %v", l, i, caught, e)
+			}
+		}
+	})
+
+	t.Run("an unreadable status does not skip the wait", func(t *testing.T) {
+		logs := captureLogs(t)
+		f := newFakeCleaner("user", "project")
+		f.order("user").gen = 0
+		denied := apierrors.NewForbidden(schema.GroupResource{Group: "c5c3.io", Resource: "keystoneusers"}, "dizzyorder-run0-user", errors.New("cannot get"))
+		f.failWith("status:user", apierrors.NewServiceUnavailable("the API server is restarting"), denied)
+		const readyTimeout = 100 * time.Millisecond
+
+		deleted, err := Cleanup(context.Background(), f, cleanupRun, nil, 2, testOpTimeout, readyTimeout, testGoneTimeout)
+		if err != nil || deleted != 2 {
+			t.Fatalf("Cleanup() = %d, %v, want 2, nil", deleted, err)
+		}
+		e := f.snapshot()
+		if n := count(e, "status:user"); n != 2 {
+			t.Errorf("the status read was sent %d times, want 2 (the 503 retried, the 403 not): %v", n, e)
+		}
+		if ended, del := index(t, e, "ended:waitsettled:user"), index(t, e, "delete:project"); del < ended {
+			t.Errorf("delete:project at %d comes before the wait for the user's generation ended at %d: %v", del, ended, e)
+		}
+		out := logs.String()
+		if !strings.Contains(out, unsettled) {
+			t.Errorf("log lacks the unsettled user order:\n%s", out)
+		}
+		if strings.Contains(out, skipped) || strings.Contains(out, "specGeneration") {
+			t.Errorf("log reports generations no status read gave:\n%s", out)
+		}
+	})
 }
 
 func TestCleanupAcceptedCredential(t *testing.T) {
@@ -981,17 +1103,39 @@ func TestCleanupListingErrorStopsBeforeDelete(t *testing.T) {
 // reported once the cleanup is done.
 func TestCleanupLookupFailureStillDeletes(t *testing.T) {
 	f := newFakeCleaner(fiveOrders...)
-	f.failWith("lookup:user", apierrors.NewServiceUnavailable("the API server is restarting"))
+	denied := apierrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, "dizzyorder-run0-user-credentials", errors.New("cannot get"))
+	f.failWith("lookup:user", denied)
 	deleted, err := runCleanup(f, nil)
-	if !apierrors.IsServiceUnavailable(err) {
-		t.Fatalf("Cleanup() = %v, want the lookup's 503", err)
+	if !apierrors.IsForbidden(err) {
+		t.Fatalf("Cleanup() = %v, want the lookup's 403", err)
 	}
 	if deleted != 5 {
 		t.Errorf("deleted = %d, want 5", deleted)
 	}
 	e := f.snapshot()
+	if n := count(e, "lookup:user"); n != 1 {
+		t.Errorf("the forbidden read was sent %d times, want once", n)
+	}
 	index(t, e, "reject:appcred:keystone_application_credential")
 	noneWithPrefix(t, e, "waitsecretgone:user", "reject:user")
+}
+
+// TestCleanupRetriesLookup confirms a transient error on a Secret read is
+// retried, as a Delete is, so it neither leaves the credential unchecked nor
+// fails the cleanup.
+func TestCleanupRetriesLookup(t *testing.T) {
+	f := newFakeCleaner(fiveOrders...)
+	f.failWith("lookup:user", apierrors.NewServiceUnavailable("the API server is restarting"))
+	deleted, err := runCleanup(f, nil)
+	if err != nil || deleted != 5 {
+		t.Fatalf("Cleanup() = %d, %v, want 5, nil after the retry", deleted, err)
+	}
+	e := f.snapshot()
+	if n := count(e, "lookup:user"); n != 2 {
+		t.Errorf("lookup:user sent %d times, want 2", n)
+	}
+	index(t, e, "reject:user:keystone_user")
+	checkBounds(t, f, map[string]time.Duration{"lookup": testOpTimeout})
 }
 
 // TestCleanupDeletesAKindInParallel confirms the Delete calls of one kind run
@@ -1004,9 +1148,15 @@ func TestCleanupDeletesAKindInParallel(t *testing.T) {
 		f.add(orderOf(c5c3.KindRoleAssignment, "role-b"))
 		return f
 	}
+	// waitsTogether holds the first role's wait until the second one's has
+	// started, and records ended:waitgone:role when its bound passes first.
 	waitsTogether := func(f *fakeCleaner) {
 		f.on("waitgone:role", func(ctx context.Context) error {
-			return f.waitFor(ctx, hasEvent("waitgone:role-b"))
+			if err := f.waitFor(ctx, hasEvent("waitgone:role-b")); err != nil {
+				f.mark("ended:waitgone:role")
+				return err
+			}
+			return nil
 		})
 	}
 
@@ -1037,7 +1187,9 @@ func TestCleanupDeletesAKindInParallel(t *testing.T) {
 		if err != nil || deleted != 4 {
 			t.Fatalf("Cleanup() = %d, %v, want 4, nil", deleted, err)
 		}
-		noneWithPrefix(t, f.snapshot(), "parallel:")
+		// The waits ran together although the deletes did not: no wait ran
+		// into goneTimeout, so no order was left for Observe to find gone.
+		noneWithPrefix(t, f.snapshot(), "parallel:", "ended:waitgone:", "observe:")
 	})
 }
 
@@ -1063,8 +1215,7 @@ func TestCleanupCancelled(t *testing.T) {
 // TestCleanupBoundsEachCall confirms each call runs under the bound boundary 8
 // names for it: a request under opTimeout, the wait for a user's generation
 // under readyTimeout and a wait for an order to be gone under goneTimeout.
-// The status read and Observe, which only an unsettled generation and an
-// order that stays reach, are checked in their tests.
+// Observe, which only an order that stays reaches, is checked in its tests.
 func TestCleanupBoundsEachCall(t *testing.T) {
 	f := newFakeCleaner(fiveOrders...)
 	if _, err := runCleanup(f, nil); err != nil {
@@ -1072,6 +1223,7 @@ func TestCleanupBoundsEachCall(t *testing.T) {
 	}
 	bounds := map[string]time.Duration{
 		"list":           testOpTimeout,
+		"status":         testOpTimeout,
 		"lookup":         testOpTimeout,
 		"waitsettled":    testReadyTimeout,
 		"delete":         testOpTimeout,
@@ -1111,7 +1263,7 @@ func TestCleanupKeepsSecretsOutOfLogsAndErrors(t *testing.T) {
 		}, 50 * time.Millisecond},
 		{"held order", func(f *fakeCleaner) { f.order("appcred").stuck = true }, 50 * time.Millisecond},
 		{"unreadable secret", func(f *fakeCleaner) {
-			f.failWith("lookup:user", apierrors.NewServiceUnavailable("the API server is restarting"))
+			f.failWith("lookup:user", apierrors.NewForbidden(schema.GroupResource{Resource: "secrets"}, "dizzyorder-run0-user-credentials", errors.New("cannot get")))
 		}, testOpTimeout},
 	} {
 		f := newFakeCleaner(fiveOrders...)

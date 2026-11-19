@@ -81,9 +81,12 @@ type fakeOrders struct {
 
 	// graceLeft is how far ahead of a Status call the superseded application
 	// credential's deletion lies after a rotation. previousGone reports the
-	// superseded credential as already deleted instead.
+	// superseded credential as already deleted instead. previousID, when set,
+	// is the id Status reports for the superseded credential in place of the
+	// id of the generation before, as after a second rotation.
 	graceLeft    time.Duration
 	previousGone bool
+	previousID   string
 }
 
 func newFake() *fakeOrders {
@@ -267,6 +270,9 @@ func (f *fakeOrders) Status(ctx context.Context, r resource.Resource) (c5c3.Orde
 		st.CredentialID = appcredID(gen)
 		if gen > 0 && !f.previousGone {
 			st.PreviousCredentialID = appcredID(gen - 1)
+			if f.previousID != "" {
+				st.PreviousCredentialID = f.previousID
+			}
 			st.PreviousCredentialDeleteAt = time.Now().Add(f.graceLeft)
 		}
 	}
@@ -538,6 +544,15 @@ func mismatch(what string) error {
 	return fmt.Errorf("%w: %s", c5c3.ErrMismatch, what)
 }
 
+// TestProberIntervalDefault pins the interval boundary 7 gives the prober in
+// production. Every test that shortens it restores it through
+// setProberInterval.
+func TestProberIntervalDefault(t *testing.T) {
+	if proberInterval != 5*time.Second {
+		t.Errorf("proberInterval = %s, want 5s", proberInterval)
+	}
+}
+
 func TestApplyRunsTheSevenStagesInOrder(t *testing.T) {
 	setProberInterval(t, time.Hour)
 	f := newFake()
@@ -751,10 +766,15 @@ func TestApplyProberMismatchFailsStage(t *testing.T) {
 	})
 	f.on("waitrotated:appcred", func(ctx context.Context) error {
 		<-ctx.Done()
+		if errors.Is(ctx.Err(), context.Canceled) {
+			f.mark("canceled:waitrotated:appcred")
+		}
 		return ctx.Err()
 	})
 
+	start := time.Now()
 	result, err := Apply(context.Background(), f, testPlan(), 1, testOpTimeout)
+	took := time.Since(start)
 	mustFailIn(t, err, 7, c5c3.ErrMismatch)
 	if errors.Is(err, context.Canceled) {
 		t.Errorf("Apply() = %v, want the prober's mismatch rather than the cancellation it caused", err)
@@ -762,7 +782,13 @@ func TestApplyProberMismatchFailsStage(t *testing.T) {
 	if !slices.Equal(result.Created, allFive) {
 		t.Errorf("Created = %+v, want %+v", result.Created, allFive)
 	}
+	// The prober's error ended the stage at once: it cancelled the wait for
+	// the rotation, which did not run into the ready timeout.
+	if took >= testReadyTimeout/2 {
+		t.Errorf("Apply took %s, want the prober's error to end the stage well before the ready timeout %s", took, testReadyTimeout)
+	}
 	e := f.snapshot()
+	index(t, e, "canceled:waitrotated:appcred")
 	noneWithPrefix(t, e, "status:appcred", "waitprevgone:", "reject:appcred-")
 
 	// The prober has stopped: no call follows the end of Apply.
@@ -778,10 +804,14 @@ func TestApplySkipsGraceCheckWhenOver(t *testing.T) {
 		name         string
 		graceLeft    time.Duration
 		previousGone bool
+		previousID   string
 		wantLogin    bool
 	}{
 		{name: "deletion 2s ahead", graceLeft: 2 * time.Second},
+		{name: "deletion 4s ahead", graceLeft: 4 * time.Second},
+		{name: "deletion 6s ahead", graceLeft: 6 * time.Second, wantLogin: true},
 		{name: "superseded credential already deleted", graceLeft: time.Hour, previousGone: true},
+		{name: "another credential superseded", graceLeft: time.Hour, previousID: "appcred-id-other"},
 		{name: "deletion far ahead", graceLeft: time.Hour, wantLogin: true},
 	}
 	for _, tt := range tests {
@@ -789,7 +819,7 @@ func TestApplySkipsGraceCheckWhenOver(t *testing.T) {
 			setProberInterval(t, time.Hour)
 			logs := captureLogs(t)
 			f := newFake()
-			f.graceLeft, f.previousGone = tt.graceLeft, tt.previousGone
+			f.graceLeft, f.previousGone, f.previousID = tt.graceLeft, tt.previousGone, tt.previousID
 
 			result, err := Apply(context.Background(), f, testPlan(), 1, testOpTimeout)
 			if err != nil {
@@ -810,6 +840,36 @@ func TestApplySkipsGraceCheckWhenOver(t *testing.T) {
 			if logged := strings.Contains(logs.String(), skipped); logged == tt.wantLogin {
 				t.Errorf("log carries %q: %t, want %t:\n%s", skipped, logged, !tt.wantLogin, logs)
 			}
+			if want := `"previousCredentialID":"` + tt.previousID + `"`; tt.previousID != "" && !strings.Contains(logs.String(), want) {
+				t.Errorf("log lacks %s:\n%s", want, logs)
+			}
+		})
+	}
+}
+
+// TestApplyFailedWaitKeepsCreated confirms an order whose wait for readiness
+// fails stays in Result.Created, after the orders created before it, so the
+// cleanup of a run that failed in stage 1 or stage 4 still finds it.
+func TestApplyFailedWaitKeepsCreated(t *testing.T) {
+	tests := []struct {
+		key   string
+		stage int
+		want  []resource.Resource
+		later []string
+	}{
+		{"waitready:project", 1, orders("user", "project"), []string{"read:", "auth:", "create:refused-"}},
+		{"waitready:appcred", 4, allFive, []string{"read:appcred", "auth:appcred-", "editsecret:"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			f := newFake()
+			f.failWith(tt.key, context.DeadlineExceeded)
+			result, err := Apply(context.Background(), f, testPlan(), 1, testOpTimeout)
+			mustFailIn(t, err, tt.stage, context.DeadlineExceeded)
+			if !slices.Equal(result.Created, tt.want) {
+				t.Errorf("Created = %+v, want %+v", result.Created, tt.want)
+			}
+			noneWithPrefix(t, f.snapshot(), tt.later...)
 		})
 	}
 }

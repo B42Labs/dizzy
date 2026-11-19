@@ -13,8 +13,8 @@ import (
 )
 
 // Cleaner is the teardown surface Cleanup drives: discover a run's orders by
-// their dizzy/run label, read the credentials their Secrets deliver, wait for a
-// user order's password generation to settle and read its status, delete an
+// their dizzy/run label, read a user order's status and wait for its password
+// generation to settle, read the credentials their Secrets deliver, delete an
 // order and wait for it to be gone, observe an order that stays, and check that
 // a deleted order's Secret is gone and Keystone rejects its credential. Like
 // Orders it is a ports-and-adapters seam to the cluster and to Keystone:
@@ -51,8 +51,9 @@ var deleteOrder = []resource.Kind{
 // Cleanup looks their credentials up and checks them.
 var credentialKinds = []resource.Kind{c5c3.KindApplicationCredential, c5c3.KindUser}
 
-// delivered is a credential read before the delete from the Secret beside a
-// user or application credential order.
+// delivered is a credential read before the delete, once the user orders'
+// password generations settled, from the Secret beside a user or application
+// credential order.
 type delivered struct {
 	order resource.Resource
 	cred  c5c3.Credential
@@ -73,15 +74,23 @@ type remaining struct {
 //     result with the run record's orders of that kind, deduplicated by id; a
 //     record entry of another kind or with an empty id is dropped. A run with
 //     no order deletes nothing and returns 0, nil.
-//  2. It reads the Secret beside each user and application credential order.
-//     An order whose Secret is missing or cannot be parsed has nothing to
-//     check in step 6.
-//  3. When an application credential order is among them, it waits up to
-//     readyTimeout for each user order's password generation to settle, since
-//     deleting a credential order while its user's password rotates can strand
-//     the credential order's finalizer. A user order that is already gone
-//     counts as settled; one that does not settle in time is logged as a
-//     warning and the cleanup goes on.
+//  2. For each user order, in parallel, it reads the order's status under
+//     opTimeout, retried on transient errors, and then waits up to
+//     readyTimeout for the password generation in the status to catch up with
+//     the spec, or for the order to be deleted, since deleting a credential
+//     order while its user's password rotates can strand the credential
+//     order's finalizer. It skips the wait for a user order whose status
+//     generation is 0: Keystone never held that user's password, so no
+//     rotation can be in flight, and the CRD defaults the spec generation to
+//     1, so the wait could only run into readyTimeout. A status read that
+//     fails for another reason does not skip the wait. A user order that is
+//     gone, before or during the wait, counts as settled; one that does not
+//     settle in time is logged as a warning and the cleanup goes on.
+//  3. It reads the Secret beside each user and application credential order,
+//     each read under opTimeout and retried on transient errors. It reads
+//     them after step 2, so a user's Secret carries the password the user
+//     holds once its rotation settled. An order whose Secret is missing or
+//     cannot be parsed has nothing to check in step 6.
 //  4. It deletes kind by kind in deleteOrder. Within a kind the Delete calls
 //     run in parallel up to concurrency, each retried on transient errors
 //     under opTimeout, and then the waits for the orders to be gone run in
@@ -94,7 +103,7 @@ type remaining struct {
 //     one found gone counts as gone, and the others are named in the returned
 //     error with what the operator reports for them, such as
 //     ReferencedByApplicationCredentials.
-//  6. For each credential of step 2 whose order is confirmed gone, it waits up
+//  6. For each credential of step 3 whose order is confirmed gone, it waits up
 //     to opTimeout for the garbage collector to remove the Secret, then sends
 //     one login under opTimeout that Keystone must reject. A Secret still
 //     present is an error wrapping c5c3.ErrMismatch, an accepted credential
@@ -103,7 +112,7 @@ type remaining struct {
 //
 // The count includes an order that was already gone when its Delete was sent.
 // A listing error stops the cleanup before anything is deleted. The errors of
-// steps 2, 5 and 6 do not stop it: they are joined and returned once step 6
+// steps 3, 5 and 6 do not stop it: they are joined and returned once step 6
 // has run. Cancelling ctx stops it after the call in flight and returns
 // ctx.Err() with the count so far. Running Cleanup again is safe at every
 // point: it rediscovers the orders by label and a 404 is success.
@@ -127,16 +136,14 @@ func Cleanup(ctx context.Context, c Cleaner, runID string, recorded []resource.R
 		return 0, nil
 	}
 
-	creds, lookupErr := lookupCredentials(ctx, c, found, opTimeout)
+	settleUsers(ctx, c, found[c5c3.KindUser], opTimeout, readyTimeout)
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 
-	if len(found[c5c3.KindApplicationCredential]) > 0 {
-		settleUsers(ctx, c, found[c5c3.KindUser], opTimeout, readyTimeout)
-		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
+	creds, lookupErr := lookupCredentials(ctx, c, found, opTimeout)
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 
 	gone, left, err := deleteKinds(ctx, c, found, concurrency, opTimeout, goneTimeout)
@@ -178,11 +185,53 @@ func discover(ctx context.Context, c Cleaner, runID string, recorded []resource.
 	return found, nil
 }
 
-// lookupCredentials is step 2: it reads the Secret beside each user and
-// application credential order once under opTimeout and returns the
-// credentials there are to check after the delete. A failed read is logged and
-// leaves that order unchecked; the first such error is returned for Cleanup to
-// report once it is done.
+// settleUsers is step 2: for every user order in parallel, it reads the
+// order's status under opTimeout, retrying transient errors, and unless the
+// order is gone or its status generation is 0, waits up to readyTimeout for
+// the status generation to catch up with the spec generation, or for the order
+// to be deleted. A status generation of 0 marks a user Keystone never held a
+// password for, so no rotation of it can be in flight; the CRD defaults the
+// spec generation to 1, so a wait on it could only run into readyTimeout. A
+// status read that fails for another reason leads to the wait, which polls
+// through what it can. A user order that goes during the wait counts as
+// settled. One that does not settle in time is logged as a warning, with the
+// generations the status read gave, and the cleanup goes on.
+func settleUsers(ctx context.Context, c Cleaner, users []resource.Resource, opTimeout, readyTimeout time.Duration) {
+	_, _ = each(ctx, users, len(users), func(ctx context.Context, r resource.Resource) error {
+		var st c5c3.OrderStatus
+		serr := WithRetry(ctx, opTimeout, func(ctx context.Context) error {
+			var err error
+			st, err = c.Status(ctx, r)
+			return err
+		})
+		switch {
+		case ctx.Err() != nil, c5c3.IsNotFound(serr):
+			return nil
+		case serr == nil && st.Generation == 0:
+			slog.Info("the user order was never provisioned in Keystone; not waiting for its password generation",
+				"id", r.ID, "specGeneration", st.SpecGeneration)
+			return nil
+		}
+
+		err := bounded(ctx, readyTimeout, func(ctx context.Context) error { return c.WaitGenerationSettled(ctx, r) })
+		if err == nil || c5c3.IsNotFound(err) || ctx.Err() != nil {
+			return nil
+		}
+		attrs := []any{"id", r.ID, "timeout", readyTimeout, "error", err}
+		if serr == nil {
+			attrs = append(attrs, "specGeneration", st.SpecGeneration, "generation", st.Generation)
+		}
+		slog.Warn("the user order's password generation did not settle; deleting the orders anyway, "+
+			"though an application credential order's teardown can strand while the password rotates", attrs...)
+		return nil
+	})
+}
+
+// lookupCredentials is step 3: it reads the Secret beside each user and
+// application credential order under opTimeout, retrying transient errors, and
+// returns the credentials there are to check after the delete. A failed read
+// is logged and leaves that order unchecked; the first such error is returned
+// for Cleanup to report once it is done.
 func lookupCredentials(ctx context.Context, c Cleaner, found map[resource.Kind][]resource.Resource, opTimeout time.Duration) ([]delivered, error) {
 	var (
 		creds    []delivered
@@ -194,7 +243,7 @@ func lookupCredentials(ctx context.Context, c Cleaner, found map[resource.Kind][
 				cred c5c3.Credential
 				ok   bool
 			)
-			err := once(ctx, opTimeout, func(ctx context.Context) error {
+			err := WithRetry(ctx, opTimeout, func(ctx context.Context) error {
 				var err error
 				cred, ok, err = c.LookupCredential(ctx, r)
 				return err
@@ -215,32 +264,6 @@ func lookupCredentials(ctx context.Context, c Cleaner, found map[resource.Kind][
 		}
 	}
 	return creds, firstErr
-}
-
-// settleUsers is step 3: it waits, for every user order in parallel, up to
-// readyTimeout for the order's status generation to catch up with its spec
-// generation. A user order that is already gone counts as settled. One that
-// does not settle in time is logged as a warning, with its generations when a
-// status read under opTimeout gives them, and the cleanup goes on.
-func settleUsers(ctx context.Context, c Cleaner, users []resource.Resource, opTimeout, readyTimeout time.Duration) {
-	_, _ = each(ctx, users, len(users), func(ctx context.Context, r resource.Resource) error {
-		err := bounded(ctx, readyTimeout, func(ctx context.Context) error { return c.WaitGenerationSettled(ctx, r) })
-		if err == nil || c5c3.IsNotFound(err) || ctx.Err() != nil {
-			return nil
-		}
-		attrs := []any{"id", r.ID, "timeout", readyTimeout, "error", err}
-		var st c5c3.OrderStatus
-		if serr := once(ctx, opTimeout, func(ctx context.Context) error {
-			var err error
-			st, err = c.Status(ctx, r)
-			return err
-		}); serr == nil {
-			attrs = append(attrs, "specGeneration", st.SpecGeneration, "generation", st.Generation)
-		}
-		slog.Warn("the user order's password generation did not settle; deleting its application credentials anyway, "+
-			"whose teardown can strand while the password rotates", attrs...)
-		return nil
-	})
 }
 
 // deleteKinds is steps 4 and 5's delete pass: it deletes the orders kind by
