@@ -77,6 +77,9 @@ type Orders interface {
 	Reject(ctx context.Context, kind resource.Kind, cred c5c3.Credential) error
 }
 
+// The production *c5c3.Client must satisfy the seam.
+var _ Orders = (*c5c3.Client)(nil)
+
 // Result is the outcome of an apply: every order Apply created and did not
 // delete itself, in creation order. A full run holds the user, the project, the
 // role assignment, the catalog entry and the application credential. A refusal

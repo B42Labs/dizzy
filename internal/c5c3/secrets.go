@@ -40,6 +40,8 @@ const editedValue = "dizzy-edited"
 // document, the name of its one entry under clouds, the Secret's
 // resourceVersion, and for a user the password, for an application credential
 // order its id and secret, each read from the data key of the same name.
+// Order is the order the Secret was delivered beside, which the Keystone
+// checks read again to tell a rejected credential from a race with a change.
 //
 // Its String, Format and LogValue methods print only the resourceVersion and
 // the application credential id, so neither fmt nor slog can leak the
@@ -52,6 +54,7 @@ type Credential struct {
 	Password                    string `json:"-"`
 	ApplicationCredentialID     string
 	ApplicationCredentialSecret string `json:"-"`
+	Order                       resource.Resource
 }
 
 // String returns the Credential's resourceVersion and application credential
@@ -214,6 +217,7 @@ func oneCloud(doc []byte) (string, error) {
 // 404, a missing or empty clouds.yaml or owned key, and a document that does
 // not hold exactly one entry under clouds each return ErrMismatch, recorded on
 // the sample with error kind mismatch. Any other failure is returned wrapped.
+// The credential carries order as its Order.
 func (c *Client) ReadCredential(ctx context.Context, order resource.Resource) (Credential, error) {
 	s, err := resolveSecret(order)
 	if err != nil {
@@ -233,6 +237,7 @@ func (c *Client) ReadCredential(ctx context.Context, order resource.Resource) (C
 	if err != nil {
 		return Credential{}, err
 	}
+	cred.Order = order
 	return cred, nil
 }
 
@@ -240,7 +245,8 @@ func (c *Client) ReadCredential(ctx context.Context, order resource.Resource) (C
 // delivered nothing yet. It reads the Secret as one get sample of kind secret
 // and reports false, with no error, when there is nothing to verify: a 404,
 // which is recorded as a successful get, and a Secret it cannot parse, which
-// it logs as a warning. Any other failure is returned wrapped.
+// it logs as a warning. Any other failure is returned wrapped. A credential it
+// reads carries order as its Order.
 func (c *Client) LookupCredential(ctx context.Context, order resource.Resource) (Credential, bool, error) {
 	s, err := resolveSecret(order)
 	if err != nil {
@@ -262,6 +268,7 @@ func (c *Client) LookupCredential(ctx context.Context, order resource.Resource) 
 			"secret", s.id(), "order", order.ID, "error", err)
 		return Credential{}, false, nil
 	}
+	cred.Order = order
 	return cred, true, nil
 }
 

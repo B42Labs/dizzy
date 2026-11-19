@@ -259,6 +259,45 @@ func TestCredentialHidesSecrets(t *testing.T) {
 	}
 }
 
+// TestCredentialCarriesOrder confirms ReadCredential, LookupCredential and
+// WaitRotated, which reads through ReadCredential, return a credential whose
+// Order is the order the Secret was delivered beside, the order the Keystone
+// checks read again.
+func TestCredentialCarriesOrder(t *testing.T) {
+	user := orderRef(KindUser, "user")
+	appcred := orderRef(KindApplicationCredential, "appcred")
+	ctx := context.Background()
+
+	c, dyn, _ := testClient()
+	seed(t, dyn, KindSecret, userSecret(testPassword, "1"))
+	seed(t, dyn, KindSecret, appcredSecret("ac-1", testAppCredSecret, "2"))
+	for _, order := range []resource.Resource{user, appcred} {
+		read, err := c.ReadCredential(ctx, order)
+		if err != nil {
+			t.Fatalf("ReadCredential(%s): %v", order.Logical, err)
+		}
+		if read.Order != order {
+			t.Errorf("ReadCredential(%s).Order = %+v, want %+v", order.Logical, read.Order, order)
+		}
+		looked, ok, err := c.LookupCredential(ctx, order)
+		if err != nil || !ok {
+			t.Fatalf("LookupCredential(%s) = %v, %v", order.Logical, ok, err)
+		}
+		if looked.Order != order {
+			t.Errorf("LookupCredential(%s).Order = %+v, want %+v", order.Logical, looked.Order, order)
+		}
+	}
+
+	seed(t, dyn, KindUser, readyAt(user, 2, map[string]any{"passwordGeneration": int64(2)}))
+	rotated, err := c.WaitRotated(shortWait(t, 5*time.Second), user, 2, Credential{Password: "pw-zero"})
+	if err != nil {
+		t.Fatalf("WaitRotated: %v", err)
+	}
+	if rotated.Order != user {
+		t.Errorf("WaitRotated.Order = %+v, want %+v", rotated.Order, user)
+	}
+}
+
 // TestLookupCredential confirms cleanup's lookup reports a missing Secret as
 // false, nil with a successful get, a Secret it cannot parse as false, nil
 // with a warning that carries no secret value, a readable Secret as its

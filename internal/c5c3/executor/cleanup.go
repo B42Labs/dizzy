@@ -31,6 +31,9 @@ type Cleaner interface {
 	Reject(ctx context.Context, kind resource.Kind, cred c5c3.Credential) error
 }
 
+// The production *c5c3.Client must satisfy the seam.
+var _ Cleaner = (*c5c3.Client)(nil)
+
 // deleteOrder lists the order kinds in the order Cleanup deletes them, the
 // order the operator's holds require. An application credential order holds
 // its user, its project and their role assignments; a role assignment holds
