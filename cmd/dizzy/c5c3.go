@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"crypto/tls"
 	"log/slog"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"k8s.io/client-go/dynamic"
 
 	"github.com/B42Labs/dizzy/internal/c5c3"
+	c5c3plan "github.com/B42Labs/dizzy/internal/c5c3/plan"
 	"github.com/B42Labs/dizzy/internal/config"
 	"github.com/B42Labs/dizzy/internal/metrics"
 	"github.com/B42Labs/dizzy/internal/telemetry"
@@ -66,19 +66,24 @@ func c5c3KeystoneEndpoint(opts *globalOptions) (string, *tls.Config, error) {
 }
 
 // c5c3Cluster is what apply, monitor and cleanup resolve once at startup and
-// every client they build shares: the Kubernetes client, and the Keystone
+// every client they build shares: the Kubernetes client, the Keystone
 // endpoint override, whose authURL is empty when no clouds.yaml entry is
-// named.
+// named, and requestTimeout, the --timeout bound on each request.
 type c5c3Cluster struct {
 	dyn       dynamic.Interface
 	authURL   string
 	tlsConfig *tls.Config
+	// requestTimeout bounds each request a client sends outside the executor,
+	// each list of its pre-check and each GET of Observe, through
+	// SetRequestTimeout. The executor bounds the requests it sends itself.
+	requestTimeout time.Duration
 }
 
 // connectC5C3 resolves the Keystone endpoint override and then builds the
 // Kubernetes client the flags select, in that order, so a missing clouds.yaml
 // or an entry without auth_url fails before the kubeconfig is read. Neither
-// step sends a request.
+// step sends a request. Every client of the cluster bounds each request it
+// sends outside the executor by --timeout.
 func connectC5C3(opts *globalOptions, kube c5c3KubeFlags) (c5c3Cluster, error) {
 	authURL, tlsConfig, err := c5c3KeystoneEndpoint(opts)
 	if err != nil {
@@ -91,26 +96,29 @@ func connectC5C3(opts *globalOptions, kube c5c3KubeFlags) (c5c3Cluster, error) {
 	if err != nil {
 		return c5c3Cluster{}, err
 	}
-	return c5c3Cluster{dyn: dyn, authURL: authURL, tlsConfig: tlsConfig}, nil
+	return c5c3Cluster{dyn: dyn, authURL: authURL, tlsConfig: tlsConfig, requestTimeout: opts.timeout}, nil
 }
 
 // client returns a client for runID's orders in namespace, recording into m
 // and mirroring into tel (nil for no export), whose Keystone checks log in at
-// the override endpoint when the cluster resolved one.
+// the override endpoint when the cluster resolved one. Each list of its
+// pre-check and each GET of Observe is bounded by the cluster's request
+// timeout on its own, so an API server that does not answer cannot hang a
+// command before its first order, nor c5c3 status.
 func (k c5c3Cluster) client(namespace, runID string, m *metrics.Collector, tel *telemetry.Telemetry) *c5c3.Client {
 	c := c5c3.New(k.dyn, namespace, runID, m)
 	c.SetTelemetry(tel)
+	c.SetRequestTimeout(k.requestTimeout)
 	if k.authURL != "" {
 		c.SetKeystoneEndpoint(k.authURL, k.tlsConfig)
 	}
 	return c
 }
 
-// precheckC5C3 runs c's Precheck under opTimeout, the bound --timeout puts on
-// every Kubernetes request a c5c3 command sends, so an API server that does
-// not answer cannot hang the command before its first order.
-func precheckC5C3(ctx context.Context, c *c5c3.Client, opTimeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(ctx, opTimeout)
-	defer cancel()
-	return c.Precheck(ctx)
+// c5c3TelemetryConfig is the telemetry configuration of c5c3 apply and
+// monitor running plan p: the cloud --os-cloud or $OS_CLOUD names, p's
+// scenario, and service c5c3, the service label every exported sample of the
+// namespace carries.
+func c5c3TelemetryConfig(opts *globalOptions, p *c5c3plan.Plan) telemetry.Config {
+	return telemetry.Config{Cloud: opts.cloudName(), Scenario: p.Scenario, Service: "c5c3"}
 }

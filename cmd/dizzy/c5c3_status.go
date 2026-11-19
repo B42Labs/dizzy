@@ -7,7 +7,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/B42Labs/dizzy/internal/c5c3"
 	"github.com/B42Labs/dizzy/internal/config"
 	"github.com/B42Labs/dizzy/internal/metrics"
 	"github.com/B42Labs/dizzy/internal/run"
@@ -17,9 +16,11 @@ import (
 // re-reads every order the run created by its <namespace>/<name> id, printing
 // a table of logical name, kind, id, and current state: Ready for a ready
 // order, otherwise the reason of its first condition with status False,
-// otherwise Pending, and gone for an order that no longer exists. It sends no
-// Keystone request, so it reads no clouds.yaml.
-func newC5C3StatusCmd(_ *globalOptions) *cobra.Command {
+// otherwise Pending, and gone for an order that no longer exists. Each GET is
+// bounded by --timeout on its own, so an API server that does not answer
+// fails the order's row instead of hanging the command. It sends no Keystone
+// request, so it reads no clouds.yaml.
+func newC5C3StatusCmd(opts *globalOptions) *cobra.Command {
 	var (
 		runPath string
 		kube    c5c3KubeFlags
@@ -47,7 +48,10 @@ func newC5C3StatusCmd(_ *globalOptions) *cobra.Command {
 			}
 			// Every order is read by the namespace its id names; the client's own
 			// namespace only scopes creates and listings, which status never sends.
-			client := c5c3.New(dyn, "", rec.RunID, metrics.NewCollector())
+			// The cluster has no Keystone endpoint override, since status logs in
+			// nowhere, and bounds each GET by --timeout.
+			cluster := c5c3Cluster{dyn: dyn, requestTimeout: opts.timeout}
+			client := cluster.client("", rec.RunID, metrics.NewCollector(), nil)
 
 			return writeStatusTable(ctx, cmd, client, rec.Created)
 		},

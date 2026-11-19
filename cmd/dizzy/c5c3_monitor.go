@@ -68,9 +68,7 @@ func newC5C3MonitorCmd(opts *globalOptions) *cobra.Command {
 				stop()
 			}()
 
-			tel, err := setupTelemetry(ctx, opts, telemetry.Config{
-				Cloud: opts.cloudName(), Scenario: p.Scenario, Service: "c5c3",
-			})
+			tel, err := setupTelemetry(ctx, opts, c5c3TelemetryConfig(opts, p))
 			if err != nil {
 				return fmt.Errorf("setting up telemetry: %w", err)
 			}
@@ -79,13 +77,14 @@ func newC5C3MonitorCmd(opts *globalOptions) *cobra.Command {
 
 			// The Keystone endpoint and the Kubernetes client are resolved once:
 			// neither holds a token that could expire over a multi-day loop. The
-			// startup pre-check records into a collector of its own, so the
-			// iterations' metrics hold only their own requests.
+			// startup pre-check records into a collector of its own and exports
+			// nothing, so the iterations' metrics hold only their own requests.
+			// Its client bounds each of its lists by --timeout.
 			cluster, err := connectC5C3(opts, kube)
 			if err != nil {
 				return err
 			}
-			if err := precheckC5C3(ctx, c5c3.New(cluster.dyn, p.Namespace, "", metrics.NewCollector()), opts.timeout); err != nil {
+			if err := cluster.client(p.Namespace, "", metrics.NewCollector(), nil).Precheck(ctx); err != nil {
 				return err
 			}
 
@@ -121,10 +120,9 @@ func newC5C3MonitorCmd(opts *globalOptions) *cobra.Command {
 
 // c5c3MonitorRunOnce builds the production per-iteration closure the loop
 // drives. Each iteration gets a fresh run id, a fresh metrics collector, and
-// its own client over the cluster resolved at startup, with the plan and the
-// Keystone endpoint override set; it runs the pre-flight sweep, the pre-check
-// and the apply, and the cleanup, then records the per-iteration summary
-// metrics and logs a one-line summary.
+// the clients c5c3IterationDeps builds over the cluster resolved at startup;
+// it runs the pre-flight sweep, the pre-check and the apply, and the cleanup,
+// then records the per-iteration summary metrics and logs a one-line summary.
 func c5c3MonitorRunOnce(opts *globalOptions, cluster c5c3Cluster, p *c5c3plan.Plan, tel *telemetry.Telemetry, keepRunRecords bool) func(ctx context.Context, iter int) bool {
 	return func(ctx context.Context, iter int) bool {
 		runID, err := newRunID()
@@ -133,13 +131,11 @@ func c5c3MonitorRunOnce(opts *globalOptions, cluster c5c3Cluster, p *c5c3plan.Pl
 			return false
 		}
 		collector := metrics.NewCollector()
-		client := cluster.client(p.Namespace, runID, collector, tel)
-		client.SetPlan(p)
 
 		start := time.Now()
 		hb := startHeartbeat(ctx, "monitor iteration in progress",
 			collectorSnapshot(collector, start, "iteration", iter, "run", runID))
-		res := runIteration(ctx, c5c3IterationDeps(client, p, runID, opts.concurrency, opts.timeout))
+		res := runIteration(ctx, c5c3IterationDeps(cluster, p, runID, collector, tel, opts.concurrency, opts.timeout))
 		hb.stop()
 
 		wall := time.Since(start)
@@ -168,24 +164,36 @@ func c5c3MonitorRunOnce(opts *globalOptions, cluster c5c3Cluster, p *c5c3plan.Pl
 	}
 }
 
-// c5c3IterationDeps builds one iteration's three phases over client, which is
-// bound to runID and carries p. The pre-flight sweep runs c5c3exec.Cleanup
-// over every order in the namespace that carries the dizzy/type label, whatever
-// its run; apply runs the pre-check on this iteration's client before anything
-// is created, since c5c3exec.Apply does not run it, and then the plan; cleanup
-// deletes this run's orders by their dizzy/run label, unioned with what apply
-// created. The sweep and the cleanup bound their waits for the operator by the
-// plan's ReadyTimeout and GoneTimeout. They are built here rather than inline
-// in the runOnce closure so a test can drive them against a fake cluster.
-func c5c3IterationDeps(client *c5c3.Client, p *c5c3plan.Plan, runID string, concurrency int, opTimeout time.Duration) iterationDeps {
+// c5c3IterationDeps builds the three phases of the iteration that runs p as
+// runID over cluster, and their two clients, both in p's namespace, bound to
+// runID and recording into collector and tel. The pre-flight sweep runs
+// c5c3exec.Cleanup over every order in the namespace that carries the
+// dizzy/type label, whatever its run; apply runs the pre-check on the
+// iteration's client before anything is created, since c5c3exec.Apply does
+// not run it, and then the plan; cleanup deletes this run's orders by their
+// dizzy/run label, unioned with what apply created. The sweep and the cleanup
+// bound their waits for the operator by the plan's ReadyTimeout and
+// GoneTimeout. They are built here rather than inline in the runOnce closure
+// so a test can drive them against a fake cluster.
+//
+// The apply and the cleanup share the iteration's client, which carries p.
+// The sweep has a client of its own: a client stops sending password logins
+// once Keystone has rejected five of them, and the sweep sends one login that
+// Keystone must reject for every user order of another run it deletes. On a
+// shared client, a sweep that reclaims five leftover users would leave the
+// iteration no password login of its own.
+func c5c3IterationDeps(cluster c5c3Cluster, p *c5c3plan.Plan, runID string, collector *metrics.Collector, tel *telemetry.Telemetry, concurrency int, opTimeout time.Duration) iterationDeps {
+	sweep := cluster.client(p.Namespace, runID, collector, tel)
+	client := cluster.client(p.Namespace, runID, collector, tel)
+	client.SetPlan(p)
 	return iterationDeps{
 		preflight: func(ctx context.Context) (int, error) {
 			// The fresh run id satisfies Cleanup's non-empty guard; the orphan
 			// adapter ignores it and discovers by the dizzy/type label.
-			return c5c3exec.Cleanup(ctx, c5c3OrphanCleaner{client}, runID, nil, concurrency, opTimeout, p.ReadyTimeout, p.GoneTimeout)
+			return c5c3exec.Cleanup(ctx, c5c3OrphanCleaner{sweep}, runID, nil, concurrency, opTimeout, p.ReadyTimeout, p.GoneTimeout)
 		},
 		apply: func(ctx context.Context) ([]resource.Resource, error) {
-			if err := precheckC5C3(ctx, client, opTimeout); err != nil {
+			if err := client.Precheck(ctx); err != nil {
 				return nil, err
 			}
 			r, err := c5c3exec.Apply(ctx, client, p, concurrency, opTimeout)
