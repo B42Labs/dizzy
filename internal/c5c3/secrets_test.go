@@ -26,16 +26,19 @@ const (
 	testAppCredSecret = "s3cr3t-appcred"
 )
 
-// appcredDocument is a delivered application credential clouds.yaml.
+// appcredDocument is a delivered application credential clouds.yaml, in the
+// shape the upstream order guide shows, its quoted entry name and
+// endpoint_type included.
 func appcredDocument(id, secret string) string {
 	return `clouds:
-  admin:
-    auth_type: "v3applicationcredential"
+  "admin":
     auth:
       auth_url: "http://controlplane-keystone.openstack.svc:5000/v3"
       application_credential_id: "` + id + `"
       application_credential_secret: "` + secret + `"
+    auth_type: v3applicationcredential
     region_name: "RegionOne"
+    endpoint_type: internal
     identity_api_version: 3
 `
 }
@@ -144,11 +147,7 @@ func TestReadCredentialMismatch(t *testing.T) {
 			if errKind(err) != "mismatch" {
 				t.Errorf("errKind = %q, want mismatch", errKind(err))
 			}
-			for _, secret := range []string{testPassword, testAppCredSecret} {
-				if strings.Contains(err.Error(), secret) {
-					t.Errorf("error %q carries a secret value", err)
-				}
-			}
+			assertNoSecret(t, "error", err.Error())
 			agg := m.Aggregate(time.Second)
 			if st := statsOf(agg, KindSecret); st.Attempted != 1 || st.Failed != 1 {
 				t.Errorf("secret samples = %+v, want 1 failed get", st)
@@ -187,7 +186,9 @@ func TestReadCredentialServerError(t *testing.T) {
 
 // TestSecretCallsRefuseOtherSecrets confirms every Secret call refuses an
 // order kind that delivers no Secret and an order not named like a dizzy
-// order, without a request.
+// order, without a request, and that EditSecret and DeleteSecret also refuse
+// another run's order without a request while the calls that only read a
+// Secret, which the pre-flight sweep sends for other runs, accept it.
 func TestSecretCallsRefuseOtherSecrets(t *testing.T) {
 	ctx := context.Background()
 	foreign := resource.Resource{Kind: KindUser, Logical: "user", Name: "workflow", ID: testNamespace + "/workflow"}
@@ -214,6 +215,35 @@ func TestSecretCallsRefuseOtherSecrets(t *testing.T) {
 			}
 		})
 	}
+	t.Run("another run's order", func(t *testing.T) {
+		c, dyn, _ := testClient()
+		name := resourceName("run1", "user")
+		other := resource.Resource{Kind: KindUser, Logical: "user", Name: name, ID: testNamespace + "/" + name}
+		seed(t, dyn, KindSecret, secretObject(secretName(name), "1", map[string]string{
+			keyCloudsYAML: userDocument(testPassword), keyPassword: testPassword}))
+
+		for verb, err := range map[string]error{"EditSecret": c.EditSecret(ctx, other), "DeleteSecret": c.DeleteSecret(ctx, other)} {
+			if err == nil || !strings.Contains(err.Error(), runPrefix(testRun)) {
+				t.Errorf("%s(%s) = %v, want an error naming this run's prefix", verb, other.ID, err)
+			}
+		}
+		if got := len(dyn.Actions()); got != 0 {
+			t.Errorf("requests = %d, want 0: another run's secret is not patched or deleted", got)
+		}
+		if got := decodedData(t, dyn, secretName(name)); got[keyPassword] != testPassword {
+			t.Errorf("another run's password key changed")
+		}
+
+		if _, ok, err := c.LookupCredential(ctx, other); !ok || err != nil {
+			t.Errorf("LookupCredential(%s) = %v, %v, want the credential", other.ID, ok, err)
+		}
+		if _, err := c.ReadCredential(ctx, other); err != nil {
+			t.Errorf("ReadCredential(%s) = %v, want the credential", other.ID, err)
+		}
+		if got := countActions(dyn, "get", "secrets"); got != 2 {
+			t.Errorf("secret gets = %d, want 2: the reads accept another run's order", got)
+		}
+	})
 }
 
 // TestCredentialHidesSecrets confirms no fmt verb, slog handler or JSON
@@ -260,9 +290,9 @@ func TestCredentialHidesSecrets(t *testing.T) {
 }
 
 // TestCredentialCarriesOrder confirms ReadCredential, LookupCredential and
-// WaitRotated, which reads through ReadCredential, return a credential whose
-// Order is the order the Secret was delivered beside, the order the Keystone
-// checks read again.
+// WaitRotated, which reads the Secret in its own poll, return a credential
+// whose Order is the order the Secret was delivered beside, the order the
+// Keystone checks read again.
 func TestCredentialCarriesOrder(t *testing.T) {
 	user := orderRef(KindUser, "user")
 	appcred := orderRef(KindApplicationCredential, "appcred")
@@ -334,9 +364,7 @@ func TestLookupCredential(t *testing.T) {
 		if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), userSecretName) {
 			t.Errorf("log %q has no warning naming the secret", logs.String())
 		}
-		if strings.Contains(logs.String(), testPassword) {
-			t.Errorf("log %q carries the password", logs.String())
-		}
+		assertNoSecret(t, "log", logs.String())
 		if st := statsOf(m.Aggregate(time.Second), KindSecret); st.Attempted != 1 || st.Succeeded != 1 {
 			t.Errorf("secret samples = %+v, want 1 successful get", st)
 		}
@@ -545,9 +573,7 @@ func TestWaitSecretGone(t *testing.T) {
 		if !errors.Is(err, ErrMismatch) || !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("WaitSecretGone = %v, want ErrMismatch at the deadline", err)
 		}
-		if strings.Contains(err.Error(), testPassword) {
-			t.Errorf("error %q carries the password", err)
-		}
+		assertNoSecret(t, "error", err.Error())
 		if got := errorCount(m.Aggregate(time.Second), "mismatch"); got != 1 {
 			t.Errorf("mismatch samples = %d, want 1", got)
 		}

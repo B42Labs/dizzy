@@ -132,6 +132,23 @@ func resolveSecret(r resource.Resource) (secretRef, error) {
 	return secretRef{order: t, namespace: t.namespace, name: secretName(t.name)}, nil
 }
 
+// resolveOwnSecret is resolveSecret for the calls that change a Secret. It
+// also returns an error for an order whose name lacks this client's run
+// prefix, dizzyorder-<runid>-: dizzy edits and deletes only the Secrets of its
+// own run's orders. The calls that only read a Secret accept the orders of
+// any run, because the pre-flight sweep reads the Secrets of other runs.
+func (c *Client) resolveOwnSecret(r resource.Resource) (secretRef, error) {
+	s, err := resolveSecret(r)
+	if err != nil {
+		return secretRef{}, err
+	}
+	if prefix := runPrefix(c.runID); !strings.HasPrefix(s.order.name, prefix) {
+		return secretRef{}, fmt.Errorf("order %s is not named %s<logical>; dizzy edits and deletes only the secrets of its own run's orders",
+			r.ID, prefix)
+	}
+	return s, nil
+}
+
 // secrets returns the dynamic client for Secrets in s's namespace.
 func (c *Client) secrets(s secretRef) dynamic.ResourceInterface {
 	return c.dyn.Resource(secretsGVR).Namespace(s.namespace)
@@ -276,9 +293,10 @@ func (c *Client) LookupCredential(ctx context.Context, order resource.Resource) 
 // or application credential order, password or application_credential_secret,
 // with the base64 of dizzy-edited, as one merge patch and one update sample of
 // kind secret. A 403 returns ErrForbidden naming checks.secret_repair, the
-// key that turns the repair check off; a 409 is retryable.
+// key that turns the repair check off; a 409 is retryable. An order of another
+// run is refused without a request.
 func (c *Client) EditSecret(ctx context.Context, order resource.Resource) error {
-	s, err := resolveSecret(order)
+	s, err := c.resolveOwnSecret(order)
 	if err != nil {
 		return err
 	}
@@ -310,9 +328,10 @@ func (c *Client) EditSecret(ctx context.Context, order resource.Resource) error 
 // DeleteSecret deletes the Secret beside a user or application credential
 // order as one delete sample of kind secret, for the operator to write it
 // again. A 403 returns ErrForbidden naming checks.secret_repair. A 404 is
-// returned wrapped: the repair check deletes a Secret it has just read.
+// returned wrapped: the repair check deletes a Secret it has just read. An
+// order of another run is refused without a request.
 func (c *Client) DeleteSecret(ctx context.Context, order resource.Resource) error {
-	s, err := resolveSecret(order)
+	s, err := c.resolveOwnSecret(order)
 	if err != nil {
 		return err
 	}

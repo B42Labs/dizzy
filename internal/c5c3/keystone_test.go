@@ -51,11 +51,20 @@ const (
 const unauthorizedBody = `{"error": {"code": 401, "message": "The request you have made requires authentication.", "title": "Unauthorized"}}`
 
 // tokenAnswer is one answer of a fakeKeystone: a 201 whose body's token object
-// is token, or status with body.
+// is token, or status with body, or with stall no answer at all. A delay holds
+// the answer back that long.
 type tokenAnswer struct {
 	status int
 	token  map[string]any
 	body   string
+	stall  bool
+	delay  time.Duration
+}
+
+// stalled answers a login with nothing until the client gives up on it or the
+// test ends, as a Keystone that accepts a connection and hangs does.
+func stalled() tokenAnswer {
+	return tokenAnswer{stall: true}
 }
 
 // issued answers a login with a token whose object is token.
@@ -78,6 +87,8 @@ type fakeKeystone struct {
 	t       *testing.T
 	srv     *httptest.Server
 	answers []tokenAnswer
+	// stop releases every stalled answer when the test ends.
+	stop chan struct{}
 
 	mu     sync.Mutex
 	bodies []map[string]any
@@ -102,7 +113,7 @@ func startFakeKeystone(t *testing.T, useTLS bool, answers []tokenAnswer) *fakeKe
 	if len(answers) == 0 {
 		t.Fatal("a fake Keystone needs at least one answer")
 	}
-	k := &fakeKeystone{t: t, answers: answers}
+	k := &fakeKeystone{t: t, answers: answers, stop: make(chan struct{})}
 	k.srv = httptest.NewUnstartedServer(http.HandlerFunc(k.serve))
 	// A refused TLS handshake is part of a test, not news for its output.
 	k.srv.Config.ErrorLog = log.New(io.Discard, "", 0)
@@ -112,6 +123,9 @@ func startFakeKeystone(t *testing.T, useTLS bool, answers []tokenAnswer) *fakeKe
 		k.srv.Start()
 	}
 	t.Cleanup(k.srv.Close)
+	// Registered after Close, so it runs first and Close finds no stalled
+	// answer to wait for.
+	t.Cleanup(func() { close(k.stop) })
 	return k
 }
 
@@ -132,6 +146,20 @@ func (k *fakeKeystone) serve(w http.ResponseWriter, r *http.Request) {
 	k.mu.Unlock()
 
 	a := k.answers[min(n, len(k.answers)-1)]
+	if a.stall {
+		select {
+		case <-r.Context().Done():
+		case <-k.stop:
+		}
+		return
+	}
+	if a.delay > 0 {
+		select {
+		case <-time.After(a.delay):
+		case <-r.Context().Done():
+			return
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	if a.status == http.StatusCreated {
 		w.Header().Set("X-Subject-Token", "token-"+strconv.Itoa(n))
@@ -517,7 +545,7 @@ func TestVerifyRole(t *testing.T) {
 	}
 	t.Run("empty project", func(t *testing.T) {
 		ks := newFakeKeystone(t, issued(keystoneToken(testProjectName, []string{testRole})))
-		c, dyn, _ := testClient()
+		c, dyn, _, reader := telemetryTestClient(t)
 		cred := deliverUser(t, c, dyn, ks.authURL())
 		if err := c.VerifyRole(context.Background(), cred, "", testDomainName, testRole); err == nil {
 			t.Error("VerifyRole without a project = nil, want an error")
@@ -528,6 +556,15 @@ func TestVerifyRole(t *testing.T) {
 		if got := ks.count(); got != 0 {
 			t.Errorf("token requests = %d, want 0", got)
 		}
+		// Each refusal is the check's one validate sample, failed.
+		for _, kind := range []resource.Kind{KindRoleAssignment, KindCatalogEntry} {
+			if got := operationErrors(t, reader, kind, "validate", "other"); got != 1 {
+				t.Errorf("%s validate errors = %d, want 1", kind, got)
+			}
+			if got := operationCount(t, reader, kind, "validate"); got != 1 {
+				t.Errorf("%s validate samples = %d, want 1", kind, got)
+			}
+		}
 	})
 }
 
@@ -535,7 +572,8 @@ func TestVerifyRole(t *testing.T) {
 // until a token lists the ordered service with its public endpoint, records
 // one validate sample of kind keystone_catalog_entry over the whole poll,
 // returns ErrMismatch at the deadline when the entry never appears, and an
-// outage at the deadline as the outage.
+// outage at the deadline as the outage, also when an earlier token lacked the
+// entry and the deadline cut the last login short.
 func TestVerifyCatalog(t *testing.T) {
 	t.Run("found on a later attempt", func(t *testing.T) {
 		ks := newFakeKeystone(t,
@@ -611,13 +649,65 @@ func TestVerifyCatalog(t *testing.T) {
 			t.Errorf("validate http_503 errors = %d, want 1", got)
 		}
 	})
+	t.Run("never, with slow logins", func(t *testing.T) {
+		// Each login takes 40ms and the polls follow each other within 2ms,
+		// so a login is under way most of the time: the deadline must not
+		// cut short the last one and turn the missing entry into a timeout.
+		slow := issued(keystoneToken(testProjectName, []string{testRole}))
+		slow.delay = 40 * time.Millisecond
+		ks := newFakeKeystone(t, slow)
+		c, dyn, _, reader := telemetryTestClient(t)
+		cred := deliverUser(t, c, dyn, ks.authURL())
+
+		err := c.VerifyCatalog(shortWait(t, 400*time.Millisecond), cred, testProjectName, testDomainName, testServiceType, testServiceName, testEndpointURL)
+		if !errors.Is(err, ErrMismatch) || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("VerifyCatalog = %v, want ErrMismatch at the deadline", err)
+		}
+		if got := ks.count(); got < 2 {
+			t.Errorf("token requests = %d, want the poll to log in more than once", got)
+		}
+		if got := operationErrors(t, reader, KindCatalogEntry, "validate", "mismatch"); got != 1 {
+			t.Errorf("validate mismatches = %d, want 1", got)
+		}
+	})
+	t.Run("stall after a token without the entry", func(t *testing.T) {
+		// The first token lacks the entry, as Keystone's catalog cache can
+		// lag, and the next login hangs until the deadline cuts it short. That
+		// says nothing about the catalog: the result is the timeout.
+		ks := newFakeKeystone(t, issued(keystoneToken(testProjectName, []string{testRole})), stalled())
+		c, dyn, _, reader := telemetryTestClient(t)
+		cred := deliverUser(t, c, dyn, ks.authURL())
+
+		start := time.Now()
+		err := c.VerifyCatalog(shortWait(t, 300*time.Millisecond), cred, testProjectName, testDomainName, testServiceType, testServiceName, testEndpointURL)
+		if errors.Is(err, ErrMismatch) || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("VerifyCatalog = %v, want the deadline, not a mismatch", err)
+		}
+		if errKind(err) != "timeout" {
+			t.Errorf("errKind = %q, want timeout", errKind(err))
+		}
+		if elapsed := time.Since(start); elapsed > 3*time.Second {
+			t.Errorf("VerifyCatalog took %v, want about the 300ms deadline", elapsed)
+		}
+		if got := ks.count(); got != 2 {
+			t.Errorf("token requests = %d, want 2: the token without the entry and the stalled login", got)
+		}
+		if got := operationErrors(t, reader, KindCatalogEntry, "validate", "timeout"); got != 1 {
+			t.Errorf("validate timeouts = %d, want 1", got)
+		}
+		if got := operationCount(t, reader, KindCatalogEntry, "validate"); got != 1 {
+			t.Errorf("validate samples = %d, want 1", got)
+		}
+	})
 }
 
-// TestLogin401Classification confirms how a 401 to a login with a delivered
-// credential is classified after the order and its Secret are read again: a
-// mismatch when the order vouched for the credential before and after the
-// login, the 401 with error kind http_401 when the login raced a change or a
-// read failed.
+// TestLogin401Classification confirms how a rejected login with a delivered
+// credential, a 401 or a 404 to an application credential login, is
+// classified after the order and its Secret are read again: a mismatch when
+// the order vouched for the credential before and after the login, the answer
+// with error kind http_401 or http_404 when the login raced a change or a
+// read failed. A 404 to a password login is no rejection and is returned
+// without the read after it.
 func TestLogin401Classification(t *testing.T) {
 	user := orderRef(KindUser, "user")
 	appcred := orderRef(KindApplicationCredential, "appcred")
@@ -632,6 +722,11 @@ func TestLogin401Classification(t *testing.T) {
 		status   map[string]any
 		setup    func(t *testing.T, dyn *fake.FakeDynamicClient, authURL string)
 		mismatch bool
+		// answer is Keystone's status for the login, 401 when zero.
+		answer int
+		// unclassified is true when the answer is returned without the read
+		// of the order after the login.
+		unclassified bool
 	}{
 		{name: "user ready and its secret unchanged", order: user, mismatch: true},
 		{name: "user not ready after the login", order: user, setup: func(t *testing.T, dyn *fake.FakeDynamicClient, _ string) {
@@ -660,9 +755,29 @@ func TestLogin401Classification(t *testing.T) {
 			setup: func(t *testing.T, dyn *fake.FakeDynamicClient, _ string) {
 				script(t, dyn, "keystoneapplicationcredentials", named("ac-2", testAppCredID), named("ac-2", ""))
 			}},
+		{name: "user secret at another resourceVersion than the credential", order: user,
+			setup: func(t *testing.T, dyn *fake.FakeDynamicClient, authURL string) {
+				// The credential was read at resourceVersion 5; the Secret reads 6
+				// before and after the login, so the login used a stale password.
+				script(t, dyn, "secrets", deliveredUserSecret(t, authURL, "6"), deliveredUserSecret(t, authURL, "6"))
+			}},
+		{name: "credential named only after the login", order: appcred,
+			status: map[string]any{"credentialID": "ac-2", "previousCredentialID": "ac-0"},
+			setup: func(t *testing.T, dyn *fake.FakeDynamicClient, _ string) {
+				script(t, dyn, "keystoneapplicationcredentials", named("ac-2", "ac-0"), named("ac-2", testAppCredID))
+			}},
+		{name: "credential named and answered 404", order: appcred,
+			status: map[string]any{"credentialID": testAppCredID}, mismatch: true, answer: http.StatusNotFound},
+		{name: "credential named by neither and answered 404", order: appcred,
+			status: map[string]any{"credentialID": "ac-2", "previousCredentialID": "ac-0"}, answer: http.StatusNotFound},
+		{name: "password login answered 404", order: user, answer: http.StatusNotFound, unclassified: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ks := newFakeKeystone(t, answered(http.StatusUnauthorized))
+			answer := tc.answer
+			if answer == 0 {
+				answer = http.StatusUnauthorized
+			}
+			ks := newFakeKeystone(t, answered(answer))
 			c, dyn, _, reader := telemetryTestClient(t)
 			var cred Credential
 			wantProject := ""
@@ -693,15 +808,20 @@ func TestLogin401Classification(t *testing.T) {
 					t.Errorf("authenticate mismatches = %d, want 1", got)
 				}
 			} else {
-				if errors.Is(err, ErrMismatch) || errKind(err) != "http_401" {
-					t.Errorf("Authenticate = %v (kind %q), want the 401 with error kind http_401", err, errKind(err))
+				want := fmt.Sprintf("http_%d", answer)
+				if errors.Is(err, ErrMismatch) || errKind(err) != want {
+					t.Errorf("Authenticate = %v (kind %q), want the %d with error kind %s", err, errKind(err), answer, want)
 				}
-				if got := operationErrors(t, reader, tc.order.Kind, "authenticate", "http_401"); got != 1 {
-					t.Errorf("authenticate http_401 errors = %d, want 1", got)
+				if got := operationErrors(t, reader, tc.order.Kind, "authenticate", want); got != 1 {
+					t.Errorf("authenticate %s errors = %d, want 1", want, got)
 				}
 			}
-			if got := countActions(dyn, "get", k.resource) - readsBefore; got != 2 {
-				t.Errorf("order reads around the login = %d, want 2", got)
+			wantReads := 2
+			if tc.unclassified {
+				wantReads = 1
+			}
+			if got := countActions(dyn, "get", k.resource) - readsBefore; got != wantReads {
+				t.Errorf("order reads around the login = %d, want %d", got, wantReads)
 			}
 			if got := ks.count(); got != 1 {
 				t.Errorf("token requests = %d, want 1", got)
