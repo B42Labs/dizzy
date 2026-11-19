@@ -17,7 +17,6 @@ import (
 	"github.com/B42Labs/dizzy/internal/metrics"
 	"github.com/B42Labs/dizzy/internal/resource"
 	"github.com/B42Labs/dizzy/internal/run"
-	"github.com/B42Labs/dizzy/internal/telemetry"
 )
 
 // newC5C3ApplyCmd builds "c5c3 apply". With --dry-run it expands the scenario
@@ -72,9 +71,7 @@ func newC5C3ApplyCmd(opts *globalOptions) *cobra.Command {
 				stop()
 			}()
 
-			tel, err := setupTelemetry(ctx, opts, telemetry.Config{
-				Cloud: opts.cloudName(), Scenario: p.Scenario, Service: "c5c3",
-			})
+			tel, err := setupTelemetry(ctx, opts, c5c3TelemetryConfig(opts, p))
 			if err != nil {
 				return fmt.Errorf("setting up telemetry: %w", err)
 			}
@@ -96,8 +93,9 @@ func newC5C3ApplyCmd(opts *globalOptions) *cobra.Command {
 
 			// The pre-check runs before any create, so a cluster without the
 			// operator's CRDs, or a process without the rights, leaves nothing in
-			// the namespace and no run record.
-			if err := precheckC5C3(ctx, client, opts.timeout); err != nil {
+			// the namespace and no run record. The client bounds each of its
+			// lists by --timeout.
+			if err := client.Precheck(ctx); err != nil {
 				return err
 			}
 

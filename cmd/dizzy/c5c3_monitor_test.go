@@ -2,13 +2,21 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic/fake"
@@ -16,6 +24,8 @@ import (
 
 	"github.com/B42Labs/dizzy/internal/c5c3"
 	"github.com/B42Labs/dizzy/internal/metrics"
+	"github.com/B42Labs/dizzy/internal/resource"
+	"github.com/B42Labs/dizzy/internal/run"
 )
 
 // c5c3SweepListings are the five listings of one pre-flight sweep, by the
@@ -54,10 +64,173 @@ var c5c3CleanupListings = []string{
 // the requests the fake receives is fixed.
 func c5c3TestDeps(t *testing.T, dyn *fake.FakeDynamicClient) iterationDeps {
 	t.Helper()
-	p := c5c3ShortPlan(t)
-	client := c5c3.New(dyn, p.Namespace, "run0", metrics.NewCollector())
-	client.SetPlan(p)
-	return c5c3IterationDeps(client, p, "run0", 1, time.Second)
+	return c5c3IterationDeps(c5c3Cluster{dyn: dyn}, c5c3ShortPlan(t), "run0", metrics.NewCollector(), nil, 1, time.Second)
+}
+
+// c5c3SecretsGVR addresses Secrets.
+var c5c3SecretsGVR = schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
+
+// rejectingKeystone starts a Keystone that answers every login with 401 and
+// returns its auth URL and a function that reports how many logins it
+// answered.
+func rejectingKeystone(t *testing.T) (authURL string, logins func() int64) {
+	t.Helper()
+	var n atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v3/auth/tokens" {
+			t.Errorf("Keystone got %s %s, want POST /v3/auth/tokens", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		n.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"code":401,"message":"The request you have made requires authentication.","title":"Unauthorized"}}`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL + "/v3", n.Load
+}
+
+// seedC5C3UserWithSecret stores runID's user order in dyn, labelled as
+// CreateOrder labels it, and the Secret the operator delivers beside it, whose
+// clouds.yaml logs in at authURL with a password, and returns the order.
+func seedC5C3UserWithSecret(t *testing.T, dyn *fake.FakeDynamicClient, runID, authURL string) resource.Resource {
+	t.Helper()
+	name := "dizzyorder-" + runID + "-user"
+	order := seedC5C3Order(t, dyn, c5c3.KindUser, name, map[string]any{"dizzy/run": runID, "dizzy/type": string(c5c3.KindUser)})
+	password := "pw-" + runID
+	doc := fmt.Sprintf("clouds:\n  admin:\n    auth:\n      auth_url: %q\n      username: %q\n      password: %q\n      user_domain_name: Default\n    identity_api_version: 3\n",
+		authURL, name, password)
+	secret := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata":   map[string]any{"name": name + "-credentials", "namespace": c5c3TestNamespace, "resourceVersion": "1"},
+		"type":       "Opaque",
+		"data": map[string]any{
+			"clouds.yaml": base64.StdEncoding.EncodeToString([]byte(doc)),
+			"password":    base64.StdEncoding.EncodeToString([]byte(password)),
+		},
+	}}
+	if err := dyn.Tracker().Create(c5c3SecretsGVR, secret, c5c3TestNamespace); err != nil {
+		t.Fatalf("seeding the secret of %s: %v", name, err)
+	}
+	return order
+}
+
+// TestC5C3SweepHasItsOwnPasswordLoginLimit confirms the pre-flight sweep logs
+// in through a client of its own. The sweep deletes the user orders five
+// other runs left and sends one login per user that Keystone rejects, which
+// is the limit of rejected password logins one client takes. The iteration's
+// cleanup then still sends the login that checks its own deleted user's
+// password is rejected.
+func TestC5C3SweepHasItsOwnPasswordLoginLimit(t *testing.T) {
+	authURL, logins := rejectingKeystone(t)
+	dyn := newC5C3FakeDynamic()
+	// The garbage collector deletes a user order's Secret with the order.
+	dyn.PrependReactor("delete", "keystoneusers", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		_ = dyn.Tracker().Delete(c5c3SecretsGVR, a.GetNamespace(), a.(k8stesting.DeleteAction).GetName()+"-credentials")
+		return false, nil, nil
+	})
+	for i := range 5 {
+		seedC5C3UserWithSecret(t, dyn, fmt.Sprintf("left%04d", i), authURL)
+	}
+	deps := c5c3TestDeps(t, dyn)
+	ctx := context.Background()
+
+	swept, err := deps.preflight(ctx)
+	if err != nil || swept != 5 {
+		t.Fatalf("preflight = %d, %v; want the five leftover users swept", swept, err)
+	}
+	if got := logins(); got != 5 {
+		t.Fatalf("the sweep sent %d logins, want one rejected login per leftover user, 5", got)
+	}
+
+	// The iteration's own user, as an apply that failed after stage 1 leaves it.
+	own := seedC5C3UserWithSecret(t, dyn, "run0", authURL)
+	deleted, err := deps.cleanup(ctx, []resource.Resource{own})
+	if err != nil || deleted != 1 {
+		t.Errorf("cleanup = %d, %v; want the iteration's user deleted and its password rejected", deleted, err)
+	}
+	if got := logins(); got != 6 {
+		t.Errorf("Keystone answered %d logins, want 6: the cleanup's password login was not sent after the sweep's "+
+			"five rejected logins", got)
+	}
+}
+
+// TestC5C3MonitorIterationAgainstAPI runs one c5c3 monitor iteration, the
+// production closure included, against an API server that stores the orders
+// it is sent and never makes them ready. With --concurrency 1, stage 1 creates
+// the user order, polls it until timeouts.ready and fails. The requests come
+// in the iteration's order: the startup pre-check, the sweep by the dizzy/type
+// label, the iteration's pre-check, the create and its polls, and the cleanup
+// by dizzy/run=<id>, which deletes the created order although the listings
+// stay empty. The iteration record lists the created order.
+func TestC5C3MonitorIterationAgainstAPI(t *testing.T) {
+	t.Setenv("OS_CLOUD", "")
+	api := &fakeKubeAPI{store: true}
+	kubeconfig := serveKubeAPI(t, api)
+	path := shippedC5C3Profile(t)
+	t.Chdir(t.TempDir())
+
+	if _, err := execRoot(t, "c5c3", "monitor", "--scenario", path, "--set", "timeouts.ready=1s", "--iterations", "1",
+		"--keep-run-records", "--concurrency", "1", "--kubeconfig", kubeconfig); err != nil {
+		t.Fatalf("c5c3 monitor: %v", err)
+	}
+
+	records, _ := filepath.Glob("run-*.json")
+	if len(records) != 1 {
+		t.Fatalf("monitor wrote %v, want one iteration record", records)
+	}
+	rec, err := run.Load(records[0])
+	if err != nil {
+		t.Fatalf("loading the iteration record: %v", err)
+	}
+	user := "dizzyorder-" + rec.RunID + "-user"
+	want := []resource.Resource{{Kind: c5c3.KindUser, Logical: "user", Name: user, ID: c5c3TestNamespace + "/" + user}}
+	if rec.Service != "c5c3" || rec.Seed != 0 || !slices.Equal(rec.Created, want) {
+		t.Errorf("record = service %q, seed %d, created %+v; want c5c3, 0, %+v", rec.Service, rec.Seed, rec.Created, want)
+	}
+	if !strings.HasPrefix(rec.Error, "apply: stage 1 (user and project): ") {
+		t.Errorf("record error = %q, want stage 1's failure", rec.Error)
+	}
+
+	const base = "/apis/c5c3.io/v1alpha1/namespaces/" + c5c3TestNamespace + "/"
+	listings := func(query string) []string {
+		var out []string
+		for _, res := range []string{"keystoneapplicationcredentials", "keystoneroleassignments", "keystonecatalogentries", "keystoneprojects", "keystoneusers"} {
+			out = append(out, "GET "+base+res+"?labelSelector="+query)
+		}
+		return out
+	}
+	getUser := "GET " + base + "keystoneusers/" + user
+	head := slices.Concat(c5c3PrecheckRequests(), listings("dizzy%2Ftype"), c5c3PrecheckRequests(),
+		[]string{"POST " + base + "keystoneusers"})
+	got := api.log()
+	if len(got) < len(head) || !slices.Equal(got[:len(head)], head) {
+		t.Fatalf("requests = %q, want them to start %q", got, head)
+	}
+	rest := got[len(head):]
+	polls := 0
+	for polls < len(rest) && rest[polls] == getUser {
+		polls++
+	}
+	if polls == 0 {
+		t.Errorf("requests = %q; the apply did not poll the created user order", got)
+	}
+	rest = rest[polls:]
+	cleanup := listings("dizzy%2Frun%3D" + rec.RunID)
+	if len(rest) < len(cleanup) || !slices.Equal(rest[:len(cleanup)], cleanup) {
+		t.Fatalf("requests after the polls = %q, want the cleanup's listings %q first", rest, cleanup)
+	}
+	wantTail := []string{
+		getUser, // the status the password generation wait reads
+		"GET /api/v1/namespaces/" + c5c3TestNamespace + "/secrets/" + user + "-credentials",
+		"DELETE " + base + "keystoneusers/" + user,
+		getUser, // the wait for the order to be gone
+	}
+	if tail := rest[len(cleanup):]; !slices.Equal(tail, wantTail) {
+		t.Errorf("cleanup requests after its listings = %q, want %q", tail, wantTail)
+	}
 }
 
 // listOptionsOf returns the label selector and the limit of a list action.

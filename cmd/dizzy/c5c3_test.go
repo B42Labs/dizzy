@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -255,9 +256,19 @@ users:
 type fakeKubeAPI struct {
 	objects   map[string]string
 	notServed map[string]bool
+	// store makes the fake keep the orders it is sent: a POST to an order
+	// collection stores the object it carries and answers it with 201, a GET
+	// of a stored order answers it as it was sent, without a status, so it
+	// never turns ready, and a DELETE removes it. Listings stay empty, so a
+	// cleanup reaches a stored order only through the orders it was handed.
+	store bool
+	// listDelay delays the answer to every listing with a limit, as each list
+	// of a pre-check is.
+	listDelay time.Duration
 
 	mu       sync.Mutex
 	requests []string
+	stored   map[string]string
 }
 
 func (f *fakeKubeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -270,16 +281,73 @@ func (f *fakeKubeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
+	if f.store && f.serveStored(w, r) {
+		return
+	}
 	if body, ok := f.objects[r.URL.Path]; ok && r.Method == http.MethodGet {
 		_, _ = io.WriteString(w, body)
 		return
 	}
 	if apiVersion, listKind, res, ok := collection(r.URL.Path); ok && r.Method == http.MethodGet && !f.notServed[res] {
+		if r.URL.Query().Has("limit") && f.listDelay > 0 {
+			select {
+			case <-time.After(f.listDelay):
+			case <-r.Context().Done():
+				return
+			}
+		}
 		_, _ = fmt.Fprintf(w, `{"apiVersion":%q,"kind":%q,"metadata":{"resourceVersion":"1"},"items":[]}`, apiVersion, listKind)
 		return
 	}
 	w.WriteHeader(http.StatusNotFound)
 	_, _ = io.WriteString(w, `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","reason":"NotFound","code":404}`)
+}
+
+// serveStored answers r from the stored orders, as store describes, and
+// reports whether it did.
+func (f *fakeKubeAPI) serveStored(w http.ResponseWriter, r *http.Request) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch r.Method {
+	case http.MethodPost:
+		if _, _, res, ok := collection(r.URL.Path); !ok || res == "secrets" {
+			return false
+		}
+		body, err := io.ReadAll(r.Body)
+		var obj struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+		}
+		if err == nil {
+			err = json.Unmarshal(body, &obj)
+		}
+		if err != nil || obj.Metadata.Name == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return true
+		}
+		if f.stored == nil {
+			f.stored = map[string]string{}
+		}
+		f.stored[r.URL.Path+"/"+obj.Metadata.Name] = string(body)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write(body)
+		return true
+	case http.MethodGet:
+		body, ok := f.stored[r.URL.Path]
+		if ok {
+			_, _ = io.WriteString(w, body)
+		}
+		return ok
+	case http.MethodDelete:
+		if _, ok := f.stored[r.URL.Path]; !ok {
+			return false
+		}
+		delete(f.stored, r.URL.Path)
+		_, _ = io.WriteString(w, `{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Success"}`)
+		return true
+	}
+	return false
 }
 
 // collection reports whether path addresses a namespaced collection of an
@@ -496,6 +564,101 @@ func TestC5C3ApplyPrecheckStopsBeforeCreate(t *testing.T) {
 	}
 }
 
+// c5c3PrecheckRequests are the five listings of one pre-check in
+// c5c3TestNamespace as fakeKubeAPI logs them, in the order Precheck sends them.
+func c5c3PrecheckRequests() []string {
+	var out []string
+	for _, r := range c5c3OrderResources {
+		out = append(out, "GET /apis/c5c3.io/v1alpha1/namespaces/"+c5c3TestNamespace+"/"+r.resource+"?limit=1")
+	}
+	return out
+}
+
+// TestC5C3ApplyPrecheckBoundsEachList confirms --timeout bounds each list of
+// apply's pre-check on its own rather than the pre-check as a whole: five
+// lists of 300ms each take longer than --timeout 1s together, and the
+// pre-check still passes, so apply goes on to its first create.
+func TestC5C3ApplyPrecheckBoundsEachList(t *testing.T) {
+	t.Setenv("OS_CLOUD", "")
+	api := &fakeKubeAPI{listDelay: 300 * time.Millisecond}
+	kubeconfig := serveKubeAPI(t, api)
+	path := shippedC5C3Profile(t)
+	t.Chdir(t.TempDir())
+
+	_, err := execRoot(t, "c5c3", "apply", "--timeout", "1s", "--scenario", path, "--kubeconfig", kubeconfig)
+
+	// The fake answers each create 404, which fails stage 1.
+	if err == nil || !strings.Contains(err.Error(), "stage 1 (user and project)") {
+		t.Errorf("apply = %v, want a failure in stage 1, after the pre-check", err)
+	}
+	got := api.log()
+	if want := c5c3PrecheckRequests(); len(got) < len(want) || !slices.Equal(got[:len(want)], want) {
+		t.Fatalf("requests = %q, want the five pre-check lists %q first", got, want)
+	}
+	if !slices.Contains(got, "POST /apis/c5c3.io/v1alpha1/namespaces/dizzy-orders/keystoneusers") {
+		t.Errorf("requests = %q, want the create of the user order after the pre-check", got)
+	}
+}
+
+// TestC5C3ApplyRecordsCreatedOrders confirms the run record apply writes lists
+// the orders Apply created. The fake API server stores the user and the project
+// order stage 1 creates and never makes them ready, so the stage fails at
+// timeouts.ready with both created; the record carries service c5c3, seed 0
+// and both orders with their <namespace>/<name> ids, and apply leaves them in
+// place.
+func TestC5C3ApplyRecordsCreatedOrders(t *testing.T) {
+	t.Setenv("OS_CLOUD", "")
+	api := &fakeKubeAPI{store: true}
+	kubeconfig := serveKubeAPI(t, api)
+	path := shippedC5C3Profile(t)
+	t.Chdir(t.TempDir())
+
+	out, err := execRoot(t, "c5c3", "apply", "--scenario", path, "--set", "timeouts.ready=1s", "--kubeconfig", kubeconfig)
+	if err == nil || !strings.Contains(err.Error(), "stage 1 (user and project)") {
+		t.Errorf("apply = %v, want a failure in stage 1", err)
+	}
+
+	records, _ := filepath.Glob("run-*.json")
+	if len(records) != 1 {
+		t.Fatalf("apply wrote %v, want one run record", records)
+	}
+	if !strings.Contains(out, "run record written to "+records[0]) {
+		t.Errorf("output does not name the record %s:\n%s", records[0], out)
+	}
+	raw, err := os.ReadFile(records[0])
+	if err != nil {
+		t.Fatalf("reading record: %v", err)
+	}
+	for _, want := range []string{`"service": "c5c3"`, `"seed": 0`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("record lacks %s:\n%s", want, raw)
+		}
+	}
+	rec, err := run.Load(records[0])
+	if err != nil {
+		t.Fatalf("loading record: %v", err)
+	}
+	var want []resource.Resource
+	for _, o := range []struct {
+		kind    resource.Kind
+		logical string
+	}{{c5c3.KindUser, "user"}, {c5c3.KindProject, "project"}} {
+		name := "dizzyorder-" + rec.RunID + "-" + o.logical
+		want = append(want, resource.Resource{Kind: o.kind, Logical: o.logical, Name: name, ID: c5c3TestNamespace + "/" + name})
+	}
+	if !slices.Equal(rec.Created, want) {
+		t.Errorf("record lists %+v, want %+v", rec.Created, want)
+	}
+	if !strings.Contains(rec.Error, "stage 1 (user and project)") {
+		t.Errorf("record error = %q, want stage 1's failure", rec.Error)
+	}
+	for _, r := range api.log() {
+		if strings.HasPrefix(r, "DELETE ") {
+			t.Errorf("apply sent %q; an apply that was not interrupted leaves its orders", r)
+		}
+	}
+}
+
 // TestC5C3RunRecordOfCompletedApply confirms the record of a completed apply
 // carries service c5c3, seed 0 and the five orders the client created, each
 // with its <namespace>/<name> id, and that it survives a write and a load.
@@ -690,9 +853,115 @@ func TestC5C3StatusRequiresRunFlag(t *testing.T) {
 	}
 }
 
+// silentKubeconfig returns a kubeconfig whose server accepts every connection
+// and never answers on it.
+func silentKubeconfig(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening: %v", err)
+	}
+	var (
+		mu    sync.Mutex
+		conns []net.Conn
+	)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	return writeKubeconfig(t, "http://"+ln.Addr().String())
+}
+
+// execRootWithin runs the root command with args as execRoot does and fails
+// the test when it has not returned after limit. The command keeps running in
+// the background then, until the test's cleanup ends what it waits for.
+func execRootWithin(t *testing.T, limit time.Duration, args ...string) (string, error) {
+	t.Helper()
+	type result struct {
+		out string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := execRoot(t, args...)
+		done <- result{out, err}
+	}()
+	select {
+	case res := <-done:
+		return res.out, res.err
+	case <-time.After(limit):
+		t.Fatalf("%q had not returned after %s", args, limit)
+		return "", nil
+	}
+}
+
+// TestC5C3StatusTimeoutBoundsEachGet confirms --timeout bounds each GET of
+// status: against an API server that accepts the connection and never
+// answers, status with --timeout 1s fails the order's row and returns within
+// a few seconds instead of hanging.
+func TestC5C3StatusTimeoutBoundsEachGet(t *testing.T) {
+	kubeconfig := silentKubeconfig(t)
+	name := "dizzyorder-c5c30006-user"
+	path, err := run.Write(t.TempDir(), &run.Record{RunID: "c5c30006", Service: "c5c3", Created: []resource.Resource{
+		{Kind: c5c3.KindUser, Logical: "user", Name: name, ID: c5c3TestNamespace + "/" + name},
+	}})
+	if err != nil {
+		t.Fatalf("seeding record: %v", err)
+	}
+
+	out, err := execRootWithin(t, 10*time.Second, "c5c3", "status", "--timeout", "1s", "--run", path, "--kubeconfig", kubeconfig)
+	const want = "re-querying 1 of 1 resources failed"
+	if err == nil || err.Error() != want {
+		t.Errorf("status = %v, want %q", err, want)
+	}
+	if !strings.Contains(out, "error") {
+		t.Errorf("status table does not show the failed row as error:\n%s", out)
+	}
+}
+
+// TestC5C3PrecheckTimeoutAgainstSilentServer confirms apply and monitor bound
+// the lists of their pre-check by --timeout: against an API server that
+// accepts the connection and never answers, each fails at its first list
+// with the deadline within a few seconds instead of hanging.
+func TestC5C3PrecheckTimeoutAgainstSilentServer(t *testing.T) {
+	t.Setenv("OS_CLOUD", "")
+	path := shippedC5C3Profile(t)
+	for _, verb := range [][]string{{"apply"}, {"monitor", "--iterations", "1"}} {
+		t.Run(verb[0], func(t *testing.T) {
+			kubeconfig := silentKubeconfig(t)
+			t.Chdir(t.TempDir())
+			args := slices.Concat([]string{"c5c3"}, verb, []string{"--timeout", "1s", "--scenario", path, "--kubeconfig", kubeconfig})
+			_, err := execRootWithin(t, 10*time.Second, args...)
+			if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "keystoneusers") {
+				t.Errorf("c5c3 %s = %v, want the deadline of the pre-check's list of keystoneusers", verb[0], err)
+			}
+			if records, _ := filepath.Glob("run-*"); len(records) != 0 {
+				t.Errorf("c5c3 %s that failed its pre-check wrote %v, want no run record", verb[0], records)
+			}
+		})
+	}
+}
+
 // TestC5C3StatusPrintsOrderStates confirms status prints one row per recorded
 // order: Ready, the reason of a False condition, Pending, and gone, reading
-// each order in the namespace of its id and reading no clouds.yaml.
+// each order in the namespace of its id. It names a cloud with --os-cloud
+// while OS_CLIENT_CONFIG_FILE names a file that does not exist, so a status
+// that read the entry would fail: status reads no clouds.yaml.
 func TestC5C3StatusPrintsOrderStates(t *testing.T) {
 	t.Setenv("OS_CLOUD", "")
 	t.Setenv("OS_CLIENT_CONFIG_FILE", filepath.Join(t.TempDir(), "missing-clouds.yaml"))
@@ -723,7 +992,7 @@ func TestC5C3StatusPrintsOrderStates(t *testing.T) {
 		t.Fatalf("seeding record: %v", err)
 	}
 
-	out, err := execRoot(t, "c5c3", "status", "--run", path, "--kubeconfig", kubeconfig)
+	out, err := execRoot(t, "c5c3", "status", "--os-cloud", "any", "--run", path, "--kubeconfig", kubeconfig)
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
@@ -915,6 +1184,27 @@ func TestC5C3KeystoneEndpointFromEntry(t *testing.T) {
 	}
 	if tlsConfig == nil || !tlsConfig.InsecureSkipVerify {
 		t.Errorf("TLS config = %+v, want verification off as the entry says", tlsConfig)
+	}
+}
+
+// TestC5C3TelemetryConfig confirms c5c3 apply and monitor tag their telemetry
+// with service c5c3, the plan's scenario and the cloud --os-cloud names, and
+// that both commands set telemetry up with c5c3TelemetryConfig.
+func TestC5C3TelemetryConfig(t *testing.T) {
+	cfg := c5c3TelemetryConfig(&globalOptions{osCloud: "prod"}, c5c3SmallPlan(t))
+	if cfg.Service != "c5c3" || cfg.Scenario != "small" || cfg.Cloud != "prod" {
+		t.Errorf("telemetry config = service %q, scenario %q, cloud %q; want c5c3, small, prod", cfg.Service, cfg.Scenario, cfg.Cloud)
+	}
+
+	const call = "setupTelemetry(ctx, opts, c5c3TelemetryConfig(opts, p))"
+	for _, f := range []string{"c5c3_apply.go", "c5c3_monitor.go"} {
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("reading %s: %v", f, err)
+		}
+		if !strings.Contains(string(src), call) {
+			t.Errorf("%s does not set telemetry up with %s", f, call)
+		}
 	}
 }
 
