@@ -1,0 +1,17 @@
+name: small
+namespace: dizzy-orders          # Kubernetes namespace the orders are created in
+control_plane:
+  name: controlplane
+  namespace: openstack           # optional; empty means the orders' own namespace
+role: member                     # must be on the namespace entry's allowedRoles
+refused_role: dizzy-refused      # must not be on allowedRoles
+catalog:
+  service_type: dizzy-probe      # a type no OpenStack client resolves
+  endpoint_url: https://dizzy-probe.invalid/v1
+rotation:
+  grace_period: 2m               # spec.rotation.gracePeriod of the credential order
+timeouts:
+  ready: 15m                     # create, rotation, repair and refusal waits
+  gone: 15m                      # wait for a deleted order to disappear
+checks:
+  secret_repair: true

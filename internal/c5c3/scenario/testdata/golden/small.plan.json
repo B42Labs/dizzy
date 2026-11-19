@@ -1,0 +1,62 @@
+{
+  "scenario": "small",
+  "namespace": "dizzy-orders",
+  "controlPlane": {
+    "name": "controlplane",
+    "namespace": "openstack"
+  },
+  "orders": [
+    {
+      "kind": "keystone_user",
+      "name": "user"
+    },
+    {
+      "kind": "keystone_project",
+      "name": "project"
+    },
+    {
+      "kind": "keystone_role_assignment",
+      "name": "role",
+      "user": "user",
+      "project": "project",
+      "role": "member"
+    },
+    {
+      "kind": "keystone_catalog_entry",
+      "name": "catalog",
+      "serviceType": "dizzy-probe",
+      "endpointURL": "https://dizzy-probe.invalid/v1"
+    },
+    {
+      "kind": "keystone_application_credential",
+      "name": "appcred",
+      "user": "user",
+      "project": "project"
+    }
+  ],
+  "refusals": [
+    {
+      "order": {
+        "kind": "keystone_application_credential",
+        "name": "refused-appcred",
+        "user": "user",
+        "project": "project"
+      },
+      "reason": "NoRoleOnProject"
+    },
+    {
+      "order": {
+        "kind": "keystone_role_assignment",
+        "name": "refused-role",
+        "user": "user",
+        "project": "project",
+        "role": "dizzy-refused"
+      },
+      "reason": "RoleNotAllowed"
+    }
+  ],
+  "gracePeriod": 120000000000,
+  "readyTimeout": 900000000000,
+  "goneTimeout": 900000000000,
+  "secretRepair": true
+}

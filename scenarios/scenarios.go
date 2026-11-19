@@ -8,7 +8,8 @@ import "embed"
 // Files holds the built-in scenario profile YAML files, addressed by their
 // service-scoped path (for example "neutron/medium.yaml", "cinder/small.yaml",
 // "keystone/small.yaml", "nova/small.yaml", "glance/small.yaml",
-// "barbican/small.yaml", "octavia/small.yaml", or "mix/small.yaml").
+// "barbican/small.yaml", "octavia/small.yaml", "mix/small.yaml", or
+// "c5c3/small.yaml").
 //
-//go:embed neutron cinder keystone nova glance barbican octavia mix
+//go:embed neutron cinder keystone nova glance barbican octavia mix c5c3
 var Files embed.FS
