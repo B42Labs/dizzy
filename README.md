@@ -4,7 +4,10 @@ A scenario-driven load and consistency tester for OpenStack control planes.
 
 `dizzy` builds large, randomized but **reproducible** workloads through the
 OpenStack APIs, records how long every operation takes and which states the
-resources reach, and cleans up after itself. It covers seven services today:
+resources reach, and cleans up after itself. It covers eight services today,
+seven of them through the OpenStack APIs. The eighth, `c5c3`, orders Keystone
+resources from Cobalt Core's c5c3-operator through the Kubernetes API and
+checks the result in Keystone:
 
 | Namespace | Service | What it exercises |
 |---|---|---|
@@ -15,13 +18,17 @@ resources reach, and cleans up after itself. It covers seven services today:
 | `dizzy glance` | Image | Image create + synthetic data upload, metadata/property churn, visibility transitions (private / shared / community / public), member add/accept/remove, deactivate/reactivate, delete |
 | `dizzy barbican` | Key manager | Secret store with a synthetic payload and metadata stamp, AES-256 key orders polled to ACTIVE, generic containers, secret ACLs and container consumers, byte-compared payload read-back, ACL and consumer read-back |
 | `dizzy octavia` | Load balancer | VIP networks, load balancers polled to ACTIVE after every write, TCP listeners, pools, synthetic members, TCP health monitors |
+| `dizzy c5c3` | Keystone orders | KeystoneUser, KeystoneProject, KeystoneRoleAssignment, KeystoneCatalogEntry and KeystoneApplicationCredential orders polled to Ready, a credential and a role the operator must refuse, logins with every delivered credential, a scoped token's role and catalog, repair of an edited and a deleted Secret, password and application credential rotation |
 | `dizzy mix` | Combined | Several workload personas side by side, each in its own project, in one churn run: the CI persona (short-lived servers on one network each, with data volumes), the Gardener persona (Kubernetes-style clusters of workers in anti-affinity server groups, each worker with a data volume, replaced one at a time, with load balancers kept in front of each cluster when Octavia is opted in) and the Legacy persona (long-lived servers that are stopped and started, resized, live- and cold-migrated, and have their volumes and ports detached and re-attached until teardown), plus optional background lanes that run the Cinder, Glance, Keystone or Neutron churn next to them |
 
-Every service namespace offers the same five verbs — `generate`, `apply`,
-`chaos`, `monitor`, `cleanup` — plus `status` and `report`. A scenario expands
-deterministically into a plan; applying that plan produces a run record you can
-re-query, report on, and tear down by tag.
+Every service namespace but `c5c3` offers the same five verbs — `generate`,
+`apply`, `chaos`, `monitor`, `cleanup` — plus `status` and `report`. A scenario
+expands deterministically into a plan; applying that plan produces a run record
+you can re-query, report on, and tear down by tag.
 `dizzy mix` offers `generate`, `chaos`, `status`, `report` and `cleanup`.
+`dizzy c5c3` offers six verbs, `generate`, `apply`, `monitor`, `status`,
+`report` and `cleanup`, and no `chaos`; see
+[Test c5c3-operator orders](docs/how-to/test-c5c3-orders.md).
 
 `dizzy keystone` additionally offers `pressure`, a closed-loop load on
 Keystone's token validation, revocation and role-listing path for a lab cloud.
@@ -73,7 +80,7 @@ $ dizzy neutron report --run run-<id>.json                     # see the timings
 $ dizzy neutron cleanup --run run-<id>.json                    # tear it down
 ```
 
-`--scenario` takes a filesystem path, and the twenty-four built-in profiles live under
+`--scenario` takes a filesystem path, and the twenty-five built-in profiles live under
 `scenarios/` in this repository — so clone it even if you installed a release
 binary; the container image carries them under `/usr/share/dizzy/scenarios`. The
 `small` profile fits Neutron's default per-project quotas and runs against a
@@ -99,6 +106,7 @@ matches what you are doing right now.
 - [Export metrics to OpenTelemetry](docs/how-to/export-to-otel.md)
 - [Serve Prometheus metrics and a health check](docs/how-to/serve-prometheus-metrics.md)
 - [Run against a Cobalt Core dev stack](docs/how-to/run-against-devstack-c5c3.md)
+- [Test c5c3-operator orders](docs/how-to/test-c5c3-orders.md)
 - [Deal with the quota pre-check](docs/how-to/raise-quotas.md)
 
 **Reference** — dry, complete, look-it-up material.
@@ -121,13 +129,15 @@ matches what you are doing right now.
 ## Safety
 
 - `dizzy` operates only within the project of the selected `clouds.yaml` entry,
-  or, for `dizzy mix`, of the entry each persona and lane names.
+  or, for `dizzy mix`, of the entry each persona and lane names. `dizzy c5c3`
+  operates only within the one Kubernetes namespace its scenario names.
 - Every resource it creates carries a run identifier — a Neutron tag, Cinder
   metadata, a Keystone name prefix, (for Nova) server and volume metadata, (for
   Glance) an image tag, (for Barbican) a name prefix plus secret metadata, or
   for a secret whose metadata never landed the name prefix plus the token's
-  user as its creator, or
-  (for Octavia) a tag on every load balancer object and VIP network.
+  user as its creator,
+  (for Octavia) a tag on every load balancer object and VIP network, or
+  (for c5c3) the Kubernetes labels `dizzy/run` and `dizzy/type` on every order.
   `cleanup` deletes strictly on that identifier, so it never touches resources
   the tool did not create.
 - `apply --dry-run` previews a plan without making a single API call.
@@ -135,8 +145,9 @@ matches what you are doing right now.
 
 One exception is worth knowing before you run `monitor`: its pre-flight sweep
 reclaims **any** `dizzy`-tagged resource in the project, not just its own. Do not
-run two `dizzy` processes against the same project concurrently. The details are
-in [Resource identity and cleanup](docs/explanation/resource-identity.md).
+run two `dizzy` processes against the same project concurrently, or, for
+`dizzy c5c3`, against the same Kubernetes namespace. The details are in
+[Resource identity and cleanup](docs/explanation/resource-identity.md).
 
 ## Development
 

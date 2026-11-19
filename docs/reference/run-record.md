@@ -24,10 +24,10 @@ same way.
 
 | Field | Type | Notes |
 |---|---|---|
-| `runID` | string | The run id; also the tag/metadata/name-prefix value |
-| `service` | string | `neutron`, `cinder`, `keystone`, `nova`, `glance`, `barbican`, `octavia`, or `mix`. Omitted on older records |
+| `runID` | string | The run id; also the tag/metadata/label/name-prefix value |
+| `service` | string | `neutron`, `cinder`, `keystone`, `nova`, `glance`, `barbican`, `octavia`, `c5c3`, or `mix`. Omitted on older records |
 | `scenario` | string | Scenario name |
-| `seed` | int | The seed the plan was expanded from |
+| `seed` | int | The seed the plan was expanded from; `0` on a `c5c3` record, whose plan has no seed |
 | `startedAt` | timestamp | RFC 3339 |
 | `finishedAt` | timestamp | RFC 3339 |
 | `created` | array | Every created resource; see below |
@@ -116,6 +116,20 @@ reference, so that name is how `status` finds the pool it observes the member
 through. `cleanup` deletes the recorded listeners, pools, members, and health
 monitors only through their load balancer's cascade delete, never one by one.
 
+On a `c5c3` record the list holds one entry per order `apply` created and did
+not delete itself, in creation order: the five orders `user`, `project`,
+`role`, `catalog` and `appcred`. The two refusal orders, `refused-appcred` and
+`refused-role`, appear only when the run failed before they were gone. An
+entry's `kind` is the order kind, `keystone_user`, `keystone_project`,
+`keystone_role_assignment`, `keystone_catalog_entry` or
+`keystone_application_credential`; its `name` is the Kubernetes name
+`dizzyorder-<run>-<logical>`, e.g. `dizzyorder-a1b2c3d4-user`; and its `id` is
+`<namespace>/<name>`, e.g. `dizzy-orders/dizzyorder-a1b2c3d4-user`.
+`c5c3 status` and `c5c3 cleanup --run` address every order through that id,
+and `c5c3 cleanup` takes its namespace from the first entry. The delivered
+Secrets are not listed: the operator writes them, and the garbage collector
+removes them with their orders.
+
 This list is `cleanup`'s belt-and-suspenders handle. It is the *only* handle for
 resources that cannot be discovered by tag — Neutron address scopes, and Keystone
 role assignments.
@@ -166,6 +180,23 @@ that differs from what was written, and `order_error`, for an order that ended
 in ERROR. An `octavia` record, and a `mix` record whose `services` lists
 `octavia`, adds `provisioning_error`, for a load balancer that reached ERROR
 after a write.
+
+A `c5c3` record adds `refused`, for an order whose condition carries a reason
+the operator does not retry, such as `NamespaceNotAssigned` or
+`RoleNotAllowed`. On it `mismatch` means that what the operator delivered
+does not hold in Keystone: a delivered credential that Keystone rejects while
+its order is ready and the credential did not change, an application
+credential token scoped to another project than the ordered one, a delivered
+document gophercloud cannot read, a scoped token without the role or a
+catalog without the entry, a Secret that still carries the old credential
+after a rotation or is still missing when the rotation's wait ends, a ready
+order's Secret that is missing, lacks one of its keys or does not hold exactly
+one `clouds.yaml` entry, a refusal order that turned ready or reported another
+reason, or a Secret still present after its order is gone.
+`accepted` means a login that had to fail got a token: the old password after
+a rotation, the superseded application credential after its grace period, or
+a credential after cleanup deleted its order. A Keystone outage keeps
+`http_<status>`, `timeout` or `other`.
 
 ## `chaos`
 

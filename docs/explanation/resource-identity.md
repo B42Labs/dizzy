@@ -54,7 +54,7 @@ persona's other resources.
 `dizzy:run=<id>` and `dizzy:type=image` — as Glance image tags, set atomically at
 create via the create call rather than a follow-up tag request, and the image
 list API filters on a tag server-side. Discovery is therefore a single tag query,
-the cleanest of the seven: images are one kind with no dependency ordering, so a
+the cleanest of the eight: images are one kind with no dependency ordering, so a
 bare `--run-id` reclaims everything the run created.
 
 **Barbican layers a name prefix with secret metadata.** Barbican has no tags
@@ -116,10 +116,39 @@ delete failed is still attached, stays next to its successor of the same name
 until a later delete or the teardown removes it; a lookup that finds both
 adopts the first and logs the other.
 
-All seven converge on the same deterministic naming: a resource with logical name
-`net-0001` in run `a1b2c3d4` is called `dizzy-a1b2c3d4-net-0001` on the cloud.
-That is what makes it findable in Horizon, in `openstack network list`, and by
-prefix scan.
+**c5c3 labels its orders, and the operator owns everything else.** A c5c3 run
+creates no OpenStack resource itself. It creates custom resources of
+`c5c3.io/v1alpha1` in one Kubernetes namespace, and the c5c3-operator creates
+the Keystone user, project, role assignment, catalog entry and application
+credential behind them. Every order carries two Kubernetes labels,
+`dizzy/run=<id>` and `dizzy/type=<kind>`, the counterpart of the tag pair of
+the other services. Discovery is a server-side label selector on
+`dizzy/run=<id>`, one listing per kind in that namespace, and the run record
+identifies an order as `<namespace>/<name>`. The Secrets the operator delivers
+beside the orders carry no dizzy label. The operator writes each with an
+owner reference to its order, the garbage collector removes it with the
+order, and dizzy touches no Secret that is not named after one of its orders.
+Everything else the operator creates lives in the ControlPlane's
+namespace, where dizzy has no rights, and goes with the operator's teardown of
+each order. Cleanup deletes the orders kind by kind in the order the operator's
+holds require, application credentials, role assignments, catalog entries,
+projects and then users, and waits until each kind is gone before the next,
+because the operator holds a user, a project or a role assignment that another
+order still names.
+
+The seven OpenStack services converge on the same deterministic naming: a
+resource with logical name `net-0001` in run `a1b2c3d4` is called
+`dizzy-a1b2c3d4-net-0001` on the cloud. That is what makes it findable in
+Horizon, in `openstack network list`, and by prefix scan.
+
+A c5c3 order is named `dizzyorder-<runid>-<logical>` instead, e.g.
+`dizzyorder-a1b2c3d4-user`. The operator names the Keystone user after its
+order, and `keystone monitor --reclaim-orphans` deletes every Keystone user
+whose name starts with `dizzy-`, whatever run it belongs to. With the
+`dizzy-` prefix, a Keystone monitor against the same Keystone would delete the
+Keystone users behind running c5c3 orders. The different prefix keeps that
+sweep away from them, and the label, not the name, is what c5c3 discovery
+reads.
 
 A combined run (`mix chaos`) gives each persona an identity of its own: the run
 id with the persona name appended, `<runID>-<persona>`. The CI persona's first
@@ -223,6 +252,10 @@ The practical consequence is a real asymmetry in the `cleanup` command:
 This is why `--run-id` exists at all: it is the recovery path for a run whose
 record was lost, and it is honest about being incomplete.
 
+For c5c3 the two reach the same orders, since every order carries the run
+label. `c5c3 cleanup --run-id` needs `--namespace`, which `--run` reads from
+the record's first entry.
+
 ## Cleanup is idempotent and ordered
 
 Deletion runs in reverse dependency order — snapshots before their volumes, ports
@@ -245,6 +278,16 @@ are the Nova cluster networks, which carry the same `dizzy:run` tag and belong
 to the Nova teardown that follows. The lane runs only the load-balancer stage,
 then the Nova teardown even when that stage failed, and reports the errors of
 both. `mix cleanup` takes the same order.
+
+A c5c3 cleanup waits after every kind until its orders are gone, because the
+operator holds an order's finalizer until K-ORC and the External Secrets
+Operator have cleared Keystone and OpenBao. Once a user or application
+credential order is gone, cleanup waits for its Secret to disappear and sends
+one login with the credential, which must fail, so a cleanup that succeeds
+has also shown that the run's credentials stop working. An order whose
+finalizer the operator never releases stays, and every later cleanup reports
+it by name; see
+[Release a stranded finalizer](../how-to/test-c5c3-orders.md#release-a-stranded-finalizer).
 
 ## The one dangerous exception: the monitor sweep
 
@@ -300,6 +343,16 @@ iteration. An amphora provider needs `--timeout 5m`, because an amphora build
 outlasts the default of 60s that bounds both the wait for a new load balancer
 and the sweep's wait until a deleted one is gone.
 
+c5c3 sweeps unconditionally too, scoped to one Kubernetes namespace instead
+of a project. Its sweep lists the orders by the `dizzy/type` label, so it
+takes every dizzy order in the namespace whatever its run, and runs the same
+steps as `c5c3 cleanup` over them, credential checks included. The process
+needs rights in that namespace only, so the sweep cannot reach further, but
+within it the rule is the same as for a project: run one dizzy process per
+Kubernetes namespace. The `dizzyorder-` prefix keeps the Keystone sweep of
+`keystone monitor --reclaim-orphans` away from the users behind the orders,
+and the c5c3 sweep in turn never touches a Keystone user directly.
+
 ## What cleanup will never do
 
 It will never delete a resource that does not carry the run's stamp. Not on
@@ -311,7 +364,9 @@ exception: discovery takes two kinds of secret without a stamp. One is the
 secret that carries the name prefix, no metadata at all, and the user of
 dizzy's token as its `creator_id`. Barbican sets that field from the token
 that created the secret, so only a secret the same user created under a
-`dizzy-` name matches it.
+`dizzy-` name matches it. A c5c3 cleanup deletes only orders that carry the
+run's label or are in its record, reads only the Secrets named after them, and
+sends nothing to the ControlPlane's namespace.
 
 The `monitor` sweep is the single place where the filter widens from "this run"
 to "any dizzy run", and it is documented above precisely because it is the one
