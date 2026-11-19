@@ -136,7 +136,9 @@ const (
 // default of every key that has one. yaml.v2 decodes a block into the struct
 // already in place and sets only the keys the block names, so a block that
 // names some of its keys keeps the defaults of the others, and a key written
-// explicitly, 0s included, replaces its default.
+// explicitly, 0s included, replaces its default. A block header without
+// children is the exception Parse handles: yaml.v2 decodes it as null, which
+// zeroes the struct.
 func defaults() Scenario {
 	return Scenario{
 		RefusedRole: defaultRefusedRole,
@@ -151,11 +153,35 @@ func defaults() Scenario {
 // Parse decodes a scenario from YAML, starting from the defaults. Unknown
 // keys are rejected so that a typo in a scenario file fails loudly instead of
 // being silently ignored; seed is one of them, since a c5c3 plan draws
-// nothing. It does no semantic validation; call Validate for that.
+// nothing. A block header written without children, such as "rotation:"
+// with every key commented out, names none of its keys and keeps their
+// defaults, as an absent block does. It does no semantic validation; call
+// Validate for that.
 func Parse(data []byte) (Scenario, error) {
-	s := defaults()
+	d := defaults()
+	s := d
 	if err := yaml.UnmarshalStrict(data, &s); err != nil {
 		return Scenario{}, fmt.Errorf("parsing scenario: %w", err)
+	}
+
+	// yaml.v2 decodes a block header without children as null and null into
+	// a struct as its zero value, so the strict decode above cannot tell such
+	// a block from one whose keys are all written as zero. A second decode
+	// into untyped fields can: a header without children, like an absent
+	// block, leaves its field nil, and a block with keys, or {}, does not.
+	// checks needs no such step, since its zero value is its default.
+	var blocks struct {
+		Rotation interface{} `yaml:"rotation"`
+		Timeouts interface{} `yaml:"timeouts"`
+	}
+	if err := yaml.Unmarshal(data, &blocks); err != nil {
+		return Scenario{}, fmt.Errorf("parsing scenario: %w", err)
+	}
+	if blocks.Rotation == nil {
+		s.Rotation = d.Rotation
+	}
+	if blocks.Timeouts == nil {
+		s.Timeouts = d.Timeouts
 	}
 	return s, nil
 }
@@ -170,6 +196,10 @@ const (
 	// maxRoleLength is the longest role name the c5c3-operator accepts, the
 	// cap of K-ORC's KeystoneName.
 	maxRoleLength = 255
+	// maxEndpointURLLength is the longest catalog endpoint URL the
+	// c5c3-operator's KeystoneCatalogEntry accepts, the cap of K-ORC's
+	// EndpointResourceSpec.URL.
+	maxEndpointURLLength = 1024
 	// minGracePeriod is the shortest grace period dizzy accepts. The
 	// application credential stage logs in with the superseded credential
 	// only while its deletion is more than 5 seconds away, so a shorter grace
@@ -265,20 +295,31 @@ func validateRole(key, value string) error {
 	return nil
 }
 
-// validateEndpointURL checks that value, the value of key, is an http or
-// https URL that names a host. An error quotes the URL with any password in
-// it redacted.
+// validateEndpointURL checks that value, the value of key, is an endpoint URL
+// the c5c3-operator's KeystoneCatalogEntry admits, whose CRD gives it the
+// pattern ^https?://[^\s/]+ and a cap of maxEndpointURLLength characters: at
+// most that long, with the http or https scheme written in lowercase, and
+// naming a host. An error quotes the URL with any password in it redacted.
 func validateEndpointURL(key, value string) error {
 	if value == "" {
 		return fmt.Errorf("%s must not be empty", key)
+	}
+	// The API server counts the characters of a string in runes.
+	if n := utf8.RuneCountInString(value); n > maxEndpointURLLength {
+		return fmt.Errorf("%s must be at most %d characters, got %d", key, maxEndpointURLLength, n)
 	}
 	u, err := url.Parse(value)
 	if err != nil {
 		return fmt.Errorf("%s is not a URL: %w", key, err)
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("%s must use the http or https scheme, got %q", key, u.Scheme)
+	// url.Parse lowercases the scheme, and the CRD's pattern admits only a
+	// lowercase one, so the scheme is read as written: url.Parse takes it
+	// from the start of value and keeps its length. It holds no password.
+	if scheme := value[:len(u.Scheme)]; scheme != "http" && scheme != "https" {
+		return fmt.Errorf("%s must use the http or https scheme, in lowercase, got %q", key, scheme)
 	}
+	// url.Parse reads a host only after "//", so a URL that names one
+	// starts with "http://" or "https://", as the pattern requires.
 	if u.Hostname() == "" {
 		return fmt.Errorf("%s must name a host, got %q", key, u.Redacted())
 	}

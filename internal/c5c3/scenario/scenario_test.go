@@ -124,8 +124,9 @@ func TestParseRejectsMalformedDuration(t *testing.T) {
 // refused-role refusal asks for dizzy-refused, with a 2m grace period, 15m
 // for both timeouts and the Secret repair check on. It also confirms the
 // defaults never hide a value written explicitly: a block keeps the defaults
-// of the keys it omits, an explicit 0s stays 0s and fails Validate, and an
-// explicit false turns the repair check off.
+// of the keys it omits, a block header without children keeps all of them,
+// an explicit 0s stays 0s and fails Validate, and an explicit false turns the
+// repair check off.
 func TestParseDefaults(t *testing.T) {
 	t.Run("absent keys", func(t *testing.T) {
 		s, err := Parse([]byte(minimalYAML))
@@ -173,13 +174,57 @@ func TestParseDefaults(t *testing.T) {
 		}
 	})
 
-	t.Run("an explicit 0s is kept and fails Validate", func(t *testing.T) {
-		s, err := Parse([]byte(minimalYAML + "timeouts:\n  ready: 0s\n"))
+	// yaml.v2 decodes a block header without children as null, and null
+	// into a struct as its zero value. Such a block names none of its keys,
+	// so its plan must be the plan of a file that leaves the block out.
+	t.Run("a block without children keeps its defaults", func(t *testing.T) {
+		absent, err := Parse([]byte(minimalYAML))
 		if err != nil {
 			t.Fatalf("Parse() = %v, want nil", err)
 		}
-		if want := "timeouts.ready must be positive, got 0s"; s.Validate() == nil || s.Validate().Error() != want {
-			t.Errorf("Validate() = %v, want %q", s.Validate(), want)
+		want := marshal(t, generate(t, absent))
+
+		for _, block := range []string{
+			"rotation:\n",
+			"rotation:\n  # grace_period: 2m\n",
+			"rotation: {}\n",
+			"timeouts:\n",
+			"timeouts:\n  # ready: 15m\n  # gone: 15m\n",
+			"timeouts: {}\n",
+			"checks:\n",
+			"checks:\n  # secret_repair: true\n",
+		} {
+			t.Run(block, func(t *testing.T) {
+				s, err := Parse([]byte(minimalYAML + block))
+				if err != nil {
+					t.Fatalf("Parse() = %v, want nil", err)
+				}
+				if !reflect.DeepEqual(s, absent) {
+					t.Errorf("Parse() = %+v, want the defaults of an absent block %+v", s, absent)
+				}
+				if got := marshal(t, generate(t, s)); !bytes.Equal(got, want) {
+					t.Errorf("plan = %s, want the plan of an absent block %s", got, want)
+				}
+			})
+		}
+	})
+
+	t.Run("an explicit 0s is kept and fails Validate", func(t *testing.T) {
+		for _, tc := range []struct {
+			block   string
+			wantErr string
+		}{
+			{"timeouts:\n  ready: 0s\n", "timeouts.ready must be positive, got 0s"},
+			{"timeouts:\n  gone: 0s\n", "timeouts.gone must be positive, got 0s"},
+			{"rotation:\n  grace_period: 0s\n", "rotation.grace_period must be at least 10s and below 720h, got 0s"},
+		} {
+			s, err := Parse([]byte(minimalYAML + tc.block))
+			if err != nil {
+				t.Fatalf("Parse(%q) = %v, want nil", tc.block, err)
+			}
+			if err := s.Validate(); err == nil || err.Error() != tc.wantErr {
+				t.Errorf("Parse(%q).Validate() = %v, want %q", tc.block, err, tc.wantErr)
+			}
 		}
 	})
 
@@ -216,23 +261,32 @@ func urlParseError(t *testing.T, raw string) string {
 }
 
 // TestValidate asserts Validate accepts the fixture and the edge values each
-// rule still admits, and rejects one failing input per rule of the scenario
-// schema with the exact message, which starts with the key it names.
+// rule still admits, and rejects a failing input per rule of the scenario
+// schema, the label pattern one part at a time, with the exact message, which
+// starts with the key it names.
 func TestValidate(t *testing.T) {
 	label63 := strings.Repeat("a", 63)
 	label64 := strings.Repeat("a", 64)
 	role255 := strings.Repeat("r", 255)
 	role256 := strings.Repeat("r", 256)
 	badURL := "https://dizzy probe.invalid/v1"
+	// The CRD caps the endpoint URL at 1024 characters, counted as the API
+	// server counts them, in runes, so a URL of 1024 multibyte characters is
+	// still admitted although it is longer in bytes.
+	urlPrefix := "https://dizzy-probe.invalid/"
+	url1024 := urlPrefix + strings.Repeat("a", 1024-len(urlPrefix))
+	url1024Multibyte := urlPrefix + strings.Repeat("ä", 1024-len(urlPrefix))
+	url1025 := url1024 + "a"
 
-	tests := []struct {
+	type validateCase struct {
 		name   string
 		mutate func(*Scenario)
 		// key is the scenario key the error must name; empty means valid.
 		key string
 		// wantErr is the exact expected error.
 		wantErr string
-	}{
+	}
+	tests := []validateCase{
 		{name: "valid", mutate: func(*Scenario) {}},
 		{name: "control plane in the orders' namespace", mutate: func(s *Scenario) { s.ControlPlane.Namespace = "" }},
 		{name: "namespace of 63 characters", mutate: func(s *Scenario) { s.Namespace = label63 }},
@@ -243,6 +297,8 @@ func TestValidate(t *testing.T) {
 		{name: "refused role of 255 characters", mutate: func(s *Scenario) { s.RefusedRole = role255 }},
 		{name: "service type of 63 characters", mutate: func(s *Scenario) { s.Catalog.ServiceType = label63 }},
 		{name: "http endpoint", mutate: func(s *Scenario) { s.Catalog.EndpointURL = "http://dizzy-probe.invalid:8080/v1" }},
+		{name: "endpoint url of 1024 characters", mutate: func(s *Scenario) { s.Catalog.EndpointURL = url1024 }},
+		{name: "endpoint url of 1024 multibyte characters", mutate: func(s *Scenario) { s.Catalog.EndpointURL = url1024Multibyte }},
 		{name: "grace period of 10s", mutate: func(s *Scenario) { s.Rotation.GracePeriod = Duration(10 * time.Second) }},
 		{name: "grace period just below 720h", mutate: func(s *Scenario) { s.Rotation.GracePeriod = Duration(720*time.Hour - time.Second) }},
 
@@ -314,19 +370,49 @@ func TestValidate(t *testing.T) {
 			name:    "endpoint url with another scheme",
 			mutate:  func(s *Scenario) { s.Catalog.EndpointURL = "ftp://dizzy-probe.invalid/v1" },
 			key:     "catalog.endpoint_url",
-			wantErr: `catalog.endpoint_url must use the http or https scheme, got "ftp"`,
+			wantErr: `catalog.endpoint_url must use the http or https scheme, in lowercase, got "ftp"`,
 		},
 		{
 			name:    "endpoint url without a scheme",
 			mutate:  func(s *Scenario) { s.Catalog.EndpointURL = "dizzy-probe.invalid/v1" },
 			key:     "catalog.endpoint_url",
-			wantErr: `catalog.endpoint_url must use the http or https scheme, got ""`,
+			wantErr: `catalog.endpoint_url must use the http or https scheme, in lowercase, got ""`,
+		},
+		{
+			name:    "endpoint url too long",
+			mutate:  func(s *Scenario) { s.Catalog.EndpointURL = url1025 },
+			key:     "catalog.endpoint_url",
+			wantErr: "catalog.endpoint_url must be at most 1024 characters, got 1025",
+		},
+		{
+			name:    "endpoint url with an uppercase scheme",
+			mutate:  func(s *Scenario) { s.Catalog.EndpointURL = "HTTPS://dizzy-probe.invalid/v1" },
+			key:     "catalog.endpoint_url",
+			wantErr: `catalog.endpoint_url must use the http or https scheme, in lowercase, got "HTTPS"`,
+		},
+		{
+			name:    "endpoint url with a mixed-case scheme",
+			mutate:  func(s *Scenario) { s.Catalog.EndpointURL = "Http://dizzy-probe.invalid/v1" },
+			key:     "catalog.endpoint_url",
+			wantErr: `catalog.endpoint_url must use the http or https scheme, in lowercase, got "Http"`,
 		},
 		{
 			name:    "endpoint url without a host",
 			mutate:  func(s *Scenario) { s.Catalog.EndpointURL = "https:///v1" },
 			key:     "catalog.endpoint_url",
 			wantErr: `catalog.endpoint_url must name a host, got "https:///v1"`,
+		},
+		{
+			name:    "endpoint url without the slashes after the scheme",
+			mutate:  func(s *Scenario) { s.Catalog.EndpointURL = "http:dizzy-probe.invalid/v1" },
+			key:     "catalog.endpoint_url",
+			wantErr: `catalog.endpoint_url must name a host, got "http:dizzy-probe.invalid/v1"`,
+		},
+		{
+			name:    "endpoint url with one slash after the scheme",
+			mutate:  func(s *Scenario) { s.Catalog.EndpointURL = "https:/dizzy-probe.invalid/v1" },
+			key:     "catalog.endpoint_url",
+			wantErr: `catalog.endpoint_url must name a host, got "https:/dizzy-probe.invalid/v1"`,
 		},
 		{
 			name:    "endpoint url with a port but no host, password redacted",
@@ -352,6 +438,44 @@ func TestValidate(t *testing.T) {
 		{name: "zero gone timeout", mutate: func(s *Scenario) { s.Timeouts.Gone = 0 }, key: "timeouts.gone", wantErr: "timeouts.gone must be positive, got 0s"},
 		{name: "negative gone timeout", mutate: func(s *Scenario) { s.Timeouts.Gone = Duration(-time.Minute) }, key: "timeouts.gone", wantErr: "timeouts.gone must be positive, got -1m0s"},
 	}
+	// Each label key gets edge values the pattern
+	// ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ admits, and inputs that each break one
+	// part of it: an underscore, an uppercase letter or a dot at the start,
+	// in the middle or at the end, and a dash at either end. A pattern that
+	// admits '_', an uppercase letter or '.' in any position, or a dash at
+	// either end, fails one of them.
+	labelKeys := []struct {
+		key string
+		set func(*Scenario, string)
+	}{
+		{"namespace", func(s *Scenario, v string) { s.Namespace = v }},
+		{"control_plane.namespace", func(s *Scenario, v string) { s.ControlPlane.Namespace = v }},
+		{"catalog.service_type", func(s *Scenario, v string) { s.Catalog.ServiceType = v }},
+	}
+	labels := []string{"a", "7", "0-probe", "a--b", "probe-0"}
+	notLabels := []string{
+		"_probe", "pro_be", "probe_",
+		"Probe", "proBe", "probE",
+		".probe", "pro.be", "probe.",
+		"-probe", "probe-", "-",
+	}
+	for _, lk := range labelKeys {
+		for _, value := range labels {
+			tests = append(tests, validateCase{
+				name:   lk.key + " " + value,
+				mutate: func(s *Scenario) { lk.set(s, value) },
+			})
+		}
+		for _, value := range notLabels {
+			tests = append(tests, validateCase{
+				name:    lk.key + " " + value,
+				mutate:  func(s *Scenario) { lk.set(s, value) },
+				key:     lk.key,
+				wantErr: lk.key + ` must be a DNS-1123 label (lowercase letters, digits and '-', starting and ending with a letter or digit), got "` + value + `"`,
+			})
+		}
+	}
+
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			s := smallScenario()
