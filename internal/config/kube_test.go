@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
 )
 
 // kubeconfigYAML defines one cluster, one user and the single context "dizzy",
@@ -51,6 +54,32 @@ func TestNewKubeClientExplicitPath(t *testing.T) {
 		if client == nil {
 			t.Fatalf("NewKubeClient(%q, %q) returned a nil client", path, kubeContext)
 		}
+	}
+}
+
+// TestKubeRESTConfigDisablesRateLimiter asserts the configuration
+// NewKubeClient builds its client from turns off client-go's client-side rate
+// limiter, whose default of 5 requests per second would add its waits to the
+// durations dizzy records, and that the REST client built from it the way
+// dynamic.NewForConfig builds one indeed has no limiter.
+func TestKubeRESTConfigDisablesRateLimiter(t *testing.T) {
+	restConfig, err := kubeRESTConfig(writeKubeconfig(t), "")
+	if err != nil {
+		t.Fatalf("kubeRESTConfig: %v", err)
+	}
+	if restConfig.QPS >= 0 {
+		t.Errorf("QPS = %v, want it negative, which turns client-side rate limiting off", restConfig.QPS)
+	}
+	if restConfig.RateLimiter != nil {
+		t.Errorf("RateLimiter = %v, want nil, since a set limiter overrides a negative QPS", restConfig.RateLimiter)
+	}
+
+	restClient, err := rest.UnversionedRESTClientFor(dynamic.ConfigFor(restConfig))
+	if err != nil {
+		t.Fatalf("building the REST client: %v", err)
+	}
+	if limiter := restClient.GetRateLimiter(); limiter != nil {
+		t.Errorf("REST client rate limiter = %v, want none", limiter)
 	}
 }
 

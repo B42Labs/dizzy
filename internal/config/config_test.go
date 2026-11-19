@@ -249,12 +249,22 @@ func writeCloudsWith(t *testing.T, settings, entry string) {
 	for line := range strings.Lines(entry) {
 		b.WriteString("      " + strings.TrimSuffix(line, "\n") + "\n")
 	}
-	path := filepath.Join(t.TempDir(), "clouds.yaml")
-	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+	writeCloudsYAML(t, b.String())
+}
+
+// writeCloudsYAML points clouds.yaml discovery at a file holding doc, a whole
+// clouds.yaml document, in a directory of its own, and returns the directory,
+// where a test may put a secure.yaml next to it.
+func writeCloudsYAML(t *testing.T, doc string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "clouds.yaml")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
 		t.Fatalf("writing clouds.yaml: %v", err)
 	}
 	t.Setenv("OS_CLOUD", "")
 	t.Setenv("OS_CLIENT_CONFIG_FILE", path)
+	return dir
 }
 
 // credentialAuth is a username-and-password auth block for authURL. It names no
@@ -699,15 +709,54 @@ func TestIdentityEndpoint(t *testing.T) {
 	}
 }
 
+// TestIdentityEndpointWithoutAuthURL asserts an entry that names no auth_url
+// fails with an error naming the entry, whether its auth block lacks the key,
+// is written without children, or is missing altogether. gophercloud's
+// clouds.Parse panics on an entry without an auth block, so the last two
+// cases crash the process unless IdentityEndpoint handles them.
 func TestIdentityEndpointWithoutAuthURL(t *testing.T) {
-	writeClouds(t, "username: u\npassword: p\n")
+	for _, tc := range []struct {
+		name string
+		doc  string
+	}{
+		{"auth block without auth_url", "clouds:\n  fake:\n    auth:\n      username: u\n      password: p\n"},
+		{"auth block without children", "clouds:\n  fake:\n    region_name: RegionOne\n    auth:\n"},
+		{"no auth block", "clouds:\n  fake:\n    region_name: RegionOne\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeCloudsYAML(t, tc.doc)
+
+			authURL, tlsConfig, err := IdentityEndpoint("fake")
+			if err == nil {
+				t.Fatalf("IdentityEndpoint = %q, want an error", authURL)
+			}
+			if want := `clouds.yaml entry "fake" has no auth_url`; err.Error() != want {
+				t.Errorf("error = %q, want %q", err, want)
+			}
+			if authURL != "" || tlsConfig != nil {
+				t.Errorf("IdentityEndpoint = %q, %+v, want nothing next to the error", authURL, tlsConfig)
+			}
+		})
+	}
+}
+
+// TestIdentityEndpointAuthFromSecureYAML asserts an entry whose auth block
+// lives only in the secure.yaml next to clouds.yaml still yields its
+// auth_url: an entry is judged after gophercloud merged the two files, not by
+// clouds.yaml alone.
+func TestIdentityEndpointAuthFromSecureYAML(t *testing.T) {
+	dir := writeCloudsYAML(t, "clouds:\n  fake:\n    region_name: RegionOne\n")
+	secure := "clouds:\n  fake:\n    auth:\n      auth_url: https://keystone.invalid/v3\n"
+	if err := os.WriteFile(filepath.Join(dir, "secure.yaml"), []byte(secure), 0o600); err != nil {
+		t.Fatalf("writing secure.yaml: %v", err)
+	}
 
 	authURL, _, err := IdentityEndpoint("fake")
-	if err == nil {
-		t.Fatalf("IdentityEndpoint = %q, want an error", authURL)
+	if err != nil {
+		t.Fatalf("IdentityEndpoint: %v", err)
 	}
-	if want := `clouds.yaml entry "fake" has no auth_url`; err.Error() != want {
-		t.Errorf("error = %q, want %q", err, want)
+	if want := "https://keystone.invalid/v3"; authURL != want {
+		t.Errorf("auth URL = %q, want %q", authURL, want)
 	}
 }
 

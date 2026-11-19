@@ -19,7 +19,9 @@ package config
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"runtime"
 
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack"
@@ -55,13 +57,41 @@ func newProvider(ctx context.Context, cloudName string) (*gophercloud.ProviderCl
 	return provider, endpointOptions, nil
 }
 
+// errNoAuthBlock is the error parseClouds returns for a clouds.yaml entry
+// without an auth block.
+var errNoAuthBlock = errors.New("the entry has no auth block")
+
+// parseClouds is clouds.Parse for an entry that may have no auth block. In
+// gophercloud v2.15.0, clouds.Parse reads the fields of the entry's auth block
+// through a nil pointer when the entry, merged with secure.yaml and any public
+// cloud profile, has none, and panics. parseClouds returns errNoAuthBlock for
+// that panic. The check cannot run before the call, since only clouds.Parse
+// knows which file its search found and what the merges gave. A panic that is
+// not a runtime error does not come from that nil pointer and is passed on.
+// IdentityEndpoint uses it because an --os-cloud entry for c5c3 needs no
+// credentials, which makes an entry without an auth block likely there.
+func parseClouds(opts ...clouds.ParseOption) (authOptions gophercloud.AuthOptions, endpointOptions gophercloud.EndpointOpts, tlsConfig *tls.Config, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if _, ok := r.(runtime.Error); !ok {
+				panic(r)
+			}
+			err = errNoAuthBlock
+		}
+	}()
+	return clouds.Parse(opts...)
+}
+
 // IdentityEndpoint returns the auth_url and the TLS configuration of the
 // clouds.yaml entry cloudName. It authenticates nothing: the c5c3 namespace
 // logs in with the credentials an order delivers and takes only where Keystone
-// answers, and how to trust it, from the entry. An entry without auth_url is an
-// error.
+// answers, and how to trust it, from the entry. An entry without auth_url, or
+// without an auth block at all, is an error.
 func IdentityEndpoint(cloudName string) (authURL string, tlsConfig *tls.Config, err error) {
-	authOptions, _, tlsConfig, err := clouds.Parse(clouds.WithCloudName(cloudName))
+	authOptions, _, tlsConfig, err := parseClouds(clouds.WithCloudName(cloudName))
+	if errors.Is(err, errNoAuthBlock) {
+		return "", nil, fmt.Errorf("clouds.yaml entry %q has no auth_url", cloudName)
+	}
 	if err != nil {
 		return "", nil, fmt.Errorf("parsing clouds.yaml: %w", err)
 	}
