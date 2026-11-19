@@ -12,6 +12,10 @@
 // operator are bounded by the plan's timeouts. A refused order, a mismatch and
 // an accepted credential are never retried, so each fails the run. The created
 // orders are the hand-off surface a later run record and cleanup consume.
+//
+// Cleanup deletes a run's orders kind by kind in the order the operator's
+// holds require, and checks that every credential they delivered stops
+// working once its order is gone.
 package executor
 
 import (
