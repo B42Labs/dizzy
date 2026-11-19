@@ -5,7 +5,8 @@ plus an RNG seed that makes its expansion deterministic. Each service has its ow
 schema — and therefore its own `--set` keys — so a key that belongs to another
 service is rejected rather than silently ignored.
 
-Every scenario shares this top-level shape:
+Every scenario except a c5c3 one shares this top-level shape; see
+[C5C3](#c5c3) for that one:
 
 ```yaml
 name: <string>       # profile name, recorded in the run record
@@ -22,8 +23,9 @@ pressure:   { … }    # keystone only; optional; consumed only by `keystone pre
 A `{ min: <int>, max: <int> }` **range** is drawn once per resource, inclusive at
 both ends. A **ratio** is a float from 0 to 1.
 
-The global `--seed` flag overrides the file's `seed`. Individual values are
-overridden with `--set <dotted.key>=<value>`.
+The global `--seed` flag overrides the file's `seed`; a c5c3 scenario has no
+seed, and the flag has no effect there. Individual values are overridden with
+`--set <dotted.key>=<value>`.
 
 ## Neutron
 
@@ -1259,6 +1261,103 @@ and `profile: small`. They use the services' `small` profiles because
 Keystone's `small` is the only one a domain manager can run. A lane on the
 default cloud shares the quota of every persona that also names none.
 
+## C5C3
+
+A c5c3 scenario names where the orders go and what they request. It has no
+`seed`, `resources` or `distribution`: every c5c3 scenario orders the same five
+orders and two refusals, so its plan is a function of the scenario alone. A
+`seed:` key fails the strict parse like any unknown key.
+
+```yaml
+name: small
+namespace: dizzy-orders          # Kubernetes namespace the orders are created in
+control_plane:
+  name: controlplane
+  namespace: openstack           # optional; empty means the orders' own namespace
+role: member                     # must be on the namespace entry's allowedRoles
+refused_role: dizzy-refused      # must not be on allowedRoles
+catalog:
+  service_type: dizzy-probe      # a type no OpenStack client resolves
+  endpoint_url: https://dizzy-probe.invalid/v1
+rotation:
+  grace_period: 2m               # spec.rotation.gracePeriod of the credential order
+timeouts:
+  ready: 15m                     # create, rotation, repair and refusal waits
+  gone: 15m                      # wait for a deleted order to disappear
+checks:
+  secret_repair: true
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `name` | string | required | Profile name, recorded in the run record |
+| `namespace` | string | required | Kubernetes namespace the orders are created in, which a ControlPlane must assign |
+| `control_plane.name` | string | required | The ControlPlane every order names in `spec.controlPlaneRef.name` |
+| `control_plane.namespace` | string | empty | The ControlPlane's namespace, written to `spec.controlPlaneRef.namespace`. Empty leaves that key out, and the operator reads the orders' own namespace |
+| `role` | string | required | The role the `role` order assigns the user on the project. It must be on the namespace entry's `allowedRoles` |
+| `refused_role` | string | `dizzy-refused` | The role of the `refused-role` order, which the operator must refuse with `RoleNotAllowed`. It must not be on `allowedRoles`. The default names no role in Keystone, so a ControlPlane that admits it by mistake grants nothing |
+| `catalog.service_type` | string | required | `spec.serviceType` of the `catalog` order |
+| `catalog.endpoint_url` | string | required | URL of the `catalog` order's one endpoint, of interface `public` |
+| `rotation.grace_period` | duration | `2m` | `spec.rotation.gracePeriod` of every application credential order: how long the superseded credential stays in Keystone after a rotation |
+| `timeouts.ready` | duration | `15m` | Bound of each wait for an order to turn ready, rotate, restore its Secret or report its refusal, and of cleanup's wait for a user order's password generation to settle |
+| `timeouts.gone` | duration | `15m` | Bound of each wait for a deleted order to disappear. The wait for the superseded application credential to go lasts up to `rotation.grace_period` plus this bound |
+| `checks.secret_repair` | bool | `true` | Edit and delete each delivered Secret and wait until the operator restores it. Absent means `true`; `false` turns the check off for a deployment that grants only `get` on Secrets |
+
+Validation rejects each of these with an error that names the key:
+
+- an empty `name`, `namespace`, `control_plane.name`, `role`,
+  `refused_role`, `catalog.service_type` or `catalog.endpoint_url`
+- a `namespace`, or a non-empty `control_plane.namespace`, that is not a
+  DNS-1123 label: `^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`, at most 63 characters
+- a `role` or `refused_role` that contains a comma or is longer than 255
+  characters, and a `role` equal to `refused_role`
+- a `catalog.service_type` that does not match the label pattern above, is
+  longer than 63 characters, or is `identity`
+- a `catalog.endpoint_url` longer than 1024 characters, whose scheme is not
+  `http` or `https` written in lowercase, or whose host is empty, since the
+  KeystoneCatalogEntry CRD admits no other URL
+- a `rotation.grace_period` below `10s`, or of `720h` or more, since the CRD
+  requires the grace period to be shorter than the default rotation interval
+  of 720 hours
+- a `timeouts.ready` or `timeouts.gone` that is not positive
+
+`--set` takes `namespace`, `control_plane.name`, `control_plane.namespace`,
+`role`, `refused_role`, `catalog.service_type`, `catalog.endpoint_url`,
+`rotation.grace_period`, `timeouts.ready`, `timeouts.gone` and
+`checks.secret_repair`, e.g. `--set role=reader` or
+`--set checks.secret_repair=false`. Any other key fails with an error that
+names it.
+
+The plan holds the same orders and refusals for every scenario, in this
+order:
+
+| Plan entry | Logical name | Kind | Fields from the scenario | Expected reason |
+|---|---|---|---|---|
+| order | `user` | `keystone_user` | | |
+| order | `project` | `keystone_project` | | |
+| order | `role` | `keystone_role_assignment` | `role` | |
+| order | `catalog` | `keystone_catalog_entry` | `catalog.service_type`, `catalog.endpoint_url` | |
+| order | `appcred` | `keystone_application_credential` | | |
+| refusal | `refused-appcred` | `keystone_application_credential` | | `NoRoleOnProject` |
+| refusal | `refused-role` | `keystone_role_assignment` | `refused_role` | `RoleNotAllowed` |
+
+The role assignments and the application credentials reference the `user` and
+`project` orders. Each entry is created as a custom resource of its kind,
+`KeystoneUser`, `KeystoneProject`, `KeystoneRoleAssignment`,
+`KeystoneCatalogEntry` or `KeystoneApplicationCredential`, named
+`dizzyorder-<runid>-<logical>`. The operator names the Keystone user after its
+order, so a run's user is `dizzyorder-<runid>-user`. See
+[`c5c3 apply`](cli.md#c5c3-apply) for the stages that create them.
+
+### Profiles
+
+One profile ships, `scenarios/c5c3/small.yaml`, the file above. It is named
+`small` so that `make devstack-c5c3 DEVSTACK_C5C3_SERVICE=c5c3` finds it under
+`scenarios/c5c3/small.yaml`. It carries no `chaos:` block, since the namespace
+has no `chaos`. Its ControlPlane, `controlplane` in `openstack`, is the one
+the Cobalt Core ControlPlane quick start creates. A run of it lasts at least
+its 2 minute grace period.
+
 ## The `chaos:` block
 
 Optional, and read only by the `chaos` command. It adds a temporal frame to the
@@ -1289,8 +1388,9 @@ chaos:                                # the block shipped by scenarios/neutron/m
 | `retrieve_ratio` | ratio | barbican | Probability per step of one read-back: the payload of a live secret the plan marks for read-back, byte-compared; the users of a live ACL; or a live consumer in its container's list. `0` switches all three off |
 | `update_ratio` | ratio | octavia | Probability per step of setting a live listener or member to `admin_state_up=false` and back to `true` |
 
-All twenty-four built-in profiles carry a `chaos:` block, so `chaos` runs any
-of them with no flags at all. A mix scenario's block holds only `duration`,
+Every built-in profile except `scenarios/c5c3/small.yaml` carries a `chaos:`
+block, so `chaos` runs any of them with no flags at all; the `c5c3` namespace
+has no `chaos`. A mix scenario's block holds only `duration`,
 `parallel.max` and `bucket_width`; its interval, churn ratio and target fill
 are set per persona. A background lane of a mix run reads its own scenario's
 block instead; see [Lanes](#lanes). See [The churn engine](../explanation/churn-engine.md) for

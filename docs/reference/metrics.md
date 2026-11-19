@@ -245,9 +245,9 @@ These identify one installation across time.
 |---|---|
 | `service.name` | `dizzy` (semantic convention; constant) |
 | `service.version` | The build version |
-| `cloud` | The `--os-cloud` name; for a `mix` persona or lane, the `clouds.yaml` entry it authenticated with |
+| `cloud` | The `--os-cloud` name; for a `mix` persona or lane, the `clouds.yaml` entry it authenticated with; for `c5c3`, the `--os-cloud` or `$OS_CLOUD` name, whose entry replaced the delivered Keystone endpoint, and absent when neither is set |
 | `scenario` | The scenario name; for a `mix` lane, the name of its plan, e.g. `small/keystone` |
-| `service` | `neutron`, `cinder`, `keystone`, `nova`, `glance`, `barbican`, `octavia`, or `mix` |
+| `service` | `neutron`, `cinder`, `keystone`, `nova`, `glance`, `barbican`, `octavia`, `c5c3`, or `mix` |
 | `persona` | `mix` only; the persona name, `ci`, `gardener` or `legacy` |
 | `lane` | `mix` only; the background lane name, `cinder`, `glance`, `keystone` or `neutron`. A resource carries `persona` or `lane`, never both |
 
@@ -258,9 +258,9 @@ churns.
 
 `service` is a bespoke attribute, deliberately distinct from the semantic
 `service.name`. It keeps the iteration-level series — which carry no `kind` — 
-apart when a Neutron, a Cinder, a Keystone, a Nova, a Glance, a Barbican, and
-an Octavia monitor feed the same backend. It mirrors the run record's `service`
-field.
+apart when a Neutron, a Cinder, a Keystone, a Nova, a Glance, a Barbican, an
+Octavia, and a c5c3 monitor feed the same backend. It mirrors the run record's
+`service` field.
 
 ### Instruments
 
@@ -273,7 +273,7 @@ field.
 | `dizzy.iteration.operations` | counter | | `result` |
 | `dizzy.iterations` | counter | | `outcome` |
 
-All seven services share this schema; no service adds an instrument.
+All eight services share this schema; no service adds an instrument.
 
 ### Attribute values
 
@@ -281,11 +281,11 @@ Every value set is bounded.
 
 | Attribute | Values |
 |---|---|
-| `kind` | **neutron:** `address-scope`, `subnet-pool`, `network`, `subnet`, `router`, `router-interface`, `security-group`, `security-group-rule`, `port`, `floating-ip` — **cinder:** `volume`, `snapshot` — **keystone:** `domain`, `project`, `user`, `role`, `implied_role` (an implied-role rule), `role_assignment`, `token`, `application_credential`, `trust`, and for `keystone pressure` also `probe`, `bad_token` and `propagation` (a request to Nova, Neutron, Cinder or Glance) and, on `dizzy.resource.time_to_ready` only, `revocation` (the propagation delay) — **nova:** `server`, `network`, `subnet`, `port`, `volume`, `server_group` (only the `mix` Gardener persona creates server groups) — **glance:** `image`; **barbican:** `secret` (a stored secret and the secret an order generates alike), `order`, `container`, `acl` (a secret's read ACL), `consumer` (a container consumer) — **octavia:** `loadbalancer`, `listener`, `pool`, `member`, `healthmonitor`, `network`, `subnet`; the `mix` Gardener persona records `loadbalancer`, `listener`, `pool`, `member` and `healthmonitor` when Octavia is opted in with `services: [octavia]`, plus `port` and `subnet` samples of operation `list` from the address lookups of its member and load balancer creates |
-| `operation` | `create`, `delete`, `get`, `list`, `tag`, `attach`, `detach`, `extend` (cinder resize), `update` (keystone domain disable-before-delete; glance property churn; barbican secret metadata stamp; octavia listener and member admin-state toggle), `validate`, `revoke` (keystone token validation and revocation; `keystone pressure` only), `authenticate` (keystone authentication with an application credential or a trust), `stop`, `start`, `reboot`, `resize`, `confirm-resize`, `live-migrate`, `cold-migrate` (nova server lifecycle; `cold-migrate` only for the `mix` Legacy persona), `upload`, `visibility`, `deactivate`, `reactivate`, `member-add`, `member-accept`, `member-remove` (glance image lifecycle), `download` (barbican payload read-back), `nova`, `neutron`, `cinder`, `glance` (the service a `probe`, `bad_token` or `propagation` request went to; `keystone pressure` only) |
+| `kind` | **neutron:** `address-scope`, `subnet-pool`, `network`, `subnet`, `router`, `router-interface`, `security-group`, `security-group-rule`, `port`, `floating-ip` — **cinder:** `volume`, `snapshot` — **keystone:** `domain`, `project`, `user`, `role`, `implied_role` (an implied-role rule), `role_assignment`, `token`, `application_credential`, `trust`, and for `keystone pressure` also `probe`, `bad_token` and `propagation` (a request to Nova, Neutron, Cinder or Glance) and, on `dizzy.resource.time_to_ready` only, `revocation` (the propagation delay) — **nova:** `server`, `network`, `subnet`, `port`, `volume`, `server_group` (only the `mix` Gardener persona creates server groups) — **glance:** `image`; **barbican:** `secret` (a stored secret and the secret an order generates alike), `order`, `container`, `acl` (a secret's read ACL), `consumer` (a container consumer) — **octavia:** `loadbalancer`, `listener`, `pool`, `member`, `healthmonitor`, `network`, `subnet`; the `mix` Gardener persona records `loadbalancer`, `listener`, `pool`, `member` and `healthmonitor` when Octavia is opted in with `services: [octavia]`, plus `port` and `subnet` samples of operation `list` from the address lookups of its member and load balancer creates — **c5c3:** `keystone_user`, `keystone_project`, `keystone_role_assignment`, `keystone_catalog_entry`, `keystone_application_credential` (the five order kinds), `secret` (a Secret the operator delivered beside an order) |
+| `operation` | `create`, `delete`, `get`, `list`, `tag`, `attach`, `detach`, `extend` (cinder resize), `update` (keystone domain disable-before-delete; glance property churn; barbican secret metadata stamp; octavia listener and member admin-state toggle; c5c3 raise of an order's password or credential generation, and edit of a delivered Secret), `validate`, `revoke` (keystone token validation and revocation in `keystone pressure`; c5c3 records its check of a scoped token's role and catalog as `validate`), `authenticate` (keystone authentication with an application credential or a trust; c5c3 login with a delivered credential), `finalize` (c5c3: from the return of a delete until the order is gone, and under `kind=secret` until the garbage collector removed a deleted order's delivered Secret, with `error.kind=mismatch` when the Secret is still present at the deadline), `rotate` (c5c3: from the raised generation until the new credential is delivered), `repair` (c5c3: from the edit or delete of a Secret until the operator restored it), `reject` (c5c3: a login that must fail), `refuse` (c5c3: from the create of an order until it reports the expected refusal reason), `stop`, `start`, `reboot`, `resize`, `confirm-resize`, `live-migrate`, `cold-migrate` (nova server lifecycle; `cold-migrate` only for the `mix` Legacy persona), `upload`, `visibility`, `deactivate`, `reactivate`, `member-add`, `member-accept`, `member-remove` (glance image lifecycle), `download` (barbican payload read-back), `nova`, `neutron`, `cinder`, `glance` (the service a `probe`, `bad_token` or `propagation` request went to; `keystone pressure` only) |
 | `outcome` | `success`, `error`, `timeout` for an operation; `success`, `timeout` for time-to-ready, where `timeout` under `kind=revocation` is a propagation probe that reached its ceiling; `success`, `failure` for an iteration |
 | `result` | `attempted`, `succeeded`, `failed` |
-| `error.kind` | `quota`, `timeout`, `canceled`, `other`, `http_<status>` for the statuses the service returns, `http_other` for the rest, `accepted` for a `bad_token` request that a service answered with a 2xx, `mismatch` for a barbican read-back of a payload, an ACL or a container's consumers that returned data that differs from what was written, `order_error` for a barbican order that ended in ERROR, `provisioning_error` for an octavia load balancer that reached ERROR |
+| `error.kind` | `quota`, `timeout`, `canceled`, `other`, `http_<status>` for the statuses the service returns, `http_other` for the rest, `accepted` for a `bad_token` request that a service answered with a 2xx, `mismatch` for a barbican read-back of a payload, an ACL or a container's consumers that returned data that differs from what was written, `order_error` for a barbican order that ended in ERROR, `provisioning_error` for an octavia load balancer that reached ERROR. c5c3 adds `refused` for an order whose condition carries a reason the operator does not retry, such as `NamespaceNotAssigned` or `RoleNotAllowed`, and gives `mismatch` and `accepted` a meaning of their own: `mismatch` for a delivered credential that Keystone rejects while its order is ready, an application credential token scoped to another project than the ordered one, a delivered document gophercloud cannot read, a scoped token without the role or a catalog without the entry, a Secret that still carries the old credential after a rotation or is still missing when the rotation's wait ends, a ready order's Secret that is missing or unreadable, a refusal order that turned ready or reported another reason, and a Secret still present after its order is gone; `accepted` for a login that had to fail and got a token |
 
 > **Cardinality rule.** Run IDs, resource IDs, and resource names are **never**
 > metric attributes. They live in the run records and the logs.
@@ -374,6 +374,44 @@ failed `<kind>`/`get` under the written kind with
 `error.kind=provisioning_error`, after the churn delete of a listener, pool,
 member, or health monitor too. The VIP networks record their time-to-ready
 under `kind=network`, as Nova's companion networks do.
+
+c5c3 records `dizzy.resource.time_to_ready` under the five order kinds, for
+the wait from the return of an order's create until the order is `Ready` at
+its current generation: the time the c5c3-operator, K-ORC, the External
+Secrets Operator, OpenBao and Keystone take together before the credential is
+delivered. A wait that ends without `Ready`, at its deadline, on a refusal,
+because the order vanished or because the run was interrupted, records
+`outcome=timeout`. Unlike the Barbican and Octavia waits, every poll of a c5c3
+wait records a `get` sample for each read, of the order's kind for the order
+and of kind `secret` for a Secret, and the 404 that ends the wait for a
+deleted order or its Secret records a successful one. The health check of
+`--listen-address` counts those samples as progress, so a wait of 15 minutes
+does not read as a stall. Most waits also record one sample over their whole
+length under an operation of their own: `finalize` for a deleted order, and
+under `kind=secret` for a deleted order's Secret; `rotate` for a raised
+generation; `repair` for an edited or deleted Secret; and `refuse` for an
+order that must be refused. The wait for the superseded application
+credential to go and cleanup's wait for a user's password generation to
+settle record their polls only. The reads, edits and deletes of the delivered Secrets
+record under `kind=secret`. A login records as `authenticate` or, for one that
+must fail, `reject` of the order's kind, and the checks of a scoped token as
+`validate` under `keystone_role_assignment` and `keystone_catalog_entry`. The
+catalog check logs in again until the catalog lists the entry and records one
+`validate` over all its logins when it ends, at the latest once `--timeout`
+has passed. Before each login except one that must fail, dizzy reads the
+credential's order and its Secret, one `get` of the order's kind and one of
+kind `secret`, and it reads both again after a 401, or a 404 to an
+application credential login.
+
+A delivered credential that Keystone rejects while its order is ready shows as
+`dizzy_operation_errors_total{service="c5c3", operation="authenticate", error_kind="mismatch"}`,
+and so do an application credential token scoped to another project than the
+ordered one and a delivered document gophercloud cannot read. A Keystone
+outage shows as `http_<status>`, `timeout` or `other` on the same operation: a
+5xx or a connection error is retried, a timeout ends the call with error kind
+`timeout`, and none of them becomes a mismatch. A 401, or for an application
+credential a 404, that raced a change of the credential records as `http_401`
+or `http_404`.
 
 ### Prometheus naming
 

@@ -2,7 +2,7 @@
 
 A single binary, `dizzy`, with one command namespace per OpenStack service:
 `neutron`, `cinder`, `keystone`, `nova`, `glance`, `barbican`, and `octavia`.
-Each namespace offers the same verbs.
+Each of them offers the same verbs.
 
 | Verb | Touches the API | Purpose |
 |---|---|---|
@@ -24,6 +24,11 @@ An eighth namespace, `mix`, runs several workload personas side by side in one
 churn run. It has its own subset of the verbs; see
 [The `mix` namespace](#the-mix-namespace).
 
+A ninth namespace, `c5c3`, orders Keystone resources from Cobalt Core's
+c5c3-operator as Kubernetes custom resources and checks in Keystone what the
+operator made of them. It has six of the verbs, all but `chaos`; see
+[The `c5c3` namespace](#the-c5c3-namespace).
+
 ## Global flags
 
 Accepted by every command.
@@ -39,6 +44,10 @@ Accepted by every command.
 | `--listen-address <host:port>` | off | Serve Prometheus metrics on `/metrics` and a health check on `/healthz` |
 | `--health-stall-timeout <duration>` | `15m` | With `--listen-address`: `/healthz` turns unhealthy after this long without progress; `0` disables the check |
 | `--version` / `-v` | — | Print the version and exit |
+
+In the `c5c3` namespace `--os-cloud`, `--concurrency`, `--timeout` and
+`--seed` mean something else; see
+[The `c5c3` namespace](#the-c5c3-namespace).
 
 `--otel` is the *only* thing that enables export. The standard
 `OTEL_EXPORTER_OTLP_*` environment variables configure the exporter but never
@@ -239,8 +248,9 @@ so the live population never exceeds the scenario's counts and only planned
 resources are ever created. See [The churn engine](../explanation/churn-engine.md).
 
 Every flag can instead be set in a `chaos:` block in the scenario YAML; flags
-override the block. All twenty-four built-in profiles ship such a block, so
-`chaos` runs them with no extra flags.
+override the block. Every built-in profile except `scenarios/c5c3/small.yaml`
+ships such a block, so `chaos` runs them with no extra flags; the `c5c3`
+namespace has no `chaos`.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -835,7 +845,9 @@ across iterations. To broaden coverage, run several monitors with different
 > resource in the project, so it would tear a concurrent run down mid-flight.
 > For `keystone` the equivalent sweep is opt-in via `--reclaim-orphans`, and
 > because an admin token lists cloud-wide it is only safe when no other `dizzy`
-> process targets the cloud at all.
+> process targets the cloud at all. For `c5c3` the sweep is always on and takes
+> every dizzy order in the Kubernetes namespace, so run one `dizzy` process per
+> namespace.
 
 `barbican monitor` runs the quota pre-check once at startup, where an
 oversized plan exits before the first iteration, and again in each
@@ -880,7 +892,7 @@ Re-queries the current state of a run's resources from the API.
 ## `report`
 
 Renders metrics from a run record. Never touches the API. The same command
-builder backs all eight namespaces, so `dizzy cinder report` and
+builder backs all nine namespaces, so `dizzy cinder report` and
 `dizzy neutron report` are the same code.
 
 | Flag | Default | Description |
@@ -1080,6 +1092,11 @@ Discovery differs per service, and so does what `--run-id` alone can reach:
   create: cleanup stops with an error that says so and never deletes a port.
   Everything an Octavia run creates carries the tag, so a bare `--run-id`
   reaches all of it.
+- **c5c3**: orders are found by the `dizzy/run=<id>` label in one Kubernetes
+  namespace, with the run record's created list as a fallback, and deleted
+  kind by kind in the order the operator's holds require. A bare `--run-id`
+  reaches every order but needs `--namespace`. See
+  [`c5c3 cleanup`](#c5c3-cleanup).
 
 See [Resource identity and cleanup](../explanation/resource-identity.md).
 
@@ -1386,6 +1403,319 @@ lane and continues past a failing one, then exits non-zero naming it, as
 `nova cleanup --run` on a mix record fails with
 `run record is for service "mix", not "nova"`, and `mix cleanup --run` on a
 `nova` record fails the same way the other way round.
+
+## The `c5c3` namespace
+
+`c5c3` orders Keystone resources from Cobalt Core's c5c3-operator as
+Kubernetes custom resources of `c5c3.io/v1alpha1` and checks in Keystone what
+the operator made of them. It is the one namespace that writes through the
+Kubernetes API. Its only Keystone requests are token issues with the
+credentials the operator delivers. A run orders a `KeystoneUser`, a
+`KeystoneProject`, a `KeystoneRoleAssignment`, a `KeystoneCatalogEntry` and a
+`KeystoneApplicationCredential` in the Kubernetes namespace its scenario
+names, which a ControlPlane must assign. See
+[Test c5c3-operator orders](../how-to/test-c5c3-orders.md) for the
+assignment, the rights the process needs and the endpoint override.
+
+| Subcommand | Touches the API | Purpose |
+|---|---|---|
+| `c5c3 generate` | no | Expand a c5c3 scenario into its plan and dump it |
+| `c5c3 apply` | yes | Create the orders, wait for the operator, check the delivered credentials in Keystone, record a run |
+| `c5c3 monitor` | yes | Repeat sweep, `apply` and `cleanup` unattended, exporting metrics |
+| `c5c3 status` | yes | Re-query the orders of a run record |
+| `c5c3 report` | no | Render metrics from a run record, the shared `report` |
+| `c5c3 cleanup` | yes | Delete a run's orders and check that their credentials stop working |
+
+There is no `c5c3 chaos`: the namespace has no churn graph.
+
+| Verb | Flags beside the global ones |
+|---|---|
+| `generate` | `--scenario` (required), `--out`, `--set` |
+| `apply` | `--scenario` (required), `--dry-run`, `--set`, `--keep-on-abort`, `--kubeconfig`, `--kube-context` |
+| `monitor` | `--scenario` (required), `--set`, `--interval`, `--iterations`, `--error-wait`, `--keep-run-records`, `--kubeconfig`, `--kube-context` |
+| `status` | `--run` (required), `--kubeconfig`, `--kube-context` |
+| `cleanup` | `--run`, `--run-id`, `--namespace`, `--kubeconfig`, `--kube-context` |
+
+Every flag but the three below means what it means for the other namespaces.
+
+| Flag | Description |
+|---|---|
+| `--kubeconfig <path>` | Kubeconfig file to read. Without it dizzy reads `$KUBECONFIG` or `~/.kube/config`, and uses the pod's service account when it finds no kubeconfig |
+| `--kube-context <name>` | Kubeconfig context to use in place of the current one |
+| `--namespace <name>` | `cleanup` only: the Kubernetes namespace of the run's orders; see [`c5c3 cleanup`](#c5c3-cleanup) |
+
+`generate` and `apply --dry-run` build no Kubernetes client, so they run
+without a kubeconfig.
+
+Four global flags mean something particular here:
+
+- `--os-cloud`, or `$OS_CLOUD`, names a `clouds.yaml` entry whose `auth_url`
+  and TLS settings (`verify`, `cacert`, `cert` and `key`) replace those of
+  every document the operator delivers. dizzy authenticates nothing with the
+  entry and leaves its credentials unused. With neither set, dizzy reads no
+  `clouds.yaml` and logs in with each document as delivered, except that
+  gophercloud applies the environment variables `OS_CACERT`, `OS_CERT` and
+  `OS_KEY` to every login with a delivered document, ahead of the TLS
+  settings of the document or of the entry. A delivered document names no
+  client certificate, so `OS_CERT` without `OS_KEY`, or the other way round,
+  fails every login.
+  `apply`, `monitor` and `cleanup` read the entry once at startup, so a
+  missing `clouds.yaml` fails before the first order, and an entry without
+  `auth_url` fails with `clouds.yaml entry "<name>" has no auth_url`.
+  `status` sends no Keystone request and reads no entry.
+- `--concurrency` bounds the parallel creates and deletes.
+- `--timeout` bounds each Kubernetes or Keystone request, the catalog check of
+  `apply` and `cleanup`'s wait for a deleted order's Secret to go. The waits
+  for the operator, and the polls within them, are bounded by the scenario's
+  `timeouts.ready` and `timeouts.gone` instead, since an order takes minutes
+  where an API call takes seconds.
+- `--seed` has no effect. A c5c3 plan has no seed, and the run record's
+  `seed` is `0`.
+
+Every poll of a wait for the operator records a `get` operation for each
+read, of the order's kind for the order and of kind `secret` for a Secret, so
+the health check of `--listen-address` counts a wait of several minutes as
+progress. The
+catalog check records one `validate` over all its logins when it ends, at the
+latest once `--timeout` has passed.
+
+### `c5c3 generate`
+
+Expands a c5c3 scenario into its plan and writes it as JSON: the namespace, the
+ControlPlane, the five orders, the two refusals, the grace period, both
+timeouts and whether the Secret repair check runs. The plan depends on the
+scenario alone, so the same scenario always yields byte-identical output. Never
+touches the API.
+
+```console
+$ dizzy c5c3 generate --scenario scenarios/c5c3/small.yaml --out plan.json
+```
+
+### `c5c3 apply`
+
+Creates the orders, waits for the operator, checks the delivered credentials
+in Keystone, and writes a `run-<id>.json` record. With `--dry-run` it prints
+the plan summary instead and builds no Kubernetes client. For the bundled
+profile:
+
+```text
+Plan for scenario "small"
+  namespace:      dizzy-orders
+  control plane:  openstack/controlplane
+  order:          user (keystone_user)
+  order:          project (keystone_project)
+  order:          role (keystone_role_assignment) user=user project=project role=member
+  order:          catalog (keystone_catalog_entry) service_type=dizzy-probe endpoint_url=https://dizzy-probe.invalid/v1
+  order:          appcred (keystone_application_credential) user=user project=project
+  refusal:        refused-appcred (keystone_application_credential) user=user project=project, expects NoRoleOnProject
+  refusal:        refused-role (keystone_role_assignment) user=user project=project role=dizzy-refused, expects RoleNotAllowed
+  grace period:   2m0s
+  ready timeout:  15m0s
+  gone timeout:   15m0s
+  secret repair:  on
+```
+
+Every order is named `dizzyorder-<runid>-<logical>` and carries the labels
+`dizzy/run=<runid>` and `dizzy/type=<kind>`; see
+[Resource identity and cleanup](../explanation/resource-identity.md). Each
+references the scenario's ControlPlane in `spec.controlPlaneRef`, with a
+`namespace` only when the scenario sets `control_plane.namespace`.
+
+Before it creates anything, the command lists each of the five resources in
+the namespace with a limit of 1. When the cluster does not serve one, because
+the operator's CRDs are missing, or answers the listing with 403, the command
+stops with an error that names the resource, and for a 403 also the
+namespace, and writes no record.
+
+It then runs seven stages in order. The first failure stops the run, and the
+record lists the orders created so far.
+
+1. Orders `user` and `project` in parallel and waits until each is ready,
+   then reads the user's Secret and logs in with it, unscoped.
+2. Orders `refused-appcred`, an application credential before any role
+   exists, and waits until the operator refuses it with `NoRoleOnProject`,
+   then orders `refused-role`, a role assignment for `refused_role`, and waits
+   for `RoleNotAllowed`. It deletes both and waits until they are gone.
+3. Orders `role` and `catalog` in parallel and waits until each is ready. With
+   the user's credential it issues a token scoped to the project and domain
+   the `project` order reports, which must carry the scenario's `role`. It
+   issues that token again until its catalog lists a service of type
+   `catalog.service_type`, with the service name the `catalog` order reports
+   and a public endpoint at `catalog.endpoint_url`, for at most `--timeout`.
+4. Orders `appcred`, waits until it is ready, reads its Secret and logs in
+   with it. The token must be scoped to the project the `project` order
+   reports.
+5. Only with `checks.secret_repair` on, first for `user` and then for
+   `appcred`: overwrites the key of the Secret the operator owns, `password`
+   or `application_credential_secret`, and waits until the operator restores
+   the Secret, then deletes the Secret and waits again, then logs in with the
+   restored one. A 403 on the patch or the delete fails the stage with an
+   error that names `checks.secret_repair`.
+6. Rotates the password. It raises `spec.passwordGeneration` above the
+   generation the status reports and waits until the order is ready at the
+   new generation and its Secret carries a new password, which must log in;
+   the old one must fail. It sends no login in between, because upstream
+   documents that the old password stops working when Keystone applies the
+   new one, before the Secret is rewritten.
+7. Rotates the application credential the same way through
+   `spec.credentialGeneration`, while a prober reads the Secret and logs in
+   with it every 5 seconds; the prober's first failure ends the stage. When the
+   status names the superseded credential with more than 5 seconds of its
+   grace period left, that credential must still log in; otherwise the run
+   logs that the grace period was already over and skips the login. The stage
+   then waits until the operator has deleted the superseded credential, which
+   must then fail to log in.
+
+The password rotates before the credential. K-ORC creates the successor
+credential through the operator's `mint-cloud` document, which carries the
+user's password, so a completed credential rotation proves that the document
+carries the new password before cleanup deletes the credential order. Stage 7
+lasts at least the grace period, so a run of the bundled profile takes at
+least 2 minutes.
+
+An order is ready when its `Ready` condition is `True` and
+`status.observedGeneration` equals `metadata.generation`. A wait polls with a
+GET at once and then at an interval that starts at 500 ms, grows by a factor
+of 1.5 and is capped at 5 s.
+`timeouts.ready` bounds each wait for readiness, a rotation, a restored Secret
+or a refusal, `timeouts.gone` each wait for a deleted order, and the wait for
+the superseded credential to go lasts up to the grace period plus
+`timeouts.gone`. A wait ends at once with error kind `refused`, quoting the
+condition's reason and message, when a condition with status `False` carries
+one of the reasons the operator does not retry: `NamespaceNotAssigned`,
+`ControlPlaneNotFound`, `ClusterNameTooLong`, `ControlPlaneMismatch`,
+`ServiceAccountCollision`, `ProjectCollision`, `ServiceCollision`,
+`RoleNotAllowed`, `CatalogNotAllowed`, `DuplicateRoleAssignment`,
+`KeystoneNotPublished` or `DeliveryRefused`. Every other reason is waited
+through: the `*Failed` and `*Error` reasons, which the operator retries, and
+`UserNotFound`, `ProjectNotFound` and `NoRoleOnProject`, which the operator's
+cache can report for a moment about an order dizzy has just seen ready. An
+order that disappears while dizzy waits for it to turn ready ends the wait
+with an error.
+
+A rejected login is a `mismatch` only when the credential did not change
+around it. A rejection is a 401, and for an application credential also a
+404, which is how Keystone answers a login with a credential id it does not
+know. For a user it is a mismatch when the order was ready before and after
+the login and the Secret's `resourceVersion` stayed the same; for an
+application credential, when `status.credentialID` or
+`status.previousCredentialID` named the credential dizzy sent before and
+after the login. Any other rejection raced a change, or could not be checked
+because a read around it failed, and fails as `http_401` or `http_404`. A
+login that has to fail and gets a token fails as `accepted`.
+
+Each single request of the stages, except the catalog check and a login that
+has to fail, is retried on a 429, a 500, 502, 503 or 504, a 409 to a merge
+patch, or a connection error, up to five attempts with a backoff. The catalog
+check logs in again on such an error until `--timeout`. A timeout ends the
+call with error kind `timeout`, and none of these errors becomes a mismatch.
+When the retry of a create whose answer was lost finds the order already
+there, with this run's `dizzy/run` and `dizzy/type` labels, `apply` takes it
+as created. No log line, error, plan or run record carries a password or a
+credential secret.
+
+**On interrupt.** SIGINT/SIGTERM writes the run record first, then deletes the
+orders with the steps of [`c5c3 cleanup`](#c5c3-cleanup), unless
+`--keep-on-abort` is set. A successful apply keeps its orders.
+
+### `c5c3 monitor`
+
+Repeats sweep, `apply` and `cleanup` unattended, with the cadence, the
+iteration bound, the error wait and the run records of every
+[`monitor`](#monitor). It builds the Kubernetes client and reads the
+`--os-cloud` entry once at startup and lists the five resources there, so a
+missing CRD or right fails before the first iteration. Each iteration gets a
+new run id. It sweeps, lists the five resources again, applies, and cleans up
+by its run id. A failed sweep skips the iteration's apply, and its cleanup
+still runs.
+
+The sweep is always on. It runs the steps of [`c5c3 cleanup`](#c5c3-cleanup)
+over every order in the namespace that carries the `dizzy/type` label,
+whatever run created it, so it reclaims the orders of a killed iteration and
+would tear down those of a second dizzy process in the same namespace. Run one
+dizzy process per Kubernetes namespace. The plan has no seed, so every
+iteration orders the same five orders under a new run id, and `--seed` does
+not broaden coverage. The iterations' metrics carry `service=c5c3`.
+
+### `c5c3 status`
+
+Re-queries every order of a run record by its `<namespace>/<name>` id, each
+read bounded by `--timeout`, and prints the status table with one row per
+order. The state is `Ready` for a ready order, otherwise the reason of its
+first condition with status `False`, otherwise `Pending`, `gone` for an order
+that no longer exists, and `error` for one it could not read, which makes the
+command exit non-zero. The command sends no Keystone request.
+
+| Flag | Description |
+|---|---|
+| `--run <path>` | Path to the run record to re-query (**required**) |
+
+A record of another service fails, e.g.
+`run record is for service "barbican", not "c5c3"`.
+
+### `c5c3 report`
+
+The shared [`report`](#report). A c5c3 record renders in every format with
+nothing of its own.
+
+### `c5c3 cleanup`
+
+Deletes a run's orders and checks that the credentials they delivered stop
+working. Idempotent: it finds the orders by label again on every run, and a
+404 counts as success.
+
+| Flag | Description |
+|---|---|
+| `--run <path>` | Path to the run record whose orders to delete |
+| `--run-id <id>` | Delete the orders of this run id directly, without a record; needs `--namespace` |
+| `--namespace <name>` | The Kubernetes namespace of the orders |
+
+Exactly one of `--run` and `--run-id` is required. The namespace is
+`--namespace` when given; otherwise, with `--run`, the namespace half of the
+record's first `created` id. Otherwise the command fails with
+`--namespace is required with --run-id, or with a run record that lists no order`.
+A record of another service fails as for `c5c3 status`.
+
+The command has no scenario, so it bounds both of its waits for the operator
+by 15 minutes, where a monitor iteration and an interrupted apply use the
+scenario's `timeouts.ready` and `timeouts.gone`. It runs six steps:
+
+1. Lists each kind by the `dizzy/run=<id>` label and adds the orders of the
+   record. When it finds none, it deletes nothing and succeeds.
+2. Waits until the password generation in each user order's status has caught
+   up with its spec, or the order is being deleted. It skips a user order
+   whose status still reports password generation 0, a user Keystone never
+   provisioned, and counts one that is already gone as settled. When the
+   bound passes, it logs a warning and goes on. Upstream documents that
+   deleting a credential order while its user's password rotates can strand
+   the credential order's finalizer, and an apply interrupted in stage 6
+   leaves exactly that state.
+3. Reads the Secret of every user and application credential order it found.
+   It reads them after the wait of step 2, so a user's Secret carries the
+   password a finished rotation delivered. An order without a readable Secret
+   has nothing to check in step 6.
+4. Deletes kind by kind in the order the operator's holds require:
+   application credentials, role assignments, catalog entries, projects,
+   users. Within a kind the deletes run in parallel up to `--concurrency`,
+   each retried as in `apply` and bounded by `--timeout`, then it waits until
+   each order is gone. The next kind starts when the previous one is gone. An
+   order that was already gone counts as deleted.
+5. When an order is still present when its wait ends, the deletes of the
+   remaining kinds are still sent, so the held orders go once the hold lifts,
+   but their waits are skipped. The command then fails with an error that
+   names each order still present with what it reports, e.g.
+   `ReferencedByApplicationCredentials`.
+6. For each credential of step 3 whose order is gone, it waits up to
+   `--timeout` for the Secret to disappear, which the garbage collector
+   removes with its order, and then sends one login with it that must fail.
+   A Secret still present fails as `mismatch`, a credential that still logs
+   in as `accepted`. Every credential is checked before the first of these
+   errors is returned.
+
+An order whose finalizer the operator never releases stays until someone
+removes its K-ORC children in the ControlPlane's namespace, where dizzy has no
+rights. Every later cleanup and monitor sweep then reports it by name. See
+[Release a stranded finalizer](../how-to/test-c5c3-orders.md#release-a-stranded-finalizer).
 
 ## `list-networks`
 

@@ -6,8 +6,8 @@ regressions, and error-rate changes become visible as trends instead of being
 buried in per-run JSON files.
 
 Available in every service namespace: `neutron monitor`, `cinder monitor`,
-`keystone monitor`, `nova monitor`, `glance monitor`, `barbican monitor`, and
-`octavia monitor`.
+`keystone monitor`, `nova monitor`, `glance monitor`, `barbican monitor`,
+`octavia monitor`, and `c5c3 monitor`.
 
 > **One `dizzy` per project.** The pre-flight sweep reclaims any `dizzy`-tagged
 > resource it finds, so a concurrent `apply` or `chaos` in the same project would
@@ -187,6 +187,53 @@ router interface for example, fails every sweep at `--timeout` until you clean
 that run up with its own namespace's `cleanup --run-id <id>`; the id is the
 second field of the network's `dizzy-<id>-<logical>` name.
 
+## Monitor c5c3 orders
+
+Same cadence and shutdown semantics, against the Kubernetes namespace the
+scenario names:
+
+```console
+$ dizzy c5c3 monitor --scenario scenarios/c5c3/small.yaml --otel
+$ dizzy c5c3 monitor --scenario scenarios/c5c3/small.yaml --kube-context <context> --os-cloud <entry> --otel
+```
+
+The second form runs from outside the cluster: `--os-cloud` names a
+`clouds.yaml` entry whose `auth_url` and TLS settings replace those of the
+documents the operator delivers. See
+[Test c5c3-operator orders](test-c5c3-orders.md) for the namespace, the
+rights and the override.
+
+`c5c3 monitor` builds its Kubernetes client, reads the `--os-cloud` entry and
+lists the five order kinds once at startup, so missing CRDs or rights fail
+before the loop begins. Every iteration lists them again before its apply. A
+c5c3 plan has no seed, so every iteration places the same five orders under a
+new run id, and `--seed` changes nothing. An iteration of the bundled profile
+lasts at least its 2 minute grace period, and each wait for the operator lasts
+up to the scenario's `timeouts.ready` or `timeouts.gone`, 15 minutes each,
+except the wait for the superseded application credential, which lasts up to
+the grace period plus `timeouts.gone`. Every poll of a wait for the operator
+is recorded, so `/healthz` does not read a long wait as a stall.
+
+Watch two series. `dizzy.resource.time_to_ready` under the five order kinds,
+`keystone_user` to `keystone_application_credential`, is the time from an
+order's create until the operator reports it `Ready`. The errors of the
+`authenticate` operation separate a broken delivery from an outage:
+`error_kind="mismatch"` is chiefly a delivered credential that Keystone
+rejected while its order was ready, and otherwise an application credential
+token scoped to another project or a delivered document gophercloud cannot
+read. `http_<status>`, `timeout` or `other` is Keystone being unreachable or
+failing. A failed iteration does not stop the loop, as for `barbican monitor`,
+so watch the failed iterations and these series.
+
+The sweep is always on. It takes every order in the namespace that carries
+the `dizzy/type` label, whatever run created it, and runs the steps of
+`c5c3 cleanup` over it, so the next iteration reclaims a killed iteration's
+orders. Run one dizzy process per Kubernetes namespace. An order whose
+finalizer the operator never releases fails every later sweep, and a failed
+sweep skips its iteration's apply, until someone removes the order's K-ORC
+children in the ControlPlane's namespace; see
+[Release a stranded finalizer](test-c5c3-orders.md#release-a-stranded-finalizer).
+
 ## Via the Makefile
 
 To run against the OSISM testbed, exporting into the local OTEL stack:
@@ -199,3 +246,11 @@ $ make devstack-osism-monitor DEVSTACK_OSISM_SERVICE=cinder
 $ make devstack-osism-monitor DEVSTACK_OSISM_SERVICE=barbican
 $ make devstack-osism-monitor DEVSTACK_OSISM_SCENARIO=scenarios/neutron/medium.yaml ARGS="--error-wait 2m"
 ```
+
+To monitor c5c3 orders on a local Cobalt Core dev stack:
+
+```console
+$ make devstack-c5c3-monitor DEVSTACK_C5C3_SERVICE=c5c3
+```
+
+See [Run against a Cobalt Core dev stack](run-against-devstack-c5c3.md#order-through-the-c5c3-operator).

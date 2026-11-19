@@ -44,9 +44,16 @@ MONITOR_ITERATIONS ?= 0
 # password is a live Kubernetes Secret, so `make devstack-c5c3` first regenerates
 # $(DEVSTACK_C5C3_CLOUDS_FILE) from the cluster (target `devstack-c5c3-clouds`) —
 # a gitignored clouds.yaml with `verify: false` (the stack serves a self-signed
-# cert, matching the quick-start's `openstack --insecure`). Override any variable
-# at invocation:
+# cert, matching the quick-start's `openstack --insecure`).
+# DEVSTACK_C5C3_SERVICE=c5c3 orders Keystone resources through the stack's
+# c5c3-operator instead. It needs the namespace of scenarios/c5c3/small.yaml
+# assigned on the ControlPlane, reaches the cluster through the kubeconfig's
+# current context, and takes only auth_url and verify from the generated
+# clouds.yaml, in place of those the operator delivers; the admin credentials
+# stay unused (see docs/how-to/test-c5c3-orders.md). Override any variable at
+# invocation:
 #   make devstack-c5c3 DEVSTACK_C5C3_SCENARIO=scenarios/keystone/medium.yaml
+#   make devstack-c5c3 DEVSTACK_C5C3_SERVICE=c5c3   # runs scenarios/c5c3/small.yaml
 #   make devstack-c5c3 DEVSTACK_C5C3_CMD=chaos ARGS="--duration 10m"
 #   make devstack-c5c3 DEVSTACK_C5C3_AUTH_URL=https://keystone.127-0-0-1.nip.io/v3   # KIND_HOST_PORT=443
 #   make devstack-c5c3 KEEP=1   # skip the cleanup, keep resources and run record
@@ -141,7 +148,7 @@ devstack-c5c3-clouds:
 	} > "$(DEVSTACK_C5C3_CLOUDS_FILE)"
 	@echo "Wrote $(DEVSTACK_C5C3_CLOUDS_FILE) (cloud '$(DEVSTACK_C5C3_OS_CLOUD)', auth_url $(DEVSTACK_C5C3_AUTH_URL), verify: false)"
 
-## devstack-c5c3: Run a scenario (DEVSTACK_C5C3_SERVICE=keystone by default) against the local Cobalt Core dev stack, then clean up.
+## devstack-c5c3: Run a scenario (DEVSTACK_C5C3_SERVICE=keystone by default, or c5c3 for c5c3-operator orders) against the local Cobalt Core dev stack, then clean up.
 devstack-c5c3: build devstack-c5c3-clouds
 	@test -f "$(DEVSTACK_C5C3_SCENARIO)" || { echo "error: scenario $(DEVSTACK_C5C3_SCENARIO) not found"; exit 1; }
 	@echo "Running $(DEVSTACK_C5C3_SERVICE) $(DEVSTACK_C5C3_CMD) against the Cobalt Core dev stack:"
@@ -162,7 +169,7 @@ devstack-c5c3: build devstack-c5c3-clouds
 	done; \
 	exit $$status
 
-## devstack-c5c3-monitor: Run monitor --otel (DEVSTACK_C5C3_SERVICE=keystone) against devstack-c5c3, exporting to VictoriaMetrics.
+## devstack-c5c3-monitor: Run monitor --otel (DEVSTACK_C5C3_SERVICE=keystone|c5c3, keystone by default) against devstack-c5c3, exporting to VictoriaMetrics.
 # Like devstack-osism-monitor, monitor manages its own per-iteration cleanup, so
 # this target runs no post-run cleanup of run-*.json.
 devstack-c5c3-monitor: build devstack-c5c3-clouds

@@ -5,6 +5,9 @@ plane](https://c5c3.github.io/forge/quick-start-controlplane.html) instead of a
 real cloud. That quick-start brings up **Keystone + Horizon**, so the targets
 default to the `keystone` service and to admin credentials — exactly the tier
 Keystone's `apply` and `monitor` need, and the only one `pressure` accepts.
+`DEVSTACK_C5C3_SERVICE=c5c3` orders Keystone resources through the stack's
+c5c3-operator instead; see
+[Order through the c5c3-operator](#order-through-the-c5c3-operator).
 
 ## The two target families
 
@@ -84,6 +87,58 @@ $ ./dizzy keystone report --run run-<id>.json
 
 Each Keystone profile's `pressure:` block sets a duration too, 5 minutes for
 the default `small` profile, so `ARGS` may stay empty.
+
+## Order through the c5c3-operator
+
+`DEVSTACK_C5C3_SERVICE=c5c3` runs `c5c3 apply` with
+`scenarios/c5c3/small.yaml` against the same stack, then `c5c3 cleanup --run`
+on the new run record. The profile orders from the ControlPlane `controlplane`
+in `openstack`, the one the quick-start creates. Before the first run, create
+the profile's namespace `dizzy-orders` and assign it on that ControlPlane,
+with `member` on its `allowedRoles` and `allowCatalogEntries` set, as
+[Prepare the namespace](test-c5c3-orders.md#prepare-the-namespace) shows.
+
+```console
+$ make devstack-c5c3 DEVSTACK_C5C3_SERVICE=c5c3                                          # c5c3 apply of the small profile, then clean up
+$ make devstack-c5c3 DEVSTACK_C5C3_SERVICE=c5c3 ARGS="--set checks.secret_repair=false"
+$ make devstack-c5c3 DEVSTACK_C5C3_SERVICE=c5c3 KEEP=1                                   # keep the orders and the run record
+```
+
+The target regenerates `contrib/devstack-c5c3-clouds.yaml` and passes
+`--os-cloud devstack-c5c3`, as for every service, but c5c3 logs in with no
+admin credential. dizzy takes only the entry's `auth_url`, which is
+`DEVSTACK_C5C3_AUTH_URL`, and its `verify: false`, and puts them in place of
+the `auth_url` and TLS settings of each document the operator delivers. Those
+documents name the in-cluster Service
+`http://controlplane-keystone.openstack.svc:5000/v3`, which the host does not
+resolve. The admin password in the entry stays unused.
+
+dizzy reaches the cluster through `$KUBECONFIG` or `~/.kube/config` and its
+current context, the one `kubectl` uses. `DEVSTACK_C5C3_KUBE_CONTEXT` reaches
+only the `kubectl` calls that read the admin Secret, and `ARGS` reaches the
+`apply` command but not the cleanup step. To use another context, switch to it
+with `kubectl config use-context` before the run rather than passing
+`--kube-context` in `ARGS`, so both steps use it.
+
+The cleanup step takes the namespace from the run record. A run lasts at least
+the profile's 2 minute grace period. There is no `c5c3 chaos` and no
+`c5c3 pressure`, so leave `DEVSTACK_C5C3_CMD` at `apply`. With `KEEP=1` the
+orders stay in place; look at them and remove them later with:
+
+```console
+$ ./dizzy c5c3 status --run run-<id>.json
+$ OS_CLIENT_CONFIG_FILE=contrib/devstack-c5c3-clouds.yaml ./dizzy c5c3 cleanup --os-cloud devstack-c5c3 --run run-<id>.json
+```
+
+`status` sends no Keystone request and needs no `clouds.yaml`. `cleanup` sends
+a login with each deleted credential that must fail, so it needs the endpoint
+override as well.
+
+`make devstack-c5c3-monitor DEVSTACK_C5C3_SERVICE=c5c3` runs
+`c5c3 monitor --otel` the same way, and its series carry
+`cloud="devstack-c5c3"` and `service="c5c3"`. See
+[Test c5c3-operator orders](test-c5c3-orders.md) for what a run checks and
+how to read its failures.
 
 ## Why `clouds.yaml` is regenerated every time
 
