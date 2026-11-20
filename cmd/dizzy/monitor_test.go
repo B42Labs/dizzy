@@ -257,6 +257,7 @@ func TestMonitorCommandsHandHealthToLoop(t *testing.T) {
 	for _, f := range []string{
 		"monitor.go", "cinder_monitor.go", "keystone_monitor.go", "nova_monitor.go",
 		"glance_monitor.go", "barbican_monitor.go", "octavia_monitor.go", "c5c3_monitor.go",
+		"horizon_monitor.go",
 	} {
 		src, err := os.ReadFile(f)
 		if err != nil {

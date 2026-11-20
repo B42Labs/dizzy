@@ -46,6 +46,24 @@ type fakeHorizonCloud struct {
 	horizonN  int
 	// failPage makes every page load answer this status.
 	failPage int
+	// rejectLogin renders the login form again for every login.
+	rejectLogin bool
+	// wrongProject makes every switch leave the session in project p-a.
+	wrongProject bool
+	// failUserCreate makes every user create answer this status.
+	failUserCreate int
+	// keystoneCalls counts the Keystone requests by "METHOD /path".
+	keystoneCalls map[string]int
+	// logins and logouts count the logins Horizon accepted and the logouts
+	// it answered.
+	logins, logouts int
+}
+
+// sessionCounts returns the accepted logins and the answered logouts.
+func (f *fakeHorizonCloud) sessionCounts() (logins, logouts int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.logins, f.logouts
 }
 
 type fakeUser struct {
@@ -60,11 +78,12 @@ type fakeProject struct {
 func newFakeHorizonCloud(t *testing.T) *fakeHorizonCloud {
 	t.Helper()
 	f := &fakeHorizonCloud{
-		t:         t,
-		roles:     []string{"member"},
-		available: []string{"p-b", "p-a"},
-		users:     map[string]fakeUser{"op-id": {name: "operator", password: horizonCloudPassword}},
-		projects:  map[string]fakeProject{},
+		t:             t,
+		roles:         []string{"member"},
+		available:     []string{"p-b", "p-a"},
+		users:         map[string]fakeUser{"op-id": {name: "operator", password: horizonCloudPassword}},
+		projects:      map[string]fakeProject{},
+		keystoneCalls: map[string]int{},
 	}
 	f.keystone = httptest.NewServer(http.HandlerFunc(f.serveKeystone))
 	t.Cleanup(f.keystone.Close)
@@ -106,6 +125,24 @@ func (f *fakeHorizonCloud) horizonRequests() int {
 	return f.horizonN
 }
 
+// calls returns how many Keystone requests matched "METHOD /path".
+func (f *fakeHorizonCloud) calls(key string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.keystoneCalls[key]
+}
+
+// seedOrphans adds a user and a project of another Horizon run, and a user
+// and a project of a keystone run.
+func (f *fakeHorizonCloud) seedOrphans() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.users["orphan-u"] = fakeUser{name: "dizzyhorizon-old-user-0001"}
+	f.projects["orphan-p"] = fakeProject{name: "dizzyhorizon-old-project-0001", tags: []string{"dizzyhorizon:run=old", "dizzyhorizon:type=project"}}
+	f.users["ks-u"] = fakeUser{name: "dizzy-old-user-0001"}
+	f.projects["ks-p"] = fakeProject{name: "dizzy-old-project-0001", tags: []string{"dizzy:run=old", "dizzy:type=project"}}
+}
+
 // liveNames returns the names of the users and projects Keystone holds
 // besides the operator, sorted.
 func (f *fakeHorizonCloud) liveNames() []string {
@@ -135,6 +172,7 @@ func (f *fakeHorizonCloud) serveKeystone(w http.ResponseWriter, r *http.Request)
 	defer f.mu.Unlock()
 	body, _ := io.ReadAll(r.Body)
 	path := r.URL.Path
+	f.keystoneCalls[r.Method+" "+path]++
 	switch {
 	case r.Method == http.MethodPost && path == "/v3/auth/tokens":
 		catalog := fmt.Sprintf(`[{"type":"identity","endpoints":[{"interface":"public","region":"RegionOne","url":%q}]}]`, f.keystone.URL+"/v3/")
@@ -167,6 +205,8 @@ func (f *fakeHorizonCloud) serveKeystone(w http.ResponseWriter, r *http.Request)
 		id := fmt.Sprintf("proj-%d", f.nextID)
 		f.projects[id] = fakeProject{name: req.Project.Name, tags: req.Project.Tags}
 		writeJSON(w, http.StatusCreated, fmt.Sprintf(`{"project":{"id":%q,"name":%q,"enabled":true}}`, id, req.Project.Name))
+	case r.Method == http.MethodPost && path == "/v3/users" && f.failUserCreate != 0:
+		writeJSON(w, f.failUserCreate, `{}`)
 	case r.Method == http.MethodPost && path == "/v3/users":
 		var req struct {
 			User struct {
@@ -237,7 +277,7 @@ func (f *fakeHorizonCloud) serveHorizon(w http.ResponseWriter, r *http.Request) 
 	_ = r.ParseForm()
 	f.mu.Lock()
 	f.horizonN++
-	failPage := f.failPage
+	failPage, rejectLogin, wrongProject := f.failPage, f.rejectLogin, f.wrongProject
 	f.mu.Unlock()
 	switch path := r.URL.Path; {
 	case path == "/auth/login/" && r.Method == http.MethodGet:
@@ -252,17 +292,26 @@ func (f *fakeHorizonCloud) serveHorizon(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 		f.mu.Unlock()
-		if !ok {
+		if !ok || rejectLogin {
 			_, _ = io.WriteString(w, horizonLoginForm)
 			return
 		}
+		f.mu.Lock()
+		f.logins++
+		f.mu.Unlock()
 		http.SetCookie(w, &http.Cookie{Name: "sessionid", Value: "s", Path: "/"})
 		http.Redirect(w, r, "/project/", http.StatusFound)
 	case strings.HasPrefix(path, "/auth/switch/"):
 		id := strings.Trim(strings.TrimPrefix(path, "/auth/switch/"), "/")
+		if wrongProject {
+			id = "p-a"
+		}
 		http.SetCookie(w, &http.Cookie{Name: "recent_project", Value: id, Path: "/"})
 		http.Redirect(w, r, r.URL.Query().Get("next"), http.StatusFound)
 	case path == "/auth/logout/" && r.Method == http.MethodPost:
+		f.mu.Lock()
+		f.logouts++
+		f.mu.Unlock()
 		http.Redirect(w, r, "/auth/login/", http.StatusFound)
 	default:
 		if failPage != 0 {
@@ -303,7 +352,7 @@ func TestHorizonSubcommandsRegistered(t *testing.T) {
 	if h == nil {
 		t.Fatal("horizon command not registered on root")
 	}
-	for _, name := range []string{"generate", "apply", "status", "report", "cleanup"} {
+	for _, name := range []string{"generate", "apply", "chaos", "monitor", "status", "report", "cleanup"} {
 		if findSubcommand(h, name) == nil {
 			t.Errorf("horizon subcommand %q not registered", name)
 		}
