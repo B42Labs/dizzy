@@ -31,6 +31,8 @@ func newHorizonCmd(opts *globalOptions) *cobra.Command {
 	cmd.AddCommand(
 		newHorizonGenerateCmd(opts),
 		newHorizonApplyCmd(opts),
+		newHorizonChaosCmd(opts),
+		newHorizonMonitorCmd(opts),
 		newHorizonStatusCmd(opts),
 		newReportCmd(opts),
 		newHorizonCleanupCmd(opts),
