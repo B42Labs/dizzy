@@ -1,0 +1,62 @@
+{
+  "scenario": "small",
+  "seed": 42,
+  "projects": [],
+  "users": [],
+  "pages": [
+    {
+      "name": "api_access",
+      "path": "/project/api_access/"
+    },
+    {
+      "name": "identity",
+      "path": "/identity/"
+    }
+  ],
+  "sessions": [
+    {
+      "name": "session-0001",
+      "pages": [
+        "api_access",
+        "identity"
+      ],
+      "switch": true,
+      "switchDraw": 55263
+    },
+    {
+      "name": "session-0002",
+      "pages": [
+        "api_access",
+        "identity"
+      ],
+      "switch": true,
+      "switchDraw": 30163
+    },
+    {
+      "name": "session-0003",
+      "pages": [
+        "api_access",
+        "identity"
+      ],
+      "switch": true,
+      "switchDraw": 20364
+    },
+    {
+      "name": "session-0004",
+      "pages": [
+        "api_access",
+        "identity"
+      ],
+      "switch": true,
+      "switchDraw": 35344
+    },
+    {
+      "name": "session-0005",
+      "pages": [
+        "identity"
+      ],
+      "switch": true,
+      "switchDraw": 10256
+    }
+  ]
+}

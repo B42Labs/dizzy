@@ -1,0 +1,33 @@
+name: large
+seed: 42                      # deterministic; same seed => same plan
+
+# Every session logs in through the dashboard's login form, loads its pages,
+# switches project when its plan says so, and logs out. With users: 0 each
+# session logs in as the user of the clouds.yaml entry and a run creates
+# nothing, so this profile needs no admin rights. --set resources.users=N
+# creates N users and `projects` projects in that user's domain instead.
+resources:
+  sessions: 100               # journeys of one apply, and the envelope of chaos
+  users: 0                    # 0: log in as the clouds.yaml user. N: create N users and log in as them
+  projects: 2                 # projects created when users > 0; ignored otherwise
+role: member                  # existing role of each created user on each created project
+
+# Both pages answer 200 on a control plane that runs only Keystone and
+# Horizon. /project/ does not: its default panel needs the compute service.
+pages:                        # loaded after the login; each must answer 200
+  - name: api_access
+    path: /project/api_access/
+  - name: identity
+    path: /identity/
+
+distribution:
+  pages_per_session: { min: 1, max: 2 }   # how many of the pages a session loads
+  switch_ratio: 1.0                       # fraction of sessions that switch project
+
+chaos:                                    # `horizon chaos --scenario scenarios/horizon/large.yaml` runs as-is
+  duration: 1h                            # total runtime; the only hard stop besides Ctrl-C
+  interval: { min: 200ms, max: 2s }       # random delay drawn per churn tick
+  parallel: { max: 8 }                    # per-tick fan-out, drawn in [1, max]; capped by --concurrency
+  churn_ratio: 0.5                        # login bias at steady state (0..1)
+  target_fill: 0.8                        # fraction of the sessions kept logged in (0..1)
+  browse_ratio: 0.3                       # probability per step that a live session browses
