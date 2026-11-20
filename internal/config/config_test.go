@@ -317,7 +317,9 @@ func newFakeCloud(t *testing.T) *fakeCloud {
 		fc.srv.URL+"/key-manager/"))
 	catalog = append(catalog, fmt.Sprintf(`{"type":"load-balancer","endpoints":[{"interface":"public","region":"RegionOne","url":%q}]}`,
 		fc.srv.URL+"/load-balancer/"))
-	token := `{"token":{"expires_at":"2030-01-01T00:00:00Z","project":{"id":"pid"},"catalog":[` + strings.Join(catalog, ",") + `]}}`
+	token := `{"token":{"expires_at":"2030-01-01T00:00:00Z","project":{"id":"pid"},` +
+		`"user":{"id":"uid","name":"token-user","domain":{"id":"did","name":"Users"}},` +
+		`"catalog":[` + strings.Join(catalog, ",") + `]}}`
 
 	mux.HandleFunc("POST /v3/auth/tokens", func(w http.ResponseWriter, _ *http.Request) {
 		fc.mu.Lock()
@@ -770,4 +772,113 @@ func TestIdentityEndpointMissingCloud(t *testing.T) {
 	if !strings.HasPrefix(err.Error(), "parsing clouds.yaml: ") || !strings.Contains(err.Error(), `"other"`) {
 		t.Errorf("error = %q, want a clouds.yaml parse error naming the cloud", err)
 	}
+}
+
+// TestNewPasswordIdentity asserts a password entry yields the user and domain
+// of its token, which differ from the entry's own username here, the entry's
+// password, and its TLS settings.
+func TestNewPasswordIdentity(t *testing.T) {
+	fc := newFakeCloud(t)
+	writeCloudsWith(t, "verify: false\n", credentialAuth(fc.authURL()))
+
+	id, err := NewPasswordIdentity(t.Context(), "fake")
+	if err != nil {
+		t.Fatalf("NewPasswordIdentity: %v", err)
+	}
+	if id.Username != "token-user" || id.DomainID != "did" || id.DomainName != "Users" {
+		t.Errorf("user = %q in %q (%q), want token-user in did (Users)", id.Username, id.DomainID, id.DomainName)
+	}
+	if id.Password != "p" {
+		t.Errorf("password = %q, want the entry's", id.Password)
+	}
+	if id.TLS == nil || !id.TLS.InsecureSkipVerify {
+		t.Errorf("TLS = %+v, want verification off as the entry says", id.TLS)
+	}
+	if id.Identity == nil || id.Identity.Endpoint != fc.srv.URL+"/identity/v3/" {
+		t.Errorf("identity client = %+v, want the catalog's identity endpoint", id.Identity)
+	}
+	if id.Identity.ReauthFunc == nil {
+		t.Error("a password entry built a client that never re-authenticates")
+	}
+}
+
+// TestNewPasswordIdentityApplicationCredential asserts an application
+// credential entry authenticates and yields an empty password.
+func TestNewPasswordIdentityApplicationCredential(t *testing.T) {
+	fc := newFakeCloud(t)
+	writeCloudsWith(t, "auth_type: v3applicationcredential\n",
+		"auth_url: "+fc.authURL()+"\napplication_credential_id: acid\napplication_credential_secret: acsecret\n")
+
+	id, err := NewPasswordIdentity(t.Context(), "fake")
+	if err != nil {
+		t.Fatalf("NewPasswordIdentity: %v", err)
+	}
+	if id.Password != "" {
+		t.Errorf("password = %q, want empty for an application credential", id.Password)
+	}
+	if id.Username != "token-user" {
+		t.Errorf("user = %q, want the token's", id.Username)
+	}
+}
+
+// TestNewPasswordIdentityPreIssuedToken asserts an entry with a pre-issued
+// token reads the user from a GET of that token.
+func TestNewPasswordIdentityPreIssuedToken(t *testing.T) {
+	fc := newFakeCloud(t)
+	writeClouds(t, "auth_url: "+fc.authURL()+"\ntoken: pre-issued\n")
+
+	id, err := NewPasswordIdentity(t.Context(), "fake")
+	if err != nil {
+		t.Fatalf("NewPasswordIdentity: %v", err)
+	}
+	if id.Username != "token-user" || id.Password != "" {
+		t.Errorf("identity = %q with password %q, want token-user without one", id.Username, id.Password)
+	}
+}
+
+// TestNewPasswordIdentityErrors asserts the wrapping of each failure: a 401
+// on the token request, an entry without an auth block, and a token that
+// names no user.
+func TestNewPasswordIdentityErrors(t *testing.T) {
+	keystone := func(status int, body string) string {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Subject-Token", "tok")
+			w.WriteHeader(status)
+			_, _ = fmt.Fprint(w, body)
+		}))
+		t.Cleanup(srv.Close)
+		return srv.URL + "/v3"
+	}
+
+	t.Run("401", func(t *testing.T) {
+		writeClouds(t, credentialAuth(keystone(http.StatusUnauthorized, unauthorizedBody)))
+		_, err := NewPasswordIdentity(t.Context(), "fake")
+		if err == nil || !strings.HasPrefix(err.Error(), "creating provider client: ") {
+			t.Fatalf("error = %v, want it to start with %q", err, "creating provider client: ")
+		}
+		if !gophercloud.ResponseCodeIs(err, http.StatusUnauthorized) {
+			t.Errorf("error = %v, want it to wrap the 401", err)
+		}
+		if strings.Contains(err.Error(), "password: p") {
+			t.Errorf("error = %q carries the password", err)
+		}
+	})
+
+	t.Run("no auth block", func(t *testing.T) {
+		writeCloudsYAML(t, "clouds:\n  fake:\n    region_name: RegionOne\n")
+		_, err := NewPasswordIdentity(t.Context(), "fake")
+		if err == nil || !strings.HasPrefix(err.Error(), "parsing clouds.yaml: ") || !errors.Is(err, errNoAuthBlock) {
+			t.Fatalf("error = %v, want parsing clouds.yaml wrapping errNoAuthBlock", err)
+		}
+	})
+
+	t.Run("token without user", func(t *testing.T) {
+		token := `{"token":{"expires_at":"2030-01-01T00:00:00Z","catalog":[{"type":"identity","endpoints":[{"interface":"public","region":"RegionOne","url":"http://127.0.0.1:1/v3/"}]}]}}`
+		writeClouds(t, credentialAuth(keystone(http.StatusCreated, token)))
+		_, err := NewPasswordIdentity(t.Context(), "fake")
+		if err == nil || !strings.HasPrefix(err.Error(), "reading the token's user: ") {
+			t.Fatalf("error = %v, want it to start with %q", err, "reading the token's user: ")
+		}
+	})
 }
