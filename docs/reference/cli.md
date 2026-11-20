@@ -29,6 +29,11 @@ c5c3-operator as Kubernetes custom resources and checks in Keystone what the
 operator made of them. It has six of the verbs, all but `chaos`; see
 [The `c5c3` namespace](#the-c5c3-namespace).
 
+A tenth namespace, `horizon`, logs in to the Horizon dashboard the way a
+browser does, loads pages, switches project and logs out, and checks every
+response. It has all seven verbs and takes `--horizon-url`; see
+[The `horizon` namespace](#the-horizon-namespace).
+
 ## Global flags
 
 Accepted by every command.
@@ -128,6 +133,7 @@ Namespace-specific flags:
 | `--privilege auto\|admin\|domain-manager` | `keystone` | Privilege tier; default `auto` (detect) |
 | `--domain <name>` | `keystone` | In-scope domain for domain-manager mode (default: the token's domain; ignored in admin mode) |
 | `--roles <csv>` | `keystone` | Existing roles to reuse in domain-manager mode (default `member,reader`; ignored in admin mode) |
+| `--horizon-url <url>` | `horizon` | Base URL of the Horizon dashboard, including its `WEBROOT` path if any; required without `--dry-run` |
 
 `neutron apply`, `cinder apply`, `nova apply`, `barbican apply`, and
 `octavia apply` run a read-only **quota pre-check** against the expanded plan
@@ -140,6 +146,9 @@ are deployment config), so an over-limit request surfaces as a fast-failed 413
 during the run rather than being caught up front. See
 [Deal with the quota pre-check](../how-to/raise-quotas.md)
 and [Keystone's privilege model](../explanation/privilege-model.md).
+`horizon apply` runs no pre-check of its own: it authenticates the
+`clouds.yaml` entry at Keystone before its first dashboard request, see
+[The `horizon` namespace](#the-horizon-namespace).
 
 `nova apply` takes no service-specific flags: the boot image, flavor, and resize
 flavor are named in the scenario (`image`, `flavor`, `resize_flavor`) and
@@ -275,6 +284,8 @@ Namespace-specific:
 | `--lifecycle-ratio <float>` | `glance` | `0.3` | Probability per churn step of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, or metadata churn); `0` disables |
 | `--retrieve-ratio <float>` | `barbican` | `0.3` | Probability per churn step of one read-back: the payload of a live stored secret the plan marks for read-back, byte-compared; the ACL of a live secret; or a live consumer in its container's list; `0` disables all three |
 | `--update-ratio <float>` | `octavia` | `0.3` | Probability per churn step of setting a live listener or member to `admin_state_up=false` and back to `true`; `0` disables |
+| `--browse-ratio <float>` | `horizon` | `0.3` | Probability per churn step that a live session browses: loads its pages and switches project as its plan says, at most once per login; `0` disables |
+| `--horizon-url <url>` | `horizon` | | As for `apply`; required |
 | `--privilege`, `--domain`, `--roles` | `keystone` | | As for `apply` |
 
 `barbican chaos` churns stored secrets, containers, ACLs and consumers and
@@ -824,6 +835,8 @@ Namespace-specific:
 | `--volume-type <name>` | `cinder` | As for `apply` |
 | `--reclaim-orphans` | `keystone` | Before each iteration, delete leftover `dizzy-` identity resources across **all** tester runs cloud-wide (off by default) |
 | `--privilege`, `--domain`, `--roles` | `keystone` | As for `apply` |
+| `--reclaim-orphans` | `horizon` | Before each iteration of a plan with users, delete the `dizzyhorizon-` users and projects of **every** run on the cloud (off by default) |
+| `--horizon-url <url>` | `horizon` | As for `apply`; required |
 
 With `--interval` omitted or `0`, the next iteration starts the moment the
 previous one finishes. A positive `--interval` is the target time between
@@ -845,9 +858,11 @@ across iterations. To broaden coverage, run several monitors with different
 > resource in the project, so it would tear a concurrent run down mid-flight.
 > For `keystone` the equivalent sweep is opt-in via `--reclaim-orphans`, and
 > because an admin token lists cloud-wide it is only safe when no other `dizzy`
-> process targets the cloud at all. For `c5c3` the sweep is always on and takes
-> every dizzy order in the Kubernetes namespace, so run one `dizzy` process per
-> namespace.
+> process targets the cloud at all. For `horizon` the sweep is opt-in via
+> `--reclaim-orphans` too, runs only for a plan with users, and is safe only
+> when no other `dizzy horizon` process uses the cloud. For `c5c3` the sweep
+> is always on and takes every dizzy order in the Kubernetes namespace, so run
+> one `dizzy` process per namespace.
 
 `barbican monitor` runs the quota pre-check once at startup, where an
 oversized plan exits before the first iteration, and again in each
@@ -892,7 +907,7 @@ Re-queries the current state of a run's resources from the API.
 ## `report`
 
 Renders metrics from a run record. Never touches the API. The same command
-builder backs all nine namespaces, so `dizzy cinder report` and
+builder backs all ten namespaces, so `dizzy cinder report` and
 `dizzy neutron report` are the same code.
 
 | Flag | Default | Description |
@@ -1716,6 +1731,165 @@ An order whose finalizer the operator never releases stays until someone
 removes its K-ORC children in the ControlPlane's namespace, where dizzy has no
 rights. Every later cleanup and monitor sweep then reports it by name. See
 [Release a stranded finalizer](../how-to/test-c5c3-orders.md#release-a-stranded-finalizer).
+
+## The `horizon` namespace
+
+`horizon` uses the Horizon dashboard the way a browser does: every session
+loads the login form, posts it with the form's CSRF token, loads pages,
+switches project and logs out, and dizzy checks every response. It is the one
+namespace that speaks plain HTTP to a web application. A session logs in as
+the user of the `clouds.yaml` entry, or, with `resources.users` above 0, as
+one of the users the run creates on projects it creates. See
+[Check the Horizon dashboard](../how-to/check-horizon.md) for what each step
+checks, the two identities and the rights they need.
+
+| Subcommand | Touches the API | Purpose |
+|---|---|---|
+| `horizon generate` | no | Expand a Horizon scenario into its plan and dump it |
+| `horizon apply` | yes | Create the plan's users and projects, if any, run every session's journey, record a run |
+| `horizon chaos` | yes | Churn sessions: log them in and out at random and let live ones browse |
+| `horizon monitor` | yes | Repeat sweep, `apply` and `cleanup` unattended, exporting metrics |
+| `horizon status` | yes | Re-query in Keystone the users and projects of a run record |
+| `horizon report` | no | Render metrics from a run record, the shared `report` |
+| `horizon cleanup` | yes | Delete a run's users and projects |
+
+| Verb | Flags beside the global ones |
+|---|---|
+| `generate` | `--scenario` (required), `--out`, `--set` |
+| `apply` | `--scenario` (required), `--dry-run`, `--set`, `--keep-on-abort`, `--horizon-url` |
+| `chaos` | `--scenario` (required), `--set`, `--duration`, `--bucket-width`, `--min-interval`, `--max-interval`, `--max-parallel`, `--churn-ratio`, `--target-fill`, `--browse-ratio`, `--no-cleanup`, `--horizon-url` |
+| `monitor` | `--scenario` (required), `--set`, `--interval`, `--iterations`, `--error-wait`, `--keep-run-records`, `--reclaim-orphans`, `--horizon-url` |
+| `status` | `--run` (required) |
+| `cleanup` | `--run`, `--run-id` |
+
+Every flag but the three below means what it means for the other namespaces.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--horizon-url <url>` | — | Base URL of the dashboard. Required by `chaos`, `monitor`, and `apply` without `--dry-run`. A path in it, Horizon's `WEBROOT` such as `/dashboard`, prefixes every request; trailing slashes are dropped |
+| `--browse-ratio <float>` | `0.3` | `chaos` only: probability per churn step that a live session browses, at most once per login; `0` disables |
+| `--reclaim-orphans` | off | `monitor` only: before each iteration of a plan with users, delete the `dizzyhorizon-` users and projects of every run on the cloud. Safe only when no other `dizzy horizon` process uses that cloud |
+
+`--horizon-url` comes from a flag rather than from the scenario, as the other
+cloud-specific inputs do, so the bundled profiles run against any cloud
+unchanged. An empty value fails with
+`--horizon-url is required: the base URL of the Horizon dashboard, e.g. https://horizon.example.com`,
+and so does, with its own message, a scheme other than `http` or `https`, a
+URL without a host, and one with a query or a fragment, each before any
+request. An `http` URL logs one warning that passwords travel unencrypted.
+`generate` and `apply --dry-run` read no `clouds.yaml` and send no request.
+
+Three global flags mean something particular here:
+
+- `--os-cloud`, or `$OS_CLOUD`, names the entry that `apply`, `chaos` and
+  `monitor` authenticate at Keystone before the first dashboard request. A
+  wrong password fails there, once. The token supplies the user name and the
+  domain name every login sends, and the entry's TLS settings (`cacert`,
+  `verify`) apply to the dashboard's connections too.
+- `--concurrency` bounds the journeys that run at once and the parallel
+  Keystone calls that create and delete users and projects.
+- `--timeout` bounds each attempt of one step: one request to the dashboard or
+  one Keystone call. A 429, a 5xx or a failed connection is retried, up to
+  five attempts in all; a rejected login or a mismatch is not.
+
+Before its first dashboard request, a run also checks its identity, and
+fails with one of these when it does not hold:
+
+| Condition | Error |
+|---|---|
+| The sessions log in as the `clouds.yaml` user and the entry has no password, e.g. an application credential | `horizon logs in as the clouds.yaml user and the entry has no password; use a username and password entry, or set resources.users to log in as created users` |
+| A session switches and the `clouds.yaml` user has no enabled project | `the clouds.yaml user has no enabled project to switch to` |
+| The plan creates users and the scenario's `role` does not exist | `role "<name>" not found in Keystone; set role in the scenario` |
+
+It then logs one line naming the URL, the identity (`cloud` or `created`), the
+user and the domain. No cookie, CSRF token or password is written to a plan,
+a record, a log line or an error text.
+
+### `horizon generate`
+
+Expands a Horizon scenario into its plan and writes it as JSON: the role, the
+projects and users a run creates (both `[]` without users), the pages, and
+each session's user, pages, switch decision and switch draw. The same
+scenario and seed give byte-identical output. Never touches the API.
+
+```console
+$ dizzy horizon generate --scenario scenarios/horizon/small.yaml --out plan.json
+```
+
+### `horizon apply`
+
+Creates the plan's projects, then its users, each with a fresh random
+password, then one role assignment per user and project, and runs every
+session's journey, up to `--concurrency` at a time. A journey logs in, loads
+its pages, switches project when its plan says so, and logs out whenever the
+login succeeded. A failed login ends its journey; any other failed step does
+not stop the next one. Every journey runs to its end, and the command exits
+non-zero with `<n> of <total> journeys failed` when one failed. It prints the
+metrics and writes a `run-<id>.json` record either way. With `--dry-run` it
+prints the plan summary instead:
+
+```console
+$ dizzy horizon apply --scenario scenarios/horizon/small.yaml --dry-run
+Plan for scenario "small" (seed 42)
+  identity:        the clouds.yaml user
+  sessions:        5
+  page api_access (/project/api_access/): 4 session(s)
+  page identity (/identity/): 5 session(s)
+  switches:        5
+```
+
+A successful apply keeps the created users and projects for `status` and
+`cleanup`. On SIGINT or SIGTERM every logged-in session logs out, the record
+is written, and the created users and projects are deleted; `--keep-on-abort`
+leaves them and prints `horizon cleanup --run <path>`. A 403 on a create
+stops the run without a retry, with a hint that `resources.users` needs an
+entry that may create projects and users in its domain.
+
+### `horizon chaos`
+
+Provisions the plan's users and projects once, then churns its sessions: a
+create logs a session in, a delete logs it out, and a mutate, drawn with
+`--browse-ratio`, loads its pages and switches project. A failed provisioning
+deletes what it created and returns. The record's `created` lists the
+provisioned users and projects, never the sessions. The teardown always logs
+out every session still logged in. Unless `--no-cleanup`, it then deletes the
+users and projects and runs a leak check; with `--no-cleanup` it prints
+`horizon cleanup --run <path>`. A rejected login or a mismatch does not stop
+the churn, but after the teardown the command exits non-zero, e.g.
+`horizon checks failed (run <id>): 2 login(s) rejected, 0 response(s) mismatched`.
+
+### `horizon monitor`
+
+Repeats sweep, `apply` and `cleanup` unattended, with the cadence, the
+iteration bound, the error wait and the run records of every
+[`monitor`](#monitor). It authenticates once at startup, so a wrong URL, a
+wrong password or a missing role fails before the loop, and again in every
+iteration, with a fresh run id and a fresh collector; a failed
+authentication fails its iteration and not the loop. The sweep runs only with
+`--reclaim-orphans` and a plan with users. Cleanup deletes the iteration's
+own users and projects and sends nothing for a plan without users.
+
+### `horizon status`
+
+Re-queries in Keystone every user and project of a run record and prints the
+status table: `enabled`, `disabled`, or `gone`. A record without created
+resources prints the header alone and reads no `clouds.yaml`. It sends no
+dashboard request. A record of another service fails, e.g.
+`run record is for service "keystone", not "horizon"`.
+
+### `horizon report`
+
+The shared [`report`](#report).
+
+### `horizon cleanup`
+
+Deletes the users and then the projects of a run, found by their
+`dizzyhorizon-<id>-` name prefix and the project tag `dizzyhorizon:run=<id>`,
+unioned with the record's `created` list, and prints
+`deleted N resource(s) for run <id>`. A resource without the `dizzyhorizon-`
+prefix is skipped with a warning. Idempotent: a 404 counts as gone, so a
+second run deletes nothing. Exactly one of `--run` and `--run-id` is
+required. It sends no dashboard request: a session needs no cleanup.
 
 ## `list-networks`
 

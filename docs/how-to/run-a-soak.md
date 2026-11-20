@@ -99,7 +99,7 @@ pool is the real ceiling.
 
 ## Add mutations
 
-Cinder, Keystone, Nova, Glance, Barbican, and Octavia can mutate live
+Cinder, Keystone, Nova, Glance, Barbican, Octavia, and Horizon can mutate live
 resources instead of only creating and deleting them. Mutations do not change
 the population.
 
@@ -115,6 +115,9 @@ $ dizzy barbican chaos --scenario scenarios/barbican/small.yaml \
 
 $ dizzy octavia chaos --scenario scenarios/octavia/small.yaml \
     --duration 30m --update-ratio 0.5
+
+$ dizzy horizon chaos --scenario scenarios/horizon/small.yaml \
+    --horizon-url https://horizon.example.com --duration 30m --browse-ratio 0.5
 ```
 
 `--resize-ratio` is the probability per churn step of extending a live,
@@ -127,7 +130,9 @@ read-back and comparing it byte for byte with the payload stored, reading back
 the users of a live ACL, or finding a live consumer in its container's list.
 `--update-ratio` is the probability of setting a live listener or member to
 `admin_state_up=false` and back to `true`, waiting after each change until its
-load balancer is ACTIVE again. Set any of them to `0` to disable.
+load balancer is ACTIVE again. `--browse-ratio` is the probability that a
+live dashboard session browses: it loads its pages and switches project as
+its plan says. Set any of them to `0` to disable.
 
 `keystone chaos` churns application credentials and trusts under their
 assignment. Each is parented on the assignment node of the grant it carries,
@@ -144,8 +149,11 @@ not stop the churn. The run finishes and tears down as usual, then
 `barbican chaos` exits non-zero, and the run record's `error` names the
 count, e.g.
 `read-back mismatch (run <id>): 2 read-back(s) returned data that differs from what was written`.
-No other `chaos` command fails on an operation error. This one does because a
-mismatch means the key manager returned wrong data, which is a correctness
+`horizon chaos` fails the same way, after its teardown, when Horizon rejected a
+login or answered a step with something its status does not promise, e.g.
+`horizon checks failed (run <id>): 2 login(s) rejected, 0 response(s) mismatched`.
+No other `chaos` command fails on an operation error. These two do because a
+mismatch means the service returned wrong data, which is a correctness
 failure rather than a latency one.
 
 Each resource instance is mutated at most once per lifetime, and re-armed when it

@@ -25,7 +25,7 @@ same way.
 | Field | Type | Notes |
 |---|---|---|
 | `runID` | string | The run id; also the tag/metadata/label/name-prefix value |
-| `service` | string | `neutron`, `cinder`, `keystone`, `nova`, `glance`, `barbican`, `octavia`, `c5c3`, or `mix`. Omitted on older records |
+| `service` | string | `neutron`, `cinder`, `keystone`, `nova`, `glance`, `barbican`, `octavia`, `c5c3`, `horizon`, or `mix`. Omitted on older records |
 | `scenario` | string | Scenario name |
 | `seed` | int | The seed the plan was expanded from; `0` on a `c5c3` record, whose plan has no seed |
 | `startedAt` | timestamp | RFC 3339 |
@@ -130,6 +130,15 @@ and `c5c3 cleanup` takes its namespace from the first entry. The delivered
 Secrets are not listed: the operator writes them, and the garbage collector
 removes them with their orders.
 
+On a `horizon` record the list holds the projects and then the users the run
+created, of kinds `project` and `user`, each named
+`dizzyhorizon-<run>-<logical>`, e.g. `dizzyhorizon-a1b2c3d4-user-0001`, with
+its Keystone id. It is empty for a run that logs in as the `clouds.yaml` user,
+which every bundled profile does. A session is never listed, not even on a
+`horizon chaos` record: it carries no identifier, and dizzy logs out every
+session it opened. Role assignments are not listed either, since Keystone
+removes them with their user.
+
 This list is `cleanup`'s belt-and-suspenders handle. It is the *only* handle for
 resources that cannot be discovered by tag — Neutron address scopes, and Keystone
 role assignments.
@@ -180,6 +189,17 @@ that differs from what was written, and `order_error`, for an order that ended
 in ERROR. An `octavia` record, and a `mix` record whose `services` lists
 `octavia`, adds `provisioning_error`, for a load balancer that reached ERROR
 after a write.
+
+A `horizon` record adds `rejected`, for a login Horizon answered with the
+login form again, and `mismatch`, for an answer with the expected status that
+does not hold what the status promises: a login form without its CSRF token
+or region, a login redirected into `/auth/` or without a session cookie, a
+switch that lands elsewhere or in another project, a landing page reporting
+that the switch failed, or a logout without a CSRF cookie or that does not
+lead back to the login page. `byType` holds one entry per step kind:
+`login_page`, `login`, `page_<name>`, `switch`, `switch_landing` and
+`logout`, plus `project`, `user` and `role_assignment` for a run with created
+users, and `readiness` one `session` entry for the logins.
 
 A `c5c3` record adds `refused`, for an order whose condition carries a reason
 the operator does not retry, such as `NamespaceNotAssigned` or
