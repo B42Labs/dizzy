@@ -12,6 +12,7 @@ Every scenario except a c5c3 one shares this top-level shape; see
 name: <string>       # profile name, recorded in the run record
 seed: <int>          # deterministic; same seed => same plan
 image / flavor / resize_flavor   # nova only; referenced by name, never created
+role / pages         # horizon only; see Horizon below
 provider: <string>   # octavia only; empty selects the cloud's default
 resources:  { … }    # fixed counts
 distribution: { … }  # ranges and ratios drawn per resource
@@ -1358,6 +1359,75 @@ has no `chaos`. Its ControlPlane, `controlplane` in `openstack`, is the one
 the Cobalt Core ControlPlane quick start creates. A run of it lasts at least
 its 2 minute grace period.
 
+## Horizon
+
+```yaml
+name: small
+seed: 42
+resources:
+  sessions: 5      # journeys of one apply, and the envelope of chaos
+  users: 0         # 0: log in as the clouds.yaml user. N: create N users and log in as them
+  projects: 2      # projects created when users > 0; ignored otherwise
+role: member       # existing role of each created user on each created project
+pages:             # loaded after the login; each must answer 200
+  - name: api_access
+    path: /project/api_access/
+  - name: identity
+    path: /identity/
+distribution:
+  pages_per_session: { min: 1, max: 2 }   # how many of the pages a session loads
+  switch_ratio: 1.0                       # fraction of sessions that switch project
+chaos:
+  duration: 5m
+  interval: { min: 1s, max: 5s }
+  parallel: { max: 2 }
+  churn_ratio: 0.5
+  target_fill: 0.8
+  browse_ratio: 0.3                       # probability per step that a live session browses
+```
+
+A Horizon scenario has `role` and `pages` beside `resources` and
+`distribution`. With `resources.users: 0` every session logs in as the user of
+the `clouds.yaml` entry and a run creates nothing; `resources.projects` and
+`role` are then ignored and not validated. With `resources.users: N` a run
+creates N users and `resources.projects` projects in the domain of the
+`clouds.yaml` user and grants each user `role` on each project. See
+[Check the Horizon dashboard](../how-to/check-horizon.md).
+
+| Key | Type | Meaning |
+|---|---|---|
+| `resources.sessions` | int | Sessions of one `apply`, each one journey, and the sessions `chaos` churns; at least 1 |
+| `resources.users` | int | Users to create; `0` logs in as the `clouds.yaml` user. At most `resources.sessions`; session *i* logs in as user *(i-1) mod users* |
+| `resources.projects` | int | Projects to create when `resources.users > 0`; then at least 1 |
+| `role` | string | Existing role each created user gets on each created project, looked up by name; required when `resources.users > 0` |
+| `pages[].name` | string | Logical name of a page, matching `^[a-z0-9_]{1,32}$` and unique; it names the metric kind `page_<name>` |
+| `pages[].path` | string | Path below the dashboard's base URL; starts with one `/`, lies outside `/auth/`, and carries no `?`, `#` or whitespace |
+| `distribution.pages_per_session` | range | How many of the pages a session loads, at most the number of pages; a session loads them in the scenario's order |
+| `distribution.switch_ratio` | ratio | Fraction of sessions that switch project after their pages and land on the first page |
+
+`pages` is a list, so it has no `--set` key. The `--set` keys are `seed`,
+`resources.sessions`, `resources.users`, `resources.projects`, `role`,
+`distribution.pages_per_session.min`, `distribution.pages_per_session.max` and
+`distribution.switch_ratio`.
+
+A session that switches picks its target with its switch draw among the
+run's created projects, or, without them, among the enabled projects of the
+`clouds.yaml` user.
+
+### Profiles
+
+| Profile | `sessions` | `users` | `projects` | `chaos.duration` | `chaos.interval` | `chaos.parallel.max` |
+|---|---|---|---|---|---|---|
+| `small` | 5 | 0 | 2 | 5m | 1s to 5s | 2 |
+| `medium` | 25 | 0 | 2 | 30m | 500ms to 3s | 4 |
+| `large` | 100 | 0 | 2 | 1h | 200ms to 2s | 8 |
+
+The three differ in nothing else. All log in as the `clouds.yaml` user, so each
+runs without admin rights; `--set resources.users=5` switches a profile to
+created users. Both pages answer `200` on a control plane that runs only
+Keystone and Horizon. `/project/` does not: its default panel needs the
+compute service.
+
 ## The `chaos:` block
 
 Optional, and read only by the `chaos` command. It adds a temporal frame to the
@@ -1387,6 +1457,7 @@ chaos:                                # the block shipped by scenarios/neutron/m
 | `lifecycle_ratio` | ratio | glance | Probability per step of mutating a live image (deactivate/reactivate, visibility flip, member add/remove, or metadata churn) |
 | `retrieve_ratio` | ratio | barbican | Probability per step of one read-back: the payload of a live secret the plan marks for read-back, byte-compared; the users of a live ACL; or a live consumer in its container's list. `0` switches all three off |
 | `update_ratio` | ratio | octavia | Probability per step of setting a live listener or member to `admin_state_up=false` and back to `true` |
+| `browse_ratio` | ratio | horizon | Probability per step that a live session browses: loads its pages and switches project as its plan says, at most once per login. Omitted falls back to `0.3`; `0` switches browsing off |
 
 Every built-in profile except `scenarios/c5c3/small.yaml` carries a `chaos:`
 block, so `chaos` runs any of them with no flags at all; the `c5c3` namespace

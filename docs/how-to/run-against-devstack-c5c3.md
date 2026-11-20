@@ -44,6 +44,21 @@ $ make devstack-c5c3 DEVSTACK_C5C3_CMD=pressure ARGS="--mix probe=30 --propagati
 $ make devstack-c5c3 KEEP=1                                                 # keep the resources and the run record
 ```
 
+The quick-start's Horizon is checked with `DEVSTACK_C5C3_SERVICE=horizon`. This
+repository records no Horizon hostname for the stack, so pass the dashboard's
+URL; `<URL>` below is that placeholder:
+
+```console
+$ make devstack-c5c3 DEVSTACK_C5C3_SERVICE=horizon ARGS="--horizon-url <URL>"   # scenarios/horizon/small.yaml as the admin user
+$ make devstack-c5c3 DEVSTACK_C5C3_SERVICE=horizon ARGS="--horizon-url <URL> --set resources.users=5"
+```
+
+Every session logs in as the admin user of the generated `clouds.yaml`, or,
+with `--set resources.users`, as users the run creates; the cleanup step after
+the run deletes those and finds nothing to delete otherwise. The entry's
+`verify: false` applies to the dashboard's connections too. See
+[Check the Horizon dashboard](check-horizon.md).
+
 Note that `scenarios/keystone/medium.yaml` declares two domains and is therefore
 admin-only — fine here, since the `devstack-c5c3` targets use admin credentials.
 See [Keystone's privilege model](../explanation/privilege-model.md).

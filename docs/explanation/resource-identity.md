@@ -136,6 +136,17 @@ projects and then users, and waits until each kind is gone before the next,
 because the operator holds a user, a project or a role assignment that another
 order still names.
 
+**Horizon names the users and projects it creates, and tags the projects.** A
+Horizon run that logs in as the `clouds.yaml` user creates nothing at all. One
+with `resources.users` above 0 creates users and projects in Keystone, named
+`dizzyhorizon-<runid>-<logical>`, e.g. `dizzyhorizon-a1b2c3d4-user-0001`. The
+projects also carry the tags `dizzyhorizon:run=<runid>` and
+`dizzyhorizon:type=project`. Discovery lists users by the run's name prefix
+and projects by the run tag, server side, and rechecks the tag and the prefix
+in the answer. A user's role assignments go with the user. The sessions
+themselves carry no identifier at all; see
+[Where the stamp doesn't reach](#where-the-stamp-doesnt-reach).
+
 The seven OpenStack services converge on the same deterministic naming: a
 resource with logical name `net-0001` in run `a1b2c3d4` is called
 `dizzy-a1b2c3d4-net-0001` on the cloud. That is what makes it findable in
@@ -149,6 +160,11 @@ whose name starts with `dizzy-`, whatever run it belongs to. With the
 Keystone users behind running c5c3 orders. The different prefix keeps that
 sweep away from them, and the label, not the name, is what c5c3 discovery
 reads.
+
+Horizon uses `dizzyhorizon-` for the same reason. The Keystone sweep also
+deletes every project tagged `dizzy:type=project`, so Horizon's projects carry
+`dizzyhorizon:` tags instead, and neither sweep reaches the other's users or
+projects.
 
 A combined run (`mix chaos`) gives each persona an identity of its own: the run
 id with the persona name appended, `<runID>-<persona>`. The CI persona's first
@@ -252,6 +268,13 @@ The practical consequence is a real asymmetry in the `cleanup` command:
 This is why `--run-id` exists at all: it is the recovery path for a run whose
 record was lost, and it is honest about being incomplete.
 
+A Horizon session is the one thing a run makes that carries no stamp: Horizon
+gives a dashboard session no name, tag or metadata, and lists no sessions.
+dizzy therefore logs out every session it opened, at the end of a journey, on
+interrupt, and in the teardown of `horizon chaos`, and a run record never
+lists one. A session that a killed process leaves logged in expires in
+Horizon on its own.
+
 For c5c3 the two reach the same orders, since every order carries the run
 label. `c5c3 cleanup --run-id` needs `--namespace`, which `--run` reads from
 the record's first entry.
@@ -318,6 +341,13 @@ default, and safe only when no other `dizzy` process targets that cloud at all.
 Left off, a Keystone monitor still cleans up after each of its own iterations. It
 just does not adopt orphans it did not create.
 
+Horizon's sweep is opt-in via `--reclaim-orphans` too, for the same reason:
+users are listed cloud-wide. It deletes every user named `dizzyhorizon-` and
+every project tagged `dizzyhorizon:type=project`, whatever run created them,
+so it is safe only when no other `dizzy horizon` process uses the cloud. It
+runs only for a plan with users; a monitor of the `clouds.yaml` user creates
+nothing and sweeps nothing.
+
 Barbican has no type tag, so its sweep widens the name prefix to `dizzy-`. It
 takes containers and orders on that prefix, each secret a swept order names as
 its `secret_ref`, any other secret once its `dizzy_type=secret` metadata
@@ -366,7 +396,9 @@ dizzy's token as its `creator_id`. Barbican sets that field from the token
 that created the secret, so only a secret the same user created under a
 `dizzy-` name matches it. A c5c3 cleanup deletes only orders that carry the
 run's label or are in its record, reads only the Secrets named after them, and
-sends nothing to the ControlPlane's namespace.
+sends nothing to the ControlPlane's namespace. A Horizon cleanup skips every
+user or project whose name lacks the `dizzyhorizon-` prefix, even one in the
+record.
 
 The `monitor` sweep is the single place where the filter widens from "this run"
 to "any dizzy run", and it is documented above precisely because it is the one

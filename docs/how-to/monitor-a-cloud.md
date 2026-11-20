@@ -234,6 +234,36 @@ sweep skips its iteration's apply, until someone removes the order's K-ORC
 children in the ControlPlane's namespace; see
 [Release a stranded finalizer](test-c5c3-orders.md#release-a-stranded-finalizer).
 
+## Monitor Horizon
+
+Same cadence and shutdown semantics, against the dashboard `--horizon-url`
+names:
+
+```console
+$ dizzy horizon monitor --scenario scenarios/horizon/small.yaml --horizon-url https://horizon.example.com --otel
+$ dizzy horizon monitor --scenario scenarios/horizon/small.yaml --horizon-url https://horizon.example.com --set resources.users=5 --reclaim-orphans --otel
+```
+
+The first form logs every session in as the `clouds.yaml` user and creates
+nothing, so a member-only test user is enough. The second creates five users
+and two projects per iteration, deletes them again at the iteration's end, and
+with `--reclaim-orphans` first deletes the `dizzyhorizon-` users and projects
+any earlier iteration left behind. Use a dedicated identity: dizzy caps failed
+logins nowhere, and Keystone can lock an account after repeated ones.
+
+`horizon monitor` authenticates the `clouds.yaml` entry once at startup, so a
+wrong URL, a wrong password or a missing role fails before the loop begins,
+and again at the start of every iteration, which a Keystone outage fails
+without ending the loop. Watch `dizzy.operation.duration` per step kind,
+`login_page` to `logout`, and `dizzy.resource.time_to_ready` under
+`kind=session`, the time from the login form to the dashboard. The errors
+separate a broken dashboard from a slow one: `error_kind="rejected"` is a
+login Horizon refused, `error_kind="mismatch"` an answer that did not hold
+what its status promised, and `http_<status>`, `timeout` or `other` the
+dashboard failing or unreachable. A failed check fails its iteration while the
+loop goes on, so watch the failed iterations and these series. See
+[Check the Horizon dashboard](check-horizon.md).
+
 ## Via the Makefile
 
 To run against the OSISM testbed, exporting into the local OTEL stack:
@@ -251,6 +281,12 @@ To monitor c5c3 orders on a local Cobalt Core dev stack:
 
 ```console
 $ make devstack-c5c3-monitor DEVSTACK_C5C3_SERVICE=c5c3
+```
+
+To monitor the dev stack's Horizon:
+
+```console
+$ make devstack-c5c3-monitor DEVSTACK_C5C3_SERVICE=horizon ARGS="--horizon-url <URL>"
 ```
 
 See [Run against a Cobalt Core dev stack](run-against-devstack-c5c3.md#order-through-the-c5c3-operator).

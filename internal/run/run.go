@@ -27,8 +27,9 @@ type Record struct {
 	RunID string `json:"runID"`
 	// Service names the OpenStack service the run exercised (neutron, cinder,
 	// keystone, nova, glance, barbican, or octavia), c5c3 for a run that orders
-	// Keystone resources through the c5c3-operator, or mix for a combined run
-	// of several workload personas. It is omitempty and read as "neutron" when
+	// Keystone resources through the c5c3-operator, horizon for a run that
+	// checks the Horizon dashboard, or mix for a combined run of several
+	// workload personas. It is omitempty and read as "neutron" when
 	// absent, so run records written before Cinder support (which carry no service
 	// field) still load and report unchanged.
 	Service    string              `json:"service,omitempty"`
