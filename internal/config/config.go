@@ -13,7 +13,9 @@
 // NewKubeClient builds the Kubernetes dynamic client the c5c3 namespace orders
 // through, from a kubeconfig or the pod's service account, and
 // IdentityEndpoint reads a clouds.yaml entry's Keystone URL and TLS settings
-// without authenticating.
+// without authenticating. NewPasswordIdentity authenticates an entry and
+// returns what the horizon namespace logs in to the dashboard with: the
+// token's user and domain, the entry's password and its TLS settings.
 package config
 
 import (
@@ -27,6 +29,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack"
 	gcconfig "github.com/gophercloud/gophercloud/v2/openstack/config"
 	"github.com/gophercloud/gophercloud/v2/openstack/config/clouds"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
 )
 
 // newProvider parses the clouds.yaml entry for cloudName (or $OS_CLOUD when
@@ -99,6 +102,97 @@ func IdentityEndpoint(cloudName string) (authURL string, tlsConfig *tls.Config, 
 		return "", nil, fmt.Errorf("clouds.yaml entry %q has no auth_url", cloudName)
 	}
 	return authOptions.IdentityEndpoint, tlsConfig, nil
+}
+
+// PasswordIdentity is an authenticated clouds.yaml entry together with what a
+// login form needs from it. Identity is the IdentityV3 client of the entry.
+// Username, DomainID and DomainName are those of the user the token names,
+// so an entry that names its user by id still yields a name. Password is the
+// entry's password, empty for an entry without one, such as an application
+// credential. TLS is the entry's TLS configuration (cacert, verify, client
+// certificate).
+type PasswordIdentity struct {
+	Identity   *gophercloud.ServiceClient
+	Username   string
+	DomainID   string
+	DomainName string
+	Password   string
+	TLS        *tls.Config
+}
+
+// NewPasswordIdentity authenticates the clouds.yaml entry cloudName (or
+// $OS_CLOUD when empty) and returns its PasswordIdentity. It parses through
+// parseClouds, so an entry without an auth block is an error rather than a
+// panic, and enables re-authentication as newProvider does. The user is read
+// from the cached token result, or, for an entry that carries a pre-issued
+// token, from a GET of that token. A wrong password fails here with the 401
+// Keystone sent, before anything else is sent anywhere.
+func NewPasswordIdentity(ctx context.Context, cloudName string) (*PasswordIdentity, error) {
+	var parseOpts []clouds.ParseOption
+	if cloudName != "" {
+		parseOpts = append(parseOpts, clouds.WithCloudName(cloudName))
+	}
+	authOptions, endpointOptions, tlsConfig, err := parseClouds(parseOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("parsing clouds.yaml: %w", err)
+	}
+	authOptions.AllowReauth = authOptions.TokenID == ""
+
+	provider, err := gcconfig.NewProviderClient(ctx, authOptions, gcconfig.WithTLSConfig(tlsConfig))
+	if err != nil {
+		return nil, fmt.Errorf("creating provider client: %w", err)
+	}
+	client, err := openstack.NewIdentityV3(provider, endpointOptions)
+	if err != nil {
+		return nil, fmt.Errorf("creating identity v3 client: %w", err)
+	}
+
+	user, err := tokenUser(ctx, client)
+	if err != nil {
+		return nil, fmt.Errorf("reading the token's user: %w", err)
+	}
+	return &PasswordIdentity{
+		Identity:   client,
+		Username:   user.Name,
+		DomainID:   user.Domain.ID,
+		DomainName: user.Domain.Name,
+		Password:   authOptions.Password,
+		TLS:        tlsConfig,
+	}, nil
+}
+
+// tokenUser returns the user the client's token names: from the cached
+// result of the token request, or from a GET of the current token when the
+// client holds no such result. A token that names no user, or a user without
+// a name, is an error.
+func tokenUser(ctx context.Context, client *gophercloud.ServiceClient) (*tokens.User, error) {
+	var (
+		user *tokens.User
+		err  error
+	)
+	switch ar := client.GetAuthResult().(type) {
+	case tokens.CreateResult:
+		user, err = ar.ExtractUser()
+	case tokens.GetResult:
+		user, err = ar.ExtractUser()
+	default:
+		token := client.Token()
+		if token == "" {
+			return nil, errors.New("no token available")
+		}
+		res := tokens.Get(ctx, client, token)
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		user, err = res.ExtractUser()
+	}
+	if err != nil {
+		return nil, err
+	}
+	if user == nil || user.Name == "" {
+		return nil, errors.New("the token names no user")
+	}
+	return user, nil
 }
 
 // NewNetworkClient authenticates against the cloud described in clouds.yaml and
