@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"time"
 
 	"github.com/B42Labs/dizzy/internal/keystone"
@@ -28,6 +29,11 @@ type Cleaner interface {
 
 // The production *keystone.Client must satisfy the seam.
 var _ Cleaner = (*keystone.Client)(nil)
+
+// cleanupRetryMaxDelay caps the backoff between two attempts of one cleanup
+// call. It is longer than WithRetry's retryMaxDelay because a cleanup rides
+// out an outage within its retry budget rather than failing an apply fast.
+const cleanupRetryMaxDelay = 30 * time.Second
 
 // Cleanup deletes every resource a run created in reverse dependency order —
 // unassign role assignments, delete users, delete projects, delete implied-role
@@ -60,6 +66,15 @@ var _ Cleaner = (*keystone.Client)(nil)
 // error joins every recorded failure in call order (nil when none failed) and
 // is returned with the count actually deleted.
 //
+// Cleanup makes one attempt per call; it is CleanupWithRetry with a zero
+// budget. CleanupWithRetry retries a call that failed with a 5xx, a 429, its
+// own opTimeout, or a connection error (retryableCleanupError) while the next
+// attempt would start before the budget, measured from the start of the run,
+// runs out. Each call backs off from 250ms, doubling up to
+// cleanupRetryMaxDelay. A 404, a 403, and every other error are never
+// retried, and no call is retried once ctx is done. Once the budget is spent,
+// each remaining call still gets its one attempt.
+//
 // Roles and domains are additionally guarded by the dizzy- name prefix
 // (HasNamePrefix): in domain-manager mode the run shares a pre-existing domain
 // and reuses pre-existing roles that carry no prefix and must never be deleted —
@@ -71,10 +86,16 @@ var _ Cleaner = (*keystone.Client)(nil)
 // "never touches resources the tool did not create" invariant depends on a
 // non-empty run id.
 func Cleanup(ctx context.Context, c Cleaner, runID string, recorded []resource.Resource, opTimeout time.Duration) (int, error) {
+	return CleanupWithRetry(ctx, c, runID, recorded, opTimeout, 0)
+}
+
+// CleanupWithRetry is Cleanup with a retry budget for transient failures: see
+// Cleanup for the teardown and the retry policy. A budget of 0 never retries.
+func CleanupWithRetry(ctx context.Context, c Cleaner, runID string, recorded []resource.Resource, opTimeout, retryBudget time.Duration) (int, error) {
 	if runID == "" {
 		return 0, fmt.Errorf("cleanup: empty run id; refusing to delete by an empty prefix")
 	}
-	s := &sweeper{c: c, opTimeout: opTimeout}
+	s := &sweeper{c: c, opTimeout: opTimeout, retryUntil: time.Now().Add(retryBudget)}
 
 	// Discover this run's users first: they are both a delete target and the
 	// handle for discovering their live assignments.
@@ -120,22 +141,57 @@ func Cleanup(ctx context.Context, c Cleaner, runID string, recorded []resource.R
 	return s.deleted, errors.Join(s.errs...)
 }
 
-// sweeper carries one Cleanup run's state: the cleaner, the per-call bound,
-// the count deleted so far, and every failure recorded so far, in call order.
+// sweeper carries one Cleanup run's state: the cleaner, the per-attempt bound,
+// the end of the retry budget, the count deleted so far, and every failure
+// recorded so far, in call order.
 type sweeper struct {
-	c         Cleaner
-	opTimeout time.Duration
-	deleted   int
-	errs      []error
+	c          Cleaner
+	opTimeout  time.Duration
+	retryUntil time.Time
+	deleted    int
+	errs       []error
 }
 
-// call runs fn on a context bounded by opTimeout, so a wedged Keystone call
-// bounds one operation rather than the whole sweep. Every Cleaner call goes
-// through it.
+// call runs fn, bounding each attempt with opTimeout so a wedged Keystone call
+// bounds one attempt rather than the whole sweep. Every Cleaner call goes
+// through it. A failed attempt is retried after a backoff unless ctx is done,
+// the error is not retryableCleanupError, or the next attempt would not start
+// before retryUntil; the backoff starts at retryBaseDelay for each call and
+// doubles up to cleanupRetryMaxDelay.
 func (s *sweeper) call(ctx context.Context, fn func(context.Context) error) error {
-	opCtx, cancel := context.WithTimeout(ctx, s.opTimeout)
-	defer cancel()
-	return fn(opCtx)
+	backoff := retryBaseDelay
+	for attempt := 1; ; attempt++ {
+		opCtx, cancel := context.WithTimeout(ctx, s.opTimeout)
+		err := fn(opCtx)
+		cancel()
+		if err == nil || ctx.Err() != nil || !retryableCleanupError(err) || !time.Now().Add(backoff).Before(s.retryUntil) {
+			return err
+		}
+		slog.Warn("retrying cleanup call", "attempt", attempt, "backoff", backoff, "error", err)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		backoff = min(backoff*2, cleanupRetryMaxDelay)
+	}
+}
+
+// retryableCleanupError reports whether a failed cleanup call is worth another
+// attempt: a 5xx or a 429 (keystone.IsRetryable), the attempt's own opTimeout
+// expiring, or a connection error, which gophercloud returns as the net/http
+// client's *url.Error for a refused, reset, or closed connection. A 404 (the
+// resource is already gone) and a 403 (a policy denial no retry changes) are
+// not, and neither is anything else, so a 400 or a 409 is terminal.
+func retryableCleanupError(err error) bool {
+	switch {
+	case keystone.IsNotFound(err), keystone.IsForbidden(err):
+		return false
+	case keystone.IsRetryable(err), errors.Is(err, context.DeadlineExceeded):
+		return true
+	}
+	var urlErr *url.Error
+	return errors.As(err, &urlErr)
 }
 
 // list runs a discovery listing through call. A failed listing is recorded and
