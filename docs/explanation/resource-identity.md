@@ -339,7 +339,10 @@ and whole domains. It is therefore opt-in via `--reclaim-orphans`, off by
 default, and safe only when no other `dizzy` process targets that cloud at all.
 
 Left off, a Keystone monitor still cleans up after each of its own iterations. It
-just does not adopt orphans it did not create.
+just does not adopt orphans it did not create. It does re-run the cleanup of its
+own iterations whose cleanup failed, before each later iteration, scoped to their
+run ids. Unlike `--reclaim-orphans`, that stays safe beside a concurrent run,
+whose resources carry a different run id.
 
 Horizon's sweep is opt-in via `--reclaim-orphans` too, for the same reason:
 users are listed cloud-wide. It deletes every user named `dizzyhorizon-` and
