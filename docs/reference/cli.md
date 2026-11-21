@@ -834,6 +834,7 @@ Namespace-specific:
 | `--external-network <name>` | `neutron` | As for `apply` |
 | `--volume-type <name>` | `cinder` | As for `apply` |
 | `--reclaim-orphans` | `keystone` | Before each iteration, delete leftover `dizzy-` identity resources across **all** tester runs cloud-wide (off by default) |
+| `--cleanup-retry-budget <duration>` | `keystone` | How long one iteration's cleanup retries list and delete calls that fail with a 5xx, 429, timeout, or connection error (default `5m`); `0` makes one attempt per call |
 | `--privilege`, `--domain`, `--roles` | `keystone` | As for `apply` |
 | `--reclaim-orphans` | `horizon` | Before each iteration of a plan with users, delete the `dizzyhorizon-` users and projects of **every** run on the cloud (off by default) |
 | `--horizon-url <url>` | `horizon` | As for `apply`; required |
@@ -863,6 +864,19 @@ across iterations. To broaden coverage, run several monitors with different
 > when no other `dizzy horizon` process uses the cloud. For `c5c3` the sweep
 > is always on and takes every dizzy order in the Kubernetes namespace, so run
 > one `dizzy` process per namespace.
+
+`keystone monitor` retries an iteration's cleanup calls that fail with a 5xx,
+a 429, a timeout, or a connection error for up to `--cleanup-retry-budget`,
+backing off from 250ms to at most 30s between attempts, and a call that still
+fails no longer stops the rest of the cleanup. It keeps each iteration whose
+cleanup still fails, at most 20; past that it drops the oldest with an error
+log. Before each later iteration it cleans every kept iteration up again by
+its run id, with one attempt per call, and forgets the iteration once that
+succeeds. Scoped to its own run ids, this cleanup is safe beside a concurrent
+run. The kept iterations live in memory only, so a restart forgets them; at
+shutdown the monitor logs each one still pending with its
+`dizzy keystone cleanup --run-id <id>` command. The `iteration complete` log
+line carries how many are pending.
 
 `barbican monitor` runs the quota pre-check once at startup, where an
 oversized plan exits before the first iteration, and again in each
@@ -1053,7 +1067,12 @@ Discovery differs per service, and so does what `--run-id` alone can reach:
   trust on its own, with a record or without one: they go with their users,
   because Keystone deletes a user's application credentials and every trust
   the user is trustor or trustee of when it deletes the user. The
-  `deleted <n> resource(s)` count leaves them out.
+  `deleted <n> resource(s)` count leaves them out. A failed call does not stop
+  the cleanup: the remaining listings, disables, and deletes still run (a
+  domain whose disable failed is not deleted), every failure is reported, and
+  the command exits non-zero. Users, domains, and projects are listed 500 per
+  page, since Keystone 29 cuts a listing without a page size at
+  `max_db_limit` (1,000 entries) without saying so.
 - **nova** — servers and data volumes are found by their `dizzy:run=<id>`
   metadata; the companion networks, subnets, and ports by the `dizzy:run=<id>`
   tag. Servers are deleted first (so their attachments release), then ports,

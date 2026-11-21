@@ -116,6 +116,21 @@ by default — with an admin token it lists cloud-wide, so enabling it is only s
 when no other `dizzy` process targets the cloud at all. Left off, the loop still
 cleans up after each of its own iterations.
 
+An iteration's cleanup retries calls that fail with a 5xx, a 429, a timeout, or
+a connection error for up to `--cleanup-retry-budget`, 5 minutes by default.
+Raise it for a cloud whose faults last longer:
+
+```console
+$ dizzy keystone monitor --scenario scenarios/keystone/small.yaml --cleanup-retry-budget 10m
+```
+
+An iteration whose cleanup still fails is cleaned up again, by its run id,
+before each later iteration, so a transient fault costs a retry instead of
+leaking the iteration's users, projects, and domains. The monitor keeps at most
+20 such runs, in memory only: a restart forgets them, and the monitor logs each
+one still pending at shutdown with its `dizzy keystone cleanup --run-id <id>`
+command.
+
 ## Monitor Barbican
 
 Same cadence, fixed-seed, and shutdown semantics:
