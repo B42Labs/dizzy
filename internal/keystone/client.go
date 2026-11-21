@@ -52,6 +52,12 @@ const (
 // handle the monitor pre-flight sweep reclaims by).
 const namePrefix = "dizzy-"
 
+// listPageSize is the limit every user, domain, and project listing sends.
+// Keystone 29 answers a listing without limit with at most max_db_limit
+// (1,000) entries and no next link, so discovery would silently miss the rest;
+// with limit, each page links to the next (C5C3/cobaltcore#1842).
+const listPageSize = 500
+
 // Project tag keys binding a created project to a tester run and its kind.
 // Keystone project tags are plain strings, so the key=value shape mirrors
 // Neutron's tags; Keystone forbids only "/" and "," in tags, and neither of

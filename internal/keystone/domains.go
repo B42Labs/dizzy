@@ -70,15 +70,15 @@ func (c *Client) ListDomainsByAnyRun(ctx context.Context) ([]resource.Resource, 
 	return c.listDomains(ctx, namePrefix)
 }
 
-// listDomains streams the domain list a page at a time and keeps only those
-// whose name carries prefix, so cleanup never touches a domain the tool did not
-// name — critical in domain-manager mode where the run shares a pre-existing
-// domain that carries no prefix.
+// listDomains streams the domain list a page at a time (listPageSize per
+// page) and keeps only those whose name carries prefix, so cleanup never
+// touches a domain the tool did not name — critical in domain-manager mode
+// where the run shares a pre-existing domain that carries no prefix.
 func (c *Client) listDomains(ctx context.Context, prefix string) ([]resource.Resource, error) {
 	var found []resource.Resource
 	err := c.timed(ctx, string(KindDomain), "list", func(ctx context.Context) error {
 		found = nil
-		return domains.List(c.gc, domains.ListOpts{}).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
+		return domains.List(c.gc, domains.ListOpts{Limit: listPageSize}).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
 			items, err := domains.ExtractDomains(page)
 			if err != nil {
 				return false, err

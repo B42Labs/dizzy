@@ -283,11 +283,83 @@ func TestProjectListingFiltersByTag(t *testing.T) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	want := []string{
-		"GET /v3/projects?tags=dizzyhorizon%3Arun%3Drun1",
-		"GET /v3/projects?tags=dizzyhorizon%3Atype%3Dproject",
+		"GET /v3/projects?limit=500&tags=dizzyhorizon%3Arun%3Drun1",
+		"GET /v3/projects?limit=500&tags=dizzyhorizon%3Atype%3Dproject",
 	}
 	if strings.Join(k.calls, "\n") != strings.Join(want, "\n") {
 		t.Errorf("calls = %v, want %v", k.calls, want)
+	}
+}
+
+// TestListingsPageWithLimit asserts the user and project listings ask for
+// listPageSize entries per page, follow links.next to a second page, and
+// return the run's resources from both pages.
+func TestListingsPageWithLimit(t *testing.T) {
+	var mu sync.Mutex
+	var calls []string
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls = append(calls, r.URL.Path+"?"+r.URL.RawQuery)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		second := r.URL.Query().Has("marker")
+		switch {
+		case r.URL.Path == "/v3/users" && !second:
+			_, _ = fmt.Fprintf(w, `{"users":[{"id":"u1","name":"dizzyhorizon-run1-user-0001"},{"id":"u-foreign","name":"alice"}],"links":{"next":%q}}`,
+				srv.URL+"/v3/users?limit=500&marker=u-foreign")
+		case r.URL.Path == "/v3/users":
+			_, _ = fmt.Fprint(w, `{"users":[{"id":"u2","name":"dizzyhorizon-run1-user-0002"}],"links":{"next":null}}`)
+		case r.URL.Path == "/v3/projects" && !second:
+			_, _ = fmt.Fprintf(w, `{"projects":[{"id":"p1","name":"dizzyhorizon-run1-project-0001","tags":["dizzyhorizon:run=run1","dizzyhorizon:type=project"]}],"links":{"next":%q}}`,
+				srv.URL+"/v3/projects?limit=500&marker=p1&tags=dizzyhorizon%3Arun%3Drun1")
+		case r.URL.Path == "/v3/projects":
+			_, _ = fmt.Fprint(w, `{"projects":[{"id":"p2","name":"dizzyhorizon-run1-project-0002","tags":["dizzyhorizon:run=run1","dizzyhorizon:type=project"]}],"links":{"next":null}}`)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	base, _ := url.Parse("http://horizon.invalid")
+	c := New(base, nil, "run1", metrics.NewCollector())
+	c.SetIdentity(&gophercloud.ServiceClient{ProviderClient: &gophercloud.ProviderClient{}, Endpoint: srv.URL + "/v3/"})
+	ctx := t.Context()
+
+	for _, tc := range []struct {
+		name, path, want string
+		list             func() ([]resource.Resource, error)
+	}{
+		{"users", "/v3/users", "u1,u2", func() ([]resource.Resource, error) { return c.ListUsersByRun(ctx, "run1") }},
+		{"projects", "/v3/projects", "p1,p2", func() ([]resource.Resource, error) { return c.ListProjectsByRun(ctx, "run1") }},
+	} {
+		got, err := tc.list()
+		if err != nil {
+			t.Fatalf("%s listing: %v", tc.name, err)
+		}
+		var ids []string
+		for _, r := range got {
+			ids = append(ids, r.ID)
+		}
+		if strings.Join(ids, ",") != tc.want {
+			t.Errorf("%s listing = %v, want %s", tc.name, ids, tc.want)
+		}
+		mu.Lock()
+		var requests []string
+		for _, call := range calls {
+			if strings.HasPrefix(call, tc.path+"?") {
+				requests = append(requests, call)
+			}
+		}
+		mu.Unlock()
+		if len(requests) != 2 {
+			t.Fatalf("%s requests = %v, want 2", tc.name, requests)
+		}
+		q, _ := url.ParseQuery(strings.TrimPrefix(requests[0], tc.path+"?"))
+		if q.Get("limit") != "500" || q.Has("marker") {
+			t.Errorf("first %s request = %s, want limit=500 and no marker", tc.name, requests[0])
+		}
 	}
 }
 

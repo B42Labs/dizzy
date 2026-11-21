@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 
 	"github.com/gophercloud/gophercloud/v2"
@@ -53,13 +54,24 @@ func (c *Client) ListUsersByAnyRun(ctx context.Context) ([]resource.Resource, er
 	return c.listUsers(ctx, namePrefix)
 }
 
-// listUsers streams the user list a page at a time and keeps only those whose
+// pagedUserListOpts asks for listPageSize users per page. gophercloud's
+// users.ListOpts has no Limit field, so the query is built here; UserPage
+// follows links.next, which carries Keystone's marker.
+type pagedUserListOpts struct{}
+
+// ToUserListQuery returns the limit query.
+func (pagedUserListOpts) ToUserListQuery() (string, error) {
+	return "?limit=" + strconv.Itoa(listPageSize), nil
+}
+
+// listUsers streams the user list a page at a time, each request carrying
+// limit so Keystone links every page to the next, and keeps only those whose
 // name carries prefix, so cleanup never deletes a user the tool did not name.
 func (c *Client) listUsers(ctx context.Context, prefix string) ([]resource.Resource, error) {
 	var found []resource.Resource
 	err := c.timed(ctx, string(KindUser), "list", func(ctx context.Context) error {
 		found = nil
-		return users.List(c.gc, users.ListOpts{}).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
+		return users.List(c.gc, pagedUserListOpts{}).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
 			items, err := users.ExtractUsers(page)
 			if err != nil {
 				return false, err

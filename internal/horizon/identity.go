@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/gophercloud/gophercloud/v2"
@@ -22,6 +23,21 @@ import (
 // It differs from the keystone namespace's dizzy-, whose orphan sweep
 // deletes every user named dizzy-*.
 const namePrefix = "dizzyhorizon-"
+
+// listPageSize is the limit the user and project listings send. Keystone 29
+// answers a listing without limit with at most max_db_limit (1,000) entries
+// and no next link; with limit, each page links to the next. It duplicates
+// the keystone namespace's value rather than importing it.
+const listPageSize = 500
+
+// pagedUserListOpts asks for listPageSize users per page. gophercloud's
+// users.ListOpts has no Limit field, so the query is built here.
+type pagedUserListOpts struct{}
+
+// ToUserListQuery returns the limit query.
+func (pagedUserListOpts) ToUserListQuery() (string, error) {
+	return "?limit=" + strconv.Itoa(listPageSize), nil
+}
 
 // The project tags binding a created project to a run and to its kind. They
 // differ from the keystone namespace's dizzy:run= and dizzy:type=, so its
@@ -133,14 +149,14 @@ func (c *Client) ListUsersByAnyRun(ctx context.Context) ([]resource.Resource, er
 	return c.listUsers(ctx, namePrefix)
 }
 
-// listUsers lists the users page by page and keeps those whose name starts
-// with prefix. A 403 logs a warning and returns no users and no error, as
-// the keystone namespace's listing does.
+// listUsers lists the users page by page, listPageSize per page, and keeps
+// those whose name starts with prefix. A 403 logs a warning and returns no
+// users and no error, as the keystone namespace's listing does.
 func (c *Client) listUsers(ctx context.Context, prefix string) ([]resource.Resource, error) {
 	var found []resource.Resource
 	err := c.timed(ctx, KindUser, "list", func(ctx context.Context) error {
 		found = nil
-		return users.List(c.identity, users.ListOpts{}).EachPage(ctx, func(_ context.Context, page pagination.Page) (bool, error) {
+		return users.List(c.identity, pagedUserListOpts{}).EachPage(ctx, func(_ context.Context, page pagination.Page) (bool, error) {
 			items, err := users.ExtractUsers(page)
 			if err != nil {
 				return false, err
@@ -174,15 +190,15 @@ func (c *Client) ListProjectsByAnyRun(ctx context.Context) ([]resource.Resource,
 	return c.listProjects(ctx, tagType+"project", namePrefix)
 }
 
-// listProjects lists the projects carrying tag, filtered by Keystone, and
-// rechecks the tag and the name prefix itself, so a server that ignores the
-// filter never widens the result. A 403 logs a warning and returns no
-// projects and no error.
+// listProjects lists the projects carrying tag, filtered by Keystone,
+// listPageSize per page, and rechecks the tag and the name prefix itself, so
+// a server that ignores the filter never widens the result. A 403 logs a
+// warning and returns no projects and no error.
 func (c *Client) listProjects(ctx context.Context, tag, prefix string) ([]resource.Resource, error) {
 	var found []resource.Resource
 	err := c.timed(ctx, KindProject, "list", func(ctx context.Context) error {
 		found = nil
-		return projects.List(c.identity, projects.ListOpts{Tags: tag}).EachPage(ctx, func(_ context.Context, page pagination.Page) (bool, error) {
+		return projects.List(c.identity, projects.ListOpts{Tags: tag, Limit: listPageSize}).EachPage(ctx, func(_ context.Context, page pagination.Page) (bool, error) {
 			items, err := projects.ExtractProjects(page)
 			if err != nil {
 				return false, err
