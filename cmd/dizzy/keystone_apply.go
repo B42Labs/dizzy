@@ -212,8 +212,8 @@ func finishAbortedKeystoneApply(ctx context.Context, out io.Writer, c keystoneex
 // drive Cleanup on a context.WithoutCancel that strips any deadline, and the
 // gophercloud client sets no HTTP timeout of its own. Without this a wedged
 // Keystone call would hang the teardown — and, in the monitor loop, the whole
-// loop — indefinitely. Cleanup additionally bounds each mutating op with the
-// same opTimeout; the double bound is equivalent and harmless.
+// loop — indefinitely. Cleanup additionally bounds each call with the same
+// opTimeout; the double bound is equivalent and harmless.
 type keystoneTimeoutCleaner struct {
 	inner     keystoneexec.Cleaner
 	opTimeout time.Duration

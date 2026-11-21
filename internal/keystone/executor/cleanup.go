@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -46,9 +47,18 @@ var _ Cleaner = (*keystone.Client)(nil)
 // them out. Keystone refuses to delete an enabled
 // domain, so each domain is disabled before it is deleted (a cascade removes
 // its remaining contents). An already-gone resource (a 404) counts as success,
-// so running Cleanup twice is a no-op; each mutating op is bounded by
-// opTimeout. The first non-404 error stops the run and is returned with the
-// count deleted so far.
+// so running Cleanup twice is a no-op; each call is bounded by opTimeout.
+//
+// A failed call does not stop the run. A failed listing is recorded and its
+// stage goes on with the record's resources of that kind (for users, live
+// assignments are then listed for the recorded users only); a failed
+// assignment listing is recorded and the next user is listed; a failed delete
+// is recorded and the next resource is deleted; a failed disable is recorded
+// and that domain's delete is skipped. Every stage runs, since Keystone deletes
+// a user's and a project's role assignments with them, a role's implied-role
+// rules with the role, and a disabled domain's contents with the domain. The
+// error joins every recorded failure in call order (nil when none failed) and
+// is returned with the count actually deleted.
 //
 // Roles and domains are additionally guarded by the dizzy- name prefix
 // (HasNamePrefix): in domain-manager mode the run shares a pre-existing domain
@@ -64,134 +74,122 @@ func Cleanup(ctx context.Context, c Cleaner, runID string, recorded []resource.R
 	if runID == "" {
 		return 0, fmt.Errorf("cleanup: empty run id; refusing to delete by an empty prefix")
 	}
-	var deleted int
+	s := &sweeper{c: c, opTimeout: opTimeout}
 
 	// Discover this run's users first: they are both a delete target and the
 	// handle for discovering their live assignments.
-	discoveredUsers, err := c.ListUsersByPrefix(ctx, runID)
-	if err != nil {
-		return deleted, err
-	}
-	users := union(discoveredUsers, recordedOfKind(recorded, keystone.KindUser))
+	users := union(s.list(ctx, func(ctx context.Context) ([]resource.Resource, error) {
+		return c.ListUsersByPrefix(ctx, runID)
+	}), recordedOfKind(recorded, keystone.KindUser))
 
 	// Revoke assignments: the recorded synthetic-id grants plus every live grant
 	// held by a surviving user. Tokens need no teardown (they expire).
 	assignments := recordedOfKind(recorded, keystone.KindAssignment)
 	for _, u := range users {
-		live, err := c.ListAssignmentsForUser(ctx, u.ID)
-		if err != nil {
-			return deleted, err
-		}
-		assignments = union(assignments, live)
+		assignments = union(assignments, s.list(ctx, func(ctx context.Context) ([]resource.Resource, error) {
+			return c.ListAssignmentsForUser(ctx, u.ID)
+		}))
 	}
-	n, err := deleteResources(ctx, c, assignments, opTimeout)
-	deleted += n
-	if err != nil {
-		return deleted, err
-	}
+	s.deleteAll(ctx, assignments)
 
 	// Delete the users, now that their assignments are gone.
-	n, err = deleteResources(ctx, c, users, opTimeout)
-	deleted += n
-	if err != nil {
-		return deleted, err
-	}
+	s.deleteAll(ctx, users)
 
 	// Delete the projects (discovered by tag, unioned with the record).
-	discoveredProjects, err := c.ListProjectsByTag(ctx, runID)
-	if err != nil {
-		return deleted, err
-	}
-	n, err = deleteResources(ctx, c, union(discoveredProjects, recordedOfKind(recorded, keystone.KindProject)), opTimeout)
-	deleted += n
-	if err != nil {
-		return deleted, err
-	}
+	s.deleteAll(ctx, union(s.list(ctx, func(ctx context.Context) ([]resource.Resource, error) {
+		return c.ListProjectsByTag(ctx, runID)
+	}), recordedOfKind(recorded, keystone.KindProject)))
 
 	// Delete the implied-role rules before their roles — admin-created only, as
 	// no domain-manager run records one. They are discovered from the record
 	// alone; deleting a role removes any rule the record missed.
-	n, err = deleteResources(ctx, c, union(recordedOfKind(recorded, keystone.KindImpliedRole)), opTimeout)
-	deleted += n
-	if err != nil {
-		return deleted, err
-	}
+	s.deleteAll(ctx, union(recordedOfKind(recorded, keystone.KindImpliedRole)))
 
 	// Delete the roles — admin-created only. A reused role carries no dizzy-
 	// prefix, so ownedOnly drops it even if it somehow reached the record.
-	discoveredRoles, err := c.ListRolesByPrefix(ctx, runID)
-	if err != nil {
-		return deleted, err
-	}
-	n, err = deleteResources(ctx, c, ownedOnly(union(discoveredRoles, recordedOfKind(recorded, keystone.KindRole))), opTimeout)
-	deleted += n
-	if err != nil {
-		return deleted, err
-	}
+	s.deleteAll(ctx, ownedOnly(union(s.list(ctx, func(ctx context.Context) ([]resource.Resource, error) {
+		return c.ListRolesByPrefix(ctx, runID)
+	}), recordedOfKind(recorded, keystone.KindRole))))
 
 	// Disable then delete the domains — admin-created only, guarded by the prefix
 	// so a reused in-scope domain is never touched.
-	discoveredDomains, err := c.ListDomainsByPrefix(ctx, runID)
-	if err != nil {
-		return deleted, err
-	}
-	n, err = deleteDomains(ctx, c, ownedOnly(union(discoveredDomains, recordedOfKind(recorded, keystone.KindDomain))), opTimeout)
-	deleted += n
-	if err != nil {
-		return deleted, err
-	}
+	s.deleteDomains(ctx, ownedOnly(union(s.list(ctx, func(ctx context.Context) ([]resource.Resource, error) {
+		return c.ListDomainsByPrefix(ctx, runID)
+	}), recordedOfKind(recorded, keystone.KindDomain))))
 
-	return deleted, nil
+	return s.deleted, errors.Join(s.errs...)
 }
 
-// deleteResources deletes each resource, treating an already-gone resource (a
-// 404) as success so cleanup is idempotent. Each delete is bounded by opTimeout.
-// It returns the number actually deleted, so a no-op second sweep returns zero.
-func deleteResources(ctx context.Context, c Cleaner, resources []resource.Resource, opTimeout time.Duration) (int, error) {
-	var deleted int
-	for _, r := range resources {
-		slog.Info("deleting resource", "kind", r.Kind, "id", r.ID)
-		if err := bounded(ctx, opTimeout, func(ctx context.Context) error { return c.Delete(ctx, r) }); err != nil {
-			if keystone.IsNotFound(err) {
-				continue
-			}
-			return deleted, fmt.Errorf("deleting %s %s: %w", r.Kind, r.ID, err)
-		}
-		deleted++
+// sweeper carries one Cleanup run's state: the cleaner, the per-call bound,
+// the count deleted so far, and every failure recorded so far, in call order.
+type sweeper struct {
+	c         Cleaner
+	opTimeout time.Duration
+	deleted   int
+	errs      []error
+}
+
+// call runs fn on a context bounded by opTimeout, so a wedged Keystone call
+// bounds one operation rather than the whole sweep. Every Cleaner call goes
+// through it.
+func (s *sweeper) call(ctx context.Context, fn func(context.Context) error) error {
+	opCtx, cancel := context.WithTimeout(ctx, s.opTimeout)
+	defer cancel()
+	return fn(opCtx)
+}
+
+// list runs a discovery listing through call. A failed listing is recorded and
+// returns no resources, so its stage goes on with the record alone.
+func (s *sweeper) list(ctx context.Context, fn func(context.Context) ([]resource.Resource, error)) []resource.Resource {
+	var found []resource.Resource
+	err := s.call(ctx, func(ctx context.Context) error {
+		var err error
+		found, err = fn(ctx)
+		return err
+	})
+	if err != nil {
+		s.errs = append(s.errs, err)
+		return nil
 	}
-	return deleted, nil
+	return found
+}
+
+// deleteAll deletes each resource, treating an already-gone resource (a 404)
+// as success so cleanup is idempotent. A failed delete is recorded and the
+// next resource is deleted. Only actual deletions count, so a no-op second
+// sweep counts zero.
+func (s *sweeper) deleteAll(ctx context.Context, resources []resource.Resource) {
+	for _, r := range resources {
+		s.delete(ctx, r)
+	}
 }
 
 // deleteDomains disables each domain before deleting it, since Keystone refuses
-// to delete an enabled domain. A 404 on either step counts as success. It
-// returns the number actually deleted.
-func deleteDomains(ctx context.Context, c Cleaner, domains []resource.Resource, opTimeout time.Duration) (int, error) {
-	var deleted int
+// to delete an enabled domain. A 404 on either step counts as success. A failed
+// disable is recorded and that domain's delete is skipped.
+func (s *sweeper) deleteDomains(ctx context.Context, domains []resource.Resource) {
 	for _, d := range domains {
-		if err := bounded(ctx, opTimeout, func(ctx context.Context) error { return c.DisableDomain(ctx, d) }); err != nil {
+		if err := s.call(ctx, func(ctx context.Context) error { return s.c.DisableDomain(ctx, d) }); err != nil {
 			if !keystone.IsNotFound(err) {
-				return deleted, fmt.Errorf("disabling domain %s: %w", d.ID, err)
+				s.errs = append(s.errs, fmt.Errorf("disabling domain %s: %w", d.ID, err))
 			}
-			continue // already gone
+			continue // already gone, or still enabled
 		}
-		slog.Info("deleting resource", "kind", d.Kind, "id", d.ID)
-		if err := bounded(ctx, opTimeout, func(ctx context.Context) error { return c.Delete(ctx, d) }); err != nil {
-			if keystone.IsNotFound(err) {
-				continue
-			}
-			return deleted, fmt.Errorf("deleting %s %s: %w", d.Kind, d.ID, err)
-		}
-		deleted++
+		s.delete(ctx, d)
 	}
-	return deleted, nil
 }
 
-// bounded runs fn on a context bounded by opTimeout, so a wedged Keystone call
-// bounds one operation rather than the whole sweep.
-func bounded(ctx context.Context, opTimeout time.Duration, fn func(context.Context) error) error {
-	ctx, cancel := context.WithTimeout(ctx, opTimeout)
-	defer cancel()
-	return fn(ctx)
+// delete deletes one resource through call, counting it on success and
+// recording a non-404 failure.
+func (s *sweeper) delete(ctx context.Context, r resource.Resource) {
+	slog.Info("deleting resource", "kind", r.Kind, "id", r.ID)
+	if err := s.call(ctx, func(ctx context.Context) error { return s.c.Delete(ctx, r) }); err != nil {
+		if !keystone.IsNotFound(err) {
+			s.errs = append(s.errs, fmt.Errorf("deleting %s %s: %w", r.Kind, r.ID, err))
+		}
+		return
+	}
+	s.deleted++
 }
 
 // ownedOnly keeps only resources whose name carries the dizzy- prefix — the
