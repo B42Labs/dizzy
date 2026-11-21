@@ -130,10 +130,11 @@ func newKeystoneMonitorCmd(opts *globalOptions) *cobra.Command {
 
 // keystoneMonitorRunOnce builds the production per-iteration closure the loop
 // drives. Each iteration gets a fresh run id, a fresh metrics collector, and its
-// own authenticated client. It first cleans up the earlier iterations pending
-// a cleanup again, each by its own run id with one attempt per call, recorded
-// into a collector of their own so the iteration's op counts and wall time
-// stay comparable. It then runs the opt-in pre-flight orphan sweep (only
+// own authenticated client. It first cleans up again the earlier iterations
+// whose cleanup failed, each by its own run id with one attempt per call,
+// recorded into a collector of their own so the iteration's op counts and wall
+// time stay comparable; a signal during that reclaim ends the iteration before
+// it starts. It then runs the opt-in pre-flight orphan sweep (only
 // with --reclaim-orphans; see keystonePreflight), applies the plan in the
 // startup-fixed tier (admin mode recreates its roots per iteration under the
 // fresh run id; domain-manager mode reuses the startup resolution), and cleans
@@ -163,6 +164,11 @@ func keystoneMonitorRunOnce(opts *globalOptions, p *keystoneplan.Plan, tel *tele
 		pending.reclaim(ctx, func(ctx context.Context, id string, recorded []resource.Resource) (int, error) {
 			return keystoneexec.Cleanup(ctx, keystoneTimeoutCleaner{reclaimClient, opts.timeout}, id, recorded, opts.timeout)
 		})
+		// A signal during the reclaim ends the iteration here: nothing of it
+		// exists yet, and Apply must not start on a cancelled context.
+		if ctx.Err() != nil {
+			return false
+		}
 
 		start := time.Now()
 		hb := startHeartbeat(ctx, "monitor iteration in progress",

@@ -3,17 +3,20 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
 
 	"github.com/B42Labs/dizzy/internal/keystone"
+	keystonescenario "github.com/B42Labs/dizzy/internal/keystone/scenario"
 	"github.com/B42Labs/dizzy/internal/metrics"
 	"github.com/B42Labs/dizzy/internal/resource"
 )
@@ -177,6 +180,67 @@ func TestKeystonePendingCleanupsStopsOnCancel(t *testing.T) {
 	})
 	if want := []keystonePendingCleanup{{"A", nil}, {"B", nil}}; !reflect.DeepEqual(p.entries, want) {
 		t.Errorf("pending = %+v, want A and B kept", p.entries)
+	}
+}
+
+// TestKeystoneMonitorRunOnceStopsAfterCancelledReclaim is the regression
+// guard for a signal that lands while an iteration cleans up a pending run: the
+// iteration must stop there instead of applying on the cancelled context,
+// where Apply indexes an empty stage result and panics, and the pending run
+// must be kept for the shutdown log.
+func TestKeystoneMonitorRunOnceStopsAfterCancelledReclaim(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var (
+		mu       sync.Mutex
+		requests []string
+	)
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		if r.Method == http.MethodPost && r.URL.Path == "/v3/auth/tokens" {
+			w.Header().Set("X-Subject-Token", "tok")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = fmt.Fprintf(w, `{"token":{"expires_at":"2030-01-01T00:00:00Z","project":{"id":"p1"},"catalog":[{"type":"identity","endpoints":[{"interface":"public","region":"RegionOne","url":%q}]}]}}`, ts.URL+"/v3/")
+			return
+		}
+		if r.Method == http.MethodDelete {
+			cancel() // the signal lands while the reclaim deletes
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(ts.Close)
+	tenantClouds(t, ts.URL+"/v3")
+
+	s, err := keystonescenario.Parse([]byte(sampleKeystoneScenarioYAML))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	p, err := s.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	opts := &globalOptions{osCloud: "tenant-ci", concurrency: 1, timeout: time.Second}
+	recorded := []resource.Resource{{Kind: keystone.KindUser, ID: "u1", Name: "dizzy-oldrun-user-0001"}}
+	pending := &keystonePendingCleanups{max: maxPendingKeystoneCleanups}
+	pending.add("oldrun", recorded)
+
+	ok := keystoneMonitorRunOnce(opts, p, nil, keystone.TierAdmin, keystone.Resolution{}, false, false, 0, pending)(ctx, 1)
+	if ok {
+		t.Error("an iteration cancelled during the reclaim reported ok")
+	}
+	if want := []keystonePendingCleanup{{"oldrun", recorded}}; !reflect.DeepEqual(pending.entries, want) {
+		t.Errorf("pending = %+v, want the failed reclaim kept", pending.entries)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, r := range requests {
+		if strings.HasPrefix(r, "POST ") && r != "POST /v3/auth/tokens" {
+			t.Errorf("the iteration sent %s after the reclaim was cancelled", r)
+		}
 	}
 }
 
