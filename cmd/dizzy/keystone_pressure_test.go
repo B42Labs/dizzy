@@ -837,7 +837,7 @@ var pressureCreated = []resource.Resource{
 }
 
 // failingUserDeleteCleaner is a recordingKeystoneCleaner whose user deletes
-// fail, so a teardown stops after the assignments.
+// fail, so a teardown deletes everything but the users.
 type failingUserDeleteCleaner struct {
 	*recordingKeystoneCleaner
 	err error
@@ -942,7 +942,7 @@ func TestFailPressureSetup(t *testing.T) {
 		if !errors.Is(err, keystone.ErrForbidden) || !errors.Is(err, deleteErr) {
 			t.Errorf("error %v does not wrap both the cause and the teardown error", err)
 		}
-		for _, want := range []string{"teardown incomplete after deleting 1 resource(s)", "keystone cleanup --run run-run1234.json"} {
+		for _, want := range []string{"teardown incomplete after deleting 4 resource(s)", "keystone cleanup --run run-run1234.json"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("error %q missing %q", err.Error(), want)
 			}
