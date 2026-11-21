@@ -205,6 +205,161 @@ func TestListDomainsByPrefixToleratesForbidden(t *testing.T) {
 	}
 }
 
+// pagedListing serves a Keystone listing of key ("users", "domains", or
+// "projects") in two pages. A request without a marker gets the first page,
+// whose links.next is <server>/<key>?limit=500&marker=<marker>; a request with
+// a marker gets the second, whose links.next is null. Every request's query is
+// recorded.
+func pagedListing(t *testing.T, key, marker string, pages [2]string) (*httptest.Server, *[]url.Values) {
+	t.Helper()
+	var queries []url.Values
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/"+key {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		queries = append(queries, r.URL.Query())
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("marker") == "" {
+			_, _ = fmt.Fprintf(w, `{%q:[%s],"links":{"next":%q}}`, key, pages[0], ts.URL+"/"+key+"?limit=500&marker="+marker)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{%q:[%s],"links":{"next":null}}`, key, pages[1])
+	}))
+	t.Cleanup(ts.Close)
+	return ts, &queries
+}
+
+// resourceIDs returns the ids of rs, in order.
+func resourceIDs(rs []resource.Resource) []string {
+	ids := make([]string, len(rs))
+	for i, r := range rs {
+		ids[i] = r.ID
+	}
+	return ids
+}
+
+// TestListUsersByPrefixPagesWithLimit confirms the user listing asks for
+// listPageSize users per page and follows Keystone's next link, so discovery
+// sees past the cut Keystone makes in a listing without limit.
+func TestListUsersByPrefixPagesWithLimit(t *testing.T) {
+	ts, queries := pagedListing(t, "users", "u-foreign", [2]string{
+		`{"id":"u-1","name":"dizzy-run0-user-0001"},{"id":"u-foreign","name":"admin"}`,
+		`{"id":"u-2","name":"dizzy-run0-user-0002"}`,
+	})
+
+	c, _ := testClient(ts)
+	got, err := c.ListUsersByPrefix(context.Background(), "run0")
+	if err != nil {
+		t.Fatalf("ListUsersByPrefix: %v", err)
+	}
+	if ids := strings.Join(resourceIDs(got), ","); ids != "u-1,u-2" {
+		t.Errorf("ListUsersByPrefix = %s, want u-1,u-2", ids)
+	}
+	if len(*queries) != 2 {
+		t.Fatalf("requests = %d, want 2", len(*queries))
+	}
+	if q := (*queries)[0]; q.Get("limit") != "500" || q.Has("marker") {
+		t.Errorf("first query = %v, want limit=500 and no marker", q)
+	}
+}
+
+// TestListUsersByPrefixEmptyPage confirms an empty first page ends the
+// listing with no users and no error.
+func TestListUsersByPrefixEmptyPage(t *testing.T) {
+	var requests atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"users":[],"links":{"next":null}}`)
+	}))
+	defer ts.Close()
+
+	c, _ := testClient(ts)
+	got, err := c.ListUsersByPrefix(context.Background(), "run0")
+	if err != nil || len(got) != 0 {
+		t.Errorf("ListUsersByPrefix = %+v, %v; want nothing and no error", got, err)
+	}
+	if n := requests.Load(); n != 1 {
+		t.Errorf("requests = %d, want 1", n)
+	}
+}
+
+// TestListUsersByPrefixFailedPage confirms a 503 on the second page fails the
+// whole listing with a retryable error rather than returning the first page
+// alone.
+func TestListUsersByPrefixFailedPage(t *testing.T) {
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Has("marker") {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"error":{"code":503,"title":"Service Unavailable","message":"busy"}}`)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"users":[{"id":"u-1","name":"dizzy-run0-user-0001"}],"links":{"next":%q}}`, ts.URL+"/users?limit=500&marker=u-1")
+	}))
+	defer ts.Close()
+
+	c, _ := testClient(ts)
+	got, err := c.ListUsersByPrefix(context.Background(), "run0")
+	if got != nil {
+		t.Errorf("ListUsersByPrefix = %+v, want nil on a failed page", got)
+	}
+	if err == nil || !strings.HasPrefix(err.Error(), "listing users by prefix: ") {
+		t.Fatalf("ListUsersByPrefix error = %v, want one starting with %q", err, "listing users by prefix: ")
+	}
+	if !IsRetryable(err) {
+		t.Errorf("IsRetryable(%v) = false, want true for a 503", err)
+	}
+}
+
+// TestListDomainsByPrefixPagesWithLimit confirms the domain listing asks for
+// listPageSize domains per page and follows the next link.
+func TestListDomainsByPrefixPagesWithLimit(t *testing.T) {
+	ts, queries := pagedListing(t, "domains", "d-1", [2]string{
+		`{"id":"d-1","name":"dizzy-run0-dom-0001"}`,
+		`{"id":"d-2","name":"dizzy-run0-dom-0002"}`,
+	})
+
+	c, _ := testClient(ts)
+	got, err := c.ListDomainsByPrefix(context.Background(), "run0")
+	if err != nil {
+		t.Fatalf("ListDomainsByPrefix: %v", err)
+	}
+	if ids := strings.Join(resourceIDs(got), ","); ids != "d-1,d-2" {
+		t.Errorf("ListDomainsByPrefix = %s, want d-1,d-2", ids)
+	}
+	if len(*queries) == 0 || (*queries)[0].Get("limit") != "500" {
+		t.Errorf("queries = %v, want limit=500 on the first", *queries)
+	}
+}
+
+// TestListProjectsByTagPagesWithLimit confirms the project listing asks for
+// listPageSize projects per page with the run tag, follows the next link, and
+// still drops a project that does not carry the tag.
+func TestListProjectsByTagPagesWithLimit(t *testing.T) {
+	ts, queries := pagedListing(t, "projects", "p-foreign", [2]string{
+		`{"id":"p-1","name":"dizzy-run0-proj-0001","tags":["dizzy:run=run0","dizzy:type=project"]},{"id":"p-foreign","name":"other","tags":[]}`,
+		`{"id":"p-2","name":"dizzy-run0-proj-0002","tags":["dizzy:run=run0","dizzy:type=project"]}`,
+	})
+
+	c, _ := testClient(ts)
+	got, err := c.ListProjectsByTag(context.Background(), "run0")
+	if err != nil {
+		t.Fatalf("ListProjectsByTag: %v", err)
+	}
+	if ids := strings.Join(resourceIDs(got), ","); ids != "p-1,p-2" {
+		t.Errorf("ListProjectsByTag = %s, want p-1,p-2", ids)
+	}
+	if len(*queries) != 2 {
+		t.Fatalf("requests = %d, want 2", len(*queries))
+	}
+	if q := (*queries)[0]; q.Get("limit") != "500" || q.Get("tags") != "dizzy:run=run0" {
+		t.Errorf("first query = %v, want limit=500 and tags=dizzy:run=run0", q)
+	}
+}
+
 // TestFindRoleByName confirms the lookup prefers the global role over a
 // domain-scoped one of the same name, and that a name no role has fails
 // with the binder's message wrapping ErrRoleNotFound, while a failed listing

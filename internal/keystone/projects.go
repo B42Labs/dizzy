@@ -56,13 +56,14 @@ func (c *Client) ListProjectsByType(ctx context.Context) ([]resource.Resource, e
 }
 
 // listProjects streams the project list filtered server-side by tag a page at a
-// time, rechecking the tag client-side so a server that ignores the filter never
-// widens the result beyond what the tool actually tagged.
+// time (listPageSize per page), rechecking the tag client-side so a server
+// that ignores the filter never widens the result beyond what the tool
+// actually tagged.
 func (c *Client) listProjects(ctx context.Context, tag string) ([]resource.Resource, error) {
 	var found []resource.Resource
 	err := c.timed(ctx, string(KindProject), "list", func(ctx context.Context) error {
 		found = nil
-		return projects.List(c.gc, projects.ListOpts{Tags: tag}).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
+		return projects.List(c.gc, projects.ListOpts{Tags: tag, Limit: listPageSize}).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
 			items, err := projects.ExtractProjects(page)
 			if err != nil {
 				return false, err
