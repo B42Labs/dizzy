@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
@@ -25,6 +28,7 @@ type fakeCleaner struct {
 	userAssignments                 map[string][]resource.Resource
 	gone                            map[string]bool
 	failDel                         map[string]error
+	failDelTimes                    map[string]int   // fail only the first N deletes of an id (0 = every one)
 	failList                        map[string]error // "users", "projects", "roles", "domains", "assignments:<userID>"
 	failDisable                     map[string]error
 	attempts                        map[string]int // Delete calls per id
@@ -36,6 +40,7 @@ func newFakeCleaner() *fakeCleaner {
 		userAssignments: make(map[string][]resource.Resource),
 		gone:            make(map[string]bool),
 		failDel:         make(map[string]error),
+		failDelTimes:    make(map[string]int),
 		failList:        make(map[string]error),
 		failDisable:     make(map[string]error),
 		attempts:        make(map[string]int),
@@ -93,7 +98,7 @@ func (f *fakeCleaner) DisableDomain(_ context.Context, r resource.Resource) erro
 
 func (f *fakeCleaner) Delete(_ context.Context, r resource.Resource) error {
 	f.attempts[r.ID]++
-	if err := f.failDel[r.ID]; err != nil {
+	if err := f.failDel[r.ID]; err != nil && (f.failDelTimes[r.ID] == 0 || f.attempts[r.ID] <= f.failDelTimes[r.ID]) {
 		f.events = append(f.events, "fail:"+r.ID)
 		return err
 	}
@@ -480,4 +485,179 @@ func TestCleanupWithoutRecordedImpliedRoles(t *testing.T) {
 	if !slices.Equal(f.events, want) {
 		t.Errorf("events = %v, want %v", f.events, want)
 	}
+}
+
+// errUnavailable is the Keystone 503 the retry tests inject.
+var errUnavailable = gophercloud.ErrUnexpectedResponseCode{Actual: 503}
+
+// The retry tests run inside a synctest bubble, so the backoff passes on the
+// bubble's clock and costs no wall time, and time.Now reads that clock.
+
+// TestCleanupWithRetryRetriesTransient confirms a delete that fails twice with
+// a 503 is retried until it succeeds, and the sweep reports no error.
+func TestCleanupWithRetryRetriesTransient(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := seedRun()
+		f.failDel["u1"] = errUnavailable
+		f.failDelTimes["u1"] = 2
+
+		deleted, err := CleanupWithRetry(t.Context(), f, "run0", nil, time.Minute, time.Minute)
+		if err != nil {
+			t.Fatalf("CleanupWithRetry: %v", err)
+		}
+		if deleted != 5 {
+			t.Errorf("deleted %d resources, want 5", deleted)
+		}
+		if got := f.attempts["u1"]; got != 3 {
+			t.Errorf("u1 attempts = %d, want 3", got)
+		}
+	})
+}
+
+// TestCleanupWithRetryRetriesTimeoutAndConnectionErrors confirms an attempt
+// that timed out, a refused connection, and a 429 are each retried.
+func TestCleanupWithRetryRetriesTimeoutAndConnectionErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"timeout", context.DeadlineExceeded},
+		{"connection refused", &url.Error{Op: "Delete", URL: "http://keystone/v3/users/u1", Err: syscall.ECONNREFUSED}},
+		{"rate limited", gophercloud.ErrUnexpectedResponseCode{Actual: 429}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := seedRun()
+				f.failDel["u1"] = tc.err
+				f.failDelTimes["u1"] = 1
+
+				if _, err := CleanupWithRetry(t.Context(), f, "run0", nil, time.Minute, time.Minute); err != nil {
+					t.Fatalf("CleanupWithRetry: %v", err)
+				}
+				if got := f.attempts["u1"]; got != 2 {
+					t.Errorf("u1 attempts = %d, want 2", got)
+				}
+			})
+		})
+	}
+}
+
+// TestCleanupWithRetryNeverRetriesTerminal confirms a 400, 403, or 409 is
+// attempted once and reported, and a 404 is attempted once and counts as
+// already gone.
+func TestCleanupWithRetryNeverRetriesTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		wantErr bool
+	}{
+		{"bad request", 400, true},
+		{"forbidden", 403, true},
+		{"conflict", 409, true},
+		{"not found", 404, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := seedRun()
+				f.failDel["u1"] = gophercloud.ErrUnexpectedResponseCode{Actual: tc.status}
+
+				deleted, err := CleanupWithRetry(t.Context(), f, "run0", nil, time.Minute, time.Minute)
+				if got := f.attempts["u1"]; got != 1 {
+					t.Errorf("u1 attempts = %d, want 1", got)
+				}
+				if tc.wantErr {
+					if err == nil || !strings.HasPrefix(err.Error(), "deleting user u1: ") {
+						t.Errorf("CleanupWithRetry error = %v, want one starting with %q", err, "deleting user u1: ")
+					}
+					return
+				}
+				if err != nil {
+					t.Errorf("CleanupWithRetry: %v", err)
+				}
+				// assignment + project + role + domain; the gone user is not counted.
+				if deleted != 4 {
+					t.Errorf("deleted %d resources, want 4", deleted)
+				}
+			})
+		})
+	}
+}
+
+// TestCleanupWithRetryStopsAtBudget confirms the retries of a call stop once
+// the next attempt would start past the budget, that the backoff is capped at
+// cleanupRetryMaxDelay, and that the rest of the sweep still runs.
+func TestCleanupWithRetryStopsAtBudget(t *testing.T) {
+	for _, tc := range []struct {
+		budget time.Duration
+		want   int
+	}{
+		// Attempts at 0, 0.25, 0.75, 1.75, 3.75, and 7.75s; the next would
+		// start at 15.75s.
+		{10 * time.Second, 6},
+		// The backoff is capped at 30s; without the cap it would be 10.
+		{3 * time.Minute, 12},
+	} {
+		t.Run(tc.budget.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := seedRun()
+				f.failDel["u1"] = errUnavailable
+
+				_, err := CleanupWithRetry(t.Context(), f, "run0", nil, time.Minute, tc.budget)
+				if got := f.attempts["u1"]; got != tc.want {
+					t.Errorf("u1 attempts = %d, want %d", got, tc.want)
+				}
+				if err == nil || !strings.HasPrefix(err.Error(), "deleting user u1: ") {
+					t.Errorf("CleanupWithRetry error = %v, want one starting with %q", err, "deleting user u1: ")
+				}
+				for _, e := range []string{"del:p1", "del:r1", "del:d1"} {
+					if !slices.Contains(f.events, e) {
+						t.Errorf("event %q never happened after the budget ran out; log=%v", e, f.events)
+					}
+				}
+			})
+		})
+	}
+}
+
+// TestCleanupZeroBudgetMakesOneAttempt confirms Cleanup, a zero budget, never
+// retries a transient failure.
+func TestCleanupZeroBudgetMakesOneAttempt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := seedRun()
+		f.failDel["u1"] = errUnavailable
+
+		if _, err := Cleanup(t.Context(), f, "run0", nil, time.Minute); err == nil {
+			t.Fatal("Cleanup: expected the 503 to be reported")
+		}
+		if got := f.attempts["u1"]; got != 1 {
+			t.Errorf("u1 attempts = %d, want 1", got)
+		}
+	})
+}
+
+// TestCleanupWithRetryStopsOnCancel confirms a parent context cancelled during
+// a backoff ends that call's retries with the cancellation.
+func TestCleanupWithRetryStopsOnCancel(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := seedRun()
+		f.failDel["u1"] = errUnavailable
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := CleanupWithRetry(ctx, f, "run0", nil, time.Minute, time.Minute)
+			done <- err
+		}()
+		synctest.Wait() // the sweep now waits out u1's first backoff
+		cancel()
+		err := <-done
+
+		if got := f.attempts["u1"]; got != 1 {
+			t.Errorf("u1 attempts = %d, want 1", got)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("CleanupWithRetry error = %v, want one wrapping context.Canceled", err)
+		}
+	})
 }
