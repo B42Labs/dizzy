@@ -395,18 +395,34 @@ func (e *applier) passwordRotation(ctx context.Context) error {
 // superseded credential, C0, is still more than graceMargin from its deletion,
 // it must still log in; once the operator has deleted it, it must be rejected.
 // The prober's first error ends the stage and is returned in preference to the
-// cancellation it causes; the prober has stopped when the stage returns.
+// cancellation it causes. When the rotation's checks end, the stage stops the
+// prober and waits for it: a probe under way runs to its end, and its failure
+// fails the stage even when the checks passed, while an interrupt that cuts it
+// fails the stage as an interrupt. A rotation that failed on its own, decided
+// when it returns, is returned with the prober's failure beside it; a prober
+// failure that ended the stage before then wins.
 func (e *applier) credentialRotation(ctx context.Context) error {
 	stageCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	pr := e.startProber(stageCtx, cancel, e.appcred, e.projectName)
 	err := e.rotateCredential(stageCtx)
-	cancel()
-	if perr := pr.wait(); perr != nil {
+	// Neither the prober nor the caller ended the stage's context.
+	own := err != nil && stageCtx.Err() == nil
+	pr.stop()
+	perr := pr.wait()
+	switch {
+	case perr == nil && err == nil:
+		// The checks passed, but an interrupt may have cut the probe the stage
+		// waited for: report it as one, as Apply does.
+		return ctx.Err()
+	case perr == nil:
+		return err
+	case own:
+		return fmt.Errorf("%w; the prober failed as well: %v", err, perr)
+	default:
 		return perr
 	}
-	return err
 }
 
 // rotateCredential is the sequence of stage 7 the prober runs beside.
@@ -468,20 +484,25 @@ func (e *applier) rotate(ctx context.Context, r resource.Resource, previous c5c3
 }
 
 // prober is stage 7's background login with the application credential's
-// delivered Secret.
+// delivered Secret. The stage stops it with stop, which lets a probe under way
+// run to its end; ctx ending stops it too and cuts that probe short, since
+// every probe runs under ctx.
 type prober struct {
 	done chan struct{}
-	// err is the error that ended the stage, written before done is closed.
+	// stopped is closed by stop.
+	stopped chan struct{}
+	// err is the prober's first error not caused by ctx ending, written before
+	// done is closed.
 	err error
 }
 
-// startProber starts a goroutine that, every proberInterval until ctx ends,
-// reads the delivered Secret of the application credential order r and logs
-// in with it, scoped to project. Its first error that is not caused by ctx
-// ending is kept for wait and cancels ctx through cancel, which ends the
-// stage.
+// startProber starts a goroutine that, every proberInterval until it is
+// stopped or ctx ends, reads the delivered Secret of the application
+// credential order r and logs in with it, scoped to project. Its first error
+// that is not caused by ctx ending is kept for wait and cancels ctx through
+// cancel, which ends the stage.
 func (e *applier) startProber(ctx context.Context, cancel context.CancelFunc, r resource.Resource, project string) *prober {
-	pr := &prober{done: make(chan struct{})}
+	pr := &prober{done: make(chan struct{}), stopped: make(chan struct{})}
 	interval := proberInterval
 	go func() {
 		defer close(pr.done)
@@ -491,7 +512,16 @@ func (e *applier) startProber(ctx context.Context, cancel context.CancelFunc, r 
 			select {
 			case <-ctx.Done():
 				return
+			case <-pr.stopped:
+				return
 			case <-ticker.C:
+			}
+			// A tick and the stop can be ready together, and select then picks
+			// either: start no probe after the stop.
+			select {
+			case <-pr.stopped:
+				return
+			default:
 			}
 			err := e.probe(ctx, r, project)
 			if err == nil {
@@ -517,8 +547,14 @@ func (e *applier) probe(ctx context.Context, r resource.Resource, project string
 	return e.authenticate(ctx, r, cred, project)
 }
 
-// wait blocks until the prober has stopped and returns the error that ended
-// the stage, or nil when the stage ended for another reason.
+// stop makes the prober start no further probe and lets one under way run to
+// its end. The stage calls it once.
+func (pr *prober) stop() {
+	close(pr.stopped)
+}
+
+// wait blocks until the prober has stopped and returns its first error not
+// caused by ctx ending, or nil when every probe passed or ctx ended.
 func (pr *prober) wait() error {
 	<-pr.done
 	return pr.err
