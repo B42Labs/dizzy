@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
@@ -18,6 +21,7 @@ import (
 
 	"github.com/B42Labs/dizzy/internal/keystone"
 	"github.com/B42Labs/dizzy/internal/keystone/plan"
+	"github.com/B42Labs/dizzy/internal/metrics"
 	"github.com/B42Labs/dizzy/internal/resource"
 )
 
@@ -496,6 +500,84 @@ func TestApplyRetriesTransient(t *testing.T) {
 	}
 	if n := f.attempts["proj-0001"]; n != 3 {
 		t.Errorf("proj-0001 attempted %d times, want 3", n)
+	}
+}
+
+// TestWithRetryAdoptsCreateCommittedBefore5xx confirms a create Keystone
+// committed before it answered 503 is adopted within the same operation:
+// WithRetry retries the 503, the retry's POST answers 409, and the real
+// client's lookup finds the user. The operation returns nil with the listed
+// id after two POSTs, and the first attempt keeps its failed http_503
+// sample.
+func TestWithRetryAdoptsCreateCommittedBefore5xx(t *testing.T) {
+	const name = "dizzy-run0-user-0001"
+	var (
+		mu    sync.Mutex
+		posts int
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /users":
+			mu.Lock()
+			posts++
+			n := posts
+			mu.Unlock()
+			if n == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(w, `{"error":{"code":503,"title":"Service Unavailable","message":"upstream reset"}}`)
+				return
+			}
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `{"error":{"code":409,"title":"Conflict","message":"Duplicate entry found with name `+name+`."}}`)
+		case "GET /users":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"users":[{"id":"uid-kept","name":"`+name+`","domain_id":"did1"}]}`)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+	gc := &gophercloud.ServiceClient{ProviderClient: &gophercloud.ProviderClient{}, Endpoint: ts.URL + "/"}
+	m := metrics.NewCollector()
+	c := keystone.New(gc, "run0", m)
+
+	var res resource.Resource
+	err := WithRetry(context.Background(), time.Minute, func(ctx context.Context) error {
+		var err error
+		res, err = c.CreateUser(ctx, plan.User{Name: "user-0001", Domain: "dom-0001"}, "did1", "user-pw")
+		return err
+	})
+	if err != nil {
+		t.Fatalf("WithRetry: %v", err)
+	}
+	if res.ID != "uid-kept" {
+		t.Errorf("user id = %q, want the listed uid-kept", res.ID)
+	}
+	mu.Lock()
+	gotPosts := posts
+	mu.Unlock()
+	if gotPosts != 2 {
+		t.Errorf("POSTs = %d, want 2", gotPosts)
+	}
+
+	agg := m.Aggregate(time.Second)
+	var user metrics.Stats
+	for _, s := range agg.ByType {
+		if s.Type == string(keystone.KindUser) {
+			user = s
+		}
+	}
+	if user.Attempted != 2 || user.Succeeded != 1 {
+		t.Errorf("user samples = %+v, want 2 attempted and 1 succeeded", user)
+	}
+	errs := map[string]int{}
+	for _, e := range agg.Errors {
+		errs[e.Kind] = e.Count
+	}
+	if errs["http_503"] != 1 || len(errs) != 1 {
+		t.Errorf("error kinds = %v, want exactly one http_503", errs)
 	}
 }
 
