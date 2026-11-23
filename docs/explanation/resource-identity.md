@@ -26,7 +26,12 @@ metadata filter — the metadata analog of Neutron's tags.
 identity lives primarily in the deterministic **name prefix**
 `dizzy-<runid>-<logical>`, which is a reliable handle because Keystone names are
 unique within their scope. Projects are additionally tagged, so they at least get
-a server-side filter.
+a server-side filter. The same uniqueness lets dizzy adopt a resource whose
+create answer was lost: a create that Keystone answers 409 looks the name up
+and adopts the resource of that name, checked by name and domain for users, by
+name, domain and run tag for projects, by name for domains and global roles,
+and by name and project for application credentials (see
+[The churn engine](churn-engine.md#a-lost-create-answer-is-adopted)).
 
 **Nova uses both, split by who provides the resource.** Servers and the data
 volumes dizzy attaches carry the same two keys as **metadata** — the Cinder
