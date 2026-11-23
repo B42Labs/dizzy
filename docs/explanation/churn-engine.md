@@ -187,6 +187,24 @@ that carries the run's `dizzy:run` stamp; see
 The lookups and these deletes draw nothing from the seed, so the decision
 schedule stays the same.
 
+Keystone needs neither the create token nor the lookup right after the
+failure. A Keystone name is unique in its scope, and the run id in
+`dizzy-<run id>-<logical>` is random per process, so a resource of that name
+was created by this process, with the password or secret it still holds. A
+Keystone orphan holds no quota and blocks no other node, and Keystone cannot
+create a second resource of the name, so the node's next create answers 409.
+dizzy then looks the name up and adopts the user, project, domain, role or
+application credential it finds as the node's resource, and the create records
+as a success. A create that Keystone committed before it answered 5xx is
+adopted the same way by its retry within the same operation. A lookup that
+fails or finds nothing leaves the 409 as it was.
+
+An earlier instance of the node whose delete failed, and whose delete retry
+failed again, holds the name as well, and is adopted the same way. The retired
+instance and the node's new one then share one cloud id. Whichever of their
+deletes comes first removes the resource, the other finds it gone, and the
+teardown deletes it at most once.
+
 ## Mutations
 
 Create and delete change the population. Some interesting operations don't.

@@ -7,13 +7,16 @@ returned" to "status == expected" is recorded separately as **time-to-ready**,
 measured by polling with backoff.
 
 A call that the service refuses because the change it asked for is already in
-place records as a success. dizzy confirms this in nine cases: a port or volume
-attach whose follow-up read finds the attachment on the server; a stop, start,
-resize, confirm-resize, live migration or cold migration whose 409 names the
-state the call asked for; and a Cinder extend refused because the volume
-already has the size. The `already ...; treating ... as success` log line is
-then the only trace of the refusal. A 409 or 400 that dizzy does not confirm
-keeps its `http_409` or `http_400`.
+place records as a success. dizzy confirms this in fourteen cases: a port or
+volume attach whose follow-up read finds the attachment on the server; a stop,
+start, resize, confirm-resize, live migration or cold migration whose 409 names
+the state the call asked for; a Cinder extend refused because the volume
+already has the size; and a Keystone user, project, domain, role or
+application credential create whose 409 a lookup confirms as this run's
+resource of that name. The `already ...; treating ... as success` log line is
+then the only trace of the refusal; for a Keystone create it reads
+`already created; treating a refused create as success`. A 409 or 400 that
+dizzy does not confirm keeps its `http_409` or `http_400`.
 
 These measurements have two sinks. The in-memory collector is the source of
 truth for run records and `report`. With `--otel` or `--listen-address`, the
