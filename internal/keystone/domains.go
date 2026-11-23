@@ -17,11 +17,13 @@ import (
 // CreateDomain creates an enabled domain with the deterministic name. Domains
 // carry no tags — their name prefix is their only run identity. A 403 is wrapped
 // with ErrForbidden so the executor fails fast (only a cloud admin may create
-// domains).
+// domains). A 409 whose lookup finds the domain of that name adopts it and
+// records as a successful create: it is this run's domain, made by a create
+// whose answer was lost.
 func (c *Client) CreateDomain(ctx context.Context, d keystoneplan.Domain) (resource.Resource, error) {
 	name := resourceName(c.runID, d.Name)
 	var id string
-	err := c.timed(ctx, string(KindDomain), "create", func(ctx context.Context) error {
+	_, err := c.timedFold(ctx, string(KindDomain), "create", func(ctx context.Context) error {
 		created, err := domains.Create(ctx, c.gc, domains.CreateOpts{
 			Name:    name,
 			Enabled: gophercloud.Enabled,
@@ -31,12 +33,39 @@ func (c *Client) CreateDomain(ctx context.Context, d keystoneplan.Domain) (resou
 		}
 		id = created.ID
 		return nil
-	})
+	}, adoptOnConflict(KindDomain, name, &id, func(ctx context.Context) (string, error) {
+		return c.findDomain(ctx, name)
+	}))
 	if err != nil {
 		slog.Warn("create failed; a domain with this name may be orphaned in the cloud", "name", name, "error", err)
 		return resource.Resource{}, wrapCreate(KindDomain, d.Name, err)
 	}
 	return resource.Resource{Kind: KindDomain, Logical: d.Name, Name: name, ID: id}, nil
+}
+
+// findDomain returns the id of the domain named name, or "" when there is
+// none: the lookup a create answered 409 adopts by. It lists domains filtered
+// by name, outside timed, and rechecks the name client side, so a server that
+// ignores the filter never widens the match.
+func (c *Client) findDomain(ctx context.Context, name string) (string, error) {
+	var found string
+	err := domains.List(c.gc, domains.ListOpts{Name: name}).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
+		items, err := domains.ExtractDomains(page)
+		if err != nil {
+			return false, err
+		}
+		for _, d := range items {
+			if d.Name == name {
+				found = d.ID
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("listing domains named %q: %w", name, err)
+	}
+	return found, nil
 }
 
 // DisableDomain disables a domain so it can be deleted: Keystone refuses to

@@ -16,11 +16,14 @@ import (
 
 // CreateProject creates an enabled project in domainID, tagged with the run and
 // type so it can be discovered server-side. A 403 is wrapped with ErrForbidden
-// so the executor fails fast.
+// so the executor fails fast. A 409 whose lookup finds the project of that
+// name in domainID with this run's tag adopts it and records as a successful
+// create: it is this run's project, made by a create whose answer was lost or
+// by an earlier instance of the node whose deletes failed.
 func (c *Client) CreateProject(ctx context.Context, p keystoneplan.Project, domainID string) (resource.Resource, error) {
 	name := resourceName(c.runID, p.Name)
 	var id string
-	err := c.timed(ctx, string(KindProject), "create", func(ctx context.Context) error {
+	_, err := c.timedFold(ctx, string(KindProject), "create", func(ctx context.Context) error {
 		created, err := projects.Create(ctx, c.gc, projects.CreateOpts{
 			Name:     name,
 			DomainID: domainID,
@@ -32,12 +35,41 @@ func (c *Client) CreateProject(ctx context.Context, p keystoneplan.Project, doma
 		}
 		id = created.ID
 		return nil
-	})
+	}, adoptOnConflict(KindProject, name, &id, func(ctx context.Context) (string, error) {
+		return c.findProject(ctx, name, domainID)
+	}))
 	if err != nil {
 		slog.Warn("create failed; a project with this name may be orphaned in the cloud", "name", name, "error", err)
 		return resource.Resource{}, wrapCreate(KindProject, p.Name, err)
 	}
 	return resource.Resource{Kind: KindProject, Logical: p.Name, Name: name, ID: id}, nil
+}
+
+// findProject returns the id of the project named name in domainID that
+// carries this run's dizzy:run tag, or "" when there is none: the lookup a
+// create answered 409 adopts by. It lists projects filtered by name and
+// domain, outside timed, and rechecks name, domain and tag client side; the
+// tag is checked because cleanup discovers projects by it alone. An empty
+// domainID matches nothing.
+func (c *Client) findProject(ctx context.Context, name, domainID string) (string, error) {
+	var found string
+	err := projects.List(c.gc, projects.ListOpts{Name: name, DomainID: domainID}).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
+		items, err := projects.ExtractProjects(page)
+		if err != nil {
+			return false, err
+		}
+		for _, pr := range items {
+			if pr.Name == name && domainID != "" && pr.DomainID == domainID && hasTag(pr.Tags, tagRun+c.runID) {
+				found = pr.ID
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("listing projects named %q: %w", name, err)
+	}
+	return found, nil
 }
 
 // ListProjectsByTag returns the projects carrying this run's dizzy:run=<id>
