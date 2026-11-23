@@ -1593,12 +1593,14 @@ record lists the orders created so far.
    new one, before the Secret is rewritten.
 7. Rotates the application credential the same way through
    `spec.credentialGeneration`, while a prober reads the Secret and logs in
-   with it every 5 seconds; the prober's first failure ends the stage. When the
-   status names the superseded credential with more than 5 seconds of its
-   grace period left, that credential must still log in; otherwise the run
-   logs that the grace period was already over and skips the login. The stage
-   then waits until the operator has deleted the superseded credential, which
-   must then fail to log in.
+   with it every 5 seconds; the prober's first failure ends the stage. A probe
+   under way when the stage's checks end runs to its end before the stage
+   returns, and its failure fails the stage; the stage's own end cuts no probe
+   short. When the status names the superseded credential with more than 5
+   seconds of its grace period left, that credential must still log in;
+   otherwise the run logs that the grace period was already over and skips
+   the login. The stage then waits until the operator has deleted the
+   superseded credential, which must then fail to log in.
 
 The password rotates before the credential. K-ORC creates the successor
 credential through the operator's `mint-cloud` document, which carries the
