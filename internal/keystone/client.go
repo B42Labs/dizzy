@@ -17,6 +17,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -144,7 +145,32 @@ func HasNamePrefix(name string) bool {
 func (c *Client) timed(ctx context.Context, typ, op string, fn func(context.Context) error) error {
 	start := time.Now()
 	err := fn(ctx)
+	c.record(ctx, typ, op, time.Since(start), err)
+	return err
+}
+
+// timedFold runs fn like timed, for a call whose error can show that the
+// change it requested is already in place. When fn fails, it calls applied
+// with fn's error; applied reports whether that error confirms the change,
+// and may send a follow-up read to find out, which records no sample. A
+// confirmed call records as a success and returns (true, nil). Any other
+// outcome records fn's error as timed does and returns (false, fn's error).
+// The recorded duration covers fn alone, not applied.
+func (c *Client) timedFold(ctx context.Context, typ, op string, fn func(context.Context) error, applied func(context.Context, error) bool) (bool, error) {
+	start := time.Now()
+	err := fn(ctx)
 	d := time.Since(start)
+	if err != nil && applied(ctx, err) {
+		c.record(ctx, typ, op, d, nil)
+		return true, nil
+	}
+	c.record(ctx, typ, op, d, err)
+	return false, err
+}
+
+// record adds one sample for a call of typ and op that took d and ended
+// with err to the collector, and mirrors it into telemetry under op.
+func (c *Client) record(ctx context.Context, typ, op string, d time.Duration, err error) {
 	ek := errKind(err)
 	c.metrics.Record(metrics.Sample{
 		Type:     typ,
@@ -153,7 +179,6 @@ func (c *Client) timed(ctx context.Context, typ, op string, fn func(context.Cont
 		ErrKind:  ek,
 	})
 	c.tel.RecordOperation(ctx, typ, op, d, ek)
-	return err
 }
 
 // wrapCreate adds operation context to a create/assign/issue error and, when the
@@ -165,6 +190,35 @@ func wrapCreate(kind resource.Kind, logical string, err error) error {
 		return fmt.Errorf("creating %s %q: %w: %w", kind, logical, ErrForbidden, err)
 	}
 	return fmt.Errorf("creating %s %q: %w", kind, logical, err)
+}
+
+// adoptOnConflict returns the applied function of a create's timedFold. It
+// confirms a 409 when find returns the id of this run's resource named
+// name, stores that id in *id and logs the adoption. Any other error, a
+// failed find and an empty id leave the 409 unconfirmed.
+//
+// A Keystone name is unique within its scope and carries the run id, which
+// is random per process, so the one resource a 409 refers to was created by
+// this process: a create whose answer was lost, or an earlier instance of
+// the node whose deletes failed. find runs with the operation's context and
+// records no sample.
+func adoptOnConflict(kind resource.Kind, name string, id *string, find func(context.Context) (string, error)) func(context.Context, error) bool {
+	return func(ctx context.Context, err error) bool {
+		if !gophercloud.ResponseCodeIs(err, 409) {
+			return false
+		}
+		found, findErr := find(ctx)
+		if findErr != nil {
+			slog.Warn("lookup after a 409 on create failed; the 409 stands", "kind", string(kind), "name", name, "error", findErr)
+			return false
+		}
+		if found == "" {
+			return false
+		}
+		*id = found
+		slog.Info("already created; treating a refused create as success", "kind", string(kind), "name", name, "id", found)
+		return true
+	}
 }
 
 // httpStatus returns the HTTP status code carried by a gophercloud error, or 0

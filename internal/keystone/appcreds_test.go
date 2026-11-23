@@ -55,10 +55,11 @@ func errorReply(status int, message string) keystoneReply {
 }
 
 // seenRequest is one request the fake Keystone of the delegation tests
-// received: its "<METHOD> <path>" route, its X-Auth-Token header and its
-// decoded JSON body (nil for none).
+// received: its "<METHOD> <path>" route, its raw query, its X-Auth-Token
+// header and its decoded JSON body (nil for none).
 type seenRequest struct {
 	route     string
+	rawQuery  string
 	authToken string
 	body      map[string]any
 }
@@ -74,7 +75,7 @@ func delegationKeystone(t *testing.T, routes map[string]keystoneReply) (*httptes
 		seen []seenRequest
 	)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		req := seenRequest{route: r.Method + " " + r.URL.Path, authToken: r.Header.Get("X-Auth-Token")}
+		req := seenRequest{route: r.Method + " " + r.URL.Path, rawQuery: r.URL.RawQuery, authToken: r.Header.Get("X-Auth-Token")}
 		if raw, _ := io.ReadAll(r.Body); len(raw) > 0 {
 			if err := json.Unmarshal(raw, &req.body); err != nil {
 				t.Errorf("%s: body %q is not a JSON object: %v", req.route, raw, err)

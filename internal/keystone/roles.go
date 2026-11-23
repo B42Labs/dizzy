@@ -16,23 +16,53 @@ import (
 
 // CreateRole creates a global role (no domain) with the deterministic name. A
 // 403 is wrapped with ErrForbidden so the executor fails fast (only a cloud
-// admin may create roles).
+// admin may create roles). A 409 whose lookup finds the global role of that
+// name adopts it and records as a successful create: it is this run's role,
+// made by a create whose answer was lost.
 func (c *Client) CreateRole(ctx context.Context, r keystoneplan.Role) (resource.Resource, error) {
 	name := resourceName(c.runID, r.Name)
 	var id string
-	err := c.timed(ctx, string(KindRole), "create", func(ctx context.Context) error {
+	_, err := c.timedFold(ctx, string(KindRole), "create", func(ctx context.Context) error {
 		created, err := roles.Create(ctx, c.gc, roles.CreateOpts{Name: name}).Extract()
 		if err != nil {
 			return err
 		}
 		id = created.ID
 		return nil
-	})
+	}, adoptOnConflict(KindRole, name, &id, func(ctx context.Context) (string, error) {
+		return c.findRole(ctx, name)
+	}))
 	if err != nil {
 		slog.Warn("create failed; a role with this name may be orphaned in the cloud", "name", name, "error", err)
 		return resource.Resource{}, wrapCreate(KindRole, r.Name, err)
 	}
 	return resource.Resource{Kind: KindRole, Logical: r.Name, Name: name, ID: id}, nil
+}
+
+// findRole returns the id of the global role named name, or "" when there is
+// none: the lookup a create answered 409 adopts by. It lists roles filtered by
+// name, outside timed, and rechecks the name and the empty domain client
+// side. Unlike FindRoleByName it never falls back to a domain-scoped role,
+// which CreateRole does not make, and finding nothing is no error.
+func (c *Client) findRole(ctx context.Context, name string) (string, error) {
+	var found string
+	err := roles.List(c.gc, roles.ListOpts{Name: name}).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
+		items, err := roles.ExtractRoles(page)
+		if err != nil {
+			return false, err
+		}
+		for _, r := range items {
+			if r.Name == name && r.DomainID == "" {
+				found = r.ID
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("listing roles named %q: %w", name, err)
+	}
+	return found, nil
 }
 
 // CreateImpliedRole creates the implied-role rule r: a grant of the role
