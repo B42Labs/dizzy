@@ -720,39 +720,139 @@ func TestApplyProbesDuringCredentialRotation(t *testing.T) {
 	}
 }
 
-// TestApplyStopsProberBeforeReturning confirms stage 7 waits for a probe that
-// is still running when the rotation is done: the probe's Secret read only
-// returns some time after the stage has ended, and Apply returns after it.
-func TestApplyStopsProberBeforeReturning(t *testing.T) {
+// slowProbe makes the prober's logins with the rotated credential take 50 ms
+// from the rotation's last call on, holds that call until one such login is in
+// flight, and then answers the call with last. A slow login marks
+// started:probe when it begins and canceled:probe when its context ends first;
+// otherwise it marks finished:probe and answers with probeErr. The hold waits
+// for the login's own started:probe, since the prober can enter the hook at
+// any moment after its install. The tests assume the stage reaches its stop
+// within those 50 ms.
+func slowProbe(f *fakeOrders, probeErr, last error) {
+	f.on("reject:appcred-0r", func(ctx context.Context) error {
+		f.on("auth:appcred-1", func(ctx context.Context) error {
+			f.mark("started:probe")
+			select {
+			case <-ctx.Done():
+				f.mark("canceled:probe")
+				return ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+				f.mark("finished:probe")
+				return probeErr
+			}
+		})
+		if err := f.waitFor(ctx, func(e []string) bool { return slices.Contains(e, "started:probe") }); err != nil {
+			return err
+		}
+		return last
+	})
+}
+
+// TestApplyLetsInFlightProbeFinish confirms stage 7 lets a probe that is still
+// logging in when the rotation's last call returns run to its end: nothing
+// cancels the login, and Apply returns after it.
+func TestApplyLetsInFlightProbeFinish(t *testing.T) {
 	setProberInterval(t, time.Millisecond)
 	f := newFake()
-	f.on("raise:appcred", func(context.Context) error {
-		// From here on, only the prober reads the Secret: it stays in the read
-		// until the stage ends, and takes a while longer to return.
-		f.on("read:appcred", func(ctx context.Context) error {
-			<-ctx.Done()
-			time.Sleep(50 * time.Millisecond)
-			f.mark("returned:probe")
-			return ctx.Err()
-		})
-		f.mark("installed:probe")
-		return nil
-	})
-	f.on("waitrotated:appcred", func(ctx context.Context) error {
-		// Hold the rotation until a probe is in its slow read.
-		return f.waitFor(ctx, func(e []string) bool {
-			installed := slices.Index(e, "installed:probe")
-			return installed >= 0 && slices.Contains(e[installed:], "read:appcred")
-		})
-	})
+	slowProbe(f, nil, nil)
 
 	if _, err := Apply(context.Background(), f, testPlan(), 1, testOpTimeout); err != nil {
 		t.Fatalf("Apply() = %v, want nil", err)
 	}
 	e := f.snapshot()
-	if got := e[len(e)-1]; got != "returned:probe" {
-		t.Errorf("last call before Apply returned = %s, want the probe's return: %v", got, e)
+	noneWithPrefix(t, e, "canceled:probe")
+	if n := count(e, "finished:probe"); n != 1 {
+		t.Errorf("%d probes finished, want 1: %v", n, e)
 	}
+	if got := e[len(e)-1]; got != "finished:probe" {
+		t.Errorf("last event before Apply returned = %s, want finished:probe: %v", got, e)
+	}
+}
+
+// TestApplyInFlightProbeFailureFailsStage confirms a probe that fails for a
+// reason of its own after the rotation's checks passed fails stage 7 with that
+// reason.
+func TestApplyInFlightProbeFailureFailsStage(t *testing.T) {
+	t.Run("the login is rejected", func(t *testing.T) {
+		setProberInterval(t, time.Millisecond)
+		f := newFake()
+		slowProbe(f, mismatch("keystone rejects the credential of a ready order"), nil)
+		_, err := Apply(context.Background(), f, testPlan(), 1, testOpTimeout)
+		mustFailIn(t, err, 7, c5c3.ErrMismatch)
+		noneWithPrefix(t, f.snapshot(), "canceled:probe")
+	})
+
+	t.Run("the Secret read outlasts opTimeout", func(t *testing.T) {
+		setProberInterval(t, time.Millisecond)
+		f := newFake()
+		f.on("reject:appcred-0r", func(ctx context.Context) error {
+			// From here on, the prober's Secret read never answers.
+			f.on("read:appcred", func(ctx context.Context) error {
+				f.mark("started:probe")
+				<-ctx.Done()
+				return ctx.Err()
+			})
+			return f.waitFor(ctx, func(e []string) bool { return slices.Contains(e, "started:probe") })
+		})
+		const opTimeout = 100 * time.Millisecond
+		start := time.Now()
+		_, err := Apply(context.Background(), f, testPlan(), 1, opTimeout)
+		mustFailIn(t, err, 7, context.DeadlineExceeded)
+		if errors.Is(err, context.Canceled) {
+			t.Errorf("Apply() = %v, want the read's deadline rather than a cancellation", err)
+		}
+		// The deadline is the probe's, not the rotation's own wait running out.
+		if msg := err.Error(); !strings.Contains(msg, "probing the credential of order") || strings.Contains(msg, "the prober failed as well") {
+			t.Errorf("Apply() = %q, want the prober's error alone", msg)
+		}
+		if took := time.Since(start); took >= testReadyTimeout/2 {
+			t.Errorf("Apply took %s, want the read bounded by opTimeout %s", took, opTimeout)
+		}
+	})
+}
+
+// TestApplyRotationFailureLetsProbeFinish confirms stage 7 lets a probe in
+// flight run to its end when the rotation's last check fails, and fails with
+// the rotation's error, naming the probe's failure beside it.
+func TestApplyRotationFailureLetsProbeFinish(t *testing.T) {
+	accepted := fmt.Errorf("%w: keystone issued a token for the deleted credential", c5c3.ErrAccepted)
+
+	t.Run("the probe passes", func(t *testing.T) {
+		setProberInterval(t, time.Millisecond)
+		f := newFake()
+		slowProbe(f, nil, accepted)
+		_, err := Apply(context.Background(), f, testPlan(), 1, testOpTimeout)
+		mustFailIn(t, err, 7, c5c3.ErrAccepted)
+		e := f.snapshot()
+		noneWithPrefix(t, e, "canceled:probe")
+		if got := e[len(e)-1]; got != "finished:probe" {
+			t.Errorf("last event before Apply returned = %s, want finished:probe: %v", got, e)
+		}
+		if strings.Contains(err.Error(), "the prober failed as well") {
+			t.Errorf("Apply() = %q, want no prober failure named", err)
+		}
+	})
+
+	t.Run("the probe fails too", func(t *testing.T) {
+		setProberInterval(t, time.Millisecond)
+		f := newFake()
+		slowProbe(f, mismatch("keystone rejects the credential of a ready order"), accepted)
+		_, err := Apply(context.Background(), f, testPlan(), 1, testOpTimeout)
+		mustFailIn(t, err, 7, c5c3.ErrAccepted)
+		if errors.Is(err, c5c3.ErrMismatch) {
+			t.Errorf("Apply() = %v, want only the rotation's error wrapped", err)
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, "the prober failed as well") {
+			t.Errorf("Apply() = %q, want it to name the prober's failure", msg)
+		}
+		for _, secret := range []string{userPasswordPrefix, appcredSecretPrefix} {
+			if strings.Contains(msg, secret) {
+				t.Errorf("Apply() = %q carries a secret with prefix %s", msg, secret)
+			}
+		}
+		noneWithPrefix(t, f.snapshot(), "canceled:probe")
+	})
 }
 
 func TestApplyProberMismatchFailsStage(t *testing.T) {
@@ -1054,6 +1154,34 @@ func TestApplyCancelled(t *testing.T) {
 			t.Errorf("Created = %+v, want %+v", result.Created, allFive)
 		}
 		noneWithPrefix(t, f.snapshot(), "status:appcred", "waitprevgone:", "reject:appcred-")
+	})
+
+	t.Run("in stage 7 while the last probe runs", func(t *testing.T) {
+		setProberInterval(t, time.Millisecond)
+		f := newFake()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		f.on("reject:appcred-0r", func(rejectCtx context.Context) error {
+			// The rotation's checks pass; the interrupt then cuts the probe
+			// still logging in.
+			f.on("auth:appcred-1", func(authCtx context.Context) error {
+				f.mark("started:probe")
+				<-authCtx.Done()
+				f.mark("canceled:probe")
+				return authCtx.Err()
+			})
+			if err := f.waitFor(rejectCtx, func(e []string) bool { return slices.Contains(e, "started:probe") }); err != nil {
+				return err
+			}
+			cancel()
+			return nil
+		})
+		result, err := Apply(ctx, f, testPlan(), 1, testOpTimeout)
+		mustFailIn(t, err, 7, context.Canceled)
+		if !slices.Equal(result.Created, allFive) {
+			t.Errorf("Created = %+v, want %+v", result.Created, allFive)
+		}
+		index(t, f.snapshot(), "canceled:probe")
 	})
 }
 
