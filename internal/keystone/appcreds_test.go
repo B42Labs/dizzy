@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"slices"
 	"strings"
@@ -286,6 +287,135 @@ func TestCreateApplicationCredentialForbidden(t *testing.T) {
 	}
 	if st := statsOf(m.Aggregate(time.Second), string(KindApplicationCredential)); st.Attempted != 1 || st.Failed != 1 {
 		t.Errorf("application_credential samples = %+v, want 1 attempted and 1 failed", st)
+	}
+}
+
+// appcredRoute and appcredListRoute are the routes of the application
+// credential create and of its lookup after a 409.
+const (
+	appcredRoute     = "POST /users/uid1/application_credentials"
+	appcredListRoute = "GET /users/uid1/application_credentials"
+)
+
+// appcredConflict is Keystone's 409 for a credential create whose name the
+// user already holds. It quotes the secret, so a test can tell it is kept
+// out of the returned error.
+var appcredConflict = errorReply(http.StatusConflict, "Duplicate entry found with name dizzy-run0-appcred-0001 (secret "+appcredSecret+").")
+
+// TestCreateApplicationCredentialAdoptsOnConflict confirms a credential
+// create answered 409 adopts the user's credential of that name on the
+// project: the lookup lists the owner's credentials by the cloud name with
+// the owner token the create already holds, no second token is issued, and
+// the create returns the synthetic id of the listed credential and records
+// one successful create sample and no http_409.
+func TestCreateApplicationCredentialAdoptsOnConflict(t *testing.T) {
+	ts, seen := delegationKeystone(t, map[string]keystoneReply{
+		"POST /auth/tokens": issuedReply(ownerTok),
+		appcredRoute:        appcredConflict,
+		appcredListRoute: {
+			status: http.StatusOK,
+			body:   `{"application_credentials":[{"id":"acid1","name":"dizzy-run0-appcred-0001","project_id":"pid1"}]}`,
+		},
+	})
+	c, m := testClient(ts)
+
+	got, err := c.CreateApplicationCredential(context.Background(), testAppCred, "uid1", "did1", "user-pw", "pid1", "rid1", appcredSecret)
+	if err != nil {
+		t.Fatalf("CreateApplicationCredential: %v", err)
+	}
+	want := resource.Resource{Kind: KindApplicationCredential, Logical: "appcred-0001", Name: "dizzy-run0-appcred-0001", ID: "uid1:acid1"}
+	if got != want {
+		t.Errorf("CreateApplicationCredential = %+v, want %+v", got, want)
+	}
+
+	reqs := seen()
+	wantRoutes := []string{"POST /auth/tokens", appcredRoute, appcredListRoute}
+	if !slices.Equal(routesOf(reqs), wantRoutes) {
+		t.Fatalf("requests = %v, want %v (one owner token)", routesOf(reqs), wantRoutes)
+	}
+	lookup := reqs[2]
+	if lookup.authToken != ownerTok {
+		t.Errorf("lookup X-Auth-Token = %q, want the owner token %q", lookup.authToken, ownerTok)
+	}
+	q, err := url.ParseQuery(lookup.rawQuery)
+	if err != nil {
+		t.Fatalf("lookup query %q: %v", lookup.rawQuery, err)
+	}
+	if got := q.Get("name"); got != "dizzy-run0-appcred-0001" {
+		t.Errorf("lookup name = %q, want dizzy-run0-appcred-0001", got)
+	}
+
+	agg := m.Aggregate(time.Second)
+	if st := statsOf(agg, string(KindApplicationCredential)); st.Attempted != 1 || st.Succeeded != 1 {
+		t.Errorf("application_credential samples = %+v, want 1 attempted and 1 succeeded", st)
+	}
+	if got := errorCount(agg, "http_409"); got != 0 {
+		t.Errorf("http_409 samples = %d, want 0", got)
+	}
+}
+
+// TestCreateApplicationCredentialConflictUnconfirmed confirms a credential
+// create answered 409 keeps the 409 when its lookup does not confirm this
+// run's credential: an empty or absent list, a credential of another name or
+// on another project, or a lookup that fails. Each records one failed
+// create sample with http_409. The returned error never carries the secret
+// the 409 quotes, and the warning of a failed lookup never carries the owner
+// token its 403 quotes.
+func TestCreateApplicationCredentialConflictUnconfirmed(t *testing.T) {
+	cases := []struct {
+		name     string
+		lookup   keystoneReply
+		wantWarn bool
+	}{
+		{name: "empty list", lookup: keystoneReply{status: http.StatusOK, body: `{"application_credentials":[]}`}},
+		{name: "absent list", lookup: keystoneReply{status: http.StatusOK, body: `{}`}},
+		{name: "another name", lookup: keystoneReply{status: http.StatusOK, body: `{"application_credentials":[{"id":"acid1","name":"dizzy-run0-appcred-0002","project_id":"pid1"}]}`}},
+		{name: "another project", lookup: keystoneReply{status: http.StatusOK, body: `{"application_credentials":[{"id":"acid1","name":"dizzy-run0-appcred-0001","project_id":"pid2"}]}`}},
+		{name: "lookup 503", lookup: errorReply(http.StatusServiceUnavailable, "Service Unavailable"), wantWarn: true},
+		{name: "lookup 403", lookup: errorReply(http.StatusForbidden, "token "+ownerTok+" may not list application credentials"), wantWarn: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLogs(t)
+			ts, seen := delegationKeystone(t, map[string]keystoneReply{
+				"POST /auth/tokens": issuedReply(ownerTok),
+				appcredRoute:        appcredConflict,
+				appcredListRoute:    tc.lookup,
+			})
+			c, m := testClient(ts)
+
+			res, err := c.CreateApplicationCredential(context.Background(), testAppCred, "uid1", "did1", "user-pw", "pid1", "rid1", appcredSecret)
+			if !gophercloud.ResponseCodeIs(err, http.StatusConflict) {
+				t.Fatalf("CreateApplicationCredential error = %v, want the POST's 409", err)
+			}
+			if strings.Contains(err.Error(), appcredSecret) {
+				t.Errorf("error %q carries the secret", err)
+			}
+			if res != (resource.Resource{}) {
+				t.Errorf("resource = %+v, want the zero resource", res)
+			}
+			wantRoutes := []string{"POST /auth/tokens", appcredRoute, appcredListRoute}
+			if routes := routesOf(seen()); !slices.Equal(routes, wantRoutes) {
+				t.Errorf("requests = %v, want %v", routes, wantRoutes)
+			}
+			agg := m.Aggregate(time.Second)
+			if st := statsOf(agg, string(KindApplicationCredential)); st.Attempted != 1 || st.Failed != 1 {
+				t.Errorf("application_credential samples = %+v, want 1 attempted and 1 failed", st)
+			}
+			if got := errorCount(agg, "http_409"); got != 1 {
+				t.Errorf("http_409 samples = %d, want 1", got)
+			}
+
+			warns := logs.withMessage(lookupFailedMsg)
+			if got, want := len(warns), boolToInt(tc.wantWarn); got != want {
+				t.Fatalf("%q records = %d, want %d", lookupFailedMsg, got, want)
+			}
+			for _, r := range warns {
+				if text := recordText(r); strings.Contains(text, ownerTok) {
+					t.Errorf("warning %q carries the owner token", text)
+				}
+			}
+		})
 	}
 }
 

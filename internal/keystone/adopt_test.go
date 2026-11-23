@@ -214,6 +214,18 @@ func recordAttrs(r slog.Record) map[string]slog.Value {
 	return attrs
 }
 
+// recordText renders r's message and attributes as text, as a log handler
+// would write them.
+func recordText(r slog.Record) string {
+	var b strings.Builder
+	b.WriteString(r.Message)
+	r.Attrs(func(a slog.Attr) bool {
+		fmt.Fprintf(&b, " %s=%s", a.Key, a.Value)
+		return true
+	})
+	return b.String()
+}
+
 // TestCreateAdoptsOnConflict confirms a create answered 409 adopts this run's
 // resource of that name: the lookup lists the kind filtered by the cloud
 // name (and, for a user or project, by its domain), the create returns the

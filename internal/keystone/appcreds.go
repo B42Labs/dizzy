@@ -6,8 +6,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/applicationcredentials"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
+	"github.com/gophercloud/gophercloud/v2/pagination"
 
 	keystoneplan "github.com/B42Labs/dizzy/internal/keystone/plan"
 	"github.com/B42Labs/dizzy/internal/metrics"
@@ -38,16 +40,22 @@ func (c *Client) ownerToken(ctx context.Context, user, userDomainID, password, p
 // is named dizzy-<run>-<logical>, unique per user. The returned resource's id
 // is the synthetic <userID>:<credentialID>, because Keystone addresses a
 // credential only under its user. A failed owner token and a failed create
-// both return through wrapCreate, so a 403 carries ErrForbidden.
+// both return through wrapCreate, so a 403 carries ErrForbidden. A 409 whose
+// lookup, sent with the same owner token, finds the user's credential of that
+// name on projectID adopts it and records as a successful create: it is this
+// run's credential, made by a create whose answer was lost or by an earlier
+// instance of the node whose deletes failed, with the secret the caller still
+// holds.
 func (c *Client) CreateApplicationCredential(ctx context.Context, ac keystoneplan.ApplicationCredential, userID, userDomainID, password, projectID, roleID, secret string) (resource.Resource, error) {
 	token, err := c.ownerToken(ctx, ac.User, userDomainID, password, projectID)
 	if err != nil {
 		return resource.Resource{}, wrapCreate(KindApplicationCredential, ac.Name, err)
 	}
 	name := resourceName(c.runID, ac.Name)
+	sc := withToken(c.gc, token)
 	var id string
-	err = c.timed(ctx, string(KindApplicationCredential), "create", func(ctx context.Context) error {
-		created, err := applicationcredentials.Create(ctx, withToken(c.gc, token), userID, applicationcredentials.CreateOpts{
+	_, err = c.timedFold(ctx, string(KindApplicationCredential), "create", func(ctx context.Context) error {
+		created, err := applicationcredentials.Create(ctx, sc, userID, applicationcredentials.CreateOpts{
 			Name:   name,
 			Secret: secret,
 			Roles:  []applicationcredentials.Role{{ID: roleID}},
@@ -57,11 +65,41 @@ func (c *Client) CreateApplicationCredential(ctx context.Context, ac keystonepla
 		}
 		id = created.ID
 		return nil
-	})
+	}, adoptOnConflict(KindApplicationCredential, name, &id, func(ctx context.Context) (string, error) {
+		found, err := c.findApplicationCredential(ctx, sc, userID, name, projectID)
+		return found, redactToken(err, token)
+	}))
 	if err != nil {
 		return resource.Resource{}, wrapCreate(KindApplicationCredential, ac.Name, redactToken(err, secret))
 	}
 	return resource.Resource{Kind: KindApplicationCredential, Logical: ac.Name, Name: name, ID: applicationCredentialID(userID, id)}, nil
+}
+
+// findApplicationCredential returns the id of userID's application
+// credential named name on projectID, or "" when there is none: the lookup a
+// create answered 409 adopts by. sc carries the owner's token. It lists the
+// user's credentials filtered by name, outside timed, and rechecks name and
+// project client side, so a server that ignores the filter never widens the
+// match.
+func (c *Client) findApplicationCredential(ctx context.Context, sc *gophercloud.ServiceClient, userID, name, projectID string) (string, error) {
+	var found string
+	err := applicationcredentials.List(sc, userID, applicationcredentials.ListOpts{Name: name}).EachPage(ctx, func(ctx context.Context, page pagination.Page) (bool, error) {
+		items, err := applicationcredentials.ExtractApplicationCredentials(page)
+		if err != nil {
+			return false, err
+		}
+		for _, ac := range items {
+			if ac.Name == name && ac.ProjectID == projectID {
+				found = ac.ID
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("listing application credentials named %q of user %s: %w", name, userID, err)
+	}
+	return found, nil
 }
 
 // AuthenticateApplicationCredential obtains a token with the application
