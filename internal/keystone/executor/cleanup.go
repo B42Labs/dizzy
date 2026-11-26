@@ -64,7 +64,11 @@ const cleanupRetryMaxDelay = 30 * time.Second
 // a user's and a project's role assignments with them, a role's implied-role
 // rules with the role, and a disabled domain's contents with the domain. The
 // error joins every recorded failure in call order (nil when none failed) and
-// is returned with the count actually deleted.
+// is returned with the count actually deleted. CleanupWithRetry also returns
+// the resources the sweep left behind: each one whose delete, or for a domain
+// whose disable, failed with anything but a 404, in call order and as the
+// sweep held it (the listing's copy when the record had it too). A failed
+// listing adds an error and no resource. Cleanup drops them.
 //
 // Cleanup makes one attempt per call; it is CleanupWithRetry with a zero
 // budget. CleanupWithRetry retries a call that failed with a 5xx, a 429, its
@@ -86,14 +90,16 @@ const cleanupRetryMaxDelay = 30 * time.Second
 // "never touches resources the tool did not create" invariant depends on a
 // non-empty run id.
 func Cleanup(ctx context.Context, c Cleaner, runID string, recorded []resource.Resource, opTimeout time.Duration) (int, error) {
-	return CleanupWithRetry(ctx, c, runID, recorded, opTimeout, 0)
+	n, _, err := CleanupWithRetry(ctx, c, runID, recorded, opTimeout, 0)
+	return n, err
 }
 
-// CleanupWithRetry is Cleanup with a retry budget for transient failures: see
-// Cleanup for the teardown and the retry policy. A budget of 0 never retries.
-func CleanupWithRetry(ctx context.Context, c Cleaner, runID string, recorded []resource.Resource, opTimeout, retryBudget time.Duration) (int, error) {
+// CleanupWithRetry is Cleanup with a retry budget for transient failures that
+// also returns the resources the sweep left behind: see Cleanup for the
+// teardown, those resources, and the retry policy. A budget of 0 never retries.
+func CleanupWithRetry(ctx context.Context, c Cleaner, runID string, recorded []resource.Resource, opTimeout, retryBudget time.Duration) (deleted int, remaining []resource.Resource, err error) {
 	if runID == "" {
-		return 0, fmt.Errorf("cleanup: empty run id; refusing to delete by an empty prefix")
+		return 0, nil, fmt.Errorf("cleanup: empty run id; refusing to delete by an empty prefix")
 	}
 	s := &sweeper{c: c, opTimeout: opTimeout, retryUntil: time.Now().Add(retryBudget)}
 
@@ -138,17 +144,19 @@ func CleanupWithRetry(ctx context.Context, c Cleaner, runID string, recorded []r
 		return c.ListDomainsByPrefix(ctx, runID)
 	}), recordedOfKind(recorded, keystone.KindDomain))))
 
-	return s.deleted, errors.Join(s.errs...)
+	return s.deleted, s.remaining, errors.Join(s.errs...)
 }
 
 // sweeper carries one Cleanup run's state: the cleaner, the per-attempt bound,
-// the end of the retry budget, the count deleted so far, and every failure
-// recorded so far, in call order.
+// the end of the retry budget, the count deleted so far, the resources whose
+// delete or disable failed with anything but a 404 so far, and every failure
+// recorded so far, both in call order.
 type sweeper struct {
 	c          Cleaner
 	opTimeout  time.Duration
 	retryUntil time.Time
 	deleted    int
+	remaining  []resource.Resource
 	errs       []error
 }
 
@@ -228,6 +236,7 @@ func (s *sweeper) deleteDomains(ctx context.Context, domains []resource.Resource
 		if err := s.call(ctx, func(ctx context.Context) error { return s.c.DisableDomain(ctx, d) }); err != nil {
 			if !keystone.IsNotFound(err) {
 				s.errs = append(s.errs, fmt.Errorf("disabling domain %s: %w", d.ID, err))
+				s.remaining = append(s.remaining, d)
 			}
 			continue // already gone, or still enabled
 		}
@@ -236,12 +245,13 @@ func (s *sweeper) deleteDomains(ctx context.Context, domains []resource.Resource
 }
 
 // delete deletes one resource through call, counting it on success and
-// recording a non-404 failure.
+// recording a non-404 failure along with the resource it left behind.
 func (s *sweeper) delete(ctx context.Context, r resource.Resource) {
 	slog.Info("deleting resource", "kind", r.Kind, "id", r.ID)
 	if err := s.call(ctx, func(ctx context.Context) error { return s.c.Delete(ctx, r) }); err != nil {
 		if !keystone.IsNotFound(err) {
 			s.errs = append(s.errs, fmt.Errorf("deleting %s %s: %w", r.Kind, r.ID, err))
+			s.remaining = append(s.remaining, r)
 		}
 		return
 	}

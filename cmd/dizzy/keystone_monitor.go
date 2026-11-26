@@ -180,7 +180,8 @@ func keystoneMonitorRunOnce(opts *globalOptions, p *keystoneplan.Plan, tel *tele
 				return r.Created, err
 			},
 			cleanup: keystoneCleanupStep(pending, runID, func(ctx context.Context, created []resource.Resource) (int, error) {
-				return keystoneexec.CleanupWithRetry(ctx, keystoneTimeoutCleaner{client, opts.timeout}, runID, created, opts.timeout, cleanupRetryBudget)
+				n, _, err := keystoneexec.CleanupWithRetry(ctx, keystoneTimeoutCleaner{client, opts.timeout}, runID, created, opts.timeout, cleanupRetryBudget)
+				return n, err
 			}),
 		})
 		hb.stop()
