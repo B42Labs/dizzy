@@ -16,6 +16,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2"
 
 	"github.com/B42Labs/dizzy/internal/keystone"
+	keystoneexec "github.com/B42Labs/dizzy/internal/keystone/executor"
 	keystonescenario "github.com/B42Labs/dizzy/internal/keystone/scenario"
 	"github.com/B42Labs/dizzy/internal/metrics"
 	"github.com/B42Labs/dizzy/internal/resource"
@@ -77,30 +78,32 @@ func TestKeystoneMonitorRejectsNegativeCleanupRetryBudget(t *testing.T) {
 
 // TestKeystoneCleanupStepQueuesFailedCleanup drives runIteration with a
 // keystoneCleanupStep-wrapped cleanup: a failed cleanup queues the run with
-// what its apply created, whichever phase failed first, and a successful one
-// queues nothing.
+// what the cleanup left behind, not what its apply created, whichever phase
+// failed first, and a successful one queues nothing.
 func TestKeystoneCleanupStepQueuesFailedCleanup(t *testing.T) {
 	u1 := []resource.Resource{{Kind: keystone.KindUser, ID: "u1"}}
+	p1 := []resource.Resource{{Kind: keystone.KindProject, ID: "p1"}}
 	boom := errors.New("boom")
 	for _, tc := range []struct {
 		name                   string
 		preflightErr, applyErr error
+		remaining              []resource.Resource
 		cleanupErr             error
 		wantErrPrefix          string
 		wantPending            []keystonePendingCleanup
 	}{
-		{"failed cleanup", nil, nil, boom, "cleanup: ", []keystonePendingCleanup{{"run0", u1}}},
-		{"failed apply and cleanup", nil, boom, boom, "apply: ", []keystonePendingCleanup{{"run0", u1}}},
-		{"failed pre-flight and cleanup", boom, nil, boom, "pre-flight cleanup: ", []keystonePendingCleanup{{"run0", nil}}},
-		{"successful cleanup", nil, nil, nil, "", nil},
+		{"failed cleanup", nil, nil, p1, boom, "cleanup: ", []keystonePendingCleanup{{"run0", p1}}},
+		{"failed apply and cleanup", nil, boom, p1, boom, "apply: ", []keystonePendingCleanup{{"run0", p1}}},
+		{"failed pre-flight and cleanup", boom, nil, nil, boom, "pre-flight cleanup: ", []keystonePendingCleanup{{"run0", nil}}},
+		{"successful cleanup", nil, nil, nil, nil, "", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pending := &keystonePendingCleanups{max: maxPendingKeystoneCleanups}
 			res := runIteration(context.Background(), iterationDeps{
 				preflight: func(context.Context) (int, error) { return 0, tc.preflightErr },
 				apply:     func(context.Context) ([]resource.Resource, error) { return u1, tc.applyErr },
-				cleanup: keystoneCleanupStep(pending, "run0", func(context.Context, []resource.Resource) (int, error) {
-					return 0, tc.cleanupErr
+				cleanup: keystoneCleanupStep(pending, "run0", func(context.Context, []resource.Resource) (int, []resource.Resource, error) {
+					return 0, tc.remaining, tc.cleanupErr
 				}),
 			})
 			if !reflect.DeepEqual(pending.entries, tc.wantPending) {
@@ -121,31 +124,32 @@ func TestKeystoneCleanupStepQueuesFailedCleanup(t *testing.T) {
 
 // pendingCall is one call reclaim made to its clean function.
 type pendingCall struct {
-	runID    string
-	recorded []resource.Resource
+	runID     string
+	remaining []resource.Resource
 }
 
 func TestKeystonePendingCleanupsReclaim(t *testing.T) {
-	recA := []resource.Resource{{Kind: keystone.KindUser, ID: "ua"}}
+	ua2 := resource.Resource{Kind: keystone.KindUser, ID: "ua2"}
+	recA := []resource.Resource{{Kind: keystone.KindUser, ID: "ua1"}, ua2}
 	recB := []resource.Resource{{Kind: keystone.KindUser, ID: "ub"}}
 	p := &keystonePendingCleanups{max: maxPendingKeystoneCleanups}
 	p.add("A", recA)
 	p.add("B", recB)
 
 	var calls []pendingCall
-	p.reclaim(context.Background(), func(_ context.Context, runID string, recorded []resource.Resource) (int, error) {
-		calls = append(calls, pendingCall{runID, recorded})
+	p.reclaim(context.Background(), func(_ context.Context, runID string, remaining []resource.Resource) (int, []resource.Resource, error) {
+		calls = append(calls, pendingCall{runID, remaining})
 		if runID == "A" {
-			return 0, errors.New("still failing")
+			return 1, []resource.Resource{ua2}, errors.New("still failing")
 		}
-		return 1, nil
+		return 1, nil, nil
 	})
 
 	if want := []pendingCall{{"A", recA}, {"B", recB}}; !reflect.DeepEqual(calls, want) {
 		t.Errorf("clean calls = %+v, want %+v", calls, want)
 	}
-	if want := []keystonePendingCleanup{{"A", recA}}; !reflect.DeepEqual(p.entries, want) {
-		t.Errorf("pending = %+v, want only A", p.entries)
+	if want := []keystonePendingCleanup{{"A", []resource.Resource{ua2}}}; !reflect.DeepEqual(p.entries, want) {
+		t.Errorf("pending = %+v, want only A, narrowed to ua2", p.entries)
 	}
 }
 
@@ -161,9 +165,9 @@ func TestKeystonePendingCleanupsEvictsOldest(t *testing.T) {
 
 func TestKeystonePendingCleanupsEmpty(t *testing.T) {
 	p := &keystonePendingCleanups{max: maxPendingKeystoneCleanups}
-	p.reclaim(context.Background(), func(context.Context, string, []resource.Resource) (int, error) {
+	p.reclaim(context.Background(), func(context.Context, string, []resource.Resource) (int, []resource.Resource, error) {
 		t.Error("reclaim on an empty list called clean")
-		return 0, nil
+		return 0, nil, nil
 	})
 }
 
@@ -174,9 +178,9 @@ func TestKeystonePendingCleanupsStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	p.reclaim(ctx, func(context.Context, string, []resource.Resource) (int, error) {
+	p.reclaim(ctx, func(context.Context, string, []resource.Resource) (int, []resource.Resource, error) {
 		t.Error("reclaim on a cancelled context called clean")
-		return 0, nil
+		return 0, nil, nil
 	})
 	if want := []keystonePendingCleanup{{"A", nil}, {"B", nil}}; !reflect.DeepEqual(p.entries, want) {
 		t.Errorf("pending = %+v, want A and B kept", p.entries)
@@ -241,6 +245,98 @@ func TestKeystoneMonitorRunOnceStopsAfterCancelledReclaim(t *testing.T) {
 		if strings.HasPrefix(r, "POST ") && r != "POST /v3/auth/tokens" {
 			t.Errorf("the iteration sent %s after the reclaim was cancelled", r)
 		}
+	}
+}
+
+// TestKeystoneReclaimDeletesOnlyWhatCleanupLeft is the regression guard for
+// the reclaim of a failed iteration deleting every resource of it again: the
+// iteration's cleanup deletes two users and fails on the project, so the
+// reclaim sends one DELETE, for the project, and records no failed
+// operation, where a DELETE of either user would answer 404.
+func TestKeystoneReclaimDeletesOnlyWhatCleanupLeft(t *testing.T) {
+	logs := captureLogs(t)
+	var (
+		mu       sync.Mutex
+		deletes  []string
+		deleted  = make(map[string]bool)
+		p1Failed bool
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			// Every listing is empty; its JSON key is its path.
+			switch r.URL.Path {
+			case "/users", "/projects", "/roles", "/domains", "/role_assignments":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, "{%q:[]}", strings.TrimPrefix(r.URL.Path, "/"))
+			default:
+				t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				w.WriteHeader(http.StatusNotFound)
+			}
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		deletes = append(deletes, r.URL.Path)
+		switch {
+		case r.URL.Path == "/projects/p1" && !p1Failed:
+			p1Failed = true
+			w.WriteHeader(http.StatusServiceUnavailable)
+		case deleted[r.URL.Path]:
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			deleted[r.URL.Path] = true
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer ts.Close()
+	newClient := func(collector *metrics.Collector) *keystone.Client {
+		gc := &gophercloud.ServiceClient{
+			ProviderClient: &gophercloud.ProviderClient{},
+			Endpoint:       ts.URL + "/",
+		}
+		return keystone.New(gc, "run0", collector)
+	}
+
+	p1 := resource.Resource{Kind: keystone.KindProject, ID: "p1", Name: "dizzy-run0-proj-0001"}
+	created := []resource.Resource{
+		{Kind: keystone.KindUser, ID: "u1", Name: "dizzy-run0-user-0001"},
+		{Kind: keystone.KindUser, ID: "u2", Name: "dizzy-run0-user-0002"},
+		p1,
+	}
+	pending := &keystonePendingCleanups{max: maxPendingKeystoneCleanups}
+	client := newClient(metrics.NewCollector())
+	step := keystoneCleanupStep(pending, "run0", func(ctx context.Context, created []resource.Resource) (int, []resource.Resource, error) {
+		return keystoneexec.CleanupWithRetry(ctx, client, "run0", created, time.Second, 0)
+	})
+	if _, err := step(context.Background(), created); err == nil {
+		t.Fatal("the iteration's cleanup: expected the project's 503 to be reported")
+	}
+	if want := []keystonePendingCleanup{{"run0", []resource.Resource{p1}}}; !reflect.DeepEqual(pending.entries, want) {
+		t.Errorf("pending = %+v, want only the project", pending.entries)
+	}
+	if want := `msg="cleanup failed; retrying it before the next iteration" run=run0 pending=1 remaining=1 `; !strings.Contains(logs.String(), want) {
+		t.Errorf("log %q missing %q", logs.String(), want)
+	}
+
+	mu.Lock()
+	before := len(deletes)
+	mu.Unlock()
+	reclaimCollector := metrics.NewCollector()
+	reclaimClient := newClient(reclaimCollector)
+	pending.reclaim(context.Background(), func(ctx context.Context, id string, remaining []resource.Resource) (int, []resource.Resource, error) {
+		return keystoneexec.CleanupWithRetry(ctx, reclaimClient, id, remaining, time.Second, 0)
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"/projects/p1"}; !reflect.DeepEqual(deletes[before:], want) {
+		t.Errorf("reclaim DELETEs = %v, want %v", deletes[before:], want)
+	}
+	if failed := reclaimCollector.Aggregate(time.Second).Overall.Failed; failed != 0 {
+		t.Errorf("reclaim recorded %d failed operations, want 0", failed)
+	}
+	if n := pending.len(); n != 0 {
+		t.Errorf("pending.len() = %d after the reclaim, want 0", n)
 	}
 }
 

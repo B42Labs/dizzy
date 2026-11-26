@@ -33,9 +33,9 @@ import (
 // once at startup so a wrong tier fails fast before the loop begins. An
 // iteration's cleanup retries transient failures for up to
 // --cleanup-retry-budget; an iteration whose cleanup still fails is kept in
-// memory (at most maxPendingKeystoneCleanups) and cleaned up again by its run
-// id before each later iteration, and any still pending at shutdown is logged
-// with the command that reclaims it.
+// memory (at most maxPendingKeystoneCleanups) with what that cleanup left
+// behind, and cleaned up again by its run id before each later iteration, and
+// any still pending at shutdown is logged with the command that reclaims it.
 func newKeystoneMonitorCmd(opts *globalOptions) *cobra.Command {
 	var (
 		scenarioPath       string
@@ -131,9 +131,10 @@ func newKeystoneMonitorCmd(opts *globalOptions) *cobra.Command {
 // keystoneMonitorRunOnce builds the production per-iteration closure the loop
 // drives. Each iteration gets a fresh run id, a fresh metrics collector, and its
 // own authenticated client. It first cleans up again the earlier iterations
-// whose cleanup failed, each by its own run id with one attempt per call,
-// recorded into a collector of their own so the iteration's op counts and wall
-// time stay comparable; a signal during that reclaim ends the iteration before
+// whose cleanup failed, each by its own run id and what its failed cleanup
+// left behind, with one attempt per call, recorded into a collector of their
+// own so the iteration's op counts and wall time stay comparable; a signal
+// during that reclaim ends the iteration before
 // it starts. It then runs the opt-in pre-flight orphan sweep (only
 // with --reclaim-orphans; see keystonePreflight), applies the plan in the
 // startup-fixed tier (admin mode recreates its roots per iteration under the
@@ -158,11 +159,11 @@ func keystoneMonitorRunOnce(opts *globalOptions, p *keystoneplan.Plan, tel *tele
 		client.SetTelemetry(tel)
 
 		// A client's run id only names creates; each pending run id reaches
-		// Cleanup as its argument.
+		// CleanupWithRetry as its argument.
 		reclaimClient := keystone.New(gc, runID, metrics.NewCollector())
 		reclaimClient.SetTelemetry(tel)
-		pending.reclaim(ctx, func(ctx context.Context, id string, recorded []resource.Resource) (int, error) {
-			return keystoneexec.Cleanup(ctx, keystoneTimeoutCleaner{reclaimClient, opts.timeout}, id, recorded, opts.timeout)
+		pending.reclaim(ctx, func(ctx context.Context, id string, remaining []resource.Resource) (int, []resource.Resource, error) {
+			return keystoneexec.CleanupWithRetry(ctx, keystoneTimeoutCleaner{reclaimClient, opts.timeout}, id, remaining, opts.timeout, 0)
 		})
 		// A signal during the reclaim ends the iteration here: nothing of it
 		// exists yet, and Apply must not start on a cancelled context.
@@ -179,9 +180,8 @@ func keystoneMonitorRunOnce(opts *globalOptions, p *keystoneplan.Plan, tel *tele
 				r, err := keystoneexec.Apply(ctx, client, p, tier, res, opts.concurrency, opts.timeout)
 				return r.Created, err
 			},
-			cleanup: keystoneCleanupStep(pending, runID, func(ctx context.Context, created []resource.Resource) (int, error) {
-				n, _, err := keystoneexec.CleanupWithRetry(ctx, keystoneTimeoutCleaner{client, opts.timeout}, runID, created, opts.timeout, cleanupRetryBudget)
-				return n, err
+			cleanup: keystoneCleanupStep(pending, runID, func(ctx context.Context, created []resource.Resource) (int, []resource.Resource, error) {
+				return keystoneexec.CleanupWithRetry(ctx, keystoneTimeoutCleaner{client, opts.timeout}, runID, created, opts.timeout, cleanupRetryBudget)
 			}),
 		})
 		hb.stop()
@@ -229,10 +229,10 @@ func keystoneMonitorRunOnce(opts *globalOptions, p *keystoneplan.Plan, tel *tele
 const maxPendingKeystoneCleanups = 20
 
 // keystonePendingCleanup is one iteration whose cleanup failed: its run id and
-// the resources its apply recorded.
+// the resources that cleanup left behind, whose delete or disable failed.
 type keystonePendingCleanup struct {
-	runID    string
-	recorded []resource.Resource
+	runID     string
+	remaining []resource.Resource
 }
 
 // keystonePendingCleanups holds the iterations whose cleanup failed, oldest
@@ -245,10 +245,11 @@ type keystonePendingCleanups struct {
 	entries []keystonePendingCleanup
 }
 
-// add appends an iteration whose cleanup failed. When that exceeds max, the
-// oldest entry is dropped and logged with the command that reclaims it.
-func (p *keystonePendingCleanups) add(runID string, recorded []resource.Resource) {
-	p.entries = append(p.entries, keystonePendingCleanup{runID: runID, recorded: recorded})
+// add appends an iteration whose cleanup failed, with what that cleanup left
+// behind. When that exceeds max, the oldest entry is dropped and logged with
+// the command that reclaims it.
+func (p *keystonePendingCleanups) add(runID string, remaining []resource.Resource) {
+	p.entries = append(p.entries, keystonePendingCleanup{runID: runID, remaining: remaining})
 	if len(p.entries) > p.max {
 		id := p.entries[0].runID
 		p.entries = slices.Delete(p.entries, 0, 1)
@@ -258,17 +259,19 @@ func (p *keystonePendingCleanups) add(runID string, recorded []resource.Resource
 
 // reclaim runs clean for each entry, oldest first, and stops before the next
 // one once ctx is done. An entry whose cleanup succeeds is removed; one whose
-// cleanup fails is kept for the next iteration.
-func (p *keystonePendingCleanups) reclaim(ctx context.Context, clean func(ctx context.Context, runID string, recorded []resource.Resource) (int, error)) {
+// cleanup fails is kept for the next iteration with what that cleanup left
+// behind, so a resource it deleted is not sent again.
+func (p *keystonePendingCleanups) reclaim(ctx context.Context, clean func(ctx context.Context, runID string, remaining []resource.Resource) (int, []resource.Resource, error)) {
 	var kept []keystonePendingCleanup
 	for i, e := range p.entries {
 		if ctx.Err() != nil {
 			kept = append(kept, p.entries[i:]...)
 			break
 		}
-		n, err := clean(ctx, e.runID, e.recorded)
+		n, remaining, err := clean(ctx, e.runID, e.remaining)
 		if err != nil {
-			slog.Warn("pending cleanup failed; retrying before the next iteration", "run", e.runID, "deleted", n, "error", err)
+			slog.Warn("pending cleanup failed; retrying before the next iteration", "run", e.runID, "deleted", n, "remaining", len(remaining), "error", err)
+			e.remaining = remaining
 			kept = append(kept, e)
 			continue
 		}
@@ -289,15 +292,16 @@ func (p *keystonePendingCleanups) logRemaining() {
 }
 
 // keystoneCleanupStep wraps one iteration's cleanup: when clean fails, the
-// iteration is added to pending, so a later iteration cleans it up again. It
-// returns clean's result unchanged, so runIteration stays shared with every
-// other namespace.
-func keystoneCleanupStep(pending *keystonePendingCleanups, runID string, clean func(ctx context.Context, created []resource.Resource) (int, error)) func(ctx context.Context, created []resource.Resource) (int, error) {
+// iteration is added to pending with the resources clean left behind, so a
+// later iteration cleans it up again without deleting what clean already
+// deleted. It returns clean's count and error unchanged, so runIteration stays
+// shared with every other namespace.
+func keystoneCleanupStep(pending *keystonePendingCleanups, runID string, clean func(ctx context.Context, created []resource.Resource) (int, []resource.Resource, error)) func(ctx context.Context, created []resource.Resource) (int, error) {
 	return func(ctx context.Context, created []resource.Resource) (int, error) {
-		n, err := clean(ctx, created)
+		n, remaining, err := clean(ctx, created)
 		if err != nil {
-			pending.add(runID, created)
-			slog.Warn("cleanup failed; retrying it before the next iteration", "run", runID, "pending", pending.len(), "error", err)
+			pending.add(runID, remaining)
+			slog.Warn("cleanup failed; retrying it before the next iteration", "run", runID, "pending", pending.len(), "remaining", len(remaining), "error", err)
 		}
 		return n, err
 	}
