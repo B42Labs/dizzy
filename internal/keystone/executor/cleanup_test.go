@@ -180,6 +180,14 @@ func TestCleanupRefusesEmptyRunID(t *testing.T) {
 	if deleted != 0 || len(f.events) != 0 {
 		t.Errorf("Cleanup touched resources with an empty run id: deleted=%d events=%v", deleted, f.events)
 	}
+
+	deleted, remaining, err := CleanupWithRetry(context.Background(), f, "", nil, time.Minute, 0)
+	if want := "cleanup: empty run id; refusing to delete by an empty prefix"; err == nil || err.Error() != want {
+		t.Errorf("CleanupWithRetry with an empty run id: error = %v, want %q", err, want)
+	}
+	if deleted != 0 || remaining != nil || len(f.events) != 0 {
+		t.Errorf("CleanupWithRetry with an empty run id: deleted=%d remaining=%v events=%v, want 0, nil, none", deleted, remaining, f.events)
+	}
 }
 
 // TestCleanupUnionsRecordedAndDedups confirms a resource present only in the run
@@ -501,12 +509,15 @@ func TestCleanupWithRetryRetriesTransient(t *testing.T) {
 		f.failDel["u1"] = errUnavailable
 		f.failDelTimes["u1"] = 2
 
-		deleted, err := CleanupWithRetry(t.Context(), f, "run0", nil, time.Minute, time.Minute)
+		deleted, remaining, err := CleanupWithRetry(t.Context(), f, "run0", nil, time.Minute, time.Minute)
 		if err != nil {
 			t.Fatalf("CleanupWithRetry: %v", err)
 		}
 		if deleted != 5 {
 			t.Errorf("deleted %d resources, want 5", deleted)
+		}
+		if len(remaining) != 0 {
+			t.Errorf("remaining = %v, want none once the retried delete succeeded", remaining)
 		}
 		if got := f.attempts["u1"]; got != 3 {
 			t.Errorf("u1 attempts = %d, want 3", got)
@@ -531,7 +542,7 @@ func TestCleanupWithRetryRetriesTimeoutAndConnectionErrors(t *testing.T) {
 				f.failDel["u1"] = tc.err
 				f.failDelTimes["u1"] = 1
 
-				if _, err := CleanupWithRetry(t.Context(), f, "run0", nil, time.Minute, time.Minute); err != nil {
+				if _, _, err := CleanupWithRetry(t.Context(), f, "run0", nil, time.Minute, time.Minute); err != nil {
 					t.Fatalf("CleanupWithRetry: %v", err)
 				}
 				if got := f.attempts["u1"]; got != 2 {
@@ -561,7 +572,7 @@ func TestCleanupWithRetryNeverRetriesTerminal(t *testing.T) {
 				f := seedRun()
 				f.failDel["u1"] = gophercloud.ErrUnexpectedResponseCode{Actual: tc.status}
 
-				deleted, err := CleanupWithRetry(t.Context(), f, "run0", nil, time.Minute, time.Minute)
+				deleted, _, err := CleanupWithRetry(t.Context(), f, "run0", nil, time.Minute, time.Minute)
 				if got := f.attempts["u1"]; got != 1 {
 					t.Errorf("u1 attempts = %d, want 1", got)
 				}
@@ -602,7 +613,7 @@ func TestCleanupWithRetryStopsAtBudget(t *testing.T) {
 				f := seedRun()
 				f.failDel["u1"] = errUnavailable
 
-				_, err := CleanupWithRetry(t.Context(), f, "run0", nil, time.Minute, tc.budget)
+				_, _, err := CleanupWithRetry(t.Context(), f, "run0", nil, time.Minute, tc.budget)
 				if got := f.attempts["u1"]; got != tc.want {
 					t.Errorf("u1 attempts = %d, want %d", got, tc.want)
 				}
@@ -646,7 +657,7 @@ func TestCleanupWithRetryStopsOnCancel(t *testing.T) {
 
 		done := make(chan error, 1)
 		go func() {
-			_, err := CleanupWithRetry(ctx, f, "run0", nil, time.Minute, time.Minute)
+			_, _, err := CleanupWithRetry(ctx, f, "run0", nil, time.Minute, time.Minute)
 			done <- err
 		}()
 		synctest.Wait() // the sweep now waits out u1's first backoff
@@ -660,4 +671,159 @@ func TestCleanupWithRetryStopsOnCancel(t *testing.T) {
 			t.Errorf("CleanupWithRetry error = %v, want one wrapping context.Canceled", err)
 		}
 	})
+}
+
+// remainingIDs returns the ids of rs, in order.
+func remainingIDs(rs []resource.Resource) []string {
+	var ids []string
+	for _, r := range rs {
+		ids = append(ids, r.ID)
+	}
+	return ids
+}
+
+// TestCleanupWithRetryReportsRemaining confirms CleanupWithRetry returns what
+// the sweep left behind: each resource whose delete or disable failed with
+// anything but a 404, in call order, and nothing for a 404 or a failed
+// listing. Every case passes a budget of 0, so a 500 or a 503 gets one attempt.
+func TestCleanupWithRetryReportsRemaining(t *testing.T) {
+	errProject := errors.New("project boom")
+	listErr := fmt.Errorf("listing users by prefix: %w", errUnavailable)
+	for _, tc := range []struct {
+		name        string
+		setup       func() (*fakeCleaner, []resource.Resource)
+		wantIDs     []string
+		wantDeleted int
+		wantErr     func(error) bool // nil: the error must be nil
+	}{
+		{
+			name: "failed user and project deletes",
+			setup: func() (*fakeCleaner, []resource.Resource) {
+				f := seedRun()
+				f.failDel["u1"] = gophercloud.ErrUnexpectedResponseCode{Actual: 500}
+				f.failDel["p1"] = errProject
+				return f, nil
+			},
+			wantIDs:     []string{"u1", "p1"},
+			wantDeleted: 3, // assignment + role + domain
+			wantErr: func(err error) bool {
+				return gophercloud.ResponseCodeIs(err, 500) && errors.Is(err, errProject)
+			},
+		},
+		{
+			name:        "nothing fails",
+			setup:       func() (*fakeCleaner, []resource.Resource) { return seedRun(), nil },
+			wantDeleted: 5,
+		},
+		{
+			name:  "nothing to delete",
+			setup: func() (*fakeCleaner, []resource.Resource) { return newFakeCleaner(), nil },
+		},
+		{
+			name: "recorded user already gone",
+			setup: func() (*fakeCleaner, []resource.Resource) {
+				f := newFakeCleaner()
+				f.gone["u1"] = true
+				return f, []resource.Resource{{Kind: keystone.KindUser, ID: "u1", Name: "dizzy-run0-user-0001"}}
+			},
+		},
+		{
+			name: "delete timed out",
+			setup: func() (*fakeCleaner, []resource.Resource) {
+				f := seedRun()
+				f.failDel["u1"] = context.DeadlineExceeded
+				return f, nil
+			},
+			wantIDs:     []string{"u1"},
+			wantDeleted: 4, // assignment + project + role + domain
+			wantErr:     func(err error) bool { return errors.Is(err, context.DeadlineExceeded) },
+		},
+		{
+			name: "delete canceled",
+			setup: func() (*fakeCleaner, []resource.Resource) {
+				f := seedRun()
+				f.failDel["u1"] = context.Canceled
+				return f, nil
+			},
+			wantIDs:     []string{"u1"},
+			wantDeleted: 4, // assignment + project + role + domain
+			wantErr:     func(err error) bool { return errors.Is(err, context.Canceled) },
+		},
+		{
+			name: "failed domain disable",
+			setup: func() (*fakeCleaner, []resource.Resource) {
+				f := newFakeCleaner()
+				f.domains = []resource.Resource{
+					{Kind: keystone.KindDomain, ID: "d1", Name: "dizzy-run0-dom-0001"},
+					{Kind: keystone.KindDomain, ID: "d2", Name: "dizzy-run0-dom-0002"},
+				}
+				f.failDisable["d1"] = gophercloud.ErrUnexpectedResponseCode{Actual: 500}
+				return f, nil
+			},
+			wantIDs:     []string{"d1"},
+			wantDeleted: 1, // d2
+			wantErr:     func(err error) bool { return gophercloud.ResponseCodeIs(err, 500) },
+		},
+		{
+			// The unlisted user is neither deleted nor reported, which is why
+			// the monitor still queues the run: its next sweep lists it again.
+			name: "failed user listing",
+			setup: func() (*fakeCleaner, []resource.Resource) {
+				f := seedRun()
+				f.failList["users"] = listErr
+				return f, nil
+			},
+			wantDeleted: 3, // project + role + domain
+			wantErr:     func(err error) bool { return errors.Is(err, listErr) },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, recorded := tc.setup()
+			deleted, remaining, err := CleanupWithRetry(context.Background(), f, "run0", recorded, time.Minute, 0)
+			if got := remainingIDs(remaining); !slices.Equal(got, tc.wantIDs) {
+				t.Errorf("remaining ids = %v, want %v", got, tc.wantIDs)
+			}
+			if deleted != tc.wantDeleted {
+				t.Errorf("deleted %d resources, want %d", deleted, tc.wantDeleted)
+			}
+			switch {
+			case tc.wantErr == nil && err != nil:
+				t.Errorf("CleanupWithRetry: %v", err)
+			case tc.wantErr != nil && !tc.wantErr(err):
+				t.Errorf("CleanupWithRetry error = %v, want one wrapping the injected failure", err)
+			}
+		})
+	}
+}
+
+// TestCleanupOfRemainingDeletesNothingTwice is the regression guard for a
+// later cleanup deleting again what a failed one already deleted: given what
+// the first sweep left behind, the second sends a delete for that leftover
+// and none for a resource the first sweep deleted.
+func TestCleanupOfRemainingDeletesNothingTwice(t *testing.T) {
+	f := seedRun()
+	recorded := []resource.Resource{f.userAssignments["u1"][0], f.users[0], f.projects[0], f.roles[0], f.domains[0]}
+	f.failDel["u1"] = gophercloud.ErrUnexpectedResponseCode{Actual: 500}
+	f.failDelTimes["u1"] = 1
+
+	_, remaining, err := CleanupWithRetry(context.Background(), f, "run0", recorded, time.Minute, 0)
+	if err == nil {
+		t.Fatal("first CleanupWithRetry: expected the user's 500 to be reported")
+	}
+	if got := remainingIDs(remaining); !slices.Equal(got, []string{"u1"}) {
+		t.Fatalf("remaining ids = %v, want [u1]", got)
+	}
+
+	deleted, err := Cleanup(context.Background(), f, "run0", remaining, time.Minute)
+	if err != nil || deleted != 1 {
+		t.Fatalf("second Cleanup = %d, %v; want 1, nil", deleted, err)
+	}
+	if got := f.attempts["u1"]; got != 2 {
+		t.Errorf("u1 attempts = %d, want 2", got)
+	}
+	for _, id := range []string{"u1:project:p1:r1", "p1", "r1", "d1"} {
+		if got := f.attempts[id]; got != 1 {
+			t.Errorf("%s attempts = %d, want 1 (deleted by the first sweep only)", id, got)
+		}
+	}
 }
