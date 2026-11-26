@@ -126,7 +126,8 @@ $ dizzy keystone monitor --scenario scenarios/keystone/small.yaml --cleanup-retr
 
 An iteration whose cleanup still fails is cleaned up again, by its run id,
 before each later iteration, so a transient fault costs a retry instead of
-leaking the iteration's users, projects, and domains. The monitor keeps at most
+leaking the iteration's users, projects, and domains. That later cleanup
+deletes only what the failed one left behind. The monitor keeps at most
 20 such runs, in memory only: a restart forgets them, and the monitor logs each
 one still pending at shutdown with its `dizzy keystone cleanup --run-id <id>`
 command.

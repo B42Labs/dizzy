@@ -869,10 +869,16 @@ across iterations. To broaden coverage, run several monitors with different
 a 429, a timeout, or a connection error for up to `--cleanup-retry-budget`,
 backing off from 250ms to at most 30s between attempts, and a call that still
 fails no longer stops the rest of the cleanup. It keeps each iteration whose
-cleanup still fails, at most 20; past that it drops the oldest with an error
-log. Before each later iteration it cleans every kept iteration up again by
-its run id, with one attempt per call, and forgets the iteration once that
-succeeds. Scoped to its own run ids, this cleanup is safe beside a concurrent
+cleanup still fails, at most 20, with the resources whose delete or disable
+failed; past that it drops the oldest with an error log. Before each later
+iteration it cleans every kept iteration up again, with one attempt per call:
+it deletes what it still finds by the run id and the resources the failed
+cleanup left behind, not the ones that cleanup already deleted. It forgets the
+iteration once that succeeds and otherwise keeps what this attempt left
+behind. A leftover that is already gone, because its delete failed on the
+client but reached Keystone or because it went with its domain, answers 404
+and counts once as `error_kind="http_404"` in `dizzy_operation_errors_total`.
+Scoped to its own run ids, this cleanup is safe beside a concurrent
 run. The kept iterations live in memory only, so a restart forgets them; at
 shutdown the monitor logs each one still pending with its
 `dizzy keystone cleanup --run-id <id>` command. The `iteration complete` log
